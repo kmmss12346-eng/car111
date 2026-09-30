@@ -122,14 +122,14 @@ Usart_Init();
 
 HWT101_Init();
 
-
-HAL_Delay(1000);
-
-
-//记录初始方向
-
-HWT101_Update();
-
+/* 等待第一帧角度(最多2秒)，再记录初始方向；中断接收，不阻塞 */
+{
+    uint32_t t0 = HAL_GetTick();
+    while (!HWT101_IsReady() && (HAL_GetTick() - t0) < 2000)
+    {
+    }
+}
+HWT101_ZeroSoft();
 yaw_target = HWT101_GetYaw();
 
 /* USER CODE BEGIN 2 */
@@ -192,8 +192,10 @@ yaw_target = HWT101_GetYaw();
   
 while(1)
 {
-
-	
+	/* HWT101 测试：用 OpenOCD 读 hwt101_dbg，或在 Keil 调试里看 hwt_test_yaw */
+	HWT101_Update();
+	hwt_test_yaw = HWT101_GetYawContinuous();
+	HAL_Delay(10);
 }
 }
 

@@ -199,5 +199,11 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+extern UART_HandleTypeDef huart1;
 
+/* USART1 中断：HWT101 接收(见 hwt101.c)；CubeMX 未启用该中断，所以手写在 USER CODE 区 */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
 /* USER CODE END 1 */
