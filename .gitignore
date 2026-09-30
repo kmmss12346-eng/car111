@@ -16,3 +16,4 @@ __pycache__/
 *.build_log.htm
 car_2027_keil/**/MDK-ARM/car_2027/*.hex
 car_2027_keil/**/*.uvguix.*
+chuankongping_keil/**/*.uvguix.*
