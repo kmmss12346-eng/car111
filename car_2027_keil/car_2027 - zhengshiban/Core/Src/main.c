@@ -192,10 +192,35 @@ yaw_target = HWT101_GetYaw();
   
 while(1)
 {
-	/* HWT101 测试：用 OpenOCD 读 hwt101_dbg，或在 Keil 调试里看 hwt_test_yaw */
+	static uint32_t last_send = 0;
+
 	HWT101_Update();
 	hwt_test_yaw = HWT101_GetYawContinuous();
-	HAL_Delay(10);
+
+	/* 每100ms通过USART3(PB10/PB11)发给树莓派，不控制电机 */
+	if (HAL_GetTick() - last_send >= 100)
+	{
+		char msg[80];
+		int n;
+
+		last_send = HAL_GetTick();
+
+		if (HWT101_IsFresh(500))
+		{
+			n = snprintf(msg, sizeof(msg),
+			             "YAW100 %ld CONT100 %ld OK %lu BAD %lu\r\n",
+			             (long)(HWT101_GetYaw() * 100.0f),
+			             (long)(HWT101_GetYawContinuous() * 100.0f),
+			             (unsigned long)hwt101_dbg.frames_ok,
+			             (unsigned long)hwt101_dbg.frames_bad);
+		}
+		else
+		{
+			n = snprintf(msg, sizeof(msg), "NODATA HWT101\r\n");
+		}
+
+		HAL_UART_Transmit(&huart3, (uint8_t *)msg, n, 100);
+	}
 }
 }
 
