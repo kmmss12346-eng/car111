@@ -77,6 +77,12 @@ static void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
 void Servo2_MoveRelative(float delta_angle);
+void Claw_Set(uint32_t pulse_us);
+void Claw_Open(void);
+void Claw_Close(void);
+void Turntable_Set(uint32_t pulse_us);
+void Turntable_GoTo(uint8_t slot);
+void Servos_PWM_Test(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -133,6 +139,14 @@ HWT101_ZeroSoft();
 yaw_target = HWT101_GetYaw();
 
 /* USER CODE BEGIN 2 */
+
+/* TIM2: 1MHz计数, 周期20ms -> CCR 数值 = 脉宽(微秒)。
+ * CH3=PA2 爪子舵机, CH2=PB3 转盘舵机。先写入安全位置再启动PWM，避免上电乱跳 */
+Claw_Open();
+Turntable_GoTo(1);
+HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+//Servos_PWM_Test();   /* 调试时取消注释：爪子开合、转盘依次转到1/2/3号位 */
 
 //HAL_Delay(3000);
 
@@ -494,6 +508,60 @@ static void MX_GPIO_Init(void)
 
 
 
+
+/* ---- PWM 舵机(数值沿用上一届工程，需要在新车上重新标定) ---- */
+#define CLAW_OPEN_US        2090u   /* 松开 */
+#define CLAW_CLOSE_US       2910u   /* 夹紧 */
+#define CLAW_MIN_US         1700u   /* 机械限位，别超出 */
+#define CLAW_MAX_US         2910u
+#define TURNTABLE_SLOT1_US  2608u   /* 转盘 1 号位 */
+#define TURNTABLE_STEP_US   900u    /* 相邻位置差 */
+#define TURNTABLE_MIN_US    500u
+#define TURNTABLE_MAX_US    2608u
+
+void Claw_Set(uint32_t pulse_us)
+{
+    if (pulse_us < CLAW_MIN_US) pulse_us = CLAW_MIN_US;
+    if (pulse_us > CLAW_MAX_US) pulse_us = CLAW_MAX_US;
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, pulse_us);
+}
+
+void Claw_Open(void)  { Claw_Set(CLAW_OPEN_US); }
+void Claw_Close(void) { Claw_Set(CLAW_CLOSE_US); }
+
+void Turntable_Set(uint32_t pulse_us)
+{
+    if (pulse_us < TURNTABLE_MIN_US) pulse_us = TURNTABLE_MIN_US;
+    if (pulse_us > TURNTABLE_MAX_US) pulse_us = TURNTABLE_MAX_US;
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse_us);
+}
+
+/* slot = 1/2/3 */
+void Turntable_GoTo(uint8_t slot)
+{
+    if (slot < 1) slot = 1;
+    if (slot > 3) slot = 3;
+    Turntable_Set(TURNTABLE_SLOT1_US - (uint32_t)(slot - 1) * TURNTABLE_STEP_US);
+}
+
+void Servos_PWM_Test(void)
+{
+    uint8_t i;
+
+    Claw_Open();
+    HAL_Delay(1000);
+    Claw_Close();
+    HAL_Delay(1000);
+    Claw_Open();
+    HAL_Delay(1000);
+
+    for (i = 1; i <= 3; i++)
+    {
+        Turntable_GoTo(i);
+        HAL_Delay(1500);
+    }
+    Turntable_GoTo(1);
+}
 
 void Servo2_MoveRelative(float delta_angle)
 {
