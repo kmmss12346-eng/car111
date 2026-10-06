@@ -1,0 +1,36 @@
+# Keil MDK-ARM build outputs
+**/MDK-ARM/*/
+!**/MDK-ARM/RTE/
+!**/MDK-ARM/DebugConfig/
+*.o
+*.d
+*.crf
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.lnp
+*.htm
+*.dep
+*.build_log.htm
+*.bak
+*.iex
+*.sct.bak
+
+# Keil per-user UI/debug state (machine specific)
+*.uvguix.*
+*.uvoptx
+
+# STM32CubeMX / IDE
+.mxproject.bak
+.vscode/
+.settings/
+.metadata/
+Debug/
+Release/
+
+# OS
+.DS_Store
+Thumbs.db
