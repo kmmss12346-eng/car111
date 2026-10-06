@@ -6,8 +6,8 @@
  *   整臂旋转  飞特总线舵机 ID1      (同上)
  *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Open / Claw_Close)
  *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_GoTo)
- *   扫码模块  UART5 (PC12/PD2)
- *   串口屏    USART2(PD5/PD6)
+ *   扫码模块  UART5 (PC12/PD2)   GM65，出厂 9600 8N1
+ *   串口屏    USART2(PD5/PD6)    淘晶驰 TJC4832T135，出厂 9600
  *
  * 高度约定：升降"最高点 = 0 mm"，往下为正数。所有姿态都是参数，用 SET 在线改，不用重新烧录。
  *
@@ -40,6 +40,11 @@ extern void Delay_Report(uint32_t ms);
 
 #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
 
+/* 两个模块出厂都是 9600。工程里 USART2/UART5 初始化成了 115200，Arm_Init 里会改成下面的值。
+ * 如果您把屏或扫码模块改过波特率，只改这两个数 */
+#define SCREEN_BAUD    9600u
+#define QR_BAUD        9600u
+
 /* 开机时夹爪、转盘先到这个位置(要和 main.c 里 CLAW_OPEN_US / TURNTABLE_SLOT1_US 一致) */
 #define CLAW_BOOT_US   2090u
 #define TT_BOOT_US     2608u
@@ -68,6 +73,9 @@ static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹物料 */
 static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
 static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出放到圆环 */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 转速(度/秒) */
+static float g_zstk   = 40.0f;     /* ZSTK   码垛时放下的高度(比 ZPLC 抬高一个物料的高度，物料高 60mm) */
+static float g_reach  = 0.0f;      /* REACH  伸出方向的微调(毫米，正=更远)。树莓派每次夹/放前根据摄像头设置 */
+static float g_a2dpm  = 0.0f;      /* A2DPM  ID2 每伸出 1 毫米要转多少度(带正负号，用来让 REACH 正数=更远)。0=不微调 */
 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
@@ -104,6 +112,9 @@ static const ArmTun tun[] =
     { "A2R",    &g_a2r,    -1220.0f, -503.5f },
     { "A2P",    &g_a2p,    -1220.0f, -503.5f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
+    { "ZSTK",   &g_zstk,    0.0f,    400.0f },
+    { "REACH",  &g_reach,  -80.0f,   80.0f },
+    { "A2DPM",  &g_a2dpm,  -10.0f,   10.0f },
     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
@@ -275,8 +286,8 @@ static const char *Seq_Check(uint8_t slot)
     return NULL;
 }
 
-/* 从原料盘夹一个，放进车上转盘 slot 号位 */
-static const char *Seq_Grab(uint8_t slot)
+/* 从工位(原料盘 / 地上圆环)夹一个，放进车上转盘 slot 号位。a1、a2、z：工位的转向角、伸出角、夹取高度 */
+static const char *Seq_Pick(uint8_t slot, float a1, float a2, float z)
 {
     const char *e = Seq_Check(slot);
     if (e) return e;
@@ -284,9 +295,9 @@ static const char *Seq_Grab(uint8_t slot)
     TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
     Claw_Open();
     GO(Lift_Goto(g_zhi));
-    SERVO(1, g_a1g);                               /* 转向原料盘 */
-    SERVO(2, g_a2e);                               /* 伸出 */
-    GO(Lift_Goto(g_zgrab));                        /* 下降 */
+    SERVO(1, a1);                                  /* 转向工位 */
+    SERVO(2, a2 + g_reach * g_a2dpm);              /* 伸出(REACH 是摄像头给的微调) */
+    GO(Lift_Goto(z));                              /* 下降 */
     Claw_Close();  WAIT(g_clwait);                 /* 夹紧 */
     GO(Lift_Goto(g_zhi));                          /* 抬起 */
     SERVO(2, g_a2r);                               /* 缩回 */
@@ -299,8 +310,8 @@ static const char *Seq_Grab(uint8_t slot)
     return NULL;
 }
 
-/* 从车上转盘 slot 号位取出物料，放到地上圆环 */
-static const char *Seq_Place(uint8_t slot)
+/* 从车上转盘 slot 号位取出物料，放到地上圆环。stack=1：码垛(放在已有物料上面，放下高度用 ZSTK) */
+static const char *Seq_Place(uint8_t slot, uint8_t stack)
 {
     const char *e = Seq_Check(slot);
     if (e) return e;
@@ -315,9 +326,9 @@ static const char *Seq_Place(uint8_t slot)
     Claw_Close();  WAIT(g_clwait);                 /* 夹起 */
     GO(Lift_Goto(g_zhi));
     SERVO(1, g_a1p);                               /* 转向地上圆环 */
-    SERVO(2, g_a2p);                               /* 伸出 */
-    GO(Lift_Goto(g_zplc));                         /* 下降到物料底面快贴地 */
-    Claw_Open();   WAIT(g_clwait);                 /* 松开：物料立在圆环上 */
+    SERVO(2, g_a2p + g_reach * g_a2dpm);           /* 伸出 */
+    GO(Lift_Goto(stack ? g_zstk : g_zplc));        /* 下降到物料底面快贴地(码垛时贴在下面那个物料上) */
+    Claw_Open();   WAIT(g_clwait);                 /* 松开 */
     GO(Lift_Goto(g_zhi));
     SERVO(2, g_a2r);                               /* 缩回，不要带倒物料 */
     SERVO(1, g_a1h);
@@ -342,6 +353,15 @@ void Screen_Text(const char *obj, const char *text)
         n = (int)sizeof(buf) - 1;
     }
     HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 100);
+    HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
+}
+
+/* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
+static void Screen_Raw(const char *cmd)
+{
+    static const uint8_t endb[3] = { 0xFF, 0xFF, 0xFF };
+
+    HAL_UART_Transmit(&huart2, (uint8_t *)cmd, (uint16_t)strlen(cmd), 100);
     HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
 }
 
@@ -456,6 +476,11 @@ void Arm_Init(void)
     tt_slot = 1;
     tt_ready_at = HAL_GetTick();
 
+    huart2.Init.BaudRate = SCREEN_BAUD;            /* 屏 */
+    HAL_UART_Init(&huart2);
+    huart5.Init.BaudRate = QR_BAUD;                /* 扫码模块 */
+    HAL_UART_Init(&huart5);
+
     qr_len = 0;
     qr_end = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
@@ -556,16 +581,25 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         }
     }
 
-    /* ---- 夹取 / 放置 ---- */
-    if (strncmp(cmd, "GRAB ", 5) == 0 || strncmp(cmd, "PLACE ", 6) == 0)
+    /* ---- 夹取 / 放置：GRAB n(原料盘->转盘)  PICK n(地上圆环->转盘)  PLACE n [S](转盘->地上圆环，S=码垛) ---- */
+    if (strncmp(cmd, "GRAB ", 5) == 0 || strncmp(cmd, "PICK ", 5) == 0 || strncmp(cmd, "PLACE ", 6) == 0)
     {
-        int is_grab = (cmd[0] == 'G');
-        const char *a = cmd + (is_grab ? 5 : 6);
+        char k = cmd[1];                           /* 'R' GRAB, 'I' PICK, 'L' PLACE */
+        const char *a = cmd + (k == 'L' ? 6 : 5);
         long slot = strtol(a, &e, 10);
+        uint8_t stack = 0;
         const char *r;
 
-        if (e == a || *e != 0)  FAIL("ERR ARG");
-        r = is_grab ? Seq_Grab((uint8_t)slot) : Seq_Place((uint8_t)slot);
+        if (e == a)  FAIL("ERR ARG");
+        if (k == 'L' && *e == ' ' && e[1] == 'S' && e[2] == 0)
+        {
+            stack = 1;
+            e += 2;
+        }
+        if (*e != 0)  FAIL("ERR ARG");
+        if (k == 'R')       r = Seq_Pick((uint8_t)slot, g_a1g, g_a2e, g_zgrab);
+        else if (k == 'I')  r = Seq_Pick((uint8_t)slot, g_a1p, g_a2p, g_zplc);
+        else                r = Seq_Place((uint8_t)slot, stack);
         if (r)  FAIL(r);
         return 1;
     }
@@ -584,6 +618,13 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     {
         qr_valid = 0;
         qr_code[0] = 0;
+        return 1;
+    }
+
+    /* ---- 串口屏原始指令：SCMD <淘晶驰指令> ---- */
+    if (strncmp(cmd, "SCMD ", 5) == 0)
+    {
+        Screen_Raw(cmd + 5);
         return 1;
     }
 
