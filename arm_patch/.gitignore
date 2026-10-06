@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+servo_cal.json
+vdebug.png
+*.json.bak*

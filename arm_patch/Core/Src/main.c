@@ -98,6 +98,8 @@ void  Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps);
 void  Servo_MoveRelative(uint8_t id, float delta_deg, float speed_dps);
 void  Servo_Release(uint8_t id);
 int   Servo_ReadAngle(uint8_t id, float *angle);
+uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发指令不等，返回估计要多少毫秒 */
+void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
 
 /* USER CODE END PFP */
 
@@ -946,12 +948,53 @@ float Servo_GetAngle(uint8_t id)
     return a;
 }
 
-/* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)。
- * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
- * 按角度和速度算好时间，到时间没转到位就放弃，并通过串口打印一句提示。 */
-void Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps)
+/* 把目标角度限制在限位里 */
+static float Servo_Clamp(uint8_t id, float angle_deg)
 {
-    float lo, hi, start, d, a;
+    float lo = (id == 1) ? SERVO1_MIN_DEG : SERVO2_MIN_DEG;
+    float hi = (id == 1) ? SERVO1_MAX_DEG : SERVO2_MAX_DEG;
+
+    if (angle_deg < lo) angle_deg = lo;
+    if (angle_deg > hi) angle_deg = hi;
+    return angle_deg;
+}
+
+/* 只发转动指令，不等它转完(机械臂让 ID1、ID2 同时转就用它)。
+ * *angle_deg 会被限位修正；speed_dps<=0 用默认速度。返回估计要多少毫秒转完(含加减速)，id 不对返回 0。 */
+uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
+{
+    float start, d;
+
+    if (id != 1 && id != 2)
+    {
+        return 0;
+    }
+    *angle_deg = Servo_Clamp(id, *angle_deg);
+    if (speed_dps <= 0.0f)
+    {
+        speed_dps = SERVO_DEFAULT_SPEED;
+    }
+
+    start = *angle_deg;
+    if (FSUS_QueryServoAngleMTurn(&usart2, id, &start) != FSUS_STATUS_SUCCESS)
+    {
+        start = *angle_deg + 90.0f;              /* 读不到就按最多转 90° 估时间 */
+    }
+    d = *angle_deg - start;
+    if (d < 0.0f) d = -d;
+
+    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, *angle_deg, speed_dps,
+                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
+    return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
+}
+
+/* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
+ * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
+ * 按角度和速度算好时间，再多等 extra_ms 毫秒，到时间没转到位就放弃。
+ * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印。 */
+void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
+{
+    float a, d;
     uint32_t t0, tmax;
     int ok = 0;
 
@@ -959,36 +1002,17 @@ void Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps)
     {
         return;
     }
-    lo = (id == 1) ? SERVO1_MIN_DEG : SERVO2_MIN_DEG;
-    hi = (id == 1) ? SERVO1_MAX_DEG : SERVO2_MAX_DEG;
-    if (angle_deg < lo) angle_deg = lo;
-    if (angle_deg > hi) angle_deg = hi;
-    if (speed_dps <= 0.0f)
-    {
-        speed_dps = SERVO_DEFAULT_SPEED;
-    }
-
-    start = angle_deg;
-    if (FSUS_QueryServoAngleMTurn(&usart2, id, &start) != FSUS_STATUS_SUCCESS)
-    {
-        start = angle_deg + 90.0f;               /* 读不到就按最多转 90° 估时间 */
-    }
-    d = angle_deg - start;
-    if (d < 0.0f) d = -d;
-    tmax = (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS + SERVO_WAIT_EXTRA_MS;
-
-    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, speed_dps,
-                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
+    tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
 
     t0 = HAL_GetTick();
     while ((HAL_GetTick() - t0) < tmax)
     {
-        HAL_Delay(50);
+        HAL_Delay(30);
         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
         {
             d = a - angle_deg;
             if (d < 0.0f) d = -d;
-            if (d <= SERVO_ARRIVE_TOL)
+            if (d <= tol_deg)
             {
                 ok = 1;
                 break;
@@ -996,13 +1020,19 @@ void Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps)
         }
     }
 
-    if (!ok)
+    if (!ok && tol_deg >= 1.0f)
     {
         char m[64];
         int n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
                          (int)id, (long)(angle_deg * 10.0f));
         HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
     }
+}
+
+/* 原来的接口：转到绝对角度，到位误差 2°，多等 1 秒 */
+void Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps)
+{
+    Servo_Move(id, angle_deg, speed_dps, SERVO_ARRIVE_TOL, SERVO_WAIT_EXTRA_MS);
 }
 
 /* 在当前角度上再转 delta_deg 度(正负都可以)，同样受限位保护。

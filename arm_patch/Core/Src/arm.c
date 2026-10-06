@@ -1,8 +1,8 @@
-/* arm.c  机械臂总控 v1
+/* arm.c  机械臂总控 v3
  *
  * 硬件对应：
  *   升降      Emm 步进电机 ID5(和轮子 1~4 号同一路 UART4，皮带升降)
- *   前后伸缩  飞特总线舵机 ID2      (main.c 里的 Servo_SetAngle，限位已在那里)
+ *   前后伸缩  飞特总线舵机 ID2      (main.c 里的 Servo_Move / Servo_Start，限位在那里)
  *   整臂旋转  飞特总线舵机 ID1      (同上)
  *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Open / Claw_Close)
  *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_GoTo)
@@ -11,10 +11,16 @@
  *
  * 高度约定：升降"最高点 = 0 mm"，往下为正数。所有姿态都是参数，用 SET 在线改，不用重新烧录。
  *
+ * 设计思路(为了放得准)：
+ *   - 树莓派用摄像头做闭环对准：车到工位后，先用 OBS 把手臂摆到"观察姿态"，
+ *     然后反复 AD(ID1/ID2 小角度微调)、测偏差、再调，直到对准；
+ *     对准以后才叫 GRAB n H / PICK n H(夹起放进转盘)或 AP + DROP(放下)。
+ *   - 不带 H 的 GRAB / PICK / PLACE 是"不用摄像头、全按固定姿态"的完整流程，调试和应急用。
+ *
  * 安全措施：
- *   - 没回零(LIFT ZERO / LIFT HOME)之前，不允许任何升降动作和 GRAB / PLACE
- *   - 参数 ARMOK=0(默认)时不允许 GRAB / PLACE：姿态都标定好后 SET ARMOK 1
- *   - 升降目标会被限制在 0 ~ LFMAX 毫米
+ *   - 没回零(LIFT ZERO / LIFT HOME)之前，不允许任何升降动作和夹放流程
+ *   - 参数 ARMOK=0(默认)时不允许夹放流程：姿态都标定好后 SET ARMOK 1
+ *   - 升降目标会被限制在 0 ~ LFMAX 毫米；舵机角度由 main.c 里的限位保护
  *   - 任何动作进行中收到 '!' 都会马上停升降、结束流程
  */
 #include "arm.h"
@@ -35,7 +41,9 @@ extern void Claw_Open(void);
 extern void Claw_Close(void);
 extern void Turntable_Set(uint32_t pulse_us);
 extern void Turntable_GoTo(uint8_t slot);
-extern void Servo_SetAngle(uint8_t id, float angle_deg, float speed_dps);
+extern uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);
+extern void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);
+extern int  Servo_ReadAngle(uint8_t id, float *angle);
 extern void Delay_Report(uint32_t ms);
 
 #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
@@ -49,6 +57,8 @@ extern void Delay_Report(uint32_t ms);
 #define CLAW_BOOT_US   2090u
 #define TT_BOOT_US     2608u
 
+#define SERVO_EXTRA_MS 800     /* ID1/ID2 一起转时，按速度算好的时间之外最多再等多久 */
+
 /* ================= 可调参数(SET 名字 数值) ================= */
 static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
 static float g_lrpm   = 150.0f;    /* LFRPM  升降速度(转/分) */
@@ -56,7 +66,7 @@ static float g_lacc   = 200.0f;    /* LFACC  升降加速度档位 0~255(0=不�
 static float g_lmax   = 150.0f;    /* LFMAX  升降最大行程(毫米)，从零点往下算 */
 static float g_ldir   = 0.0f;      /* LFDIR  "往下"对应的 Emm 方向：0 或 1。反了就改这个 */
 static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来算要等多久 */
-static float g_lmrg   = 300.0f;    /* LFMRG  升降走完后多等多少毫秒(加减速余量) */
+static float g_lmrg   = 200.0f;    /* LFMRG  升降走完后多等多少毫秒(加减速余量) */
 static float g_lhmd   = 2.0f;      /* LFHMD  LIFT HOME 用的 Emm 回零模式(0~3，见张大头手册) */
 static float g_lhtm   = 8000.0f;   /* LFHTM  LIFT HOME 最多等多少毫秒 */
 
@@ -64,22 +74,27 @@ static float g_zhi    = 0.0f;      /* ZHI    搬运途中的高度(最高) */
 static float g_zgrab  = 100.0f;    /* ZGRAB  在原料盘上夹物料时的高度 */
 static float g_zdrop  = 60.0f;     /* ZDROP  放进车上转盘 / 从转盘取物料时的高度 */
 static float g_zplc   = 100.0f;    /* ZPLC   放到地上圆环时的高度 */
+static float g_zstk   = 40.0f;     /* ZSTK   码垛时放下的高度(比 ZPLC 抬高一个物料的高度，物料高 60mm) */
+static float g_zobraw = 0.0f;      /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
+static float g_zobrng = 0.0f;      /* ZOBRNG 观察地上圆环时的高度 */
 
 static float g_a1g    = 495.0f;    /* A1G    ID1 角度：对准原料盘 */
 static float g_a1d    = 495.0f;    /* A1D    ID1 角度：对准车上转盘 */
 static float g_a1h    = 495.0f;    /* A1H    ID1 角度：收起/待命 */
 static float g_a1p    = 495.0f;    /* A1P    ID1 角度：对准地上圆环 */
-static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹物料 */
+static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
 static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
-static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出放到圆环 */
-static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 转速(度/秒) */
-static float g_zstk   = 40.0f;     /* ZSTK   码垛时放下的高度(比 ZPLC 抬高一个物料的高度，物料高 60mm) */
-static float g_reach  = 0.0f;      /* REACH  伸出方向的微调(毫米，正=更远)。树莓派每次夹/放前根据摄像头设置 */
-static float g_a2dpm  = 0.0f;      /* A2DPM  ID2 每伸出 1 毫米要转多少度(带正负号，用来让 REACH 正数=更远)。0=不微调 */
+static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
+static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
+static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
+static float g_atolc  = 1.0f;      /* ATOLC  大动作离目标多少度以内算到位 */
+static float g_atol   = 0.3f;      /* ATOL   微调离目标多少度以内算到位 */
+static float g_amaxd  = 60.0f;     /* AMAXD  AD 指令一次最多转多少度(防止发错数) */
+static float g_para   = 1.0f;      /* PARA   1 = ID1、ID2 一起转(快)；0 = 一个一个转 */
 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
-static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许 GRAB / PLACE */
+static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 
 typedef struct
 {
@@ -104,6 +119,9 @@ static const ArmTun tun[] =
     { "ZGRAB",  &g_zgrab,   0.0f,    400.0f },
     { "ZDROP",  &g_zdrop,   0.0f,    400.0f },
     { "ZPLC",   &g_zplc,    0.0f,    400.0f },
+    { "ZSTK",   &g_zstk,    0.0f,    400.0f },
+    { "ZOBRAW", &g_zobraw,  0.0f,    400.0f },
+    { "ZOBRNG", &g_zobrng,  0.0f,    400.0f },
     { "A1G",    &g_a1g,     390.0f,  600.0f },
     { "A1D",    &g_a1d,     390.0f,  600.0f },
     { "A1H",    &g_a1h,     390.0f,  600.0f },
@@ -112,9 +130,11 @@ static const ArmTun tun[] =
     { "A2R",    &g_a2r,    -1220.0f, -503.5f },
     { "A2P",    &g_a2p,    -1220.0f, -503.5f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
-    { "ZSTK",   &g_zstk,    0.0f,    400.0f },
-    { "REACH",  &g_reach,  -80.0f,   80.0f },
-    { "A2DPM",  &g_a2dpm,  -10.0f,   10.0f },
+    { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
+    { "ATOLC",  &g_atolc,   0.2f,    5.0f },
+    { "ATOL",   &g_atol,    0.05f,   2.0f },
+    { "AMAXD",  &g_amaxd,   1.0f,    300.0f },
+    { "PARA",   &g_para,    0.0f,    1.0f },
     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
@@ -138,6 +158,11 @@ int Arm_Param_Set(const char *name, float v)
         }
     }
     return 0;
+}
+
+static float Absf(float x)
+{
+    return (x < 0.0f) ? -x : x;
 }
 
 /* 把 v 写成 "-12.3456"，不用 %f(有的编译设置不支持浮点 printf) */
@@ -249,6 +274,43 @@ static const char *Lift_Goto(float mm)
     return NULL;
 }
 
+/* ================= ID1 / ID2 ================= */
+/* ID1、ID2 转到 a1、a2(度)。PARA=1 时两个一起转(省时间)；否则按 order 先后：
+ *   order=1：先动 ID2 再动 ID1(缩回时先缩回再转，免得伸着转扫到东西)
+ *   order=2：先动 ID1 再动 ID2(伸出时先转好再伸)
+ * tol：到位误差(度)，speed：转速(度/秒) */
+static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
+{
+    if (g_para > 0.5f)
+    {
+        uint32_t t1 = Servo_Start(1, &a1, speed);
+        uint32_t t2 = Servo_Start(2, &a2, speed);
+        uint32_t tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
+        uint32_t t0 = HAL_GetTick();
+        uint8_t ok1 = 0;
+        uint8_t ok2 = 0;
+
+        while ((HAL_GetTick() - t0) < tmax && !(ok1 && ok2) && !car_abort)
+        {
+            float a;
+
+            HAL_Delay(30);
+            if (!ok1 && Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;
+            if (!ok2 && Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;
+        }
+    }
+    else if (order == 1)
+    {
+        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
+        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
+    }
+    else
+    {
+        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
+        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
+    }
+}
+
 /* ================= 夹爪 / 转盘 ================= */
 static uint8_t  tt_slot     = 1;
 static uint32_t tt_ready_at = 0;
@@ -275,63 +337,98 @@ static int TT_WaitReady(void)
 
 /* ================= 夹取 / 放置流程 ================= */
 #define GO(expr)        do { const char *e_ = (expr); if (e_) return e_; if (car_abort) return NULL; } while (0)
-#define SERVO(id, a)    do { Servo_SetAngle((id), (a), g_aspd); if (car_abort) return NULL; } while (0)
 #define WAIT(ms)        do { if (!Wait_Ms((uint32_t)(ms))) return NULL; } while (0)
+#define SERVOS(a1, a2, order, tol, spd)   do { Servos_To((a1), (a2), (order), (tol), (spd)); if (car_abort) return NULL; } while (0)
 
-static const char *Seq_Check(uint8_t slot)
+static const char *Seq_Ready(void)
 {
-    if (slot < 1 || slot > 3)  return "ERR ARG";
     if (g_armok < 0.5f)        return "ERR NOCAL";     /* 姿态参数还没标定 */
     if (!lift_known)           return "ERR NOZERO";
     return NULL;
 }
 
-/* 从工位(原料盘 / 地上圆环)夹一个，放进车上转盘 slot 号位。a1、a2、z：工位的转向角、伸出角、夹取高度 */
-static const char *Seq_Pick(uint8_t slot, float a1, float a2, float z)
+static int Slot_Ok(long slot)
 {
-    const char *e = Seq_Check(slot);
+    return slot >= 1 && slot <= 3;
+}
+
+/* 观察姿态：升到最高 -> ID1、ID2 转到工位上方 -> 升降到观察高度。ring=0 原料盘，ring=1 地上圆环。
+ * open_claw=1 同时把夹爪张开(夹爪动的时候手臂也在动，不多花时间)。open_claw=0 时夹爪状态保持不变 */
+static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
+{
+    const char *e = Seq_Ready();
     if (e) return e;
 
-    TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
-    Claw_Open();
+    if (open_claw)  Claw_Open();
     GO(Lift_Goto(g_zhi));
-    SERVO(1, a1);                                  /* 转向工位 */
-    SERVO(2, a2 + g_reach * g_a2dpm);              /* 伸出(REACH 是摄像头给的微调) */
-    GO(Lift_Goto(z));                              /* 下降 */
-    Claw_Close();  WAIT(g_clwait);                 /* 夹紧 */
-    GO(Lift_Goto(g_zhi));                          /* 抬起 */
-    SERVO(2, g_a2r);                               /* 缩回 */
-    SERVO(1, g_a1d);                               /* 转到车上转盘上方 */
-    GO(Lift_Goto(g_zdrop));                        /* 下降到转盘上方 */
-    if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
-    Claw_Open();   WAIT(g_clwait);                 /* 松开：物料落进转盘 */
-    GO(Lift_Goto(g_zhi));
-    SERVO(1, g_a1h);                               /* 收起待命 */
+    SERVOS(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, g_atolc, g_aspd);
+    GO(Lift_Goto(ring ? g_zobrng : g_zobraw));
     return NULL;
 }
 
-/* 从车上转盘 slot 号位取出物料，放到地上圆环。stack=1：码垛(放在已有物料上面，放下高度用 ZSTK) */
-static const char *Seq_Place(uint8_t slot, uint8_t stack)
+/* 手臂已经(用摄像头)对准了物料：下降夹紧 -> 抬起 -> 缩回并转到转盘上方 -> 下降 -> 转盘到位后松开 -> 抬起。
+ * z = 夹取高度。结束时手臂停在转盘上方的最高处 */
+static const char *Seq_PickHere(uint8_t slot, float z)
 {
-    const char *e = Seq_Check(slot);
+    const char *e = Seq_Ready();
     if (e) return e;
+    if (!Slot_Ok(slot))  return "ERR ARG";
+
+    TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
+    Claw_Open();                                   /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
+    GO(Lift_Goto(z));                              /* 下降 */
+    Claw_Close();  WAIT(g_clwait);                 /* 夹紧 */
+    GO(Lift_Goto(g_zhi));                          /* 抬起 */
+    SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);      /* 缩回，转到转盘上方 */
+    GO(Lift_Goto(g_zdrop));                        /* 下降 */
+    if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
+    Claw_Open();   WAIT(g_clwait);                 /* 松开：物料落进转盘 */
+    GO(Lift_Goto(g_zhi));
+    return NULL;
+}
+
+/* 从车上转盘 slot 号位取出物料：手臂转到转盘上方 -> 下降夹紧 -> 抬起。结束时夹着物料停在转盘上方的最高处 */
+static const char *Seq_Take(uint8_t slot)
+{
+    const char *e = Seq_Ready();
+    if (e) return e;
+    if (!Slot_Ok(slot))  return "ERR ARG";
 
     TT_Go(slot);
     Claw_Open();
     GO(Lift_Goto(g_zhi));
-    SERVO(2, g_a2r);
-    SERVO(1, g_a1d);                               /* 转到车上转盘上方 */
+    SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
     Claw_Close();  WAIT(g_clwait);                 /* 夹起 */
     GO(Lift_Goto(g_zhi));
-    SERVO(1, g_a1p);                               /* 转向地上圆环 */
-    SERVO(2, g_a2p + g_reach * g_a2dpm);           /* 伸出 */
-    GO(Lift_Goto(stack ? g_zstk : g_zplc));        /* 下降到物料底面快贴地(码垛时贴在下面那个物料上) */
-    Claw_Open();   WAIT(g_clwait);                 /* 松开 */
+    return NULL;
+}
+
+/* 手臂夹着物料，已经(用摄像头)对准了目标：下降 -> 松开 -> 抬起 -> ID2 缩回。
+ * stack=1 是码垛(放在已有物料上，下降高度用 ZSTK)。
+ * 最后缩回 ID2(不转 ID1)：之后底盘要沿着圆环板挪动，爪子不能还伸在已经放好的物料上方 */
+static const char *Seq_Drop(uint8_t stack)
+{
+    const char *e = Seq_Ready();
+    if (e) return e;
+
+    GO(Lift_Goto(stack ? g_zstk : g_zplc));
+    Claw_Open();   WAIT(g_clwait);
     GO(Lift_Goto(g_zhi));
-    SERVO(2, g_a2r);                               /* 缩回，不要带倒物料 */
-    SERVO(1, g_a1h);
+    Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
+    if (car_abort) return NULL;
+    return NULL;
+}
+
+/* 收臂待命：升到最高 -> 缩回、ID1 转到待命角度 */
+static const char *Seq_Stow(void)
+{
+    const char *e = Seq_Ready();
+    if (e) return e;
+
+    GO(Lift_Goto(g_zhi));
+    SERVOS(g_a1h, g_a2r, 1, g_atolc, g_aspd);
     return NULL;
 }
 
@@ -434,6 +531,7 @@ static int QR_Match(const char *s, int len, char *out)
 void Arm_Poll(void)
 {
     char tmp[QR_BUF];
+    char newc[16];
     int n;
 
     /* 收完一条(收到换行)，或者 60 毫秒没有新字节(有的模块不发换行)，就拿去解析 */
@@ -453,14 +551,26 @@ void Arm_Poll(void)
     qr_end = 0;
     __enable_irq();
 
-    if (QR_Match(tmp, n, qr_code))
+    if (QR_Match(tmp, n, newc))
     {
-        char m[32];
+        /* 扫码模块在连续模式下会反复发同一个码：同一个码只处理一次，免得一直重写串口屏、占用主循环 */
+        if (!qr_valid || strcmp(newc, qr_code) != 0)
+        {
+            char m[32];
+            char h1[8];
+            char h2[8];
 
-        qr_valid = 1;
-        Screen_Text("t0", qr_code);                /* 屏上显示任务码(控件名 t0，不一样就改这里) */
-        snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
-        Say(m);
+            memcpy(qr_code, newc, sizeof(qr_code));
+            qr_valid = 1;
+            /* 屏上显示任务码。赛规要求字高不小于 12mm，3.5 寸屏一行放不下 15 个字符，所以分两行：
+             * t0 = 前两组(如 452+321)，t7 = 后两组(如 254+312)。控件名不一样就改这里 */
+            memcpy(h1, qr_code, 7);      h1[7] = 0;
+            memcpy(h2, qr_code + 8, 7);  h2[7] = 0;
+            Screen_Text("t0", h1);
+            Screen_Text("t7", h2);
+            snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
+            Say(m);
+        }
     }
 }
 
@@ -488,22 +598,92 @@ void Arm_Init(void)
 
 /* ================= 树莓派指令 ================= */
 #define FAIL(s)   do { snprintf(err, (size_t)errlen, "%s", (s)); return -1; } while (0)
+#define MAXTOK    4
 
-int Arm_Command(const char *cmd, char *err, int errlen)
+/* 把一行指令按空格拆成最多 MAXTOK 个词，拆在 buf 里 */
+static int Tokenize(const char *cmd, char *buf, int buflen, char *tok[MAXTOK])
+{
+    int n = 0;
+    char *p;
+
+    strncpy(buf, cmd, (size_t)buflen - 1);
+    buf[buflen - 1] = 0;
+    p = buf;
+    while (*p != 0 && n < MAXTOK)
+    {
+        while (*p == ' ')
+        {
+            *p++ = 0;
+        }
+        if (*p == 0)
+        {
+            break;
+        }
+        tok[n++] = p;
+        while (*p != 0 && *p != ' ')
+        {
+            p++;
+        }
+    }
+    return n;
+}
+
+static int ParseL(const char *s, long *v)
 {
     char *e;
 
-    /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
-    if (strncmp(cmd, "CLAW ", 5) == 0)
-    {
-        const char *a = cmd + 5;
+    *v = strtol(s, &e, 10);
+    return (e != s && *e == 0);
+}
 
-        if (strcmp(a, "O") == 0)       Claw_Open();
-        else if (strcmp(a, "C") == 0)  Claw_Close();
+static int ParseF(const char *s, float *v)
+{
+    char *e;
+
+    *v = (float)strtod(s, &e);
+    return (e != s && *e == 0);
+}
+
+static void SayAngle(uint8_t id)
+{
+    float a;
+
+    if (Servo_ReadAngle(id, &a))
+    {
+        char m[40];
+        char b[20];
+
+        FmtF(b, (int)sizeof(b), a);
+        snprintf(m, sizeof(m), "ANG %d %s\r\n", (int)id, b);
+        Say(m);
+    }
+}
+
+int Arm_Command(const char *cmd, char *err, int errlen)
+{
+    char buf[64];
+    char *t[MAXTOK];
+    int n = Tokenize(cmd, buf, (int)sizeof(buf), t);
+    const char *v;
+    long id, slot;
+    float f, g;
+    const char *r;
+
+    if (n == 0)
+    {
+        return 0;
+    }
+    v = t[0];
+
+    /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
+    if (strcmp(v, "CLAW") == 0 && n == 2)
+    {
+        if (strcmp(t[1], "O") == 0)       Claw_Open();
+        else if (strcmp(t[1], "C") == 0)  Claw_Close();
         else
         {
-            long us = strtol(a, &e, 10);
-            if (e == a || *e != 0 || us < 500 || us > 2500)  FAIL("ERR ARG");
+            long us;
+            if (!ParseL(t[1], &us) || us < 500 || us > 2500)  FAIL("ERR ARG");
             Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
         }
         Wait_Ms((uint32_t)g_clwait);
@@ -511,19 +691,16 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     }
 
     /* ---- 转盘：TT <1~3> / TT <微秒> ---- */
-    if (strncmp(cmd, "TT ", 3) == 0)
+    if (strcmp(v, "TT") == 0 && n == 2)
     {
-        const char *a = cmd + 3;
-        long v = strtol(a, &e, 10);
-
-        if (e == a || *e != 0)  FAIL("ERR ARG");
-        if (v >= 1 && v <= 3)
+        if (!ParseL(t[1], &slot))  FAIL("ERR ARG");
+        if (slot >= 1 && slot <= 3)
         {
-            TT_Go((uint8_t)v);
+            TT_Go((uint8_t)slot);
         }
-        else if (v >= 500 && v <= 2700)
+        else if (slot >= 500 && slot <= 2700)
         {
-            Turntable_Set((uint32_t)v);
+            Turntable_Set((uint32_t)slot);
             tt_ready_at = HAL_GetTick() + (uint32_t)g_ttwait;
         }
         else
@@ -535,7 +712,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     }
 
     /* ---- 升降 ---- */
-    if (strcmp(cmd, "LIFT?") == 0)
+    if (strcmp(v, "LIFT?") == 0)
     {
         char m[40];
         char b[20];
@@ -545,11 +722,9 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         Say(m);
         return 1;
     }
-    if (strncmp(cmd, "LIFT ", 5) == 0)
+    if (strcmp(v, "LIFT") == 0 && n == 2)
     {
-        const char *a = cmd + 5;
-
-        if (strcmp(a, "ZERO") == 0)
+        if (strcmp(t[1], "ZERO") == 0)
         {
             Emm_V5_En_Control(LIFT_ADDR, true, false);
             Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
@@ -557,7 +732,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             lift_known = 1;
             return 1;
         }
-        if (strcmp(a, "HOME") == 0)
+        if (strcmp(t[1], "HOME") == 0)
         {
             Emm_V5_En_Control(LIFT_ADDR, true, false);
             Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
@@ -570,42 +745,156 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             lift_known = 1;
             return 1;
         }
-        {
-            double mm = strtod(a, &e);
-            const char *r;
-
-            if (e == a || *e != 0)  FAIL("ERR ARG");
-            r = Lift_Goto((float)mm);
-            if (r)  FAIL(r);
-            return 1;
-        }
+        if (!ParseF(t[1], &f))  FAIL("ERR ARG");
+        r = Lift_Goto(f);
+        if (r)  FAIL(r);
+        return 1;
     }
 
-    /* ---- 夹取 / 放置：GRAB n(原料盘->转盘)  PICK n(地上圆环->转盘)  PLACE n [S](转盘->地上圆环，S=码垛) ---- */
-    if (strncmp(cmd, "GRAB ", 5) == 0 || strncmp(cmd, "PICK ", 5) == 0 || strncmp(cmd, "PLACE ", 6) == 0)
+    /* ---- ID1 / ID2 精确控制：A? <id> / AF <id> <度> / AD <id> <增量度> / AP <ID1度> <ID2度> ---- */
+    if (strcmp(v, "A?") == 0 && n == 2)
     {
-        char k = cmd[1];                           /* 'R' GRAB, 'I' PICK, 'L' PLACE */
-        const char *a = cmd + (k == 'L' ? 6 : 5);
-        long slot = strtol(a, &e, 10);
-        uint8_t stack = 0;
-        const char *r;
+        float a;
 
-        if (e == a)  FAIL("ERR ARG");
-        if (k == 'L' && *e == ' ' && e[1] == 'S' && e[2] == 0)
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
+        if (!Servo_ReadAngle((uint8_t)id, &a))  FAIL("ERR READ");
+        SayAngle((uint8_t)id);
+        return 1;
+    }
+    if (strcmp(v, "AF") == 0 && n == 3)
+    {
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
+        if (!ParseF(t[2], &f))  FAIL("ERR ARG");
+        Servo_Move((uint8_t)id, f, g_aspdf, g_atol, 400);
+        SayAngle((uint8_t)id);
+        return 1;
+    }
+    if (strcmp(v, "AD") == 0 && n == 3)
+    {
+        float a0;
+
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
+        if (!ParseF(t[2], &f))  FAIL("ERR ARG");
+        if (Absf(f) > g_amaxd)  FAIL("ERR RANGE");
+        if (!Servo_ReadAngle((uint8_t)id, &a0))  FAIL("ERR READ");
+        Servo_Move((uint8_t)id, a0 + f, (Absf(f) > 8.0f) ? g_aspd : g_aspdf, g_atol, 400);
+        SayAngle((uint8_t)id);
+        return 1;
+    }
+    if (strcmp(v, "AP") == 0 && n == 3)
+    {
+        float c1, c2;
+        float spd = g_aspdf * 2.0f;                /* 小调整用微调速度的 2 倍 */
+
+        if (!ParseF(t[1], &f) || !ParseF(t[2], &g))  FAIL("ERR ARG");
+        if (Servo_ReadAngle(1, &c1) && Servo_ReadAngle(2, &c2) && (Absf(f - c1) > 10.0f || Absf(g - c2) > 10.0f))
         {
-            stack = 1;
-            e += 2;
+            if (g_aspd > spd)  spd = g_aspd;       /* 角度变化大(比如从转盘回到记下的姿态)：用大动作速度，省时间 */
         }
-        if (*e != 0)  FAIL("ERR ARG");
-        if (k == 'R')       r = Seq_Pick((uint8_t)slot, g_a1g, g_a2e, g_zgrab);
-        else if (k == 'I')  r = Seq_Pick((uint8_t)slot, g_a1p, g_a2p, g_zplc);
-        else                r = Seq_Place((uint8_t)slot, stack);
+        Servos_To(f, g, 2, g_atol, spd);
+        SayAngle(1);
+        SayAngle(2);
+        return 1;
+    }
+
+    /* ---- 观察姿态：OBS RAW|RING [O]  (O = 同时张开夹爪) ---- */
+    if (strcmp(v, "OBS") == 0 && (n == 2 || n == 3))
+    {
+        uint8_t ring;
+        uint8_t open_claw = 0;
+
+        if (strcmp(t[1], "RAW") == 0)        ring = 0;
+        else if (strcmp(t[1], "RING") == 0)  ring = 1;
+        else                                 FAIL("ERR ARG");
+        if (n == 3)
+        {
+            if (strcmp(t[2], "O") != 0)  FAIL("ERR ARG");
+            open_claw = 1;
+        }
+        r = Seq_Obs(ring, open_claw);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 夹进转盘：GRAB n [H] (原料盘) / PICK n [H] (地上圆环)。带 H = 手臂已经对准，直接夹 ---- */
+    if ((strcmp(v, "GRAB") == 0 || strcmp(v, "PICK") == 0) && (n == 2 || n == 3))
+    {
+        uint8_t ring = (v[1] == 'I') ? 1 : 0;
+        uint8_t here = 0;
+
+        if (!ParseL(t[1], &slot) || !Slot_Ok(slot))  FAIL("ERR ARG");
+        if (n == 3)
+        {
+            if (strcmp(t[2], "H") != 0)  FAIL("ERR ARG");
+            here = 1;
+        }
+        if (!here)
+        {
+            r = Seq_Obs(ring, 1);
+            if (r)  FAIL(r);
+            if (car_abort)  return 1;
+        }
+        r = Seq_PickHere((uint8_t)slot, ring ? g_zplc : g_zgrab);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 从转盘取出：TAKE n ---- */
+    if (strcmp(v, "TAKE") == 0 && n == 2)
+    {
+        if (!ParseL(t[1], &slot) || !Slot_Ok(slot))  FAIL("ERR ARG");
+        r = Seq_Take((uint8_t)slot);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 放到地上：DROP [S]  (S = 码垛) ---- */
+    if (strcmp(v, "DROP") == 0 && (n == 1 || n == 2))
+    {
+        uint8_t stack = 0;
+
+        if (n == 2)
+        {
+            if (strcmp(t[1], "S") != 0)  FAIL("ERR ARG");
+            stack = 1;
+        }
+        r = Seq_Drop(stack);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 不用摄像头的完整放置：PLACE n [S] = TAKE n + OBS RING + DROP [S] ---- */
+    if (strcmp(v, "PLACE") == 0 && (n == 2 || n == 3))
+    {
+        uint8_t stack = 0;
+
+        if (!ParseL(t[1], &slot) || !Slot_Ok(slot))  FAIL("ERR ARG");
+        if (n == 3)
+        {
+            if (strcmp(t[2], "S") != 0)  FAIL("ERR ARG");
+            stack = 1;
+        }
+        r = Seq_Take((uint8_t)slot);
+        if (r)  FAIL(r);
+        if (car_abort)  return 1;
+        r = Seq_Obs(1, 0);
+        if (r)  FAIL(r);
+        if (car_abort)  return 1;
+        r = Seq_Drop(stack);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 收臂待命 ---- */
+    if (strcmp(v, "STOW") == 0 && n == 1)
+    {
+        r = Seq_Stow();
         if (r)  FAIL(r);
         return 1;
     }
 
     /* ---- 二维码 ---- */
-    if (strcmp(cmd, "QR?") == 0)
+    if (strcmp(v, "QR?") == 0 && n == 1)
     {
         char m[32];
 
@@ -614,7 +903,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         Say(m);
         return 1;
     }
-    if (strcmp(cmd, "QR CLR") == 0)
+    if (strcmp(v, "QR") == 0 && n == 2 && strcmp(t[1], "CLR") == 0)
     {
         qr_valid = 0;
         qr_code[0] = 0;
@@ -622,37 +911,37 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     }
 
     /* ---- 串口屏原始指令：SCMD <淘晶驰指令> ---- */
-    if (strncmp(cmd, "SCMD ", 5) == 0)
+    if (strcmp(v, "SCMD") == 0 && strlen(cmd) > 5)
     {
         Screen_Raw(cmd + 5);
         return 1;
     }
 
     /* ---- 串口屏：SCR <控件名> <文字> ---- */
-    if (strncmp(cmd, "SCR ", 4) == 0)
+    if (strcmp(v, "SCR") == 0 && strlen(cmd) > 4)
     {
         char obj[12];
         char txt[40];
         const char *p = cmd + 4;
-        int n = 0;
+        int k = 0;
 
-        while (*p != 0 && *p != ' ' && n < (int)sizeof(obj) - 1)
+        while (*p != 0 && *p != ' ' && k < (int)sizeof(obj) - 1)
         {
-            obj[n++] = *p++;
+            obj[k++] = *p++;
         }
-        obj[n] = 0;
-        if (n == 0 || *p != ' ')  FAIL("ERR ARG");
+        obj[k] = 0;
+        if (k == 0 || *p != ' ')  FAIL("ERR ARG");
         p++;
-        n = 0;
-        while (*p != 0 && n < (int)sizeof(txt) - 1)
+        k = 0;
+        while (*p != 0 && k < (int)sizeof(txt) - 1)
         {
             if (*p != '"')                         /* 双引号会弄坏屏的指令，直接去掉 */
             {
-                txt[n++] = *p;
+                txt[k++] = *p;
             }
             p++;
         }
-        txt[n] = 0;
+        txt[k] = 0;
         Screen_Text(obj, txt);
         return 1;
     }

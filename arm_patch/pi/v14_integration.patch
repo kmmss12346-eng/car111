@@ -1,0 +1,55 @@
+--- lidar_map_north.orig/auto_run.py
++++ lidar_map_north/auto_run.py
+@@ -136,6 +136,11 @@
+          回启停区那一段，离启停区还有 home_approach_mm 时先用雷达定位，再按实际位置走进去。"""
+     cfg = cfg or {}
+     speeds = speeds or {}
++    if hooks is not None:
++        try:
++            hooks.ctx = ctx                          # 机械臂任务钩子要用 ctx.aborted() 检查 abort
++        except Exception:
++            pass
+     stops = cfg.get('stops') or {}
+     rescan = {str(s).upper() for s in cfg.get('rescan_stops', ['QR'])}
+     use_approach = bool(cfg.get('home_approach', True)) and hasattr(ctx, 'home_approach')
+--- lidar_map_north.orig/map_merge_live.py
++++ lidar_map_north/map_merge_live.py
+@@ -417,11 +417,25 @@
+         synced[0]=True
+         if sp_:print(f'已把配置里的 {len(sp_)} 个运动参数发给 STM32'+(f'（{len(bad)} 个失败）' if bad else '')+'。',flush=True)
+     def mission_thread(first_scan):
++        hooks=None
+         try:
+-            run_mission(Ctx(),link,log=lambda m:print(m,flush=True),first_scan=first_scan,stop_wait=args.stop_wait,cfg=raw_cfg)
++            if (raw_cfg.get('mission_cfg') or {}).get('enabled',False):
++                # 机械臂任务钩子：QR 读码、RAW 抓取、ROUGH/TEMP 放置、START 显示统计(见 mission_hooks.py)；计时从这里开始
++                from mission_hooks import MissionHooks
++                try:
++                    from mission_cli import release
++                    release()                                   # 测试命令(mtest/vcal…)占着的摄像头先放掉
++                except Exception:pass
++                hooks=MissionHooks(raw_cfg,log=lambda m:print(m,flush=True))
++                print('已启用机械臂任务钩子(mission_cfg.enabled=true)。',flush=True)
++            run_mission(Ctx(),link,log=lambda m:print(m,flush=True),first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,cfg=raw_cfg)
+         except Abort as e:print('★ 已停止：',e,flush=True)
+         except Exception as e:print('★ 出错停止：',repr(e),flush=True)
+-        finally:state['auto']=False;state['replan_from']=None;state['plan_start']=None
++        finally:
++            if hooks is not None:
++                try:hooks.close()                               # 释放摄像头，下一次 go 才能再打开
++                except Exception:pass
++            state['auto']=False;state['replan_from']=None;state['plan_start']=None
+     def command(line):
+         import unicodedata
+         line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
+@@ -528,6 +542,10 @@
+             if sp is None and c in ('F','S'):sp=int(raw_cfg.get('route_speed_rpm',220) if c=='F' else raw_cfg.get('strafe_speed_rpm',170))
+             t0=time.monotonic();print(f'发送 {c} {v}'+(f' 速度{sp}' if sp else '')+' …',flush=True)
+             ok_,rep_=link.move(c,v,sp);print(f'{c} {v} ->',rep_,f'  (往返用时{time.monotonic()-t0:.1f}秒)',flush=True);return
++        if k in ('arm','vcal','mtest','vdbg','qr','mcode'):
++            # 机械臂/视觉测试命令，见 mission_cli.py 开头的说明
++            from mission_cli import handle_cli
++            handle_cli(k,parts,link=link,raw_cfg=raw_cfg,state=state,log=lambda m:print(m,flush=True));return
+         if k in ('go','drive','p2'):
+             if link is None:raise ValueError('没有连接 STM32（--stm-port），不能用 '+k)
+             if state['auto']:raise ValueError('一键流程正在运行；输入 abort 可以中止')

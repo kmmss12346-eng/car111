@@ -1,0 +1,151 @@
+"""mission_cli.py / apply_mission_config.py 的冒烟测试(用 sim_mission 的假 STM32)：python3 test_mission_cli.py"""
+import json
+import os
+import tempfile
+import time
+import unittest
+
+import mission_cli
+import apply_mission_config
+from sim_mission import SimWorld, make, rings_summary
+
+
+def read(path):
+    with open(path, encoding='utf-8') as f:
+        return f.read()
+
+
+def load(path):
+    return json.loads(read(path))
+
+
+def wait_idle(state, timeout=10.0):
+    t0 = time.time()
+    while state.get('busy') and time.time() - t0 < timeout:
+        time.sleep(0.01)
+    assert not state.get('busy'), 'worker 没结束'
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.w = SimWorld(seed=21, code='156+123+516+231')
+        self.h = make(self.w)
+        mission_cli._S['hooks'] = self.h
+        self.lines = []
+        self.log = self.lines.append
+        self.state = {}
+
+    def run_cli(self, k, text):
+        parts = text.split()
+        mission_cli.handle_cli(k, parts, link=self.w.link, raw_cfg={}, state=self.state, log=self.log)
+        wait_idle(self.state)
+
+    def test_arm_raw_command(self):
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.assertTrue(any('DONE' in l for l in self.lines))
+        self.assertTrue(self.w.lift_known)
+        self.lines.clear()
+        self.run_cli('arm', 'arm A? 1')
+        self.assertTrue(any(l.strip().startswith('ANG 1') for l in self.lines))
+
+    def test_arm_needs_arguments(self):
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('arm', ['arm'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
+    def test_no_link(self):
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('arm', ['arm', 'GET'], link=None, raw_cfg={}, state={}, log=self.log)
+
+    def test_qr_and_mcode(self):
+        self.run_cli('qr', 'qr')
+        self.assertTrue(any('156+123+516+231' in l for l in self.lines))
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.assertIsNotNone(self.h.plan)
+        with self.assertRaises(ValueError):
+            self.run_cli('mcode', 'mcode 999')
+
+    def test_mtest_raw_then_rough_then_temp(self):
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.w.arrive('RAW', 1)
+        self.run_cli('mtest', 'mtest RAW 1')
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3))
+        self.w.arrive('ROUGH', 1)
+        self.run_cli('mtest', 'mtest ROUGH 1')
+        self.assertEqual(self.h.stats.place_ok, 3)
+        self.assertEqual(self.w.air + self.w.collisions, 0)
+        self.assertEqual(set(self.w.tray.values()), {1, 5, 6})
+        self.w.arrive('TEMP', 1)
+        self.run_cli('mtest', 'mtest TEMP 1')
+        self.assertEqual(rings_summary(self.w, 'TEMP'), {1: [1], 2: [5], 3: [6]})
+
+    def test_mtest_force_assumes_tray(self):
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.w.arrive('ROUGH', 1)
+        self.w.tray = {1: 1, 2: 5, 3: 6}                    # 世界里真的有，force 让程序也认为有
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        self.assertEqual(self.h.stats.place_ok, 3)
+
+    def test_mtest_reset(self):
+        self.run_cli('mtest', 'mtest reset')
+        self.assertIsNone(mission_cli._S['hooks'])
+
+    def test_vcal_ring(self):
+        self.w.arrive('ROUGH', 1)
+        self.run_cli('vcal', 'vcal RING')
+        text = '\n'.join(self.lines)
+        self.assertIn('手臂：ID2 每转 1°', text)
+        self.assertIn('底盘：横移 1mm', text)
+        self.assertIsNotNone(self.h.store.get('RING', 'arm'))
+        self.assertIsNotNone(self.h.store.get('RING', 'ch'))
+
+    def test_vcal_arm_only_does_not_move_chassis(self):
+        self.w.arrive('ROUGH', 1)
+        moves0 = sum(1 for r in self.w.requests if r.startswith(('S ', 'F ')))
+        self.run_cli('vcal', 'vcal RING arm')
+        self.assertIsNone(self.h.store.get('RING', 'ch'))
+        self.assertIsNotNone(self.h.store.get('RING', 'arm'))
+        self.assertEqual(abs(self.w.off_s) + abs(self.w.off_f), 0.0)
+
+    def test_vcal_bad_args(self):
+        with self.assertRaises(ValueError):
+            self.run_cli('vcal', 'vcal FOO')
+        with self.assertRaises(ValueError):
+            self.run_cli('vcal', 'vcal RAW')
+
+    def test_busy_refused(self):
+        self.state['busy'] = True
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('arm', ['arm', 'GET'], link=self.w.link, raw_cfg={}, state=self.state, log=self.log)
+        self.state['busy'] = False
+
+
+class ConfigScriptTests(unittest.TestCase):
+    def test_apply_adds_only_missing(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'cfg.json')
+        base = {'stops': {'QR': [1, 2, 90]}, 'mission': ['QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH', 'TEMP', 'START'],
+                'mission_cfg': {'time_limit_s': 123.0, 'tol_mm': {'RING': 0.8}}, 'stm32_params': {'FPPM': 12.9}}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(base, f)
+        self.assertEqual(apply_mission_config.main([path]), 0)
+        cfg = load(path)
+        mc = cfg['mission_cfg']
+        self.assertEqual(mc['time_limit_s'], 123.0)                 # 用户设的值不变
+        self.assertEqual(mc['tol_mm']['RING'], 0.8)
+        self.assertIn('RAW', mc['tol_mm'])                          # 缺的补上
+        self.assertTrue(mc['enabled'])
+        self.assertEqual(cfg['stm32_params'], {'FPPM': 12.9})       # 别的配置不动
+        self.assertTrue(os.path.exists(path.replace('.json', '.json.bak_mission')))
+        self.assertEqual(apply_mission_config.main([path, '--disable']), 0)
+        self.assertFalse(load(path)['mission_cfg']['enabled'])
+        # 再运行一次不改变内容
+        before = read(path)
+        apply_mission_config.main([path, '--disable'])
+        self.assertEqual(before, read(path))
+
+    def test_missing_file(self):
+        self.assertEqual(apply_mission_config.main(['/nonexistent/x.json']), 1)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=1)

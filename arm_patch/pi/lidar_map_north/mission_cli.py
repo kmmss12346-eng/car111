@@ -1,0 +1,189 @@
+"""树莓派终端里的机械臂 / 视觉测试命令（接在 map_merge_live 的命令行上）。
+
+arm <指令>                 直接给 STM32 发一条机械臂指令并打印回复，例如：
+                             arm LIFT ZERO        把现在的升降位置记为 0(最高点)
+                             arm OBS RAW O        手臂摆到原料盘观察姿态并张开夹爪
+                             arm AD 1 0.5         ID1 再转 0.5 度
+                             arm GET              看全部参数(含机械臂的)
+qr                         读 STM32 里存的任务码
+mcode <任务码>             手动设置任务码(不扫码也能测)，例如：mcode 156+123+516+231
+vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小动作，测出"动作量 ↔ 画面移动量"，存进 servo_cal.json
+vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
+                             只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
+vdbg [RING | RAW <颜色号>]  存一张带标注的画面到 vdebug.png：爪子位置(绿十字)、识别到的圆环/物料
+mtest QR                   单独测读码并显示
+mtest RAW <批次>           单独测原料盘抓取(批次 1 或 2；需要先 qr 或 mcode)
+mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有这批物料，没有就加 force 假定有：mtest ROUGH 1 force)
+mtest TEMP <批次>          单独测暂存区放置/码垛
+mtest START                单独测回家后的显示
+mtest reset                清空任务码和记录，重新开始
+"""
+import threading
+
+from task_plan import parse_code, TaskError
+
+_S = {'hooks': None}
+
+
+def _hooks(link, raw_cfg, log):
+    if _S['hooks'] is None:
+        from mission_hooks import MissionHooks
+        _S['hooks'] = MissionHooks(raw_cfg, log=log)
+    h = _S['hooks']
+    h.log = log
+    return h
+
+
+def release():
+    """释放测试命令占着的摄像头和记录(go 开始前由 map_merge_live 调用，免得两个地方同时开 /dev/video0)。"""
+    h = _S.get('hooks')
+    _S['hooks'] = None
+    if h is not None:
+        h.close()
+
+
+def _run_async(state, log, fn):
+    if state.get('auto') or state.get('busy'):
+        raise ValueError('正在运行或扫描，等结束再用')
+    state['busy'] = True
+
+    def worker():
+        try:
+            fn()
+        except Exception as ex:                      # 包括 Abort
+            log(f'出错/停止：{ex!r}')
+        finally:
+            state['busy'] = False
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
+    state = state if state is not None else {}
+    if link is None:
+        raise ValueError('没有连接 STM32（--stm-port）')
+    h = _hooks(link, raw_cfg or {}, log)
+
+    if k == 'arm':
+        if len(parts) < 2:
+            raise ValueError('格式：arm LIFT ZERO / arm OBS RAW O / arm AD 1 0.5 / arm GET   (见 mission_cli.py 开头)')
+        text = ' '.join(parts[1:]).upper() if parts[1].upper() not in ('SCR', 'SCMD') else ' '.join(parts[1:])
+
+        def go():
+            h._ensure_arm_only(link)
+            ok, reply, info = h.arm.request(text)
+            for line in info:
+                log('  ' + line)
+            log(f'{text} -> {reply}')
+        return _run_async(state, log, go)
+
+    if k == 'qr':
+        def go():
+            h._ensure_arm_only(link)
+            log(f'STM32 里的任务码：{h.arm.qr() or "没有"}')
+        return _run_async(state, log, go)
+
+    if k == 'mcode':
+        if len(parts) != 2:
+            raise ValueError('格式：mcode 156+123+516+231')
+        try:
+            h.plan = parse_code(parts[1])
+        except TaskError as ex:
+            raise ValueError(str(ex))
+        log(f'任务码已设置：{h.plan.code}  {h.plan.describe()}')
+        return None
+
+    if k == 'vdbg':
+        def go():
+            h._ensure_arm_only(link)
+            kind = parts[1].upper() if len(parts) > 1 else 'RING'
+            color = int(parts[2]) if len(parts) > 2 else None
+            h._ensure_vision()
+            ok = h.vision.save_debug('vdebug.png', kind, color)
+            log('已存 vdebug.png' if ok else '存图失败(摄像头没有画面？)')
+        return _run_async(state, log, go)
+
+    if k == 'vcal':
+        if len(parts) < 2 or parts[1].upper() not in ('RING', 'RAW'):
+            raise ValueError('格式：vcal RING   或   vcal RAW 1(颜色号)；只校准手臂不动底盘：vcal RING arm')
+        kind = parts[1].upper()
+        color = None
+        rest = [p.lower() for p in parts[2:]]
+        if kind == 'RAW':
+            if not parts[2:] or not parts[2].isdigit():
+                raise ValueError('vcal RAW 要给颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝，例如 vcal RAW 1')
+            color = int(parts[2])
+        chassis = 'arm' not in rest
+
+        def go():
+            h._ensure(link)
+            if h.disabled:
+                raise ValueError(h.disabled)
+            _vcal(h, kind, color, chassis, log)
+        return _run_async(state, log, go)
+
+    if k == 'mtest':
+        if len(parts) < 2:
+            raise ValueError('格式：mtest QR / mtest RAW 1 / mtest ROUGH 1 [force] / mtest TEMP 1 / mtest START / mtest reset')
+        what = parts[1].upper()
+        if what == 'RESET':
+            _S['hooks'] = None
+            log('已清空 mtest 的任务码和记录')
+            return None
+        if what not in ('QR', 'RAW', 'ROUGH', 'TEMP', 'START'):
+            raise ValueError('mtest 后面是 QR / RAW / ROUGH / TEMP / START / reset')
+        batch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        force = any(p.lower() == 'force' for p in parts[2:])
+
+        def go():
+            h._ensure(link)
+            h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+            state['abort'] = False
+            if force and h.plan is not None and what in ('ROUGH', 'TEMP'):
+                for it in h.plan.items(batch):
+                    h.in_tray[it.slot] = it
+                log('  (force：假定转盘里已经有这批物料)')
+                if what == 'TEMP' and batch == 2:
+                    for it in h.plan.items(1):
+                        h.on_ring.setdefault(('TEMP', it.ring), []).append(it)
+                    log('  (force：假定暂存区已经平放了第一批)')
+            h.run_role(what, batch)
+            log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
+        return _run_async(state, log, go)
+
+    raise ValueError('未知命令 ' + k)
+
+
+def _vcal(h, kind, color, chassis, log):
+    import numpy as np
+    from visual_servo import ServoError
+    h._ensure_vision()
+    log(f'视觉校准 {kind}：先把手臂摆到观察姿态(张开夹爪)，请确认摄像头能看到' + ('圆环' if kind == 'RING' else f'颜色 {color} 的物料(要放稳不动)') + '……')
+    h.arm.obs(kind, open_claw=True)
+    if kind == 'RING':
+        measure = h.vision.ring_error
+    else:
+        def measure():
+            return h.vision.material_error(color)
+    scale_cfg = h.vision.scale(kind)
+    try:
+        h.servo.dev = np.zeros(2)
+        Ja = h.servo._probe(measure, 'arm')
+        h.store.put(kind, 'arm', Ja)
+        mm_ps = np.linalg.norm(Ja, axis=0) / scale_cfg
+        log(f'  手臂：ID2 每转 1° ≈ {mm_ps[0]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 0]):.2f} 像素)；'
+            f'ID1 每转 1° ≈ {mm_ps[1]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 1]):.2f} 像素)  [按配置的 {scale_cfg} 像素/毫米换算]')
+        if chassis:
+            Jc = h.servo._probe(measure, 'ch')
+            h.store.put(kind, 'ch', Jc)
+            ps = np.linalg.norm(Jc, axis=0)
+            log(f'  底盘：横移 1mm 画面移动 {ps[0]:.3f} 像素；前进 1mm 画面移动 {ps[1]:.3f} 像素')
+            meas = float(ps.mean())
+            diff = abs(meas - scale_cfg) / scale_cfg
+            log(f'  实测比例 ≈ {meas:.3f} 像素/毫米(配置里 px_per_mm.{kind} = {scale_cfg})' +
+                ('' if diff < 0.1 else f'  → 相差 {diff * 100:.0f}%，建议把 mission_cfg.px_per_mm.{kind} 改成 {meas:.2f}'))
+            if abs(ps[0] - ps[1]) / max(meas, 1e-9) > 0.2:
+                log('  注意：横移和前进的比例相差超过 20%，可能底盘走的距离不准或摄像头有畸变')
+        h.store.save()
+        log('  校准结果已存进 ' + str(h.store.path) + '，以后对准直接用。' if h.store.path else '  (没有配置存储文件，校准结果只在这次运行里有效)')
+    except ServoError as ex:
+        raise ValueError(f'校准失败：{ex}')
