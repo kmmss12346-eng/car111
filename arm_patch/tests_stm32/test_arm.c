@@ -82,8 +82,12 @@ int main(void) {
     CHECK(run("OBS RAW O") == -1 && pis("ERR NOZERO"), "没回零时拒绝");
     CHECK(run("LIFT 10") == -1, "没回零时 LIFT 拒绝");
     CHECK(run("LIFT ZERO") == 1 && has("zero5;"), "LIFT ZERO");
+    /* 下面的顺序测试用固定的一组高度(和默认值无关)，都在最高点 100mm 以内 */
+    Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60); Arm_Param_Set("ZPLC", 80);
+    Arm_Param_Set("ZSTK", 40); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZOBRNG", 0);
+    CHECK(Arm_Param_Set("LFMAX", 150) == 2, "最高点写死 100mm：SET LFMAX 150 被拒绝");
     CHECK(Arm_Param_Set("ZPLC", 1000) == 2 && Arm_Param_Set("NOPE", 1) == 0 && Arm_Param_Set("ZPLC", 90) == 1, "参数范围/名字检查");
-    Arm_Param_Set("ZPLC", 100);
+    Arm_Param_Set("ZPLC", 80);
 
     /* ---- 参数错误 ---- */
     CHECK(run("GRAB 4 H") == -1 && run("GRAB 1 Z") == -1 && run("TAKE 0") == -1 && run("DROP X") == -1 && run("OBS FOO") == -1
@@ -101,7 +105,7 @@ int main(void) {
     clear();
     CHECK(run("GRAB 2 H") == 1, "GRAB 2 H");
     {
-        int tt = at("tt2;"), open0 = at("O;"), down = at("L+8000;"), close = at("C;"), up = at("L-8000;"), sw = at("S1:"), drop_dn = at("L+4800;"), open1 = -1, up2 = -1;
+        int tt = at("tt2;"), open0 = at("O;"), down = at("L+6400;"), close = at("C;"), up = at("L-6400;"), sw = at("S1:"), drop_dn = at("L+4800;"), open1 = -1, up2 = -1;
         const char *p = strstr(ev, "L+4800;");
         if (p) { const char *q = strstr(p, "O;"); if (q) open1 = (int)(q - ev); q = strstr(p, "L-4800;"); if (q) up2 = (int)(q - ev); }
         CHECK(tt >= 0 && tt < open0 && open0 < down && down < close && close < up && up < sw && sw < drop_dn && drop_dn < open1 && open1 < up2,
@@ -110,11 +114,11 @@ int main(void) {
 
     /* ---- PICK 用地面高度 ZPLC ---- */
     clear();
-    CHECK(run("PICK 1 H") == 1 && has("L+8000;"), "PICK H 下降到 ZPLC(100mm=8000 脉冲)");
-    Arm_Param_Set("ZGRAB", 120);
+    CHECK(run("PICK 1 H") == 1 && has("L+6400;"), "PICK H 走到 ZPLC(80mm=6400 脉冲)");
+    Arm_Param_Set("ZGRAB", 90);
     clear(); run("GRAB 1 H");
-    CHECK(has("L+9600;"), "GRAB H 下降到 ZGRAB(120mm=9600 脉冲)");
-    Arm_Param_Set("ZGRAB", 100);
+    CHECK(has("L+7200;"), "GRAB H 走到 ZGRAB(90mm=7200 脉冲)");
+    Arm_Param_Set("ZGRAB", 80);
 
     /* ---- TAKE ---- */
     clear();
@@ -123,7 +127,7 @@ int main(void) {
 
     /* ---- DROP / 码垛 / 缩回 ID2 ---- */
     clear();
-    CHECK(run("DROP") == 1 && has("L+8000;") && at("O;") > at("L+8000;") && has("M2:-862.0@90/1.00;"), "DROP：下降到 ZPLC→松开→抬起→ID2 缩回");
+    CHECK(run("DROP") == 1 && has("L+6400;") && at("O;") > at("L+6400;") && has("M2:-862.0@90/1.00;"), "DROP：走到 ZPLC→松开→回到 ZHI→ID2 缩回");
     clear();
     CHECK(run("DROP S") == 1 && has("L+3200;"), "DROP S 下降到 ZSTK(40mm=3200 脉冲)");
 
@@ -174,7 +178,7 @@ int main(void) {
     clear();
     run("LIFT 0"); clear();
     run("LIFT 999");
-    CHECK(has("L+12000;"), "LIFT 超出行程被限制在 LFMAX(150mm=12000 脉冲)");
+    CHECK(has("L+8000;"), "LIFT 999 被限制在最高点 100mm(8000 脉冲)");
     run("LIFT 0");
 
     /* ---- 二维码(画模式：屏工程里不用放控件) ---- */
@@ -251,7 +255,7 @@ int main(void) {
     /* ---- GET/SET 用的接口 ---- */
     clear();
     Arm_Param_Dump();
-    CHECK(pis("P ZPLC=100.0000") && pis("P ARMOK=1.0000") && pis("P ASPD=90.0000"), "参数全部打印");
+    CHECK(pis("P ZPLC=80.0000") && pis("P LFMAX=100.0000") && pis("P ARMOK=1.0000") && pis("P ASPD=90.0000"), "参数全部打印");
 
     (void)i;
     printf("%s: %d 项检查，%d 项失败\n", fails ? "失败" : "通过", checks, fails);

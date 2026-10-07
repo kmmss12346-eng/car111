@@ -63,20 +63,20 @@ extern void Delay_Report(uint32_t ms);
 static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
 static float g_lrpm   = 150.0f;    /* LFRPM  升降速度(转/分) */
 static float g_lacc   = 200.0f;    /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
-static float g_lmax   = 150.0f;    /* LFMAX  升降最大行程(毫米)，从零点(最低点)往上算 */
+static float g_lmax   = 100.0f;    /* LFMAX  最高点：离零点(最低点)往上 100mm。写死：SET 也不能超过 100 */
 static float g_ldir   = 0.0f;      /* LFDIR  升降方向：0 或 1。LIFT 数字变大时走反了就改这个 */
 static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来算要等多久 */
 static float g_lmrg   = 200.0f;    /* LFMRG  升降走完后多等多少毫秒(加减速余量) */
 static float g_lhmd   = 2.0f;      /* LFHMD  LIFT HOME 用的 Emm 回零模式(0~3，见张大头手册) */
 static float g_lhtm   = 8000.0f;   /* LFHTM  LIFT HOME 最多等多少毫秒 */
 
-static float g_zhi    = 120.0f;    /* ZHI    搬运途中的高度(抬高，越大越高) */
+static float g_zhi    = 100.0f;    /* ZHI    搬运途中的高度(抬高，越大越高) */
 static float g_zgrab  = 20.0f;     /* ZGRAB  在原料盘上夹物料时的高度 */
 static float g_zdrop  = 60.0f;     /* ZDROP  放进车上转盘 / 从转盘取物料时的高度 */
 static float g_zplc   = 0.0f;      /* ZPLC   放到地上圆环时的高度 */
 static float g_zstk   = 60.0f;     /* ZSTK   码垛时放下的高度(= ZPLC + 一个物料的高度，物料高 60mm) */
-static float g_zobraw = 120.0f;    /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
-static float g_zobrng = 120.0f;    /* ZOBRNG 观察地上圆环时的高度 */
+static float g_zobraw = 100.0f;    /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
+static float g_zobrng = 100.0f;    /* ZOBRNG 观察地上圆环时的高度 */
 
 static float g_a1g    = 495.0f;    /* A1G    ID1 角度：对准原料盘 */
 static float g_a1d    = 495.0f;    /* A1D    ID1 角度：对准车上转盘 */
@@ -110,7 +110,7 @@ static const ArmTun tun[] =
     { "LFPPM",  &g_lppm,    1.0f,    500.0f },
     { "LFRPM",  &g_lrpm,    10.0f,   600.0f },
     { "LFACC",  &g_lacc,    0.0f,    255.0f },
-    { "LFMAX",  &g_lmax,    10.0f,   400.0f },
+    { "LFMAX",  &g_lmax,    10.0f,   100.0f },   /* 最高点写死 100mm，配置里存的更大的值会被拒绝 */
     { "LFDIR",  &g_ldir,    0.0f,    1.0f },
     { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
     { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
