@@ -10,6 +10,7 @@
 需要 STM32 烧的是 v4 程序(有 MOT? 指令)。运行前先退出 map_merge_live(两个程序不能同时占串口)。
 """
 import argparse
+import os
 import re
 import sys
 import time
@@ -17,12 +18,43 @@ import time
 NAMES = {1: '1号(右前轮)', 2: '2号(左前轮)', 3: '3号(右后轮)', 4: '4号(左后轮)', 5: '5号(升降)'}
 
 
+def port_users(port):
+    """找出还有哪些程序开着这个串口(返回 [(pid, 命令行)])。"""
+    try:
+        real = os.path.realpath(port)
+    except OSError:
+        return []
+    me = os.getpid()
+    out = []
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            for fd in os.listdir(f'/proc/{pid}/fd'):
+                if os.path.realpath(f'/proc/{pid}/fd/{fd}') == real:
+                    with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                        cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'ignore').strip()
+                    out.append((int(pid), cmd or '?'))
+                    break
+        except (OSError, PermissionError):
+            continue
+    return out
+
+
 class Link:
     def __init__(self, port):
         import serial
+        self.err = serial.SerialException
         self.s = serial.Serial(port, 115200, timeout=0.1)
         time.sleep(0.2)
         self.s.reset_input_buffer()
+
+    def _read(self):
+        try:
+            return self.s.read(256)
+        except self.err:                 # 别的程序也在读这个口时会偶尔这样：等一下再读
+            time.sleep(0.05)
+            return b''
 
     def request(self, text, timeout=5.0):
         """发一行，等 DONE/ERR/PONG；返回 (回复, 中间的信息行)。YAW100 不算。"""
@@ -32,7 +64,7 @@ class Link:
         buf = b''
         info = []
         while time.time() < end:
-            buf += self.s.read(256)
+            buf += self._read()
             while b'\n' in buf:
                 line, buf = buf.split(b'\n', 1)
                 t = line.decode('ascii', 'ignore').strip()
@@ -49,7 +81,7 @@ class Link:
         end = time.time() + timeout
         buf = b''
         while time.time() < end:
-            buf += self.s.read(256)
+            buf += self._read()
             m = re.findall(rb'YAW100 (-?\d+)', buf)
             if m:
                 return int(m[-1]) / 100.0
@@ -83,6 +115,18 @@ def main():
     ap.add_argument('--port', default='/dev/serial0')
     a = ap.parse_args()
 
+    users = port_users(a.port)
+    if users:
+        print(f'★ 串口 {a.port} 还被这些程序占着(两个程序同时读，数据会被抢走，测试结果不准)：')
+        for pid, cmd in users:
+            print(f'    编号 {pid}：{cmd}')
+        print(f'  先关掉它们：map_merge_live 就在它的窗口里输入 q；或者执行  sudo kill {" ".join(str(p) for p, _ in users)}')
+        print('  如果是 agetty / serial-getty(串口登录服务)：sudo systemctl stop serial-getty@ttyAMA0 serial-getty@ttyS0')
+        if not ask('  已经关掉了，还是继续测'):
+            return 1
+        users = port_users(a.port)
+        if users:
+            print('  还有程序占着，结果可能不准，照样继续……')
     try:
         link = Link(a.port)
     except Exception as ex:
