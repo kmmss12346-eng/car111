@@ -72,6 +72,7 @@ int main(void) {
     int i;
     Arm_Init();
     CHECK(has("pwm3;") && has("pwm2;"), "Arm_Init 启动了夹爪/转盘 PWM");
+    CHECK(strstr(scr, "cls 0") && strstr(scr, "\"READY\""), "画模式开机清屏并显示 READY");
 
     /* ---- 保护 ---- */
     clear();
@@ -175,6 +176,23 @@ int main(void) {
     run("LIFT 999");
     CHECK(has("L+12000;"), "LIFT 超出行程被限制在 LFMAX(150mm=12000 脉冲)");
     run("LIFT 0");
+
+    /* ---- 二维码(画模式：屏工程里不用放控件) ---- */
+    clear();
+    {
+        const char *code = "777+111+222+333\r\n";
+        extern void Arm_Poll(void);
+        const char *p;
+        for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
+        Arm_Poll();
+    }
+    CHECK(strstr(scr, "xstr 0,0,288,80,1,65535,0,1,1,1,\"777+111\"") && strstr(scr, "xstr 0,80,288,80,1,65535,0,1,1,1,\"222+333\""),
+          "画模式：任务码用大字(字库1)画在左上两行");
+    clear(); run("SCR t1 RAW 1/3");
+    CHECK(strstr(scr, "xstr 292,2,188,38,0,65535,0,0,1,1,\"RAW 1/3\""), "画模式：t1 小字画在右上");
+    clear(); run("SCR t9 X");
+    CHECK(scr[0] == 0, "画模式：表里没有的名字不发");
+    Arm_Param_Set("SCRMODE", 0);                    /* 下面测"写控件"模式 */
 
     /* ---- 二维码 ---- */
     clear();

@@ -77,7 +77,130 @@
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
 --- a/Core/Src/arm.c
 +++ b/Core/Src/arm.c
-@@ -683,7 +683,7 @@
+@@ -95,6 +95,7 @@
+ static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
+ static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
+ static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
++static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
+ 
+ typedef struct
+ {
+@@ -138,6 +139,7 @@
+     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
+     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
+     { "ARMOK",  &g_armok,   0.0f,    1.0f },
++    { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
+ };
+ #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
+ 
+@@ -433,26 +435,89 @@
+ }
+ 
+ /* ================= 串口屏 ================= */
+-/* 默认按淘晶驰(TJC)串口屏的格式发：控件名.txt="文字" 加三个 0xFF。
+- * 如果屏的品牌不同，只需要改这个函数。 */
+-void Screen_Text(const char *obj, const char *text)
++/* 淘晶驰(TJC)串口屏，指令后面跟三个 0xFF。两种用法(参数 SCRMODE)：
++ *  1(默认) 程序自己画字：用 xstr 指令把字画在固定位置。屏的工程里不用放任何控件，只要：
++ *          横屏 480x320、字库 0 = 小字(约 24 像素高)、字库 1 = 大字(80 像素高，赛规字高 ≥12mm)，都只要 ASCII
++ *  0       写控件：屏的工程里要放好名叫 t0~t7 的文本控件，发 t0.txt="文字"
++ * 两种用法程序里都还是用 t0~t7 这几个名字，下面这张表就是"每个名字画在屏上哪里"(480x320 横屏)：
++ *   ┌──────────────┬────────┐
++ *   │ t0 任务码前半 │ t1 阶段 │  大字行 0  y=0
++ *   │              │ t4 提示 │
++ *   ├──────────────┤ t5 一批 │
++ *   │ t7 任务码后半 │ t6 二批 │  大字行 1  y=80
++ *   ├──────────────┴────────┤
++ *   │ t2 抓取数              │  大字行 2  y=160
++ *   ├───────────────────────┤
++ *   │ t3 放置数              │  大字行 3  y=240
++ *   └───────────────────────┘ */
++#define SCR_FONT_SMALL 0
++#define SCR_FONT_BIG   1
++typedef struct { const char *obj; int16_t x, y, w, h; uint8_t font; uint16_t color; } ScrBox;
++static const ScrBox scr_box[] =
++{
++    { "t0",   0,   0, 288, 80, SCR_FONT_BIG,   65535u },   /* 白 */
++    { "t7",   0,  80, 288, 80, SCR_FONT_BIG,   65535u },
++    { "t2",   0, 160, 480, 80, SCR_FONT_BIG,   2016u  },   /* 绿 */
++    { "t3",   0, 240, 480, 80, SCR_FONT_BIG,   65504u },   /* 黄 */
++    { "t1", 292,   2, 188, 38, SCR_FONT_SMALL, 65535u },
++    { "t4", 292,  42, 188, 38, SCR_FONT_SMALL, 63488u },   /* 红 */
++    { "t5", 292,  82, 188, 38, SCR_FONT_SMALL, 65535u },
++    { "t6", 292, 122, 188, 38, SCR_FONT_SMALL, 65535u },
++};
++#define SCR_BOX_N  ((int)(sizeof(scr_box) / sizeof(scr_box[0])))
++
++static void Screen_Send(const char *buf, int n)
+ {
+     static const uint8_t endb[3] = { 0xFF, 0xFF, 0xFF };
+-    char buf[64];
+-    int n = snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, text);
+ 
+     if (n < 0)
+     {
+         return;
+     }
+-    if (n >= (int)sizeof(buf))
++    if (n >= 96)
+     {
+-        n = (int)sizeof(buf) - 1;
++        n = 95;
+     }
+     HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 100);
+     HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
+ }
+ 
++void Screen_Text(const char *obj, const char *text)
++{
++    char buf[96];
++    int i;
++
++    if (g_scrmode > 0.5f)
++    {
++        for (i = 0; i < SCR_BOX_N; i++)
++        {
++            if (strcmp(scr_box[i].obj, obj) == 0)
++            {
++                const ScrBox *b = &scr_box[i];
++                /* xstr x,y,w,h,字库,字色,背景色,水平居中(0左 1中),垂直居中,背景方式(1=纯色，顺便擦掉旧字),"文字" */
++                Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,0,%d,1,1,\"%s\"",
++                                          b->x, b->y, b->w, b->h, b->font, b->color,
++                                          (b->font == SCR_FONT_BIG) ? 1 : 0, text));
++                return;
++            }
++        }
++        return;                                    /* 表里没有的名字：画模式下忽略 */
++    }
++    Screen_Send(buf, snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, text));
++}
++
++/* 画模式开机先清屏(黑底)，显示 READY */
++static void Screen_Boot(void)
++{
++    char buf[16];
++
++    if (g_scrmode > 0.5f)
++    {
++        Screen_Send(buf, snprintf(buf, sizeof(buf), "cls 0"));
++        Screen_Text("t1", "READY");
++    }
++}
++
+ /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
+ static void Screen_Raw(const char *cmd)
+ {
+@@ -594,6 +659,9 @@
+     qr_len = 0;
+     qr_end = 0;
+     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
++
++    HAL_Delay(300);                                /* 等屏上电启动 */
++    Screen_Boot();
+ }
+ 
+ /* ================= 树莓派指令 ================= */
+@@ -683,7 +751,7 @@
          else
          {
              long us;
