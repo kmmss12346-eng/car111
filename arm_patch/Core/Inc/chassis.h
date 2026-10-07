@@ -30,6 +30,7 @@ int  Car_Param_Set(const char *name, float v);    /* 0=没有这个名字 1=成�
 void Car_Param_Dump(void);                        /* 串口打印全部参数 */
 void Car_Motor_Report(void);                      /* MOT?：读 1~5 号驱动器的电压、使能、堵转保护，串口打印 */
 void Car_Motor_Enable(void);                      /* MOT EN：1~5 号解除堵转保护并使能(开机和 HOME 时自动做一次) */
+int  Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len);   /* 读驱动器参数，收到回复返回 1 */
 
 extern volatile uint8_t car_abort;                /* 串口收到 '!' 时置 1，闭环动作马上停车 */
 extern volatile float   car_last_err;             /* 上一个闭环动作结束时车头误差(度) */

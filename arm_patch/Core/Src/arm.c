@@ -28,12 +28,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 extern UART_HandleTypeDef huart5;
 extern TIM_HandleTypeDef  htim2;
 extern volatile uint8_t   car_abort;
+extern int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len);   /* chassis.c：读驱动器参数 */
 
 /* main.c 里已有的函数 */
 extern void Claw_Set(uint32_t pulse_us);
@@ -50,7 +52,8 @@ extern void Delay_Report(uint32_t ms);
 
 /* 两个模块出厂都是 9600。工程里 USART2/UART5 初始化成了 115200，Arm_Init 里会改成下面的值。
  * 如果您把屏或扫码模块改过波特率，只改这两个数 */
-/* 开机前把升降放到最低点；上电后自动升到这个高度(离最低点往上多少 mm)。改了这里要重新编译烧录 */
+/* 开机后升降要停的高度(离最低点往上多少 mm)。开机前把升降大概放在这个高度附近(±20mm)，
+ * 上电后程序读电机编码器算出准确高度，自动走到正好这个高度(要先 LIFT CAL 标定一次)。改了这里要重新编译烧录 */
 #define LIFT_BOOT_MM   60.0f
 
 #define SCREEN_BAUD    9600u
@@ -278,6 +281,247 @@ static const char *Lift_Goto(float mm)
     }
     lift_mm = mm;
     return NULL;
+}
+
+/* ================= 升降编码器：开机自动找到准确高度 =================
+ * 升降电机转一圈 = LFSPR/LFPPM 毫米(3200/80 = 40mm)。驱动器能读出电机"一圈里转到哪个角度"，
+ * 这个角度断电也不会丢(磁编码器)，只是分不出是第几圈。所以：
+ *   开机前把升降大概放在 LIFT_BOOT_MM(60mm) 附近，上下差不超过 ±20mm(半圈)，也就是 40~80mm 之间；
+ *   开机时读这个角度，就能算出准确高度，再自动走到正好 60mm。整个过程不碰任何东西。
+ * 要先标定一次：LIFT CAL <毫米>(升降现在离最低点多少毫米，用尺子量)。程序上下动 10mm，
+ * 测出"高度 0 对应的角度"和"每毫米角度变多少"，存进 STM32 内部 Flash 最后一个扇区，
+ * 断电、重新烧录程序都不会丢(除非烧录时选了"整片擦除")。 */
+#ifndef ARM_CAL_ADDR
+#define ARM_CAL_ADDR   0x08060000u        /* Flash 扇区 7(128KB)。程序只占前面几十 KB，不冲突 */
+#endif
+#define CAL_MAGIC      0x4C494654u        /* "LIFT" */
+
+static float   lift_enc0   = 0.0f;        /* 高度 0mm 时的编码器读数 */
+static float   lift_cpm    = 0.0f;        /* 每升高 1mm 编码器读数变多少(带正负) */
+static float   lift_cpr    = 65536.0f;    /* 编码器一圈的读数(标定时自动判断 65536 / 16384 / 4096) */
+static uint8_t lift_cal_ok = 0;
+
+/* 把编码器读数差折到 ±半圈 */
+static float Enc_Wrap(float d, float cpr)
+{
+    return d - cpr * floorf((d + cpr / 2.0f) / cpr);
+}
+
+/* 读升降电机的编码器(一圈里的角度)。读到返回 1 */
+static int Lift_ReadEnc(uint16_t *v)
+{
+    uint8_t r[5];
+    int k;
+
+    for (k = 0; k < 3; k++)
+    {
+        if (Car_Motor_Query(LIFT_ADDR, 0x31, r, 5))
+        {
+            *v = (uint16_t)(((uint16_t)r[2] << 8) | r[3]);
+            return 1;
+        }
+        HAL_Delay(10);
+    }
+    return 0;
+}
+
+/* 用编码器算现在的高度：在 near_mm 上下半圈(±20mm)以内找。没标定或读不到返回 0 */
+static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
+{
+    uint16_t e;
+
+    if (!lift_cal_ok || !Lift_ReadEnc(&e))
+    {
+        return 0;
+    }
+    *raw = e;
+    *z = near_mm + Enc_Wrap((float)e - (lift_enc0 + lift_cpm * near_mm), lift_cpr) / lift_cpm;
+    return 1;
+}
+
+static void Cal_Load(void)
+{
+    const volatile uint32_t *f = (const volatile uint32_t *)ARM_CAL_ADDR;
+    uint32_t w[5];
+    float e0, c, cpr;
+    int i;
+
+    for (i = 0; i < 5; i++)
+    {
+        w[i] = f[i];
+    }
+    lift_cal_ok = 0;
+    if (w[0] != CAL_MAGIC || w[4] != (w[0] ^ w[1] ^ w[2] ^ w[3] ^ 0x5A5A5A5Au))
+    {
+        return;
+    }
+    memcpy(&e0, &w[1], 4);
+    memcpy(&c, &w[2], 4);
+    memcpy(&cpr, &w[3], 4);
+    if (!(Absf(c) > 10.0f && Absf(c) < 50000.0f && cpr > 1000.0f && cpr < 70000.0f))
+    {
+        return;
+    }
+    lift_enc0 = e0;
+    lift_cpm = c;
+    lift_cpr = cpr;
+    lift_cal_ok = 1;
+}
+
+static int Cal_Save(void)
+{
+    FLASH_EraseInitTypeDef er;
+    uint32_t serr = 0;
+    uint32_t w[5];
+    int i;
+    int ok = 1;
+
+    w[0] = CAL_MAGIC;
+    memcpy(&w[1], &lift_enc0, 4);
+    memcpy(&w[2], &lift_cpm, 4);
+    memcpy(&w[3], &lift_cpr, 4);
+    w[4] = w[0] ^ w[1] ^ w[2] ^ w[3] ^ 0x5A5A5A5Au;
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
+                           FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+    er.TypeErase = FLASH_TYPEERASE_SECTORS;
+    er.Banks = FLASH_BANK_1;
+    er.Sector = FLASH_SECTOR_7;
+    er.NbSectors = 1;
+    er.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+    if (HAL_FLASHEx_Erase(&er, &serr) != HAL_OK)       /* 擦除 128KB 扇区约 1~2 秒 */
+    {
+        ok = 0;
+    }
+    for (i = 0; ok && i < 5; i++)
+    {
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, ARM_CAL_ADDR + 4u * (uint32_t)i, w[i]) != HAL_OK)
+        {
+            ok = 0;
+        }
+    }
+    HAL_FLASH_Lock();
+    if (ok)
+    {
+        Cal_Load();                                /* 读回来校验 */
+        ok = lift_cal_ok;
+    }
+    return ok;
+}
+
+/* LIFT CAL <mm>：升降现在离最低点 z0 毫米(尺子量的)。上下动 10mm 测编码器，存进 Flash */
+static const char *Lift_Cal(float z0)
+{
+    static const float cands[3] = { 65536.0f, 16384.0f, 4096.0f };
+    uint16_t a;
+    uint16_t b;
+    float step, mm_rev, d = 0.0f, cpr = 0.0f;
+    const char *r;
+    char m[96];
+    char s1[20];
+    char s2[20];
+    int i;
+
+    if (z0 < 0.0f || z0 > g_lmax)
+    {
+        return "ERR RANGE";
+    }
+    lift_known = 1;
+    lift_mm = z0;
+    if (!Lift_ReadEnc(&a))
+    {
+        return "ERR NOENC";                        /* 读不到：驱动器 TX 没接到 PC11，或 5 号驱动器没回复 */
+    }
+    step = (z0 + 15.0f <= g_lmax) ? 10.0f : -10.0f;
+    r = Lift_Goto(z0 + step);
+    if (r != NULL || car_abort)
+    {
+        return (r != NULL) ? r : "ERR ABORT";
+    }
+    HAL_Delay(300);
+    if (!Lift_ReadEnc(&b))
+    {
+        return "ERR NOENC";
+    }
+    /* 判断编码器一圈是多少：10mm 应该是 10/40 圈 */
+    mm_rev = g_lspr / g_lppm;
+    for (i = 0; i < 3; i++)
+    {
+        float di = Enc_Wrap((float)b - (float)a, cands[i]);
+        float ratio = Absf(di) / cands[i] * mm_rev / Absf(step);
+        if (ratio > 0.8f && ratio < 1.25f)
+        {
+            d = di;
+            cpr = cands[i];
+            break;
+        }
+    }
+    if (cpr == 0.0f)
+    {
+        return "ERR ENCMOVE";                      /* 编码器变化和走的距离对不上：电机没转、或读的不是升降电机 */
+    }
+    r = Lift_Goto(z0);                             /* 回到原来的位置 */
+    if (r != NULL || car_abort)
+    {
+        return (r != NULL) ? r : "ERR ABORT";
+    }
+    HAL_Delay(300);
+    if (!Lift_ReadEnc(&a))
+    {
+        return "ERR NOENC";
+    }
+    lift_cpr = cpr;
+    lift_cpm = d / step;
+    lift_enc0 = (float)a - lift_cpm * z0;
+    lift_enc0 -= cpr * floorf(lift_enc0 / cpr);   /* 折到 0~一圈 */
+    if (!Cal_Save())
+    {
+        return "ERR FLASH";
+    }
+    FmtF(s1, (int)sizeof(s1), lift_enc0);
+    FmtF(s2, (int)sizeof(s2), lift_cpm);
+    snprintf(m, sizeof(m), "LIFTCAL OK ENC0=%s CPM=%s CPR=%ld\r\n", s1, s2, (long)cpr);
+    Say(m);
+    return NULL;
+}
+
+/* 开机：用编码器找到准确高度，再走到 LIFT_BOOT_MM。没标定/读不到编码器时，当作正好在 LIFT_BOOT_MM，不动 */
+static void Lift_Boot(void)
+{
+    uint16_t e = 0;
+    float z = LIFT_BOOT_MM;
+    char m[64];
+    char s1[20];
+    int k;
+    int got = 0;
+
+    lift_known = 1;
+    lift_mm = LIFT_BOOT_MM;
+    Cal_Load();
+    if (!lift_cal_ok)
+    {
+        Say("LIFTBOOT NOCAL (assume 60)\r\n");
+        return;
+    }
+    for (k = 0; k < 20 && !got; k++)               /* 驱动器上电要一会儿才能回复，最多等约 3 秒 */
+    {
+        got = Lift_EncPos(LIFT_BOOT_MM, &z, &e);
+        if (!got)
+        {
+            HAL_Delay(100);
+        }
+    }
+    if (!got)
+    {
+        Say("LIFTBOOT NOENC (assume 60)\r\n");
+        return;
+    }
+    lift_mm = z;
+    FmtF(s1, (int)sizeof(s1), z);
+    snprintf(m, sizeof(m), "LIFTBOOT %s -> %ld\r\n", s1, (long)LIFT_BOOT_MM);
+    Say(m);
+    Lift_Goto(LIFT_BOOT_MM);
 }
 
 /* ================= ID1 / ID2 ================= */
@@ -664,16 +908,11 @@ void Arm_Init(void)
     qr_end = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
 
-    /* 升降位置写死：0 = 最低点，往上为正，最高 100mm(LFMAX)。
-     * 开机时升降放在离最低点 LIFT_BOOT_MM(60mm) 的地方，程序就从 60 开始算，不用再发 LIFT ZERO。
-     * (LIFT ZERO 仍然可以用：把"现在的位置"记为 0，只在升降正好在最低点时用) */
-    lift_known = 1;
-    lift_mm = 0.0f;                                /* 开机时升降在最低点 = 0 */
-
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();
 
-    Lift_Goto(LIFT_BOOT_MM);                       /* 开机自动升到 60mm */
+    /* 升降：0 = 最低点，往上为正，最高 100mm(LFMAX)。开机读编码器找到准确高度，自动走到 60mm(见 Lift_Boot) */
+    Lift_Boot();
 }
 
 /* ================= 树莓派指令 ================= */
@@ -827,8 +1066,40 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             lift_known = 1;
             return 1;
         }
+        if (strcmp(t[1], "ENC?") == 0)             /* 读编码器，看程序算出来的高度对不对 */
+        {
+            char m[80];
+            char s1[20];
+            char s2[20];
+            uint16_t e;
+            float z;
+
+            if (lift_cal_ok && Lift_EncPos(lift_mm, &z, &e))
+            {
+                FmtF(s1, (int)sizeof(s1), z);
+                FmtF(s2, (int)sizeof(s2), lift_mm);
+                snprintf(m, sizeof(m), "LIFTENC %u Z=%s NOW=%s\r\n", (unsigned)e, s1, s2);
+            }
+            else if (Lift_ReadEnc(&e))
+            {
+                snprintf(m, sizeof(m), "LIFTENC %u NOCAL\r\n", (unsigned)e);
+            }
+            else
+            {
+                FAIL("ERR NOENC");
+            }
+            Say(m);
+            return 1;
+        }
         if (!ParseF(t[1], &f))  FAIL("ERR ARG");
         r = Lift_Goto(f);
+        if (r)  FAIL(r);
+        return 1;
+    }
+    if (strcmp(v, "LIFT") == 0 && n == 3 && strcmp(t[1], "CAL") == 0)
+    {
+        if (!ParseF(t[2], &f))  FAIL("ERR ARG");
+        r = Lift_Cal(f);
         if (r)  FAIL(r);
         return 1;
     }

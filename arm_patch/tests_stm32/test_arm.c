@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 UART_HandleTypeDef huart2, huart3, huart5;
 TIM_HandleTypeDef htim2;
@@ -50,7 +51,27 @@ void Servo_Move(uint8_t id, float a, float spd, float tol, uint32_t extra) {
 }
 void Emm_V5_En_Control(uint8_t a, bool s, bool f) { (void)a; (void)s; (void)f; }
 void Emm_V5_Reset_CurPos_To_Zero(uint8_t a) { EV("zero%u;", a); }
-void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) { (void)a; (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk); }
+/* 假升降：真实高度 phys_mm(LFDIR=0 时 d=0 往上)，编码器 = (enc_off + 每毫米 enc_cpm × 高度) 对一圈 enc_cpr 取余 */
+static double phys_mm = 60.0, enc_off = 12345.0, enc_cpm = 1638.4, enc_cpr = 65536.0;
+static int enc_ok = 1, enc_frozen = 0;
+uint32_t fake_flash[8] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+static int flash_fail = 0;
+int HAL_FLASH_Unlock(void) { return 0; }
+int HAL_FLASH_Lock(void) { return 0; }
+int HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *err) { int i; (void)err; if (flash_fail || e->Sector != 7) return 1; for (i = 0; i < 8; i++) fake_flash[i] = 0xFFFFFFFFu; now += 1000; return 0; }
+int HAL_FLASH_Program(uint32_t type, uintptr_t addr, uint64_t data) { (void)type; fake_flash[(addr - (uintptr_t)fake_flash) / 4] = (uint32_t)data; return 0; }
+int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
+    double e; uint16_t v;
+    if (!enc_ok || addr != 5 || func != 0x31 || len != 5) return 0;
+    e = fmod(enc_off + (enc_frozen ? 0.0 : enc_cpm * phys_mm), enc_cpr); if (e < 0) e += enc_cpr;
+    v = (uint16_t)(e + 0.5) % (uint16_t)(enc_cpr > 65535 ? 65535 : enc_cpr);
+    if (enc_cpr > 65535) v = (uint16_t)((long)(e + 0.5) % 65536);
+    out[0] = 5; out[1] = 0x31; out[2] = (uint8_t)(v >> 8); out[3] = (uint8_t)v; out[4] = 0x6B; return 1;
+}
+void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) {
+    (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
+    if (a == 5) phys_mm += (d ? -1.0 : 1.0) * (double)clk / 80.0;
+}
 void Emm_V5_Stop_Now(uint8_t a, bool f) { (void)f; EV("stop%u;", a); }
 void Emm_V5_Origin_Trigger_Return(uint8_t a, uint8_t m, bool f) { (void)f; EV("home%u/%u;", a, m); }
 void Emm_V5_Origin_Interrupt(uint8_t a) { EV("homeint%u;", a); }
@@ -255,6 +276,50 @@ int main(void) {
     clear(); run("SCMD page 1");
     CHECK(strstr(scr, "page 1"), "SCMD");
     CHECK(run("SCR") == 0 && run("SCR t1") == -1, "SCR 参数检查");
+
+    /* ---- 升降编码器：标定、开机自动找高度 ---- */
+    run("LIFT 60"); phys_mm = 60.0;                      /* 让"程序以为的高度"和真实高度一致 */
+    clear();
+    CHECK(run("LIFT ENC?") == 1 && pis("LIFTENC ") && pis("NOCAL"), "没标定时 LIFT ENC? 只回原始读数");
+    clear();
+    CHECK(run("LIFT CAL 60") == 1 && pis("LIFTCAL OK") && pis("CPR=65536") && fake_flash[0] == 0x4C494654u, "LIFT CAL 60：测出编码器关系并存进 Flash");
+    CHECK(fabs(phys_mm - 60.0) < 0.05, "标定完回到原来的高度");
+    clear();
+    phys_mm = 47.3;                                       /* 关机时被人推到 47.3mm */
+    Arm_Init();
+    CHECK((pis("LIFTBOOT 47.3") || pis("LIFTBOOT 47.29")) && has("L+1016;") && fabs(phys_mm - 60.0) < 0.05, "开机：编码器算出在 47.3mm，往上走 12.7mm 到正好 60");
+    clear();
+    phys_mm = 75.6;
+    Arm_Init();
+    CHECK((pis("LIFTBOOT 75.6") || pis("LIFTBOOT 75.59")) && has("L-1248;") && fabs(phys_mm - 60.0) < 0.05, "开机：在 75.6mm，往下走 15.6mm 到 60");
+    clear();
+    CHECK(run("LIFT ENC?") == 1 && (pis("Z=60.0") || pis("Z=59.99")) && pis("NOW=60.0"), "LIFT ENC? 算出的高度和程序记的一致");
+    /* 编码器一圈是 16384 的驱动器、方向也反过来 */
+    enc_cpr = 16384.0; enc_cpm = -409.6; enc_off = 3000.0; phys_mm = 30.0;
+    run("LIFT 30"); phys_mm = 30.0;
+    clear();
+    CHECK(run("LIFT CAL 30") == 1 && pis("CPR=16384"), "一圈 16384、方向相反的编码器也能标定");
+    clear();
+    phys_mm = 68.0;
+    Arm_Init();
+    CHECK((pis("LIFTBOOT 68.0") || pis("LIFTBOOT 67.99")) && has("L-640;") && fabs(phys_mm - 60.0) < 0.05, "16384 编码器：开机在 68mm，往下 8mm 到 60");
+    /* 读不到编码器：当作在 60，不动 */
+    enc_ok = 0; clear(); phys_mm = 52.0;
+    Arm_Init();
+    CHECK(pis("LIFTBOOT NOENC") && !has("L+") && !has("L-"), "读不到编码器：不动，当作在 60");
+    CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
+    enc_ok = 1; enc_frozen = 1; clear();
+    CHECK(run("LIFT CAL 60") == -1 && pis("ERR ENCMOVE"), "电机转了编码器却不变：ERR ENCMOVE，不存");
+    enc_frozen = 0; flash_fail = 1; enc_cpr = 65536.0; enc_cpm = 1638.4; clear();
+    run("LIFT 60"); phys_mm = 60.0;
+    CHECK(run("LIFT CAL 60") == -1 && pis("ERR FLASH"), "Flash 写失败报 ERR FLASH");
+    flash_fail = 0;
+    CHECK(run("LIFT CAL 120") == -1 && pis("ERR RANGE"), "LIFT CAL 超出 0~LFMAX 拒绝");
+    /* 没标定(Flash 是空的)时开机：当作在 60，不动 */
+    { int q; for (q = 0; q < 8; q++) fake_flash[q] = 0xFFFFFFFFu; }
+    clear(); Arm_Init();
+    CHECK(pis("LIFTBOOT NOCAL") && !has("L+") && !has("L-"), "没标定：开机不动，当作在 60");
+    run("LIFT 60");
 
     /* ---- GET/SET 用的接口 ---- */
     clear();

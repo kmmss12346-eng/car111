@@ -38,7 +38,8 @@ DEFAULTS = dict(
     time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)
     qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码
     raw_wait_s=10.0,                    # 等原料盘停稳最多多久(规则：等转盘最多多停 8 秒)
-    lift_init='skip',                   # 升降位置：STM32 开机就认为升降在离最低点 60mm(开机前放到这个高度)，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
+    lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
+    lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
     frames=5,                                                    # 每次测量取几帧(多帧取中值；少一点快一点，噪声会大一点)
     claw_px=dict(RAW=[336.8, 282.9], RING=[336.8, 282.9]),      # 爪子轴线在画面里的位置
@@ -522,6 +523,8 @@ class MissionHooks:
         if self.arm is not None and not self.disabled:
             try:
                 self.arm.stow()
+                if self.cfg.get('lift_park_mm') is not None:
+                    self.arm.do(f"LIFT {float(self.cfg['lift_park_mm']):g}")   # 停到开机高度，下次上电编码器能认出来
             except ArmAbort:
                 raise
             except ArmError as ex:

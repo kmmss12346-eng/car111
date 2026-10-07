@@ -1470,6 +1470,13 @@ static int Mot_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len)
     return 0;
 }
 
+/* 给别的文件用(arm.c 读升降电机的编码器)：发 [addr func 6B]，收 len 字节的回复。收到返回 1 */
+int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len)
+{
+    HAL_Delay(2);
+    return Mot_Query(addr, func, out, len);
+}
+
 /* MOT?：每个驱动器打印一行，例如
  *   MOT 1 V=12.31 EN=1 ARR=1 STALL=0 PROT=0
  *   MOT 2 NOREPLY

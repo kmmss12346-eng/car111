@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 OUT="${TMPDIR:-/tmp}"
-gcc -std=gnu90 -Wall -Wextra -Wdeclaration-after-statement -Istub -I../Core/Inc -o "$OUT/test_arm_host" ../Core/Src/arm.c test_arm.c 2>&1 | grep -v "test_arm.c" || true
+gcc -std=gnu90 -Wall -Wextra -Wdeclaration-after-statement -Istub -I../Core/Inc -o "$OUT/test_arm_host" ../Core/Src/arm.c test_arm.c -lm 2>&1 | grep -v "test_arm.c" || true
 "$OUT/test_arm_host"
 echo
 gcc -std=gnu90 -Wall -Wextra -Wdeclaration-after-statement -Istub_ch -I../Core/Inc -o "$OUT/test_chassis_host" ../Core/Src/chassis.c test_chassis.c -lm 2>&1 | grep -v "test_chassis.c" || true
