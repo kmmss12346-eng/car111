@@ -683,7 +683,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         else
         {
             long us;
-            if (!ParseL(t[1], &us) || us < 500 || us > 2500)  FAIL("ERR ARG");
+            if (!ParseL(t[1], &us) || us < 500 || us > 3000)  FAIL("ERR ARG");   /* 夹爪合上是 2910 */
             Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
         }
         Wait_Ms((uint32_t)g_clwait);
