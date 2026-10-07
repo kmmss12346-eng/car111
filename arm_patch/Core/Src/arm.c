@@ -264,6 +264,7 @@ static const char *Lift_Goto(float mm)
     }
 
     Emm_V5_En_Control(LIFT_ADDR, true, false);
+    HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
     Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
 
     if (!Wait_Ms(Lift_Time_Ms(pulses)))
@@ -795,6 +796,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (strcmp(t[1], "ZERO") == 0)
         {
             Emm_V5_En_Control(LIFT_ADDR, true, false);
+            HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
             Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
             lift_mm = 0.0f;
             lift_known = 1;
@@ -803,6 +805,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (strcmp(t[1], "HOME") == 0)
         {
             Emm_V5_En_Control(LIFT_ADDR, true, false);
+            HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
             Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
             if (!Wait_Ms((uint32_t)g_lhtm))
             {

@@ -93,7 +93,15 @@
  };
  #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
  
-@@ -433,26 +435,89 @@
+@@ -262,6 +264,7 @@
+     }
+ 
+     Emm_V5_En_Control(LIFT_ADDR, true, false);
++    HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
+     Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
+ 
+     if (!Wait_Ms(Lift_Time_Ms(pulses)))
+@@ -433,26 +436,89 @@
  }
  
  /* ================= 串口屏 ================= */
@@ -190,7 +198,7 @@
  /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
  static void Screen_Raw(const char *cmd)
  {
-@@ -594,6 +659,9 @@
+@@ -594,6 +660,9 @@
      qr_len = 0;
      qr_end = 0;
      HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
@@ -200,7 +208,7 @@
  }
  
  /* ================= 树莓派指令 ================= */
-@@ -683,7 +751,7 @@
+@@ -683,7 +752,7 @@
          else
          {
              long us;
@@ -209,6 +217,22 @@
              Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
          }
          Wait_Ms((uint32_t)g_clwait);
+@@ -727,6 +796,7 @@
+         if (strcmp(t[1], "ZERO") == 0)
+         {
+             Emm_V5_En_Control(LIFT_ADDR, true, false);
++            HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
+             Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
+             lift_mm = 0.0f;
+             lift_known = 1;
+@@ -735,6 +805,7 @@
+         if (strcmp(t[1], "HOME") == 0)
+         {
+             Emm_V5_En_Control(LIFT_ADDR, true, false);
++            HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
+             Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
+             if (!Wait_Ms((uint32_t)g_lhtm))
+             {
 --- a/Core/Src/chassis.c
 +++ b/Core/Src/chassis.c
 @@ -8,6 +8,8 @@

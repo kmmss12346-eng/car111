@@ -6,3 +6,6 @@ arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -Os -Wall -Wextra -ffreestanding -nost
 arm-none-eabi-objcopy -O ihex uart4_test.elf uart4_test.hex
 arm-none-eabi-objcopy -O binary uart4_test.elf uart4_test.bin
 arm-none-eabi-size uart4_test.elf
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -Os -Wall -ffreestanding -nostdlib -T link.ld -o lift_test.elf lift_test.c
+arm-none-eabi-objcopy -O ihex lift_test.elf lift_test.hex
+arm-none-eabi-objcopy -O binary lift_test.elf lift_test.bin
