@@ -13,6 +13,7 @@
 | `task_plan.py` | 任务码解析、每批物料的颜色/圆环/转盘槽位、码垛目标(同色匹配) |
 | `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vcal` `vdbg` `mtest` `mot` |
 | `apply_mission_config.py` | 给配置文件加 `mission_cfg`(只补缺的，自动备份) |
+| `route_plan.py` | v14 的路线规划，加了**离黄色区硬性余量** `yellow_margin_mm`(默认 30)：某段按 30mm 走不通(如 400mm 宽的中间车道)时这一段自动减半/放到 0 并在终端提示 |
 | `auto_run.py` `map_merge_live.py` | v14 的文件，各加了几行(见 `../v14_integration.patch`)；v4：车没转到位(`ERR STALL`/车头还差 10° 以上)时停下并提示 |
 | `sim_mission.py` | 整场模拟(假 STM32 + 假摄像头 + 物理世界)，也能估算用时 |
 | `test_*.py` | 单元测试 |
@@ -27,7 +28,7 @@
 2. 把 `chengxu` 里的 **`wuliao.py`、`ring_detect.py`** 复制到这个文件夹（识别就是用它们的）。
 3. `python3 apply_mission_config.py`。
 4. 需要 `numpy` 和 `opencv`（树莓派上识别代码本来就要用）。
-5. 跑测试确认环境没问题：`python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run sim_mission`
+5. 跑测试确认环境没问题：`python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run test_route_margin sim_mission`
 
 ## 每个停车点做什么
 
@@ -72,6 +73,7 @@
 | `servo_cal_file` | servo_cal.json | 校准结果文件(相对启动目录) |
 | `chassis_fine_rpm` | 60 | 视觉微调时底盘速度 |
 | `stop_aliases` | null | 停车点别名 |
+| `yellow_margin_mm`(配置顶层) | 30 | 路线规划时车身离黄色区至少留多少 mm。嫌近就加大(50)，嫌绕远费时间就减小；0 = 和 v14 原版一样 |
 | `screen` | t0 t7 t1 t2 t3 t4 t5 t6 | 串口屏控件名 |
 
 ## 终端命令（在 `map_merge_live` 的命令行里）
@@ -117,7 +119,7 @@
 ## 测试
 
 ```
-python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run sim_mission
+python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run test_route_margin sim_mission
 python3 sim_mission.py                   # 整场模拟，打印过程和结果
 python3 sim_mission.py fast 1            # 提速参数、只做第一批，看用时估计
 python3 sim_mission.py 1 LFRPM=300 ASPD=200 CLWAIT=250    # 用您自己的速度参数估算

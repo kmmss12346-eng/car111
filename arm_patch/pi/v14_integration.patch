@@ -109,3 +109,94 @@
      def poll():
          dirty=False
          while not results.empty():
+--- lidar_map_north.orig/route_plan.py
++++ lidar_map_north/route_plan.py
+@@ -34,6 +34,10 @@
+ TEMP_ZONE = (0, 910, 150, 1490)
+ ROUGH_ZONE = (910, 0, 1490, 150)
+ 
++# 车身离黄色区至少留多少 mm(硬性，规划不会再贴着黄色区走)。配置 yellow_margin_mm 可改。
++# 某一段按这个余量规划不出来(比如中间那条只有 400mm 宽的车道)，这一段会自动减半再试，还不行才按 0 规划，并给出提示。
++YELLOW_MARGIN_MM = 30
++
+ # v11：场地按黄色区的边分成 5×5 格：偶数格是车道，奇数×奇数是黄色区。
+ #   路口 = 车道×车道(9 个)，路段 = 车道×黄色列/行(12 段)。
+ LANE_BANDS = ((0, 550), (550, 1000), (1000, 1400), (1400, 1850), (1850, 2400))
+@@ -190,6 +194,11 @@
+         self.sealed = lane_block_rects(cfg, self.obstacles) if cfg.get('lane_block', True) else []
+         self.fixed_base = YELLOW + [TEMP_ZONE, ROUGH_ZONE] + [tuple(r) for r in (cfg.get('extra_blocked_rects') or [])]
+         self.fixed = self.fixed_base + [tuple(r) for r in self.sealed]
++        # 黄色区外扩 yellow_margin_mm 以后再判断车身放不放得下(只影响"能不能走"，净空代价仍按真实黄色区算)
++        ym = max(0.0, float(cfg.get('yellow_margin_mm', YELLOW_MARGIN_MM)))
++        self.yellow_margin = ym
++        self.yellow_big = [(r[0]-ym, r[1]-ym, r[2]+ym, r[3]+ym) for r in YELLOW]
++        self.fixed_free = self.yellow_big + [r for r in self.fixed if r not in YELLOW]
+         xs = np.arange(N)*STEP
+         X, Y = np.meshgrid(xs, xs, indexing='ij')
+         # 4个车头方向各一张“车身放得下”的表：车身中心 = 转轴点 + d×车头方向
+@@ -222,7 +231,7 @@
+     def _center_free(self, X, Y, h):
+         w, e, so, no = self.ext[h]
+         free = (X - w >= 0) & (X + e <= FIELD) & (Y - so >= 0) & (Y + no <= FIELD)
+-        for r in self.fixed:                       # 与固定区域的开区间相交即禁止（刚好贴边允许）
++        for r in self.fixed_free:                  # 与固定区域的开区间相交即禁止（刚好贴边允许）；黄色区已外扩 yellow_margin_mm
+             free &= ~((X + e > r[0]) & (X - w < r[2]) & (Y + no > r[1]) & (Y - so < r[3]))
+         cx, cy, cr = self.raw                      # 原料转盘（圆）与车身外框
+         dx = np.maximum(np.maximum((X - w) - cx, cx - (X + e)), 0)
+@@ -287,8 +296,10 @@
+         w, e, so, no = self.ext[h]
+         if not (x - w >= 0 and x + e <= FIELD and y - so >= 0 and y + no <= FIELD):
+             return '车身(含雷达)会出场地'
+-        for r in self.fixed:
++        for r in self.fixed_free:
+             if x + e > r[0] and x - w < r[2] and y + no > r[1] and y - so < r[3]:
++                if r in self.yellow_big and self.yellow_margin > 0:
++                    return f'车身(含雷达)离黄色区不到 {self.yellow_margin:.0f}mm'
+                 return (f'这段车道有障碍物，已封死{r}' if r in self.sealed else f'车身(含雷达)会压到固定区域{r}')
+         for ox, oy, orr in self.obstacles:
+             m = orr + self.obs_margin
+@@ -424,7 +435,11 @@
+     """按停车点顺序逐段规划。start_pose/stops 都是车身中心 (x, y, 车头)。
+     start_pivot 给定时直接用它当起点转轴点（例如第二站斜着停、原地转回正后的转轴位置）。
+     返回 [dict(stop, start, goal, cmds, poses)], 说明, planner。位置都换算回车身中心。"""
+-    planner = Planner(cfg, obstacles)
++    # 每一段先按 yellow_margin_mm 规划，不行再减半、再按 0(只有真走不通的那一段放宽，别的段不受影响)
++    ym = max(0.0, float(cfg.get('yellow_margin_mm', YELLOW_MARGIN_MM)))
++    margins = sorted({ym, round(ym / 2), 0.0}, reverse=True)
++    planners = [Planner(dict(cfg, yellow_margin_mm=m), obstacles) for m in margins]
++    planner = planners[-1]                             # 余量 0 的那个：吸附栅格、停车点检查和以前完全一样
+     d = planner.d
+     stops = cfg['stops']
+     legs = []
+@@ -457,11 +472,20 @@
+         gp = planner.pivot_of(gx, gy, gyaw)
+         gpx, gpy = planner.snap(gp[0], gp[1], gh)
+         goal = (gpx, gpy, yaw_of(gh))
+-        acts, why = planner.plan_leg(pose, goal)
++        acts, why, used = None, '', 0.0
++        for pl in planners:
++            acts, w2 = pl.plan_leg(pose, goal)
++            if acts is not None:
++                used = pl.yellow_margin
++                break
++            why = why or w2                            # 记下最严格那一档失败的原因
+         if acts is None:
+-            return legs, f'去 {name} 的路线失败：{why}', planner
++            return legs, f'去 {name} 的路线失败：{w2}', planner
+         cmds, poses = to_commands(pose, acts, d)
+         note = ''
++        if used < ym:
++            note = (f'⚠ 去 {name} 这一段按离黄色区 {ym:.0f}mm 规划不出来(车道太窄或停车点离黄色区太近)，'
++                    f'这一段只留了 {used:.0f}mm，走这段要特别注意。({why})')
+         if planner.point_free(gp[0], gp[1], gh):
+             post = body_moves(gp[0] - gpx, gp[1] - gpy, gh)   # 栅格点 → 准确的停车点
+             gcenter = (gx, gy, gyaw)
+@@ -470,7 +494,7 @@
+             post = []
+             gcenter = planner.center_of(gpx, gpy, yaw_of(gh)) + (gyaw,)
+             gcenter = (gcenter[0], gcenter[1], gyaw)
+-            note = f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f})被障碍物挡住，改停在 ({gcenter[0]:.0f},{gcenter[1]:.0f})，差 {math.hypot(gcenter[0]-gx, gcenter[1]-gy):.0f}mm'
++            note = (note + '；' if note else '') + f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f})被障碍物挡住，改停在 ({gcenter[0]:.0f},{gcenter[1]:.0f})，差 {math.hypot(gcenter[0]-gx, gcenter[1]-gy):.0f}mm'
+         cmds = merge(pre + cmds + post)
+         pre = [(k, -v) for k, v in post]                   # 下一段先从准确停车点回到栅格点
+         legs.append(dict(stop=name, start=planner.center_of(*pose), goal=gcenter,
