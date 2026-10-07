@@ -11,9 +11,9 @@
 | `vision.py` | 摄像头(只开一次)、物料和圆环识别(复用您的 `wuliao`、`ring_detect`；圆环检测改成了亚像素) |
 | `arm_link.py` | STM32 机械臂指令封装、给视觉闭环用的手臂/底盘动作(含底盘位移记账) |
 | `task_plan.py` | 任务码解析、每批物料的颜色/圆环/转盘槽位、码垛目标(同色匹配) |
-| `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vcal` `vdbg` `mtest` |
+| `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vcal` `vdbg` `mtest` `mot` |
 | `apply_mission_config.py` | 给配置文件加 `mission_cfg`(只补缺的，自动备份) |
-| `auto_run.py` `map_merge_live.py` | v14 的文件，各加了几行(见 `../v14_integration.patch`) |
+| `auto_run.py` `map_merge_live.py` | v14 的文件，各加了几行(见 `../v14_integration.patch`)；v4：车没转到位(`ERR STALL`/车头还差 10° 以上)时停下并提示 |
 | `sim_mission.py` | 整场模拟(假 STM32 + 假摄像头 + 物理世界)，也能估算用时 |
 | `test_*.py` | 单元测试 |
 
@@ -22,11 +22,12 @@
 1. 把本文件夹里的文件复制到树莓派的 `lidar_map_north/`。`auto_run.py`、`map_merge_live.py` 会**覆盖**您现有的同名文件——它们基于 v14。如果您的版本比 v14 新，不要覆盖，用补丁(在 `lidar_map_north` 的**上一级目录**运行)：`patch -p0 < v14_integration.patch`，补丁文件是 `../v14_integration.patch`，一共 3 处小改动：
    - `auto_run.drive`：开头加 `hooks.ctx = ctx`（让任务钩子能检查 abort）
    - `map_merge_live.mission_thread`：配置里 `mission_cfg.enabled` 为 true 时创建 `MissionHooks` 并传给 `run_mission`
-   - `map_merge_live.command`：加 `arm vcal mtest vdbg qr mcode` 几个命令
+   - `map_merge_live.command`：加 `arm vcal mtest vdbg qr mcode mot` 几个命令
+   - v4 `auto_run`：第二站或路线里某条指令回 `ERR STALL`、或做完车头还差 10° 以上，马上停下并提示怎么查(以前会带着错的车位继续扫描、走路线)
 2. 把 `chengxu` 里的 **`wuliao.py`、`ring_detect.py`** 复制到这个文件夹（识别就是用它们的）。
 3. `python3 apply_mission_config.py`。
 4. 需要 `numpy` 和 `opencv`（树莓派上识别代码本来就要用）。
-5. 跑测试确认环境没问题：`python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli sim_mission`
+5. 跑测试确认环境没问题：`python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run sim_mission`
 
 ## 每个停车点做什么
 
@@ -84,6 +85,8 @@
 | `vdbg [RING\|RAW <颜色号>]` | 存 `vdebug.png`：爪子位置(绿十字)、识别到的圆环(黄)/物料(红叉) |
 | `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force` |
 | `mtest reset` | 清空任务码和记录 |
+| `mot` | 看 5 个电机驱动器(1 右前、2 左前、3 右后、4 左后、5 升降)的电压、是否使能、是否触发堵转保护，并给出中文建议。**车不动时先用它** |
+| `mot en` | 5 个驱动器解除堵转保护并使能，再看一次状态(开机和每次 `go` 时 STM32 也会自动做一次) |
 
 原有的 `set 名字 数值`、`get` 也能用于机械臂参数（`set ZPLC 95` 会存进配置，以后每次启动自动发给 STM32）。
 
@@ -108,12 +111,13 @@
 | 某个物料看不到、对不准、STM32 回错误 | 跳过这个物料，`STOW` 收臂，继续下一个 |
 | 收臂也失败 | 抛 `Abort`，路线停止（带着伸出的手臂乱走不安全） |
 | 终端输入 `abort` | STM32 停升降，当前动作回 `ERR ABORT`，钩子抛 `Abort`，路线停止 |
+| 转弯时轮子没转起来(`ERR STALL`)，或者指令做完车头还差 10° 以上 | 路线马上停止，终端提示：`mot` 看驱动器、抬车 `send R 90`、充电、电机电源关了再开 |
 | 超过 `time_limit_s` | 不再夹放，路线继续走完 |
 
 ## 测试
 
 ```
-python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli sim_mission
+python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run sim_mission
 python3 sim_mission.py                   # 整场模拟，打印过程和结果
 python3 sim_mission.py fast 1            # 提速参数、只做第一批，看用时估计
 python3 sim_mission.py 1 LFRPM=300 ASPD=200 CLWAIT=250    # 用您自己的速度参数估算

@@ -1,6 +1,29 @@
 --- lidar_map_north.orig/auto_run.py
 +++ lidar_map_north/auto_run.py
-@@ -136,6 +136,11 @@
+@@ -15,6 +15,22 @@
+ 
+ DEFAULT_SECOND_MOVES = {'left_mm': 42, 'forward_mm': 83, 'cw_deg': 60}
+ 
++MAX_HEAD_ERR_DEG = 10.0   # 指令做完车头还差这么多度：车没按指令动(正常在 2° 以内)，再往下走只会越错越远
++STALL_HINT = ('车轮没转起来(STM32 发了转弯指令，陀螺仪几乎没变；前进/横移的 DONE 是按时间算的，不代表车真的走了)。'
++              '先输入 mot 看 5 个电机驱动器的电压/使能/堵转保护；再把车抬起来输入 send R 90 看轮子转不转。'
++              '常见原因：电机电池没电或没开、驱动器触发了堵转保护、新接的升降驱动器地址或串口线接错')
++
++
++def check_move(cmd, val, ok, reply):
++    """检查一条运动指令的回复：没问题返回 None，否则返回一句给人看的原因。"""
++    reply = reply or ''
++    if not ok:
++        return f'{cmd} {val} 失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in reply else '')
++    err = parse_done(reply).get('err')
++    if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
++        return f'{cmd} {val} 做完后车头还差 {err:+.1f}°(正常在 2° 以内)。{STALL_HINT}'
++    return None
++
+ 
+ def flatten(turn_back, legs, min_move=MIN_MOVE_MM):
+     """路线 -> [(停车点名或None, 指令, 数值)]。第一步先原地转回起点车头方向。"""
+@@ -136,6 +152,11 @@
           回启停区那一段，离启停区还有 home_approach_mm 时先用雷达定位，再按实际位置走进去。"""
      cfg = cfg or {}
      speeds = speeds or {}
@@ -12,6 +35,30 @@
      stops = cfg.get('stops') or {}
      rescan = {str(s).upper() for s in cfg.get('rescan_stops', ['QR'])}
      use_approach = bool(cfg.get('home_approach', True)) and hasattr(ctx, 'home_approach')
+@@ -211,8 +232,9 @@
+         if 'err' in info:
+             extra = f'，车头误差 {info["err"]:+.2f}°'
+         log(f'  [{i}/{total}] {cmd} {val:+d} -> {"完成" if ok else reply}  用时{dt:.1f}秒{est}{extra}')
+-        if not ok:
+-            raise Abort(f'第{i}条指令 {cmd} {val} 失败：{reply}')
++        bad = check_move(cmd, val, ok, reply)
++        if bad:
++            raise Abort(f'第{i}条指令 {bad}')
+         k += 1
+     log(f'  路线行驶共用 {time.monotonic()-t_start:.1f} 秒（其中指令执行 {t_move:.1f} 秒）')
+ 
+@@ -237,7 +259,10 @@
+         log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
+         ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
+         if not ok:
+-            raise Abort(f'STM32 第二站移动失败：{reply}')
++            raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
++        err = parse_done(reply).get('err')
++        if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
++            raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
+         time.sleep(settle_s)
+         log('③ 第二次扫描：车保持不动……')
+         ctx.second()
 --- lidar_map_north.orig/map_merge_live.py
 +++ lidar_map_north/map_merge_live.py
 @@ -417,11 +417,25 @@
@@ -46,10 +93,19 @@
              if sp is None and c in ('F','S'):sp=int(raw_cfg.get('route_speed_rpm',220) if c=='F' else raw_cfg.get('strafe_speed_rpm',170))
              t0=time.monotonic();print(f'发送 {c} {v}'+(f' 速度{sp}' if sp else '')+' …',flush=True)
              ok_,rep_=link.move(c,v,sp);print(f'{c} {v} ->',rep_,f'  (往返用时{time.monotonic()-t0:.1f}秒)',flush=True);return
-+        if k in ('arm','vcal','mtest','vdbg','qr','mcode'):
-+            # 机械臂/视觉测试命令，见 mission_cli.py 开头的说明
++        if k in ('arm','vcal','mtest','vdbg','qr','mcode','mot'):
++            # 机械臂/视觉测试命令、mot(看电机驱动器状态)，见 mission_cli.py 开头的说明
 +            from mission_cli import handle_cli
 +            handle_cli(k,parts,link=link,raw_cfg=raw_cfg,state=state,log=lambda m:print(m,flush=True));return
          if k in ('go','drive','p2'):
              if link is None:raise ValueError('没有连接 STM32（--stm-port），不能用 '+k)
              if state['auto']:raise ValueError('一键流程正在运行；输入 abort 可以中止')
+@@ -607,7 +625,7 @@
+             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
+             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
+             launch(c,'user_entered_absolute_pose');return
+-        raise ValueError('命令：go(一键全流程) / drive / abort / ping / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
++        raise ValueError('命令：go(一键全流程) / drive / abort / ping / mot(电机驱动器状态) / mot en / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
+     def poll():
+         dirty=False
+         while not results.empty():

@@ -109,6 +109,11 @@ void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, ui
 /* 1 = 开机时执行下面 main() 里 #if SERVO_TEST_ON_BOOT 那一段舵机测试；平时、跑地图都保持 0 */
 #define SERVO_TEST_ON_BOOT   1
 
+/* 诊断开关(2026-10-07)：0 = 不启动新加的扫码(UART5)、串口屏(USART2)、夹爪/转盘 PWM，程序和加机械臂之前完全一样；
+ *                      1 = 全部启动(正常版本)。
+ * 用来判断"轮子不动"是不是新加的这几样引起的：先用 0 烧一次试 send S 100，再用 1 烧一次对比。 */
+#define ARM_MODULES_ON       1
+
 /* USER CODE END 0 */
 
 /**
@@ -145,8 +150,10 @@ int main(void)
   MX_USART6_UART_Init();
   MX_USART3_UART_Init();
   MX_USART1_UART_Init();
+#if ARM_MODULES_ON
   MX_UART5_Init();
   MX_USART2_UART_Init();
+#endif
   /* USER CODE BEGIN 2 */
   Usart_Init();
 
@@ -174,9 +181,22 @@ int main(void)
       }
   }
 
+  /* 轮子和升降的驱动器：解除堵转保护并使能。驱动器触发堵转保护后会一直松轴不动，
+   * 而驱动器是电池单独供电的，只重启/重新烧录 STM32 清不掉，所以开机先清一次(HOME 时也会清) */
+  Car_Motor_Enable();
+
+#if ARM_MODULES_ON
   Arm_Init();                        /* 启动夹爪/转盘 PWM，开始接收二维码 */
+  /* 扫码模块、串口屏的中断优先级降到 3，比陀螺仪(1)、树莓派通信(2)低：没接模块时乱码也不会打断陀螺仪 */
+  HAL_NVIC_SetPriority(UART5_IRQn, 3, 0);
+  HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
+#endif
   Link_Init();                       /* 开始接收树莓派指令 */
-  HAL_UART_Transmit(&huart3, (uint8_t *)"READY\r\n", 7, 100);
+#if ARM_MODULES_ON
+  HAL_UART_Transmit(&huart3, (uint8_t *)"READY ARM=1\r\n", 13, 100);
+#else
+  HAL_UART_Transmit(&huart3, (uint8_t *)"READY ARM=0\r\n", 13, 100);
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -186,7 +206,9 @@ while (1)
     static uint32_t last_send = 0;
 
     Link_Poll();                   /* 有指令就执行，执行完回 DONE 或 ERR */
+#if ARM_MODULES_ON
     Arm_Poll();                    /* 处理扫码模块收到的任务码 */
+#endif
 
     if (HAL_GetTick() - last_send >= 100)
     {
@@ -562,8 +584,10 @@ void Delay_Report(uint32_t ms)
  *   PING | HOME | P2 | YAW? | GET | SET 名字 数值 | CAL [距离mm [速度]]
  *   F <mm> [速度] | S <mm> [速度] | R <度>        前进(负数后退) / 左移(负数右移) / 逆时针转(负数顺时针)
  *   A <id> <度> | U <id>                            舵机
+ *   MOT? | MOT EN                                   读 1~5 号电机驱动器的电压/使能/堵转保护 | 解除堵转保护并使能
  *   !                                               (单独一个字符，不用换行)紧急停车
- * STM32 -> 树莓派：DONE [t=用时ms e=车头误差0.01度] | ERR <原因> | PONG | READY | YAW100 <角度x100> | P 名字=数值 | CAL …
+ * STM32 -> 树莓派：DONE [t=用时ms e=车头误差0.01度] | ERR <原因> | PONG | READY | YAW100 <角度x100> | P 名字=数值 | CAL … | MOT …
+ *   转弯时轮子没转起来(陀螺仪几乎不变)回 ERR STALL t=… e=…
  * 同一时间只发一条，等到 DONE/ERR 再发下一条。 */
 #define LINK_BUF 48
 
@@ -642,7 +666,7 @@ static void Second_Station_Move(void)
     Car_TurnBy_Center(-P2_CW_DEG);
 }
 
-/* 动作做完回复：被急停打断回 ERR ABORT，否则回 DONE t=用时(毫秒) e=车头误差(0.01度) */
+/* 动作做完回复：被急停打断回 ERR ABORT；转弯时轮子没转起来回 ERR STALL t=… e=…；否则回 DONE t=用时(毫秒) e=车头误差(0.01度) */
 static void Link_Done(uint32_t t0)
 {
     char m[40];
@@ -654,8 +678,9 @@ static void Link_Done(uint32_t t0)
         Link_Reply("ERR ABORT\r\n");
         return;
     }
-    n = snprintf(m, sizeof(m), "DONE t=%lu e=%ld\r\n",
+    n = snprintf(m, sizeof(m), "%s t=%lu e=%ld\r\n", car_stalled ? "ERR STALL" : "DONE",
                  (unsigned long)(HAL_GetTick() - t0), (long)(car_last_err * 100.0f));
+    car_stalled = 0;
     HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
 }
 
@@ -678,6 +703,7 @@ void Link_Poll(void)
     strcpy(cmd, (const char *)link_cmd);
     link_ready = 0;
     car_abort = 0;                                 /* 清掉上一条留下的急停标志 */
+    car_stalled = 0;
     t0 = HAL_GetTick();
 
     if (strcmp(cmd, "PING") == 0)
@@ -688,7 +714,20 @@ void Link_Poll(void)
     if (strcmp(cmd, "HOME") == 0)
     {
         if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
+        Car_Motor_Enable();                        /* 一键流程开始：驱动器解除堵转保护并使能 */
         Car_Home();                                /* 现在的车头方向 = 要保持的方向 */
+        Link_Reply("DONE\r\n");
+        return;
+    }
+    if (strcmp(cmd, "MOT?") == 0)
+    {
+        Car_Motor_Report();                        /* 每个驱动器一行 MOT … */
+        Link_Reply("DONE\r\n");
+        return;
+    }
+    if (strcmp(cmd, "MOT EN") == 0)
+    {
+        Car_Motor_Enable();
         Link_Reply("DONE\r\n");
         return;
     }
@@ -835,6 +874,7 @@ void Link_Poll(void)
     }
 
     /* 机械臂指令：CLAW / TT / LIFT / GRAB / PLACE / QR / SCR (见 arm.h) */
+#if ARM_MODULES_ON
     {
         char aerr[24];
         int ar = Arm_Command(cmd, aerr, (int)sizeof(aerr));
@@ -851,6 +891,7 @@ void Link_Poll(void)
             return;
         }
     }
+#endif
 
     Link_Reply("ERR CMD\r\n");
 }

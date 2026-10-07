@@ -119,6 +119,76 @@ class CliTests(unittest.TestCase):
         self.state['busy'] = False
 
 
+class MotLink:
+    """只会回 MOT? / MOT EN 的假 STM32。"""
+
+    def __init__(self, lines, known=True):
+        self.lines = lines
+        self.known = known
+        self.sent = []
+
+    def request(self, text, timeout, collect=False):
+        self.sent.append(text)
+        if not self.known:
+            out = (False, 'ERR CMD', [])
+        elif text == 'MOT?':
+            out = (True, 'DONE', list(self.lines))
+        else:
+            out = (True, 'DONE', [])
+        return out if collect else out[:2]
+
+
+class MotTests(unittest.TestCase):
+    GOOD = ['MOT 1 V=12.31 EN=1 ARR=1 STALL=0 PROT=0', 'MOT 2 V=12.29 EN=1 ARR=1 STALL=0 PROT=0',
+            'MOT 3 V=12.30 EN=1 ARR=1 STALL=0 PROT=0', 'MOT 4 V=12.30 EN=1 ARR=1 STALL=0 PROT=0',
+            'MOT 5 V=12.28 EN=1 ARR=1 STALL=0 PROT=0']
+
+    def run_mot(self, text, link):
+        lines, state = [], {}
+        mission_cli.handle_cli('mot', text.split(), link=link, raw_cfg={}, state=state, log=lines.append)
+        wait_idle(state)
+        return '\n'.join(lines)
+
+    def test_all_good(self):
+        rows, advice = mission_cli.explain_mot(self.GOOD)
+        self.assertEqual(len(rows), 5)
+        self.assertIn('1号(右前轮)：电压 12.31V，已使能', rows[0])
+        self.assertIn('send R 90', advice[0])
+
+    def test_protect_low_voltage_and_silent(self):
+        lines = ['MOT 1 V=10.10 EN=1 ARR=0 STALL=0 PROT=0', 'MOT 2 V=10.20 EN=0 ARR=0 STALL=1 PROT=1',
+                 'MOT 3 NOREPLY', 'MOT 4 V=10.15 EN=1 ARR=1 STALL=0 PROT=0', 'MOT 5 NOREPLY RX=01 00 EE 6B']
+        rows, advice = mission_cli.explain_mot(lines)
+        text = '\n'.join(rows + advice)
+        self.assertIn('堵转保护', rows[1])
+        self.assertIn('没使能', rows[1])
+        self.assertIn('3号(右后轮)：没有回复', text)
+        self.assertIn('01 00 EE 6B', rows[4])
+        self.assertIn('mot en', text)
+        self.assertIn('电池快没电', text)
+
+    def test_all_wheels_silent(self):
+        rows, advice = mission_cli.explain_mot(['MOT %d NOREPLY' % i for i in range(1, 6)])
+        self.assertIn('PC11', advice[0])
+
+    def test_cli_mot_and_mot_en(self):
+        link = MotLink(self.GOOD)
+        out = self.run_mot('mot', link)
+        self.assertEqual(link.sent, ['MOT?'])
+        self.assertIn('4号(左后轮)', out)
+        link = MotLink(self.GOOD)
+        self.run_mot('mot en', link)
+        self.assertEqual(link.sent, ['MOT EN', 'MOT?'])
+
+    def test_old_firmware(self):
+        out = self.run_mot('mot', MotLink([], known=False))
+        self.assertIn('旧程序', out)
+
+    def test_bad_args(self):
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('mot', ['mot', 'xx'], link=MotLink([]), raw_cfg={}, state={}, log=print)
+
+
 class ConfigScriptTests(unittest.TestCase):
     def test_apply_adds_only_missing(self):
         d = tempfile.mkdtemp()

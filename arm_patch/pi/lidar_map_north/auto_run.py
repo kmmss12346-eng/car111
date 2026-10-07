@@ -15,6 +15,22 @@ MIN_MOVE_MM = 20     # 小于这个距离的前进/横移不发：车本身的�
 
 DEFAULT_SECOND_MOVES = {'left_mm': 42, 'forward_mm': 83, 'cw_deg': 60}
 
+MAX_HEAD_ERR_DEG = 10.0   # 指令做完车头还差这么多度：车没按指令动(正常在 2° 以内)，再往下走只会越错越远
+STALL_HINT = ('车轮没转起来(STM32 发了转弯指令，陀螺仪几乎没变；前进/横移的 DONE 是按时间算的，不代表车真的走了)。'
+              '先输入 mot 看 5 个电机驱动器的电压/使能/堵转保护；再把车抬起来输入 send R 90 看轮子转不转。'
+              '常见原因：电机电池没电或没开、驱动器触发了堵转保护、新接的升降驱动器地址或串口线接错')
+
+
+def check_move(cmd, val, ok, reply):
+    """检查一条运动指令的回复：没问题返回 None，否则返回一句给人看的原因。"""
+    reply = reply or ''
+    if not ok:
+        return f'{cmd} {val} 失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in reply else '')
+    err = parse_done(reply).get('err')
+    if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
+        return f'{cmd} {val} 做完后车头还差 {err:+.1f}°(正常在 2° 以内)。{STALL_HINT}'
+    return None
+
 
 def flatten(turn_back, legs, min_move=MIN_MOVE_MM):
     """路线 -> [(停车点名或None, 指令, 数值)]。第一步先原地转回起点车头方向。"""
@@ -216,8 +232,9 @@ def drive(ctx, link, seq, log=print, stop_wait=3.0, hooks=None, speeds=None, mot
         if 'err' in info:
             extra = f'，车头误差 {info["err"]:+.2f}°'
         log(f'  [{i}/{total}] {cmd} {val:+d} -> {"完成" if ok else reply}  用时{dt:.1f}秒{est}{extra}')
-        if not ok:
-            raise Abort(f'第{i}条指令 {cmd} {val} 失败：{reply}')
+        bad = check_move(cmd, val, ok, reply)
+        if bad:
+            raise Abort(f'第{i}条指令 {bad}')
         k += 1
     log(f'  路线行驶共用 {time.monotonic()-t_start:.1f} 秒（其中指令执行 {t_move:.1f} 秒）')
 
@@ -242,7 +259,10 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
         ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
         if not ok:
-            raise Abort(f'STM32 第二站移动失败：{reply}')
+            raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
+        err = parse_done(reply).get('err')
+        if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
+            raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
         time.sleep(settle_s)
         log('③ 第二次扫描：车保持不动……')
         ctx.second()

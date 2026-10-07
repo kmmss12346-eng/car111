@@ -17,12 +17,94 @@ mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有�
 mtest TEMP <批次>          单独测暂存区放置/码垛
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
+mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)的电压、是否使能、是否触发堵转保护——车不动时先用它
+mot en                     让 5 个驱动器解除堵转保护并使能，然后再看一次状态
 """
+import re
 import threading
 
 from task_plan import parse_code, TaskError
 
 _S = {'hooks': None}
+
+MOT_NAMES = {1: '1号(右前轮)', 2: '2号(左前轮)', 3: '3号(右后轮)', 4: '4号(左后轮)', 5: '5号(升降)'}
+MOT_LOW_V = 10.5                     # 低于这个电压(伏)提示充电
+_MOT = re.compile(r'MOT (\d) (.*)')
+
+
+def explain_mot(lines):
+    """把 STM32 回的 MOT 行翻译成中文。返回 (每个驱动器一行的说明, 总结和建议)。"""
+    rows, advice = [], []
+    st = {}
+    for line in lines:
+        m = _MOT.match(line.strip())
+        if not m:
+            continue
+        n, rest = int(m.group(1)), m.group(2).strip()
+        name = MOT_NAMES.get(n, f'{n}号')
+        if rest.startswith('NOREPLY'):
+            raw = rest[len('NOREPLY'):].strip()
+            rows.append(f'  {name}：没有回复' + (f'(收到了对不上格式的字节：{raw[3:].strip()})' if raw.startswith('RX=') else ''))
+            st[n] = None
+            continue
+        kv = dict(p.split('=', 1) for p in rest.split() if '=' in p)
+        try:
+            v = float(kv.get('V', ''))
+        except ValueError:
+            v = None
+        d = dict(v=v, en=kv.get('EN'), prot=kv.get('PROT'), stall=kv.get('STALL'))
+        st[n] = d
+        bits = [f'电压 {v:.2f}V' if v is not None else '电压没读到']
+        if d['en'] is not None:
+            bits.append('已使能' if d['en'] == '1' else '没使能(电机松着)')
+        if d['prot'] == '1':
+            bits.append('★触发了堵转保护(电机松轴，不再响应运动指令)')
+        if d['stall'] == '1':
+            bits.append('★现在处于堵转')
+        if v is not None and v < MOT_LOW_V:
+            bits.append(f'★电压偏低(低于 {MOT_LOW_V}V)')
+        rows.append(f'  {name}：' + '，'.join(bits))
+    if not st:
+        return rows, ['STM32 没回 MOT 行：STM32 是不是旧程序(没有 MOT? 指令)？先烧录新程序。']
+    wheels = [st.get(i, None) for i in (1, 2, 3, 4)]
+    silent = [i for i in (1, 2, 3, 4) if st.get(i) is None]
+    if len(silent) == 4:
+        advice.append('4 个轮子的驱动器都没回复。可能是：① 驱动器没电(电机电池没开/没电/保险或开关断了，看驱动器屏幕亮不亮)；'
+                      '② 驱动器的 TX 没接到 STM32 的 PC11(以前的程序只发不收，这根线可能本来就没接——这种情况下"没回复"不代表坏了，'
+                      '用下面的"抬起车轮测试"判断)。')
+    elif silent:
+        advice.append('这几个没回复：' + '、'.join(MOT_NAMES[i] for i in silent) + '。检查它们的电源线、串口线，以及驱动器里设的地址(要分别是 1~4)。')
+    if any(d and d['prot'] == '1' for d in st.values()):
+        advice.append('有驱动器触发了堵转保护：输入 mot en 解除(或把电机电源关掉再开)。触发保护说明之前电机转不动：'
+                      '电池电压低、车太重、轮子被卡住、或者加速度太大。')
+    if any(d and d['en'] == '0' for d in st.values()):
+        advice.append('有驱动器没使能：输入 mot en。')
+    vs = [d['v'] for d in wheels if d and d['v'] is not None]
+    if vs and min(vs) < MOT_LOW_V:
+        advice.append(f'轮子驱动器电压最低 {min(vs):.2f}V：电池快没电了，先充电/换电池(电压低时电机没劲，转弯时最先转不动)。')
+    if len(vs) >= 2 and max(vs) - min(vs) > 0.8:
+        advice.append(f'各驱动器电压相差 {max(vs) - min(vs):.2f}V：电源线太细或接头接触不好。')
+    if not advice:
+        advice.append('驱动器看起来都正常(有电、已使能、没触发保护)。车还是不动的话：把车抬起来(轮子悬空)输入 send R 90，'
+                      '看 4 个轮子转不转——悬空能转、放地上转不动是电池没劲/车太重；悬空也不转，查电机线和驱动器设置。')
+    return rows, advice
+
+
+def _mot(link, log, enable):
+    if enable:
+        ok, reply = link.request('MOT EN', 3.0)
+        log(f'MOT EN -> {reply}')
+        if not ok:
+            raise ValueError(f'STM32 拒绝 MOT EN：{reply}(STM32 是不是旧程序？)')
+    ok, reply, info = link.request('MOT?', 5.0, collect=True)
+    if not ok:
+        raise ValueError(f'STM32 拒绝 MOT?：{reply}(STM32 是不是旧程序？先烧录新程序)')
+    rows, advice = explain_mot(info)
+    log('电机驱动器状态：')
+    for r in rows:
+        log(r)
+    for a in advice:
+        log('→ ' + a)
 
 
 def _hooks(link, raw_cfg, log):
@@ -61,6 +143,13 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
     state = state if state is not None else {}
     if link is None:
         raise ValueError('没有连接 STM32（--stm-port）')
+
+    if k == 'mot':
+        sub = parts[1].lower() if len(parts) > 1 else ''
+        if sub not in ('', 'en'):
+            raise ValueError('格式：mot(看 5 个电机驱动器的状态) / mot en(解除堵转保护并使能，再看一次状态)')
+        return _run_async(state, log, lambda: _mot(link, log, sub == 'en'))
+
     h = _hooks(link, raw_cfg or {}, log)
 
     if k == 'arm':
