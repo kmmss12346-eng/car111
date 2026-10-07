@@ -79,8 +79,9 @@ int main(void) {
     CHECK(run("GRAB 1") == -1 && pis("ERR NOCAL"), "ARMOK=0 时拒绝");
     CHECK(run("OBS RAW O") == -1, "ARMOK=0 时 OBS 拒绝");
     Arm_Param_Set("ARMOK", 1);
-    CHECK(run("OBS RAW O") == -1 && pis("ERR NOZERO"), "没回零时拒绝");
-    CHECK(run("LIFT 10") == -1, "没回零时 LIFT 拒绝");
+    clear();
+    CHECK(run("LIFT?") == 1 && pis("LIFT 1 0"), "开机就把现在的位置(最低点)当零点");
+    CHECK(run("LIFT 10") == 1 && run("LIFT 0") == 1, "开机不用 LIFT ZERO 就能动升降");
     CHECK(run("LIFT ZERO") == 1 && has("zero5;"), "LIFT ZERO");
     /* 下面的顺序测试用固定的一组高度(和默认值无关)，都在最高点 100mm 以内 */
     Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60); Arm_Param_Set("ZPLC", 80);

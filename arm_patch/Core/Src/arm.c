@@ -61,8 +61,8 @@ extern void Delay_Report(uint32_t ms);
 
 /* ================= 可调参数(SET 名字 数值) ================= */
 static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
-static float g_lrpm   = 150.0f;    /* LFRPM  升降速度(转/分) */
-static float g_lacc   = 200.0f;    /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
+static float g_lrpm   = 60.0f;     /* LFRPM  升降速度(转/分)。实测 60 稳 */
+static float g_lacc   = 0.0f;      /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
 static float g_lmax   = 100.0f;    /* LFMAX  最高点：离零点(最低点)往上 100mm。写死：SET 也不能超过 100 */
 static float g_ldir   = 0.0f;      /* LFDIR  升降方向：0 或 1。LIFT 数字变大时走反了就改这个 */
 static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来算要等多久 */
@@ -660,6 +660,11 @@ void Arm_Init(void)
     qr_len = 0;
     qr_end = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
+
+    /* 升降零点写死：开机时升降必须放在最低点，这里就是 0；往上为正，最高 100mm(LFMAX)。
+     * 不用再发 LIFT ZERO(发了也没关系：把当时的位置重新记为 0) */
+    lift_known = 1;
+    lift_mm = 0.0f;
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();

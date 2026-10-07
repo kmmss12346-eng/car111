@@ -86,12 +86,16 @@
   *
   * 设计思路(为了放得准)：
   *   - 树莓派用摄像头做闭环对准：车到工位后，先用 OBS 把手臂摆到"观察姿态"，
-@@ -63,20 +63,20 @@
+@@ -61,22 +61,22 @@
+ 
+ /* ================= 可调参数(SET 名字 数值) ================= */
  static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
- static float g_lrpm   = 150.0f;    /* LFRPM  升降速度(转/分) */
- static float g_lacc   = 200.0f;    /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
+-static float g_lrpm   = 150.0f;    /* LFRPM  升降速度(转/分) */
+-static float g_lacc   = 200.0f;    /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
 -static float g_lmax   = 150.0f;    /* LFMAX  升降最大行程(毫米)，从零点往下算 */
 -static float g_ldir   = 0.0f;      /* LFDIR  "往下"对应的 Emm 方向：0 或 1。反了就改这个 */
++static float g_lrpm   = 60.0f;     /* LFRPM  升降速度(转/分)。实测 60 稳 */
++static float g_lacc   = 0.0f;      /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
 +static float g_lmax   = 100.0f;    /* LFMAX  最高点：离零点(最低点)往上 100mm。写死：SET 也不能超过 100 */
 +static float g_ldir   = 0.0f;      /* LFDIR  升降方向：0 或 1。LIFT 数字变大时走反了就改这个 */
  static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来算要等多久 */
@@ -245,17 +249,22 @@
  /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
  static void Screen_Raw(const char *cmd)
  {
-@@ -594,6 +660,9 @@
+@@ -594,6 +660,14 @@
      qr_len = 0;
      qr_end = 0;
      HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
++
++    /* 升降零点写死：开机时升降必须放在最低点，这里就是 0；往上为正，最高 100mm(LFMAX)。
++     * 不用再发 LIFT ZERO(发了也没关系：把当时的位置重新记为 0) */
++    lift_known = 1;
++    lift_mm = 0.0f;
 +
 +    HAL_Delay(300);                                /* 等屏上电启动 */
 +    Screen_Boot();
  }
  
  /* ================= 树莓派指令 ================= */
-@@ -683,7 +752,7 @@
+@@ -683,7 +757,7 @@
          else
          {
              long us;
@@ -264,7 +273,7 @@
              Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
          }
          Wait_Ms((uint32_t)g_clwait);
-@@ -727,6 +796,7 @@
+@@ -727,6 +801,7 @@
          if (strcmp(t[1], "ZERO") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -272,7 +281,7 @@
              Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
              lift_mm = 0.0f;
              lift_known = 1;
-@@ -735,6 +805,7 @@
+@@ -735,6 +810,7 @@
          if (strcmp(t[1], "HOME") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
