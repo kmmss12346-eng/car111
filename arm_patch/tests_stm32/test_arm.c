@@ -80,7 +80,7 @@ int main(void) {
     CHECK(run("OBS RAW O") == -1, "ARMOK=0 时 OBS 拒绝");
     Arm_Param_Set("ARMOK", 1);
     clear();
-    CHECK(run("LIFT?") == 1 && pis("LIFT 1 60"), "开机位置 = 离最低点 60mm");
+    CHECK(run("LIFT?") == 1 && pis("LIFT 1 60"), "开机从最低点自动升到 60mm");
     clear();
     CHECK(run("LIFT 100") == 1 && has("L+3200;"), "开机不用 LIFT ZERO：从 60 走到 100 = 往上 40mm(3200 脉冲)");
     clear();

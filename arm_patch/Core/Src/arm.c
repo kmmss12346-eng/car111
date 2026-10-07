@@ -50,7 +50,7 @@ extern void Delay_Report(uint32_t ms);
 
 /* 两个模块出厂都是 9600。工程里 USART2/UART5 初始化成了 115200，Arm_Init 里会改成下面的值。
  * 如果您把屏或扫码模块改过波特率，只改这两个数 */
-/* 开机时升降停在哪里(离最低点往上多少 mm)。开机前把升降放到这个高度；改了这里要重新编译烧录 */
+/* 开机前把升降放到最低点；上电后自动升到这个高度(离最低点往上多少 mm)。改了这里要重新编译烧录 */
 #define LIFT_BOOT_MM   60.0f
 
 #define SCREEN_BAUD    9600u
@@ -668,10 +668,12 @@ void Arm_Init(void)
      * 开机时升降放在离最低点 LIFT_BOOT_MM(60mm) 的地方，程序就从 60 开始算，不用再发 LIFT ZERO。
      * (LIFT ZERO 仍然可以用：把"现在的位置"记为 0，只在升降正好在最低点时用) */
     lift_known = 1;
-    lift_mm = LIFT_BOOT_MM;
+    lift_mm = 0.0f;                                /* 开机时升降在最低点 = 0 */
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();
+
+    Lift_Goto(LIFT_BOOT_MM);                       /* 开机自动升到 60mm */
 }
 
 /* ================= 树莓派指令 ================= */
