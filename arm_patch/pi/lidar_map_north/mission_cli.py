@@ -282,7 +282,7 @@ def _gtest(h, link, color, nogo, log):
         raise ValueError('STM32 里没有机械臂参数，是不是没烧带 arm.c 的正式程序？')
     known, mm = h.arm.lift_state()
     if not known:
-        raise ValueError('升降还没回零：先把升降放到最低点，再输入 arm LIFT ZERO')
+        raise ValueError('升降位置不知道了(急停打断过？)：先把升降放到最低点，再输入 arm LIFT ZERO')
     log(f'夹取测试：{name}色物料。用的参数 A1G={P["A1G"]:g} A2E={P["A2E"]:g} ZOBRAW={P["ZOBRAW"]:g} ZGRAB={P["ZGRAB"]:g} ZHI={P["ZHI"]:g}')
     log('① 张开夹爪，手臂摆到原料上方')
     h.arm.do('CLAW O')

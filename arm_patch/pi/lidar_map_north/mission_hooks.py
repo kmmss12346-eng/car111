@@ -38,7 +38,7 @@ DEFAULTS = dict(
     time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)
     qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码
     raw_wait_s=10.0,                    # 等原料盘停稳最多多久(规则：等转盘最多多停 8 秒)
-    lift_init='zero',                   # 开始时怎么确定升降零点：'zero'=现在就是最低点(开机前要把升降放到最低！)；'home'=让驱动器回零；'skip'=已经回零过
+    lift_init='skip',                   # 升降位置：STM32 开机就认为升降在离最低点 60mm(开机前放到这个高度)，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
     frames=5,                                                    # 每次测量取几帧(多帧取中值；少一点快一点，噪声会大一点)
     claw_px=dict(RAW=[336.8, 282.9], RING=[336.8, 282.9]),      # 爪子轴线在画面里的位置
@@ -149,14 +149,11 @@ class MissionHooks:
                 known, mm = self.arm.lift_state()
                 if known:
                     self.log(f'  升降已回零，现在 {mm:.1f}mm')
-                elif self.cfg['lift_init'] == 'zero':
-                    self.arm.lift_zero()
-                    self.log('  升降：把现在的位置记为 0(最低点)。开机前升降必须放到最低点！')
                 elif self.cfg['lift_init'] == 'home':
                     self.arm.do('LIFT HOME')
                     self.log('  升降：驱动器回零完成')
                 else:
-                    self.disabled = '升降没有回零(lift_init=skip)'
+                    self.disabled = '升降位置不知道了(急停打断过升降？)：把升降放到最低点，输入 arm LIFT ZERO'
         except ArmAbort as ex:
             raise Abort(str(ex))
         except (ArmError, Exception) as ex:

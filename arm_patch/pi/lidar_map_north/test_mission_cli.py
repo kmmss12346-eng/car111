@@ -126,8 +126,9 @@ class CliTests(unittest.TestCase):
         self.assertTrue(any(r.startswith('AP ') for r in sent))
 
     def test_gtest_nogo_and_needs_zero(self):
+        self.w.lift_known = False                            # 模拟急停打断升降后位置丢了
         self.run_cli('gtest', 'gtest 1')
-        self.assertTrue(any('回零' in l for l in self.lines), self.lines)
+        self.assertTrue(any('LIFT ZERO' in l for l in self.lines), self.lines)
         self.run_cli('arm', 'arm LIFT ZERO')
         self.w.arrive('RAW', 1)
         self.w.a1_ref, self.w.a2_ref = self.w.params['A1G'], self.w.params['A2E']

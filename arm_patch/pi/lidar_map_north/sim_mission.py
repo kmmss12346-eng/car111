@@ -63,8 +63,8 @@ class SimWorld:
         self.params = dict(DEFAULT_PARAMS)
         self.params.update(params or {})
         self.params['ARMOK'] = 1.0 if armok else 0.0
-        self.lift_known = False
-        self.lift_mm = 0.0
+        self.lift_known = True                # 和 STM32 一样：开机就认为升降在离最低点 60mm
+        self.lift_mm = 60.0
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
         self.claw_open = True

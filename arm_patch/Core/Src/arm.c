@@ -50,6 +50,9 @@ extern void Delay_Report(uint32_t ms);
 
 /* 两个模块出厂都是 9600。工程里 USART2/UART5 初始化成了 115200，Arm_Init 里会改成下面的值。
  * 如果您把屏或扫码模块改过波特率，只改这两个数 */
+/* 开机时升降停在哪里(离最低点往上多少 mm)。开机前把升降放到这个高度；改了这里要重新编译烧录 */
+#define LIFT_BOOT_MM   60.0f
+
 #define SCREEN_BAUD    9600u
 #define QR_BAUD        9600u
 
@@ -661,10 +664,11 @@ void Arm_Init(void)
     qr_end = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
 
-    /* 升降零点写死：开机时升降必须放在最低点，这里就是 0；往上为正，最高 100mm(LFMAX)。
-     * 不用再发 LIFT ZERO(发了也没关系：把当时的位置重新记为 0) */
+    /* 升降位置写死：0 = 最低点，往上为正，最高 100mm(LFMAX)。
+     * 开机时升降放在离最低点 LIFT_BOOT_MM(60mm) 的地方，程序就从 60 开始算，不用再发 LIFT ZERO。
+     * (LIFT ZERO 仍然可以用：把"现在的位置"记为 0，只在升降正好在最低点时用) */
     lift_known = 1;
-    lift_mm = 0.0f;
+    lift_mm = LIFT_BOOT_MM;
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();
