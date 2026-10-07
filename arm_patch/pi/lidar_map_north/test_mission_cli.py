@@ -112,6 +112,32 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_cli('vcal', 'vcal RAW')
 
+    def test_gtest_align_and_grab(self):
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('RAW', 1)                              # 车停在原料盘前
+        self.w.a1_ref, self.w.a2_ref = self.w.params['A1G'], self.w.params['A2E']   # 模拟世界的几何基准 = 原料上方姿态
+        self.lines.clear()
+        color = self.w.raw_items[0]['color']
+        self.run_cli('gtest', f'gtest {color}')
+        text = '\n'.join(self.lines)
+        self.assertIn('对准结果', text, text)
+        sent = [r for r in self.w.requests]
+        self.assertIn('CLAW C', sent, text)
+        self.assertTrue(any(r.startswith('AP ') for r in sent))
+
+    def test_gtest_nogo_and_needs_zero(self):
+        self.run_cli('gtest', 'gtest 1')
+        self.assertTrue(any('回零' in l for l in self.lines), self.lines)
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('RAW', 1)
+        self.w.a1_ref, self.w.a2_ref = self.w.params['A1G'], self.w.params['A2E']
+        self.w.requests.clear()
+        self.run_cli('gtest', f'gtest {self.w.raw_items[0]["color"]} nogo')
+        self.assertTrue(any('nogo' in l for l in self.lines), self.lines)
+        self.assertNotIn('CLAW C', self.w.requests)
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('gtest', ['gtest', '9'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
     def test_busy_refused(self):
         self.state['busy'] = True
         with self.assertRaises(ValueError):

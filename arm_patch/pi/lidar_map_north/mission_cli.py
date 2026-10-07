@@ -17,6 +17,9 @@ mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有�
 mtest TEMP <批次>          单独测暂存区放置/码垛
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
+gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来(不放转盘，不需要 ARMOK)
+                             颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝；nogo = 只识别和对准，不下降不夹
+                             要先标定好：A1G A2E(手臂在原料上方的角度)、ZOBRAW(看的高度)、ZGRAB(夹的高度)、ZHI(抬起高度)，并 arm LIFT ZERO
 mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)的电压、是否使能、是否触发堵转保护——车不动时先用它
 mot en                     让 5 个驱动器解除堵转保护并使能，然后再看一次状态
 """
@@ -152,6 +155,18 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     h = _hooks(link, raw_cfg or {}, log)
 
+    if k == 'gtest':
+        if len(parts) < 2 or not parts[1].isdigit() or not 1 <= int(parts[1]) <= 6:
+            raise ValueError('格式：gtest 1(颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝)；只识别对准不夹：gtest 1 nogo')
+        color = int(parts[1])
+        nogo = any(p.lower() == 'nogo' for p in parts[2:])
+
+        def go():
+            h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+            state['abort'] = False
+            _gtest(h, link, color, nogo, log)
+        return _run_async(state, log, go)
+
     if k == 'arm':
         if len(parts) < 2:
             raise ValueError('格式：arm LIFT ZERO / arm OBS RAW O / arm AD 1 0.5 / arm GET   (见 mission_cli.py 开头)')
@@ -240,6 +255,64 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         return _run_async(state, log, go)
 
     raise ValueError('未知命令 ' + k)
+
+
+COLOR_NAMES = {1: '红', 2: '黄', 3: '蓝', 4: '绿', 5: '黑', 6: '浅蓝'}
+
+
+def _tools(h, link):
+    """只准备指令通道、摄像头、视觉闭环(不初始化升降、不检查 ARMOK)。"""
+    h._ensure_arm_only(link)
+    h._ensure_vision()
+    if getattr(h, 'servo', None) is None:
+        from arm_link import ArmActuators
+        from visual_servo import VisualServo, JacStore
+        if getattr(h, 'store', None) is None:
+            h.store = JacStore(h.cfg.get('servo_cal_file'))
+        h.act = ArmActuators(h.arm, link, h.cfg['chassis_fine_rpm'], log=h.log)
+        h.servo = VisualServo(h.act, h.store, cfg=h.cfg['servo'], log=h.log, sleep=h.sleep)
+
+
+def _gtest(h, link, color, nogo, log):
+    name = COLOR_NAMES[color]
+    _tools(h, link)
+    P = h.arm.params(refresh=True)
+    need = ['A1G', 'A2E', 'ZOBRAW', 'ZGRAB', 'ZHI']
+    if any(n not in P for n in need):
+        raise ValueError('STM32 里没有机械臂参数，是不是没烧带 arm.c 的正式程序？')
+    known, mm = h.arm.lift_state()
+    if not known:
+        raise ValueError('升降还没回零：先手动把升降放到最高点，再输入 arm LIFT ZERO')
+    log(f'夹取测试：{name}色物料。用的参数 A1G={P["A1G"]:g} A2E={P["A2E"]:g} ZOBRAW={P["ZOBRAW"]:g} ZGRAB={P["ZGRAB"]:g} ZHI={P["ZHI"]:g}')
+    log('① 张开夹爪，手臂摆到原料上方')
+    h.arm.do('CLAW O')
+    h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
+    h.arm.do(f'AP {P["A1G"]:g} {P["A2E"]:g}')
+    log(f'② 摄像头找{name}色物料……')
+    still, last = h.vision.wait_still(color, timeout_s=h.cfg['raw_wait_s'])
+    if last is None:
+        ok = h.vision.save_debug('vdebug.png', 'RAW', color)
+        raise ValueError(f'看不到{name}色物料。' + ('画面存到了 vdebug.png，看看物料在不在画面里、颜色认得对不对。' if ok else '摄像头没有画面？'))
+    e0 = h.vision.material_error(color)
+    if e0 is not None:
+        log(f'   看到了：离爪子 {e0[0]:+.0f}, {e0[1]:+.0f} 像素(约 {(e0[0] ** 2 + e0[1] ** 2) ** 0.5 / h.vision.scale("RAW"):.1f}mm)')
+    log('③ 手臂对准(第一次会先小幅动几下，测出手臂和画面的对应关系)')
+    res = h.servo.run('RAW', lambda: h.vision.material_error(color), h.vision.scale('RAW'), h.cfg['tol_mm']['RAW'],
+                      allow_chassis=False, label=f'测试{name}', bounds=h.vision.bounds('RAW'), confirm=False)
+    log(f'   对准结果：{res}')
+    if h.store is not None and getattr(h.store, 'path', None):
+        h.store.save()
+    if nogo:
+        log('nogo：只对准，不夹。看看爪子是不是在物料正上方。')
+        return
+    if not res.ok and res.err_mm > h.cfg['accept_mm']['RAW']:
+        log(f'   ★ 偏差 {res.err_mm:.1f}mm 太大，不夹(免得夹偏)。可以先 gtest {color} nogo 看看对准情况')
+        return
+    log('④ 下降、夹紧、抬起')
+    h.arm.do(f'LIFT {P["ZGRAB"]:g}')
+    h.arm.do('CLAW C')
+    h.arm.do(f'LIFT {P["ZHI"]:g}')
+    log('完成。夹起来了吗？没夹到：太高调大 ZGRAB(set ZGRAB 数字)、太低调小；夹偏了先用 nogo 看对准。松开：arm CLAW O')
 
 
 def _vcal(h, kind, color, chassis, log):

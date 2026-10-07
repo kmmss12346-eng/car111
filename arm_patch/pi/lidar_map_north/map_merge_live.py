@@ -542,7 +542,7 @@ def main():
             if sp is None and c in ('F','S'):sp=int(raw_cfg.get('route_speed_rpm',220) if c=='F' else raw_cfg.get('strafe_speed_rpm',170))
             t0=time.monotonic();print(f'发送 {c} {v}'+(f' 速度{sp}' if sp else '')+' …',flush=True)
             ok_,rep_=link.move(c,v,sp);print(f'{c} {v} ->',rep_,f'  (往返用时{time.monotonic()-t0:.1f}秒)',flush=True);return
-        if k in ('arm','vcal','mtest','vdbg','qr','mcode','mot'):
+        if k in ('arm','vcal','mtest','vdbg','qr','mcode','mot','gtest'):
             # 机械臂/视觉测试命令、mot(看电机驱动器状态)，见 mission_cli.py 开头的说明
             from mission_cli import handle_cli
             handle_cli(k,parts,link=link,raw_cfg=raw_cfg,state=state,log=lambda m:print(m,flush=True));return
@@ -625,7 +625,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：go(一键全流程) / drive / abort / ping / mot(电机驱动器状态) / mot en / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：go(一键全流程) / drive / abort / ping / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
     def poll():
         dirty=False
         while not results.empty():
