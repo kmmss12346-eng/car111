@@ -58,7 +58,7 @@
 | `enabled` | true | false = `go` 时不做夹放，只走路线 |
 | `time_limit_s` | 150 | 超过这个时间不再夹放。计时从 `go` 开始，要给回家留时间 |
 | `qr_timeout_s` / `raw_wait_s` | 6 / 10 | 等二维码 / 等原料盘停稳最多多久 |
-| `lift_init` | `"zero"` | 升降零点：`zero`(现在就是最高点) / `home`(驱动器回零) / `skip` |
+| `lift_init` | `"zero"` | 升降零点：`zero`(现在就是最低点，数字越大越高) / `home`(驱动器回零) / `skip` |
 | `camera` | /dev/video0 640x480 | `flip` 可设 -1/0/1(cv2.flip)，None 不翻 |
 | `claw_px` | RAW、RING 都是 [336.8, 282.9] | 爪子轴线在画面里的位置。**调它微调放置位置**，1 像素≈0.34mm(圆环)/0.23mm(原料盘) |
 | `px_per_mm` | RAW 4.36 / RING 2.96 | 每毫米多少像素，只用来把像素换成毫米判断容差；`vcal` 会告诉您实测值 |

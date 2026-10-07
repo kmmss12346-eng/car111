@@ -1,7 +1,7 @@
 """树莓派终端里的机械臂 / 视觉测试命令（接在 map_merge_live 的命令行上）。
 
 arm <指令>                 直接给 STM32 发一条机械臂指令并打印回复，例如：
-                             arm LIFT ZERO        把现在的升降位置记为 0(最高点)
+                             arm LIFT ZERO        把现在的升降位置记为 0(最低点；数字越大越高)
                              arm OBS RAW O        手臂摆到原料盘观察姿态并张开夹爪
                              arm AD 1 0.5         ID1 再转 0.5 度
                              arm GET              看全部参数(含机械臂的)
@@ -282,7 +282,7 @@ def _gtest(h, link, color, nogo, log):
         raise ValueError('STM32 里没有机械臂参数，是不是没烧带 arm.c 的正式程序？')
     known, mm = h.arm.lift_state()
     if not known:
-        raise ValueError('升降还没回零：先手动把升降放到最高点，再输入 arm LIFT ZERO')
+        raise ValueError('升降还没回零：先把升降放到最低点，再输入 arm LIFT ZERO')
     log(f'夹取测试：{name}色物料。用的参数 A1G={P["A1G"]:g} A2E={P["A2E"]:g} ZOBRAW={P["ZOBRAW"]:g} ZGRAB={P["ZGRAB"]:g} ZHI={P["ZHI"]:g}')
     log('① 张开夹爪，手臂摆到原料上方')
     h.arm.do('CLAW O')
@@ -312,7 +312,7 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do(f'LIFT {P["ZGRAB"]:g}')
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
-    log('完成。夹起来了吗？没夹到：太高调大 ZGRAB(set ZGRAB 数字)、太低调小；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+    log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
 
 
 def _vcal(h, kind, color, chassis, log):
