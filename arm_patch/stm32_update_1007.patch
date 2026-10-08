@@ -153,7 +153,7 @@
 -#define SERVO1_MIN_DEG   390.0f
 -#define SERVO1_MAX_DEG   600.0f
 +#define SERVO1_MIN_DEG   232.0f
-+#define SERVO1_MAX_DEG   417.6f
++#define SERVO1_MAX_DEG   440.0f    /* 原来 417.6，圆环那边要转到 440 */
  #define SERVO2_MIN_DEG   -1220.0f
  #define SERVO2_MAX_DEG    -503.5f
  
@@ -679,10 +679,10 @@
 -    { "A1D",    &g_a1d,     390.0f,  600.0f },
 -    { "A1H",    &g_a1h,     390.0f,  600.0f },
 -    { "A1P",    &g_a1p,     390.0f,  600.0f },
-+    { "A1G",    &g_a1g,     232.0f,  417.6f },
-+    { "A1D",    &g_a1d,     232.0f,  417.6f },
-+    { "A1H",    &g_a1h,     232.0f,  417.6f },
-+    { "A1P",    &g_a1p,     232.0f,  417.6f },
++    { "A1G",    &g_a1g,     232.0f,  440.0f },
++    { "A1D",    &g_a1d,     232.0f,  440.0f },
++    { "A1H",    &g_a1h,     232.0f,  440.0f },
++    { "A1P",    &g_a1p,     232.0f,  440.0f },
      { "A2E",    &g_a2e,    -1220.0f, -503.5f },
      { "A2R",    &g_a2r,    -1220.0f, -503.5f },
      { "A2P",    &g_a2p,    -1220.0f, -503.5f },
