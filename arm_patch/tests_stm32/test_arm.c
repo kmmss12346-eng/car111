@@ -130,7 +130,7 @@ int main(void) {
     /* 下面的顺序测试用固定的一组高度(和默认值无关)，都在最高点 100mm 以内 */
     Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60); Arm_Param_Set("ZPLC", 80);
     Arm_Param_Set("ZSTK", 40); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZOBRNG", 0);
-    CHECK(Arm_Param_Set("LFMAX", 150) == 2, "最高点写死 100mm：SET LFMAX 150 被拒绝");
+    CHECK(Arm_Param_Set("LFMAX", 150) == 2, "最高点写死 105mm：SET LFMAX 150 被拒绝");
     CHECK(Arm_Param_Set("ZPLC", 1000) == 2 && Arm_Param_Set("NOPE", 1) == 0 && Arm_Param_Set("ZPLC", 90) == 1, "参数范围/名字检查");
     Arm_Param_Set("ZPLC", 80);
 
@@ -264,7 +264,7 @@ int main(void) {
     clear();
     run("LIFT 0"); clear();
     run("LIFT 999");
-    CHECK(has("L+8000;"), "LIFT 999 被限制在最高点 100mm(8000 脉冲)");
+    CHECK(has("L+8400;"), "LIFT 999 被限制在最高点 105mm(8400 脉冲)");
     run("LIFT 0");
 
     /* ---- 二维码(画模式：屏工程里不用放控件) ---- */
@@ -429,7 +429,7 @@ int main(void) {
     /* ---- GET/SET 用的接口 ---- */
     clear();
     Arm_Param_Dump();
-    CHECK(pis("P ZPLC=80.0000") && pis("P LFMAX=100.0000") && pis("P ARMOK=1.0000") && pis("P ASPD=90.0000"), "参数全部打印");
+    CHECK(pis("P ZPLC=80.0000") && pis("P LFMAX=105.0000") && pis("P ARMOK=1.0000") && pis("P ASPD=90.0000"), "参数全部打印");
 
     (void)i;
     printf("%s: %d 项检查，%d 项失败\n", fails ? "失败" : "通过", checks, fails);
