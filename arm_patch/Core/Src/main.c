@@ -965,7 +965,7 @@ void Servo2_MoveRelative(float delta_angle)
 
 /* 限位(度，多圈角度)：你之前测好的数 */
 #define SERVO1_MIN_DEG   232.0f
-#define SERVO1_MAX_DEG   413.6f
+#define SERVO1_MAX_DEG   417.6f
 #define SERVO2_MIN_DEG   -1220.0f
 #define SERVO2_MAX_DEG    -503.5f
 

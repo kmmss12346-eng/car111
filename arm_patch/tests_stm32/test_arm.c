@@ -41,7 +41,7 @@ void Claw_Close(void) { EV("C;"); }
 void Turntable_Set(uint32_t p) { EV("ttus%u;", p); }
 void Turntable_GoTo(uint8_t s) { EV("tt%u;", s); }
 int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
-static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 413.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
+static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 417.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
     float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
