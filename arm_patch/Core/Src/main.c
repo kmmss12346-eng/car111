@@ -101,9 +101,11 @@ void  Servo_Release(uint8_t id);
 int   Servo_ReadAngle(uint8_t id, float *angle);
 uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发指令不等，返回估计要多少毫秒 */
 void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
-void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了：停在原地，不再一直顶着 */
+void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位：接着等；到了换小功率保持，被挡住就停在原地 */
 void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
 void  Servo_SetPower(uint16_t mw);                   /* 舵机转动时允许的最大功率(参数 SPOW) */
+void  Servo_SetHoldPower(uint16_t mw);               /* 舵机停下以后保持用的功率(参数 SHOLD) */
+void  Servo_Hold(uint8_t id, float angle_deg);       /* 停在 angle_deg，用保持功率(小功率)保持 */
 void  Servo_Params(uint8_t id);                      /* SVP?：舵机内部的保护设置 */
 int   Servo_WriteParam(uint8_t id, const char *name, long value);   /* SVW：改舵机内部设置 */
 
@@ -966,6 +968,8 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_ACC_MS          100       /* 加速时间 ms */
 #define SERVO_DEC_MS          100       /* 减速时间 ms */
 #define SERVO_POWER           20000     /* 开机时的最大功率 mW(= 舵机自己的上限 PMAX，和原来程序里填 0 一样)。可以用 SET SPOW 在线改 */
+#define SERVO_HOLD_POWER      8000      /* 转到以后(或者转不到、停下来以后)保持用的功率 mW。比转动的功率小，停着就不容易发烫；
+                                         * 机构保持不住(被碰一下就偏)就调大。可以用 SET SHOLD 在线改 */
 #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
 #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
 #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
@@ -977,10 +981,16 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
 
 static uint16_t servo_power = SERVO_POWER;      /* 现在用的最大功率(SET SPOW 改) */
+static uint16_t servo_hold_power = SERVO_HOLD_POWER;   /* 停下以后保持用的功率(SET SHOLD 改) */
 
 void Servo_SetPower(uint16_t mw)
 {
     servo_power = mw;
+}
+
+void Servo_SetHoldPower(uint16_t mw)
+{
+    servo_hold_power = mw;
 }
 
 /* 限位(度，多圈角度)：你之前测好的数 */
@@ -1049,11 +1059,18 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
     return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
 }
 
-/* 让舵机就停在 angle_deg(它现在的位置)：目标改成现在的角度，它就不会再使劲往原来的目标顶 */
-static void Servo_Hold(uint8_t id, float angle_deg)
+/* 让舵机停在 angle_deg，用保持功率(SHOLD，比转动的功率小)保持。
+ *   转到了：angle_deg = 目标，在目标上保持；
+ *   转不到：angle_deg = 它现在的位置，就不会再使劲往原来的目标顶。
+ * 舵机停着时如果还用转动时的大功率顶着(在顶着东西、或者被外力推着)，很快就烫手。
+ * SHOLD 比 SPOW 大时按 SPOW(保持不会比转动的劲还大) */
+void Servo_Hold(uint8_t id, float angle_deg)
 {
+    uint16_t p = (servo_hold_power < servo_power) ? servo_hold_power : servo_power;
+
+    HAL_Delay(10);                                  /* 和上一条指令隔开 10ms(厂家建议同一个舵机两条指令之间至少 10ms) */
     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
-                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);
+                                      SERVO_ACC_MS, SERVO_DEC_MS, p, 0);
 }
 
 /* 读舵机现在的电流(mA)和状态字节(见 fashion_star_uart_servo.h 的 FSUS_PARAM_SERVO_STATUS)。读不到是 -1 / 0 */
@@ -1086,8 +1103,11 @@ static void Servo_Say(const char *what, uint8_t id, float a, float target, long 
 /* 等舵机转到 target(离 tol_deg 以内)。tmax = 估计要多久，check_after = 开始多久以后才判断"停住了"。到位返回 1。
  * 停住了(SERVO_STILL_MS 内变化不到 0.5°)又离目标还远：
  *   - 电流大(>= SERVO_PUSH_MA)或舵机报堵转 = 被挡住了：让它停在原地，不再一直使劲顶(顶着几十秒就烫手)，打印 STUCK；
- *   - 电流小 = 没在使劲，只是停顿了：重新发一次目标(打印 PAUSED)，接着等。重发过还停着就不再等(也不拦它)。
- * 到了估计的时间还在动(舵机比设定的速度慢)：最多再多等 SERVO_SLOW_EXTRA_MS，不拦它。 */
+ *   - 电流小 = 没在使劲，只是停顿了：重新发一次目标(打印 PAUSED)，接着等。重发过还停着就不再等。
+ * 到了估计的时间还在动(舵机比设定的速度慢)：最多再多等 SERVO_SLOW_EXTRA_MS。
+ * 不管怎么结束，最后都换成保持功率(SHOLD)：
+ *   到位 / 只差一点点(SERVO_STUCK_DEG 以内) -> 在目标上保持；没转到 -> 停在现在的位置保持(不再往目标顶)；
+ *   一次角度都没读到 -> 不知道它在哪，不发。 */
 static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, uint32_t tmax, uint32_t check_after)
 {
     float a = 0.0f;
@@ -1098,6 +1118,7 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
     uint32_t el;
     int have = 0;
     int kicked = 0;
+    int near = 0;
     long ma;
     uint8_t st;
 
@@ -1111,6 +1132,7 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
             if (d < 0.0f) d = -d;
             if (d <= tol_deg)
             {
+                Servo_Hold(id, target);            /* 到了：换成小功率保持 */
                 return 1;
             }
             d = a - ref;
@@ -1131,7 +1153,8 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
                 {
                     if (el >= (uint32_t)SERVO_ACC_MS + 300u && still >= 300u)
                     {
-                        break;                     /* 停在目标附近了(只差一点点)：就这样 */
+                        near = 1;                  /* 停在目标附近了(只差一点点)：就这样 */
+                        break;
                     }
                 }
                 else if (el >= check_after && still >= (uint32_t)SERVO_STILL_MS)
@@ -1139,13 +1162,13 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
                     Servo_Load(id, &ma, &st);      /* 停住了，离目标还远：看它在不在使劲 */
                     if (ma >= SERVO_PUSH_MA || (st & 0x04u))
                     {
-                        Servo_Hold(id, a);         /* 在使劲顶着东西：停在原地 */
                         Servo_Say("STUCK, hold here", id, a, target, ma, st);
+                        Servo_Hold(id, a);         /* 在使劲顶着东西：停在原地，小功率保持 */
                         return 0;
                     }
                     if (kicked)
                     {
-                        break;                     /* 重发过还是停着：不再等，也不拦它 */
+                        break;                     /* 重发过还是停着：不再等 */
                     }
                     kicked = 1;                    /* 没使劲，只是停顿了：重发一次目标 */
                     Servo_Say("PAUSED, resend", id, a, target, ma, st);
@@ -1164,6 +1187,14 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
     {
         Servo_Load(id, &ma, &st);
         Servo_Say("NOT ARRIVED", id, a, target, ma, st);
+    }
+    if (near)
+    {
+        Servo_Hold(id, target);                    /* 只差一点点：还是在目标上保持 */
+    }
+    else if (have)
+    {
+        Servo_Hold(id, a);                         /* 没转到：停在现在的位置保持，不再一直使劲往目标顶 */
     }
     return 0;
 }
@@ -1184,7 +1215,7 @@ void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uin
 }
 
 /* 给 arm.c 用(ID1、ID2 一起转，等到时间还没到位的那个)：接着等它到位，处理办法和 Servo_Move 一样
- * (在使劲顶 = 停在原地；只是停顿 = 重发一次；还在慢慢转 = 多等一会儿) */
+ * (在使劲顶 = 停在原地；只是停顿 = 重发一次；还在慢慢转 = 多等一会儿；最后换成保持功率) */
 void Servo_StopIfStuck(uint8_t id, float target)
 {
     Servo_Wait(id, target, 0.0f, 1.0f, (uint32_t)SERVO_STILL_MS + 1000u, 0u);
