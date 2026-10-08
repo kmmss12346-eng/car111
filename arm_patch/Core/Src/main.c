@@ -967,7 +967,8 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
 #define SERVO_ACC_MS          100       /* 加速时间 ms */
 #define SERVO_DEC_MS          100       /* 减速时间 ms */
-#define SERVO_POWER           20000     /* 开机时的最大功率 mW(= 舵机自己的上限 PMAX，和原来程序里填 0 一样)。可以用 SET SPOW 在线改 */
+#define SERVO_POWER           30000     /* 开机时转动用的最大功率 mW。ID1 舵机内部的上限 PMAX 已改成 40000(20000 推不动手臂)；
+                                         * 超过舵机自己的 PMAX 时舵机按 PMAX 算。可以用 SET SPOW 在线改 */
 #define SERVO_HOLD_POWER      8000      /* 转到以后(或者转不到、停下来以后)保持用的功率 mW。比转动的功率小，停着就不容易发烫；
                                          * 机构保持不住(被碰一下就偏)就调大。可以用 SET SHOLD 在线改 */
 #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */

@@ -544,6 +544,8 @@ def main():
             ok_,rep_=link.move(c,v,sp);print(f'{c} {v} ->',rep_,f'  (往返用时{time.monotonic()-t0:.1f}秒)',flush=True);return
         if k in ('arm','vcal','mtest','vdbg','qr','mcode','mot','gtest'):
             # 机械臂/视觉测试命令、mot(看电机驱动器状态)，见 mission_cli.py 开头的说明
+            # STM32 重启(断电、重新烧录)后参数回到编译进去的默认值：第一次用这些命令前也把配置里存的参数(SPOW、CLWO…)发一遍
+            sync_now()
             from mission_cli import handle_cli
             handle_cli(k,parts,link=link,raw_cfg=raw_cfg,state=state,log=lambda m:print(m,flush=True));return
         if k in ('go','drive','p2'):

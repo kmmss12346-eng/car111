@@ -215,7 +215,7 @@ int main(void) {
     CHECK(Arm_Param_Set("SPOW", 12000) == 1 && has("pow12000;") && Arm_Param_Set("SPOW", 500) == 2, "SET SPOW 马上换舵机功率，太小拒绝");
     clear(); Arm_Init();
     CHECK(has("pow12000;"), "开机把 SPOW 交给 main.c");
-    Arm_Param_Set("SPOW", 20000);
+    Arm_Param_Set("SPOW", 30000);
     clear();
     CHECK(Arm_Param_Set("SHOLD", 6000) == 1 && has("hold6000;") && Arm_Param_Set("SHOLD", 500) == 2 && Arm_Param_Set("SHOLD", 40000) == 2, "SET SHOLD 马上换保持功率，超范围拒绝");
     clear(); Arm_Init();

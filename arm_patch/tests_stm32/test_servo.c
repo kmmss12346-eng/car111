@@ -92,7 +92,7 @@ int main(void) {
     reset1(300); t0 = now;
     Servo_Move(1, 350, 40, 0.3f, 400);
     CHECK(fabs(pos[1] - 350) < 0.31 && out[0] == 0 && now - t0 < 1700, "正常转 50°：到位返回，不打印");
-    CHECK(nset == 2 && pw[0] == 20000 && pw[1] == 8000 && fabs(tgt[1] - 350) < 0.01, "到位以后在目标上换成保持功率(转动 20000，保持 8000)");
+    CHECK(nset == 2 && pw[0] == 30000 && pw[1] == 8000 && fabs(tgt[1] - 350) < 0.01, "到位以后在目标上换成保持功率(转动 30000，保持 8000)");
     /* 2. 被挡住(电流大)：停在原地，打印 STUCK 和电流 */
     reset1(300); block_hi = 367.6; t0 = now;
     Servo_Move(1, 417, 40, 0.3f, 400);
@@ -109,7 +109,7 @@ int main(void) {
     /* 5. 中途停顿、电流小：重发一次目标，接着转到 */
     reset1(400); pause_at = 337.3;
     Servo_Move(1, 300, 40, 0.3f, 400);
-    CHECK(strstr(out, "SERVO1 PAUSED, resend at=3373 target=3000") && strstr(out, "I=14mA") && fabs(pos[1] - 300) < 0.5 && nset == 3 && pw[1] == 20000 && pw[2] == 8000, "中途停在 337.3、没使劲：重发一次(大功率)，转到 300 再换保持功率");
+    CHECK(strstr(out, "SERVO1 PAUSED, resend at=3373 target=3000") && strstr(out, "I=14mA") && fabs(pos[1] - 300) < 0.5 && nset == 3 && pw[1] == 30000 && pw[2] == 8000, "中途停在 337.3、没使劲：重发一次(大功率)，转到 300 再换保持功率");
     /* 6. 重发以后还是停：不再等，停在原地小功率保持，打印 NOT ARRIVED */
     reset1(400); pause_at = 337.3; pause_every = 1;
     Servo_Move(1, 300, 40, 0.3f, 400);
@@ -163,7 +163,7 @@ int main(void) {
     reset1(300); Servo_SetPower(4000);
     Servo_Move(1, 320, 40, 0.3f, 400);
     CHECK(pw[0] == 4000 && last_power == 4000, "SHOLD 比 SPOW 大：保持按 SPOW(不比转动的劲大)");
-    Servo_SetPower(20000); Servo_SetHoldPower(8000);
+    Servo_SetPower(30000); Servo_SetHoldPower(8000);
     /* 15. 舵机内部设置 SVP? / SVW */
     uparam[33] = 0; uparam[37] = 0; uparam[38] = 4000; uparam[42] = 8000; uparam[43] = 1500; uparam[51] = -900; uparam[52] = 1800;
     out[0] = 0; Servo_Params(1);

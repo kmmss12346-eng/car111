@@ -112,12 +112,13 @@
      if (strcmp(cmd, "P2") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
-@@ -937,14 +967,35 @@
+@@ -937,14 +967,36 @@
  #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
  #define SERVO_ACC_MS          100       /* 加速时间 ms */
  #define SERVO_DEC_MS          100       /* 减速时间 ms */
 -#define SERVO_POWER           8000      /* 最大功率 mW：顶住东西时最多用这么大的力。转不动就加大，还是烫就减小 */
-+#define SERVO_POWER           20000     /* 开机时的最大功率 mW(= 舵机自己的上限 PMAX，和原来程序里填 0 一样)。可以用 SET SPOW 在线改 */
++#define SERVO_POWER           30000     /* 开机时转动用的最大功率 mW。ID1 舵机内部的上限 PMAX 已改成 40000(20000 推不动手臂)；
++                                         * 超过舵机自己的 PMAX 时舵机按 PMAX 算。可以用 SET SPOW 在线改 */
 +#define SERVO_HOLD_POWER      8000      /* 转到以后(或者转不到、停下来以后)保持用的功率 mW。比转动的功率小，停着就不容易发烫；
 +                                         * 机构保持不住(被碰一下就偏)就调大。可以用 SET SHOLD 在线改 */
  #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
@@ -151,7 +152,7 @@
  #define SERVO2_MIN_DEG   -1220.0f
  #define SERVO2_MAX_DEG    -503.5f
  
-@@ -1004,49 +1055,315 @@
+@@ -1004,49 +1056,315 @@
      if (d < 0.0f) d = -d;
  
      FSUS_SetServoAngleMTurnByVelocity(&usart2, id, *angle_deg, speed_dps,
@@ -607,7 +608,7 @@
 +static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 +static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 +static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
-+static float g_spow   = 20000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，20000 = 舵机自己的上限。转不动就加大 */
++static float g_spow   = 30000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，超过舵机自己的上限 PMAX 时按 PMAX。转不动就加大 */
 +static float g_shold  = 8000.0f;   /* SHOLD  ID1/ID2 转到以后(或者转不到停下以后)保持用的功率(mW)。停着发烫就减小，保持不住就加大 */
  
  typedef struct
@@ -1500,7 +1501,7 @@
 + *   U <1|2>                                舵机松开(可以用手摆)，下一条转动指令会自动重新出力
 + *   SVP? <1|2>                             读舵机内部的保护设置，回 "SVP <id> RESP=.. STALLM=.. STALLP=.. … PMAX=.. IMAX=.. …"
 + *   SVW <1|2> <名字> <数值>                改一项舵机内部设置(名字见 SVP?，例如 SVW 1 PMAX 15000)，改完读回来
-+ *   舵机转动时允许的最大功率是参数 SPOW(mW，默认 20000)：转不动(停住时电流大、ST 有 0x40)就 SET SPOW 加大
++ *   舵机转动时允许的最大功率是参数 SPOW(mW，默认 30000，超过舵机自己的 PMAX 时按 PMAX)：转不动(停住时电流大、ST 有 0x40)就 SET SPOW 加大
 + *   停下以后(转到了、或者转不到停住了)换成保持功率 SHOLD(mW，默认 8000，比 SPOW 大时按 SPOW)：停着发烫就减小，保持不住就加大
 + *   舵机没转到位又停住不动了：电流大(在顶着东西)就让它停在原地、不再顶着发热，打印 "SERVOn STUCK, hold here at=.. target=.. I=..mA ST=..";
 + *   电流小(只是停顿)就重发一次目标，打印 "SERVOn PAUSED, resend …"；最后没转到打印 "SERVOn NOT ARRIVED …"，也停在原地保持
