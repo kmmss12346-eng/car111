@@ -1000,8 +1000,8 @@ void Servo_SetComp(uint8_t id, float deg)
 }
 
 /* 限位(度，多圈角度)：你之前测好的数 */
-#define SERVO1_MIN_DEG   -36000.0f    /* 测试用：放开限位，测完改回 232.0f */
-#define SERVO1_MAX_DEG    36000.0f    /* 测试用：放开限位，测完改回 417.6f */
+#define SERVO1_MIN_DEG   232.0f
+#define SERVO1_MAX_DEG   417.6f
 #define SERVO2_MIN_DEG   -1220.0f
 #define SERVO2_MAX_DEG    -503.5f
 

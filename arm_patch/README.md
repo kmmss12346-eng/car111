@@ -176,7 +176,7 @@ python3 arm_calib.py
   - `arm SVP? 1`：读舵机**内部**的保护设置(PMAX 功率上限、IMAX 电流上限、STALLM/STALLP 堵转保护…)；
   - `arm SVW 1 PMAX 15000`：改舵机内部设置(存在舵机里，断电不丢)。SPOW 超过舵机内部的 PMAX 时，舵机自己还是会限功率。
   - 先查机械：转动的轴承/转盘紧不紧、线有没有被拉扯、手臂重心偏不偏；转慢一点(`set ASPDF 15`)需要的力气也小。
-- 限位：`main.c` 的 `SERVO1_MIN_DEG/SERVO1_MAX_DEG`(现在测试用放开成 ±36000，测完改回 232~417.6)、`SERVO2_*`。
+- 限位：`main.c` 的 `SERVO1_MIN_DEG/SERVO1_MAX_DEG`(现在 232~417.6)、`SERVO2_*`。
 
 ## 三、串口屏 HMI 工程
 
