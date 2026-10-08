@@ -35,15 +35,16 @@ int HAL_UART_Receive_IT(UART_HandleTypeDef *h, uint8_t *b, uint16_t n) { (void)n
 int HAL_UART_Init(UART_HandleTypeDef *h) { (void)h; return 0; }
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *h, uint32_t c) { (void)h; EV("pwm%u;", c); return 0; }
 void tim_set(uint32_t ch, uint32_t v) { (void)ch; (void)v; }
-void Claw_Set(uint32_t p) { EV("claw%u;", p); }
-void Claw_Open(void) { EV("O;"); }
-void Claw_Close(void) { EV("C;"); }
-void Turntable_Set(uint32_t p) { EV("ttus%u;", p); }
-void Turntable_GoTo(uint8_t s) { EV("tt%u;", s); }
+/* 夹爪/转盘的脉宽：是默认的张开/夹紧/1~3 号位就记成 O; C; tt1; …，方便看先后顺序 */
+void Claw_Set(uint32_t p) { if (p == 2090u) EV("O;"); else if (p == 2910u) EV("C;"); else EV("claw%u;", p); }
+void Turntable_Set(uint32_t p) { if (p == 2608u) EV("tt1;"); else if (p == 1708u) EV("tt2;"); else if (p == 808u) EV("tt3;"); else EV("ttus%u;", p); }
 int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
+static float block1 = 1e9f;                              /* ID1 被挡住的角度(转不过去)，1e9 = 没挡 */
+void Servo_StopIfStuck(uint8_t id, float t) { EV("stuck%u:%.1f;", id, t); }
+void Servo_Report(uint8_t id) { EV("rep%u;", id); }
 static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 417.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
-    float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = *a;
+    float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
 }
 void Servo_Move(uint8_t id, float a, float spd, float tol, uint32_t extra) {
@@ -192,13 +193,40 @@ int main(void) {
     CHECK(run("AP 340 -900") == 1 && has("@90;"), "AP 大角度变化：改用大动作速度(90)");
     CHECK(pis("ANG 1") && pis("ANG 2"), "AP 回读两个角度");
 
+    /* ---- 舵机被挡住：一起转等到时间还没到位，交给 Servo_StopIfStuck(停在原地，不再顶着发热) ---- */
+    ang[1] = 323.0f; ang[2] = -862.0f; block1 = 340.0f; clear();
+    CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)");
+    block1 = 1e9f; clear();
+    CHECK(run("AP 330 -860") == 1 && !has("stuck"), "都到位：不叫 Servo_StopIfStuck");
+    clear();
+    CHECK(run("SV? 1") == 1 && has("rep1;") && run("SV? 3") == -1, "SV? 1 读舵机状态；ID 不对 ERR ARG");
+
     /* ---- 非并行模式的先后顺序 ---- */
     Arm_Param_Set("PARA", 0);
     clear(); run("OBS RING");
     CHECK(at("M1:") >= 0 && at("M1:") < at("M2:"), "PARA=0：伸出时先转 ID1 再伸 ID2");
     clear(); run("STOW");
     CHECK(at("M2:") >= 0 && at("M2:") < at("M1:"), "PARA=0：缩回时先缩 ID2 再转 ID1");
+    /* AEXT=1：ID1 管伸缩、ID2 管旋转，先后顺序跟着反过来 */
+    CHECK(Arm_Param_Set("AEXT", 1) == 1 && Arm_Param_Set("AEXT", 3) == 2, "AEXT 只能是 1 或 2");
+    clear(); run("STOW");
+    CHECK(at("M1:") >= 0 && at("M1:") < at("M2:"), "AEXT=1、PARA=0：收起时先缩 ID1 再转 ID2");
+    clear(); run("OBS RING");
+    CHECK(at("M2:") >= 0 && at("M2:") < at("M1:"), "AEXT=1、PARA=0：伸出时先转 ID2 再伸 ID1");
     Arm_Param_Set("PARA", 1);
+    clear(); run("DROP");
+    CHECK(has("M1:323.0@90/1.00;") && !has("M2:"), "AEXT=1：DROP 最后只把 ID1 缩到 A1H，不动 ID2");
+    Arm_Param_Set("AEXT", 2);
+    clear(); run("DROP");
+    CHECK(has("M2:-862.0@90/1.00;") && !has("M1:"), "AEXT=2：DROP 最后只把 ID2 缩到 A2R");
+    /* 夹爪张开/夹紧、转盘三个位置都是参数 */
+    CHECK(Arm_Param_Set("CLWO", 1999) == 1 && Arm_Param_Set("CLWC", 2777) == 1 && Arm_Param_Set("CLWC", 3000) == 2, "CLWO/CLWC 可以改，超出夹爪限位拒绝");
+    clear(); run("CLAW O"); run("CLAW C");
+    CHECK(has("claw1999;") && has("claw2777;"), "CLAW O / CLAW C 用 CLWO / CLWC");
+    CHECK(Arm_Param_Set("TT2", 1650) == 1 && Arm_Param_Set("TT3", 400) == 2, "TT1~3 可以改，超出转盘限位拒绝");
+    clear(); run("TT 2"); run("TT 1");
+    CHECK(has("ttus1650;") && has("tt1;"), "TT 2 用 TT2 的脉宽");
+    Arm_Param_Set("CLWO", 2090); Arm_Param_Set("CLWC", 2910); Arm_Param_Set("TT2", 1708);
 
     /* ---- 急停：升降停下并要求重新回零 ---- */
     clear();

@@ -28,6 +28,7 @@
 #include "arm.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "hwt101.h"
 #include "yaw_control.h"
 #include <stdlib.h>
@@ -100,6 +101,8 @@ void  Servo_Release(uint8_t id);
 int   Servo_ReadAngle(uint8_t id, float *angle);
 uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发指令不等，返回估计要多少毫秒 */
 void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
+void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了：停在原地，不再一直顶着 */
+void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
 
 /* USER CODE END PFP */
 
@@ -962,6 +965,9 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
 #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
 #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
+#define SERVO_STUCK_DEG       2.0f      /* 没到位、又停住不动了，离目标还差这么多度以上 = 被挡住或力气不够 */
+#define SERVO_STILL_MS        300       /* 角度这么久变化不到 0.5° 算停住了 */
+#define SERVO_SLOW_EXTRA_MS   2000      /* 到了估计的时间还在动(舵机比设定的速度慢)，最多再多等这么久 */
 
 /* 限位(度，多圈角度)：你之前测好的数 */
 #define SERVO1_MIN_DEG   232.0f
@@ -1029,15 +1035,56 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
     return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
 }
 
+/* 让舵机就停在 angle_deg(它现在的位置)：目标改成现在的角度，它就不会再使劲往原来的目标顶 */
+static void Servo_Hold(uint8_t id, float angle_deg)
+{
+    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
+                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);
+}
+
+/* 没转到 target，最后读到的角度是 a。
+ * stuck=1(已经停住不动了)且离目标还差 SERVO_STUCK_DEG 以上 = 被挡住或力气不够：让它停在原地，打印 SERVOn STUCK。
+ * 舵机一直往到不了的目标顶，电流很大，几十秒就烫手 —— 发热主要就是这个原因。
+ * 其他情况(只差一点点、或者还在慢慢转)：不管它，tol_deg >= 1 时打印 NOT ARRIVED，和以前一样 */
+static void Servo_NotArrived(uint8_t id, float target, float tol_deg, int stuck, float a)
+{
+    char m[96];
+    int n = 0;
+    float d = a - target;
+
+    if (d < 0.0f) d = -d;
+    if (stuck && d > SERVO_STUCK_DEG)
+    {
+        Servo_Hold(id, a);
+        n = snprintf(m, sizeof(m), "SERVO%d STUCK at=%ld target=%ld (x0.1deg), hold here\r\n",
+                     (int)id, (long)(a * 10.0f), (long)(target * 10.0f));
+    }
+    else if (tol_deg >= 1.0f)
+    {
+        n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
+                     (int)id, (long)(target * 10.0f));
+    }
+    if (n > 0)
+    {
+        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
+    }
+}
+
 /* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
  * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
- * 按角度和速度算好时间，再多等 extra_ms 毫秒，到时间没转到位就放弃。
- * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印。 */
+ *   到位 -> 马上返回；
+ *   停住不动了(SERVO_STILL_MS 内变化不到 0.5°)还没到位 -> 不再等，离得远就让它停在原地(见 Servo_NotArrived)；
+ *   按角度和速度算好的时间 + extra_ms 到了还在动(舵机比设定的慢) -> 最多再等 SERVO_SLOW_EXTRA_MS。
+ * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印(卡住一定打印)。 */
 void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
 {
-    float a, d;
-    uint32_t t0, tmax;
+    float a = 0.0f;
+    float ref = 0.0f;
+    float d;
+    uint32_t t0, tmax, tref, el;
     int ok = 0;
+    int have = 0;
+    int stuck = 0;
 
     if (id != 1 && id != 2)
     {
@@ -1046,9 +1093,11 @@ void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uin
     tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
 
     t0 = HAL_GetTick();
-    while ((HAL_GetTick() - t0) < tmax)
+    tref = t0;
+    for (;;)
     {
         HAL_Delay(30);
+        el = HAL_GetTick() - t0;
         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
         {
             d = a - angle_deg;
@@ -1058,16 +1107,104 @@ void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uin
                 ok = 1;
                 break;
             }
+            d = a - ref;
+            if (d < 0.0f) d = -d;
+            if (!have || d > 0.5f)
+            {
+                ref = a;                           /* 还在动 */
+                tref = HAL_GetTick();
+                have = 1;
+            }
+            else if (el > (uint32_t)SERVO_ACC_MS + 300u && (HAL_GetTick() - tref) >= (uint32_t)SERVO_STILL_MS)
+            {
+                stuck = 1;                         /* 停住不动了 */
+                break;
+            }
+        }
+        if (el >= tmax + (have ? (uint32_t)SERVO_SLOW_EXTRA_MS : 0u))
+        {
+            break;
         }
     }
 
-    if (!ok && tol_deg >= 1.0f)
+    if (!ok)
     {
-        char m[64];
-        int n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
-                         (int)id, (long)(angle_deg * 10.0f));
-        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
+        Servo_NotArrived(id, angle_deg, tol_deg, stuck, a);   /* 时间到了还在动(太慢)：不拦它，让它接着转 */
     }
+}
+
+/* 给 arm.c 用(ID1、ID2 一起转，等到时间还没到位的那个)：看它是不是停住了。
+ * 还在动(只是慢)就让它接着转；停住了又离目标远，就停在原地，不再顶着 */
+void Servo_StopIfStuck(uint8_t id, float target)
+{
+    float a, b, d;
+
+    if (!Servo_ReadAngle(id, &a))
+    {
+        return;
+    }
+    HAL_Delay(SERVO_STILL_MS);
+    if (!Servo_ReadAngle(id, &b))
+    {
+        return;
+    }
+    d = b - a;
+    if (d < 0.0f) d = -d;
+    if (d > 0.5f)
+    {
+        return;
+    }
+    Servo_NotArrived(id, target, 0.0f, 1, b);
+}
+
+/* SV? <id>：读舵机的角度、电压、电流、功率、温度、状态，查"发热 / 没劲 / 转不到位"用。例如
+ *   SV 1 ANG=367.6 V=7412mV I=850mA P=6300mW T=58C(adc=1500) ST=0x04 STALL
+ * 停着不动时电流还很大(几百 mA 以上) = 舵机在使劲顶着什么东西(被挡住、或者有外力在推它) */
+void Servo_Report(uint8_t id)
+{
+    static const uint8_t addr[5] = { FSUS_PARAM_VOLTAGE, FSUS_PARAM_CURRENT, FSUS_PARAM_POWER,
+                                     FSUS_PARAM_TEMPRATURE, FSUS_PARAM_SERVO_STATUS };
+    static const char *flag[8] = { " BUSY", " CMDERR", " STALL", " VHIGH", " VLOW", " OVERCURRENT", " OVERPOWER", " OVERHEAT" };
+    long v[5];
+    uint8_t buf[FSUS_PACK_RESPONSE_MAX_SIZE];
+    uint8_t sz;
+    float a = 0.0f;
+    long ta, tc = -999;
+    char m[160];
+    int i, n;
+
+    for (i = 0; i < 5; i++)
+    {
+        v[i] = -1;
+        sz = 0;
+        if (FSUS_ReadData(&usart2, id, addr[i], buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 1)
+        {
+            v[i] = (sz >= 2) ? (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) : (long)buf[0];
+        }
+        HAL_Delay(5);
+    }
+    if (v[3] > 0 && v[3] < 4096)                   /* 温度：NTC 10k、B=3435 的分压 ADC 值换算成摄氏度(约) */
+    {
+        float r = (float)v[3] / (4096.0f - (float)v[3]);
+        tc = (long)(1.0f / (logf(r) / 3435.0f + 1.0f / 298.15f) - 273.15f + 0.5f);
+    }
+    if (!Servo_ReadAngle(id, &a))
+    {
+        a = 0.0f;
+    }
+    ta = (long)(a * 10.0f + ((a >= 0.0f) ? 0.5f : -0.5f));
+    n = snprintf(m, sizeof(m), "SV %d ANG=%s%ld.%ld V=%ldmV I=%ldmA P=%ldmW T=%ldC(adc=%ld) ST=0x%02lX",
+                 (int)id, (ta < 0) ? "-" : "", ((ta < 0) ? -ta : ta) / 10, ((ta < 0) ? -ta : ta) % 10,
+                 v[0], v[1], v[2], tc, v[3], (v[4] < 0) ? 0xFFL : v[4]);
+    for (i = 1; i < 8 && v[4] >= 0; i++)           /* bit0(正在执行)不打印 */
+    {
+        if ((v[4] >> i) & 1L)
+        {
+            n += snprintf(m + n, sizeof(m) - (size_t)n, "%s", flag[i]);
+        }
+    }
+    n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
+    HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
 }
 
 /* 原来的接口：转到绝对角度，到位误差 2°，多等 1 秒 */

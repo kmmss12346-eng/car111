@@ -3,9 +3,9 @@
  * 硬件对应：
  *   升降      Emm 步进电机 ID5(和轮子 1~4 号同一路 UART4，皮带升降)
  *   前后伸缩  飞特总线舵机 ID2      (main.c 里的 Servo_Move / Servo_Start，限位在那里)
- *   整臂旋转  飞特总线舵机 ID1      (同上)
- *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Open / Claw_Close)
- *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_GoTo)
+ *   整臂旋转  飞特总线舵机 ID1      (同上)。哪个舵机管伸缩由参数 AEXT 决定(默认 2 = ID2 伸缩)
+ *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Set；张开/夹紧的脉宽是参数 CLWO / CLWC)
+ *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_Set；三个位置的脉宽是参数 TT1 / TT2 / TT3)
  *   扫码模块  UART5 (PC12/PD2)   GM65，出厂 9600 8N1
  *   串口屏    USART2(PD5/PD6)    淘晶驰 TJC4832T135，出厂 9600
  *
@@ -39,13 +39,12 @@ extern int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len
 
 /* main.c 里已有的函数 */
 extern void Claw_Set(uint32_t pulse_us);
-extern void Claw_Open(void);
-extern void Claw_Close(void);
 extern void Turntable_Set(uint32_t pulse_us);
-extern void Turntable_GoTo(uint8_t slot);
 extern uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);
 extern void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);
 extern int  Servo_ReadAngle(uint8_t id, float *angle);
+extern void Servo_StopIfStuck(uint8_t id, float target);
+extern void Servo_Report(uint8_t id);
 extern void Delay_Report(uint32_t ms);
 
 #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
@@ -89,7 +88,7 @@ static float g_a1d    = 323.0f;    /* A1D    ID1 角度：对准车上转盘 */
 static float g_a1h    = 323.0f;    /* A1H    ID1 角度：收起/待命 */
 static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
 static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
-static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
+static float g_a2r    = -862.0f;   /* A2R    ID2 角度：转盘上方(收起时 ID2 也用这个角度) */
 static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
@@ -102,6 +101,12 @@ static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
 static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
+static float g_clwo   = 2090.0f;   /* CLWO   夹爪张开的脉宽(微秒) */
+static float g_clwc   = 2910.0f;   /* CLWC   夹爪夹紧的脉宽(微秒)。太紧了舵机一直使劲会发烫：调到刚好夹稳 */
+static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
+static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
+static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
+static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
 
 typedef struct
 {
@@ -146,6 +151,12 @@ static const ArmTun tun[] =
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
+    { "CLWO",   &g_clwo,    1700.0f, 2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
+    { "CLWC",   &g_clwc,    1700.0f, 2910.0f },
+    { "TT1",    &g_tt1,     500.0f,  2608.0f },  /* 范围 = main.c 里转盘的限位 TURNTABLE_MIN_US ~ TURNTABLE_MAX_US */
+    { "TT2",    &g_tt2,     500.0f,  2608.0f },
+    { "TT3",    &g_tt3,     500.0f,  2608.0f },
+    { "AEXT",   &g_aext,    1.0f,    2.0f },
 };
 #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
 
@@ -708,9 +719,15 @@ static void Lift_Boot(void)
 }
 
 /* ================= ID1 / ID2 ================= */
+/* 管前后伸缩的是哪个舵机(参数 AEXT)，另一个管旋转 */
+static uint8_t Ext_Id(void)
+{
+    return (g_aext < 1.5f) ? 1 : 2;
+}
+
 /* ID1、ID2 转到 a1、a2(度)。PARA=1 时两个一起转(省时间)；否则按 order 先后：
- *   order=1：先动 ID2 再动 ID1(缩回时先缩回再转，免得伸着转扫到东西)
- *   order=2：先动 ID1 再动 ID2(伸出时先转好再伸)
+ *   order=1：先动伸缩舵机再转(缩回时先缩回再转，免得伸着转扫到东西)
+ *   order=2：先转再动伸缩舵机(伸出时先转好再伸)
  * tol：到位误差(度)，speed：转速(度/秒) */
 static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 {
@@ -731,16 +748,17 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
             if (!ok1 && Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;
             if (!ok2 && Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;
         }
-    }
-    else if (order == 1)
-    {
-        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
-        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
+        /* 到时间还没到位：停住了(被挡住)就让它停在原地，别一直顶着发热 */
+        if (!ok1 && !car_abort)  Servo_StopIfStuck(1, a1);
+        if (!ok2 && !car_abort)  Servo_StopIfStuck(2, a2);
     }
     else
     {
-        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
-        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
+        uint8_t first = (order == 1) ? Ext_Id() : (uint8_t)(3 - Ext_Id());
+        uint8_t second = (uint8_t)(3 - first);
+
+        Servo_Move(first, (first == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
+        Servo_Move(second, (second == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
     }
 }
 
@@ -748,14 +766,27 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 static uint8_t  tt_slot     = 1;
 static uint32_t tt_ready_at = 0;
 
+/* 夹爪张开 / 夹紧(脉宽是参数 CLWO / CLWC) */
+static void Claw_O(void)
+{
+    Claw_Set((uint32_t)g_clwo);
+}
+
+static void Claw_C(void)
+{
+    Claw_Set((uint32_t)g_clwc);
+}
+
 static void TT_Go(uint8_t slot)
 {
+    float us = (slot == 1) ? g_tt1 : ((slot == 2) ? g_tt2 : g_tt3);
+
     if (slot != tt_slot)
     {
         tt_slot = slot;
         tt_ready_at = HAL_GetTick() + (uint32_t)g_ttwait;
     }
-    Turntable_GoTo(slot);
+    Turntable_Set((uint32_t)us);
 }
 
 static int TT_WaitReady(void)
@@ -792,7 +823,7 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     const char *e = Seq_Ready();
     if (e) return e;
 
-    if (open_claw)  Claw_Open();
+    if (open_claw)  Claw_O();
     GO(Lift_Goto(g_zhi));
     SERVOS(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, g_atolc, g_aspd);
     GO(Lift_Goto(ring ? g_zobrng : g_zobraw));
@@ -808,14 +839,14 @@ static const char *Seq_PickHere(uint8_t slot, float z)
     if (!Slot_Ok(slot))  return "ERR ARG";
 
     TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
-    Claw_Open();                                   /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
+    Claw_O();                                      /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
     GO(Lift_Goto(z));                              /* 下降 */
-    Claw_Close();  WAIT(g_clwait);                 /* 夹紧 */
+    Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
     GO(Lift_Goto(g_zhi));                          /* 抬起 */
     SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);      /* 缩回，转到转盘上方 */
     GO(Lift_Goto(g_zdrop));                        /* 下降 */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
-    Claw_Open();   WAIT(g_clwait);                 /* 松开：物料落进转盘 */
+    Claw_O();      WAIT(g_clwait);                 /* 松开：物料落进转盘 */
     GO(Lift_Goto(g_zhi));
     return NULL;
 }
@@ -828,28 +859,35 @@ static const char *Seq_Take(uint8_t slot)
     if (!Slot_Ok(slot))  return "ERR ARG";
 
     TT_Go(slot);
-    Claw_Open();
+    Claw_O();
     GO(Lift_Goto(g_zhi));
     SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
-    Claw_Close();  WAIT(g_clwait);                 /* 夹起 */
+    Claw_C();      WAIT(g_clwait);                 /* 夹起 */
     GO(Lift_Goto(g_zhi));
     return NULL;
 }
 
 /* 手臂夹着物料，已经(用摄像头)对准了目标：下降 -> 松开 -> 抬起 -> ID2 缩回。
  * stack=1 是码垛(放在已有物料上，下降高度用 ZSTK)。
- * 最后缩回 ID2(不转 ID1)：之后底盘要沿着圆环板挪动，爪子不能还伸在已经放好的物料上方 */
+ * 最后只把伸缩舵机缩回(不转)：之后底盘要沿着圆环板挪动，爪子不能还伸在已经放好的物料上方 */
 static const char *Seq_Drop(uint8_t stack)
 {
     const char *e = Seq_Ready();
     if (e) return e;
 
     GO(Lift_Goto(stack ? g_zstk : g_zplc));
-    Claw_Open();   WAIT(g_clwait);
+    Claw_O();      WAIT(g_clwait);
     GO(Lift_Goto(g_zhi));
-    Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
+    if (Ext_Id() == 2)                             /* 只把伸缩舵机缩回，不转 */
+    {
+        Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
+    }
+    else
+    {
+        Servo_Move(1, g_a1h, g_aspd, g_atolc, SERVO_EXTRA_MS);   /* ID1 管伸缩：缩到收起时的位置 */
+    }
     if (car_abort) return NULL;
     return NULL;
 }
@@ -1180,8 +1218,8 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
     if (strcmp(v, "CLAW") == 0 && n == 2)
     {
-        if (strcmp(t[1], "O") == 0)       Claw_Open();
-        else if (strcmp(t[1], "C") == 0)  Claw_Close();
+        if (strcmp(t[1], "O") == 0)       Claw_O();
+        else if (strcmp(t[1], "C") == 0)  Claw_C();
         else
         {
             long us;
@@ -1286,6 +1324,14 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (!ParseF(t[2], &f))  FAIL("ERR ARG");
         r = Lift_Cal(f);
         if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 舵机状态：SV? <id>(电压/电流/功率/温度/堵转标志，查发热、没劲用) ---- */
+    if (strcmp(v, "SV?") == 0 && n == 2)
+    {
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
+        Servo_Report((uint8_t)id);
         return 1;
     }
 

@@ -1,6 +1,23 @@
 --- a/Core/Src/main.c
 +++ b/Core/Src/main.c
-@@ -181,6 +181,10 @@
+@@ -28,6 +28,7 @@
+ #include "arm.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <math.h>
+ #include "hwt101.h"
+ #include "yaw_control.h"
+ #include <stdlib.h>
+@@ -100,6 +101,8 @@
+ int   Servo_ReadAngle(uint8_t id, float *angle);
+ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发指令不等，返回估计要多少毫秒 */
+ void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
++void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了：停在原地，不再一直顶着 */
++void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
+ 
+ /* USER CODE END PFP */
+ 
+@@ -181,6 +184,10 @@
        }
    }
  
@@ -11,7 +28,7 @@
  #if ARM_MODULES_ON
    Arm_Init();                        /* 启动夹爪/转盘 PWM，开始接收二维码 */
    /* 扫码模块、串口屏的中断优先级降到 3，比陀螺仪(1)、树莓派通信(2)低：没接模块时乱码也不会打断陀螺仪 */
-@@ -580,8 +584,10 @@
+@@ -580,8 +587,10 @@
   *   PING | HOME | P2 | YAW? | GET | SET 名字 数值 | CAL [距离mm [速度]]
   *   F <mm> [速度] | S <mm> [速度] | R <度>        前进(负数后退) / 左移(负数右移) / 逆时针转(负数顺时针)
   *   A <id> <度> | U <id>                            舵机
@@ -23,7 +40,7 @@
   * 同一时间只发一条，等到 DONE/ERR 再发下一条。 */
  #define LINK_BUF 48
  
-@@ -660,7 +666,7 @@
+@@ -660,7 +669,7 @@
      Car_TurnBy_Center(-P2_CW_DEG);
  }
  
@@ -32,7 +49,7 @@
  static void Link_Done(uint32_t t0)
  {
      char m[40];
-@@ -672,8 +678,9 @@
+@@ -672,8 +681,9 @@
          Link_Reply("ERR ABORT\r\n");
          return;
      }
@@ -43,7 +60,7 @@
      HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
  }
  
-@@ -696,6 +703,7 @@
+@@ -696,6 +706,7 @@
      strcpy(cmd, (const char *)link_cmd);
      link_ready = 0;
      car_abort = 0;                                 /* 清掉上一条留下的急停标志 */
@@ -51,7 +68,7 @@
      t0 = HAL_GetTick();
  
      if (strcmp(cmd, "PING") == 0)
-@@ -706,10 +714,23 @@
+@@ -706,10 +717,23 @@
      if (strcmp(cmd, "HOME") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
@@ -75,8 +92,13 @@
      if (strcmp(cmd, "P2") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
-@@ -943,8 +964,8 @@
+@@ -941,10 +965,13 @@
+ #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
+ #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
  #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
++#define SERVO_STUCK_DEG       2.0f      /* 没到位、又停住不动了，离目标还差这么多度以上 = 被挡住或力气不够 */
++#define SERVO_STILL_MS        300       /* 角度这么久变化不到 0.5° 算停住了 */
++#define SERVO_SLOW_EXTRA_MS   2000      /* 到了估计的时间还在动(舵机比设定的速度慢)，最多再多等这么久 */
  
  /* 限位(度，多圈角度)：你之前测好的数 */
 -#define SERVO1_MIN_DEG   390.0f
@@ -86,9 +108,202 @@
  #define SERVO2_MIN_DEG   -1220.0f
  #define SERVO2_MAX_DEG    -503.5f
  
+@@ -1008,15 +1035,56 @@
+     return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
+ }
+ 
++/* 让舵机就停在 angle_deg(它现在的位置)：目标改成现在的角度，它就不会再使劲往原来的目标顶 */
++static void Servo_Hold(uint8_t id, float angle_deg)
++{
++    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
++                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);
++}
++
++/* 没转到 target，最后读到的角度是 a。
++ * stuck=1(已经停住不动了)且离目标还差 SERVO_STUCK_DEG 以上 = 被挡住或力气不够：让它停在原地，打印 SERVOn STUCK。
++ * 舵机一直往到不了的目标顶，电流很大，几十秒就烫手 —— 发热主要就是这个原因。
++ * 其他情况(只差一点点、或者还在慢慢转)：不管它，tol_deg >= 1 时打印 NOT ARRIVED，和以前一样 */
++static void Servo_NotArrived(uint8_t id, float target, float tol_deg, int stuck, float a)
++{
++    char m[96];
++    int n = 0;
++    float d = a - target;
++
++    if (d < 0.0f) d = -d;
++    if (stuck && d > SERVO_STUCK_DEG)
++    {
++        Servo_Hold(id, a);
++        n = snprintf(m, sizeof(m), "SERVO%d STUCK at=%ld target=%ld (x0.1deg), hold here\r\n",
++                     (int)id, (long)(a * 10.0f), (long)(target * 10.0f));
++    }
++    else if (tol_deg >= 1.0f)
++    {
++        n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
++                     (int)id, (long)(target * 10.0f));
++    }
++    if (n > 0)
++    {
++        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
++    }
++}
++
+ /* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
+  * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
+- * 按角度和速度算好时间，再多等 extra_ms 毫秒，到时间没转到位就放弃。
+- * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印。 */
++ *   到位 -> 马上返回；
++ *   停住不动了(SERVO_STILL_MS 内变化不到 0.5°)还没到位 -> 不再等，离得远就让它停在原地(见 Servo_NotArrived)；
++ *   按角度和速度算好的时间 + extra_ms 到了还在动(舵机比设定的慢) -> 最多再等 SERVO_SLOW_EXTRA_MS。
++ * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印(卡住一定打印)。 */
+ void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
+ {
+-    float a, d;
+-    uint32_t t0, tmax;
++    float a = 0.0f;
++    float ref = 0.0f;
++    float d;
++    uint32_t t0, tmax, tref, el;
+     int ok = 0;
++    int have = 0;
++    int stuck = 0;
+ 
+     if (id != 1 && id != 2)
+     {
+@@ -1025,9 +1093,11 @@
+     tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
+ 
+     t0 = HAL_GetTick();
+-    while ((HAL_GetTick() - t0) < tmax)
++    tref = t0;
++    for (;;)
+     {
+         HAL_Delay(30);
++        el = HAL_GetTick() - t0;
+         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
+         {
+             d = a - angle_deg;
+@@ -1037,16 +1107,104 @@
+                 ok = 1;
+                 break;
+             }
++            d = a - ref;
++            if (d < 0.0f) d = -d;
++            if (!have || d > 0.5f)
++            {
++                ref = a;                           /* 还在动 */
++                tref = HAL_GetTick();
++                have = 1;
++            }
++            else if (el > (uint32_t)SERVO_ACC_MS + 300u && (HAL_GetTick() - tref) >= (uint32_t)SERVO_STILL_MS)
++            {
++                stuck = 1;                         /* 停住不动了 */
++                break;
++            }
++        }
++        if (el >= tmax + (have ? (uint32_t)SERVO_SLOW_EXTRA_MS : 0u))
++        {
++            break;
+         }
+     }
+ 
+-    if (!ok && tol_deg >= 1.0f)
++    if (!ok)
+     {
+-        char m[64];
+-        int n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
+-                         (int)id, (long)(angle_deg * 10.0f));
+-        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
++        Servo_NotArrived(id, angle_deg, tol_deg, stuck, a);   /* 时间到了还在动(太慢)：不拦它，让它接着转 */
++    }
++}
++
++/* 给 arm.c 用(ID1、ID2 一起转，等到时间还没到位的那个)：看它是不是停住了。
++ * 还在动(只是慢)就让它接着转；停住了又离目标远，就停在原地，不再顶着 */
++void Servo_StopIfStuck(uint8_t id, float target)
++{
++    float a, b, d;
++
++    if (!Servo_ReadAngle(id, &a))
++    {
++        return;
++    }
++    HAL_Delay(SERVO_STILL_MS);
++    if (!Servo_ReadAngle(id, &b))
++    {
++        return;
++    }
++    d = b - a;
++    if (d < 0.0f) d = -d;
++    if (d > 0.5f)
++    {
++        return;
+     }
++    Servo_NotArrived(id, target, 0.0f, 1, b);
++}
++
++/* SV? <id>：读舵机的角度、电压、电流、功率、温度、状态，查"发热 / 没劲 / 转不到位"用。例如
++ *   SV 1 ANG=367.6 V=7412mV I=850mA P=6300mW T=58C(adc=1500) ST=0x04 STALL
++ * 停着不动时电流还很大(几百 mA 以上) = 舵机在使劲顶着什么东西(被挡住、或者有外力在推它) */
++void Servo_Report(uint8_t id)
++{
++    static const uint8_t addr[5] = { FSUS_PARAM_VOLTAGE, FSUS_PARAM_CURRENT, FSUS_PARAM_POWER,
++                                     FSUS_PARAM_TEMPRATURE, FSUS_PARAM_SERVO_STATUS };
++    static const char *flag[8] = { " BUSY", " CMDERR", " STALL", " VHIGH", " VLOW", " OVERCURRENT", " OVERPOWER", " OVERHEAT" };
++    long v[5];
++    uint8_t buf[FSUS_PACK_RESPONSE_MAX_SIZE];
++    uint8_t sz;
++    float a = 0.0f;
++    long ta, tc = -999;
++    char m[160];
++    int i, n;
++
++    for (i = 0; i < 5; i++)
++    {
++        v[i] = -1;
++        sz = 0;
++        if (FSUS_ReadData(&usart2, id, addr[i], buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 1)
++        {
++            v[i] = (sz >= 2) ? (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) : (long)buf[0];
++        }
++        HAL_Delay(5);
++    }
++    if (v[3] > 0 && v[3] < 4096)                   /* 温度：NTC 10k、B=3435 的分压 ADC 值换算成摄氏度(约) */
++    {
++        float r = (float)v[3] / (4096.0f - (float)v[3]);
++        tc = (long)(1.0f / (logf(r) / 3435.0f + 1.0f / 298.15f) - 273.15f + 0.5f);
++    }
++    if (!Servo_ReadAngle(id, &a))
++    {
++        a = 0.0f;
++    }
++    ta = (long)(a * 10.0f + ((a >= 0.0f) ? 0.5f : -0.5f));
++    n = snprintf(m, sizeof(m), "SV %d ANG=%s%ld.%ld V=%ldmV I=%ldmA P=%ldmW T=%ldC(adc=%ld) ST=0x%02lX",
++                 (int)id, (ta < 0) ? "-" : "", ((ta < 0) ? -ta : ta) / 10, ((ta < 0) ? -ta : ta) % 10,
++                 v[0], v[1], v[2], tc, v[3], (v[4] < 0) ? 0xFFL : v[4]);
++    for (i = 1; i < 8 && v[4] >= 0; i++)           /* bit0(正在执行)不打印 */
++    {
++        if ((v[4] >> i) & 1L)
++        {
++            n += snprintf(m + n, sizeof(m) - (size_t)n, "%s", flag[i]);
++        }
++    }
++    n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
++    HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
+ }
+ 
+ /* 原来的接口：转到绝对角度，到位误差 2°，多等 1 秒 */
 --- a/Core/Src/arm.c
 +++ b/Core/Src/arm.c
-@@ -9,7 +9,7 @@
+@@ -3,13 +3,13 @@
+  * 硬件对应：
+  *   升降      Emm 步进电机 ID5(和轮子 1~4 号同一路 UART4，皮带升降)
+  *   前后伸缩  飞特总线舵机 ID2      (main.c 里的 Servo_Move / Servo_Start，限位在那里)
+- *   整臂旋转  飞特总线舵机 ID1      (同上)
+- *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Open / Claw_Close)
+- *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_GoTo)
++ *   整臂旋转  飞特总线舵机 ID1      (同上)。哪个舵机管伸缩由参数 AEXT 决定(默认 2 = ID2 伸缩)
++ *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Set；张开/夹紧的脉宽是参数 CLWO / CLWC)
++ *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_Set；三个位置的脉宽是参数 TT1 / TT2 / TT3)
   *   扫码模块  UART5 (PC12/PD2)   GM65，出厂 9600 8N1
   *   串口屏    USART2(PD5/PD6)    淘晶驰 TJC4832T135，出厂 9600
   *
@@ -97,7 +312,7 @@
   *
   * 设计思路(为了放得准)：
   *   - 树莓派用摄像头做闭环对准：车到工位后，先用 OBS 把手臂摆到"观察姿态"，
-@@ -28,12 +28,14 @@
+@@ -28,28 +28,33 @@
  #include <stdio.h>
  #include <string.h>
  #include <stdlib.h>
@@ -112,7 +327,18 @@
  
  /* main.c 里已有的函数 */
  extern void Claw_Set(uint32_t pulse_us);
-@@ -50,6 +52,10 @@
+-extern void Claw_Open(void);
+-extern void Claw_Close(void);
+ extern void Turntable_Set(uint32_t pulse_us);
+-extern void Turntable_GoTo(uint8_t slot);
+ extern uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);
+ extern void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);
+ extern int  Servo_ReadAngle(uint8_t id, float *angle);
++extern void Servo_StopIfStuck(uint8_t id, float target);
++extern void Servo_Report(uint8_t id);
+ extern void Delay_Report(uint32_t ms);
+ 
+ #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
  
  /* 两个模块出厂都是 9600。工程里 USART2/UART5 初始化成了 115200，Arm_Init 里会改成下面的值。
   * 如果您把屏或扫码模块改过波特率，只改这两个数 */
@@ -123,7 +349,7 @@
  #define SCREEN_BAUD    9600u
  #define QR_BAUD        9600u
  
-@@ -61,27 +67,27 @@
+@@ -61,29 +66,29 @@
  
  /* ================= 可调参数(SET 名字 数值) ================= */
  static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
@@ -164,17 +390,26 @@
 +static float g_a1h    = 323.0f;    /* A1H    ID1 角度：收起/待命 */
 +static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
  static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
- static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
+-static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
++static float g_a2r    = -862.0f;   /* A2R    ID2 角度：转盘上方(收起时 ID2 也用这个角度) */
  static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
-@@ -95,6 +101,7 @@
+ static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
+ static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
+@@ -95,6 +100,13 @@
  static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
  static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
  static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 +static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
++static float g_clwo   = 2090.0f;   /* CLWO   夹爪张开的脉宽(微秒) */
++static float g_clwc   = 2910.0f;   /* CLWC   夹爪夹紧的脉宽(微秒)。太紧了舵机一直使劲会发烫：调到刚好夹稳 */
++static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
++static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
++static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
++static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
  
  typedef struct
  {
-@@ -109,7 +116,7 @@
+@@ -109,7 +121,7 @@
      { "LFPPM",  &g_lppm,    1.0f,    500.0f },
      { "LFRPM",  &g_lrpm,    10.0f,   600.0f },
      { "LFACC",  &g_lacc,    0.0f,    255.0f },
@@ -183,7 +418,7 @@
      { "LFDIR",  &g_ldir,    0.0f,    1.0f },
      { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
      { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
-@@ -122,10 +129,10 @@
+@@ -122,10 +134,10 @@
      { "ZSTK",   &g_zstk,    0.0f,    400.0f },
      { "ZOBRAW", &g_zobraw,  0.0f,    400.0f },
      { "ZOBRNG", &g_zobrng,  0.0f,    400.0f },
@@ -198,15 +433,21 @@
      { "A2E",    &g_a2e,    -1220.0f, -503.5f },
      { "A2R",    &g_a2r,    -1220.0f, -503.5f },
      { "A2P",    &g_a2p,    -1220.0f, -503.5f },
-@@ -138,6 +145,7 @@
+@@ -138,6 +150,13 @@
      { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
      { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
      { "ARMOK",  &g_armok,   0.0f,    1.0f },
 +    { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
++    { "CLWO",   &g_clwo,    1700.0f, 2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
++    { "CLWC",   &g_clwc,    1700.0f, 2910.0f },
++    { "TT1",    &g_tt1,     500.0f,  2608.0f },  /* 范围 = main.c 里转盘的限位 TURNTABLE_MIN_US ~ TURNTABLE_MAX_US */
++    { "TT2",    &g_tt2,     500.0f,  2608.0f },
++    { "TT3",    &g_tt3,     500.0f,  2608.0f },
++    { "AEXT",   &g_aext,    1.0f,    2.0f },
  };
  #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
  
-@@ -228,6 +236,10 @@
+@@ -228,6 +247,10 @@
  static float   lift_mm    = 0.0f;
  static uint8_t lift_known = 0;
  
@@ -217,7 +458,7 @@
  static uint32_t Lift_Time_Ms(uint32_t pulses)
  {
      float sps = g_lrpm / 60.0f * g_lspr;          /* 每秒多少脉冲 */
-@@ -262,18 +274,439 @@
+@@ -262,22 +285,449 @@
      }
  
      Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -656,9 +897,143 @@
 +}
 +
  /* ================= ID1 / ID2 ================= */
++/* 管前后伸缩的是哪个舵机(参数 AEXT)，另一个管旋转 */
++static uint8_t Ext_Id(void)
++{
++    return (g_aext < 1.5f) ? 1 : 2;
++}
++
  /* ID1、ID2 转到 a1、a2(度)。PARA=1 时两个一起转(省时间)；否则按 order 先后：
-  *   order=1：先动 ID2 再动 ID1(缩回时先缩回再转，免得伸着转扫到东西)
-@@ -433,26 +866,89 @@
+- *   order=1：先动 ID2 再动 ID1(缩回时先缩回再转，免得伸着转扫到东西)
+- *   order=2：先动 ID1 再动 ID2(伸出时先转好再伸)
++ *   order=1：先动伸缩舵机再转(缩回时先缩回再转，免得伸着转扫到东西)
++ *   order=2：先转再动伸缩舵机(伸出时先转好再伸)
+  * tol：到位误差(度)，speed：转速(度/秒) */
+ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
+ {
+@@ -298,16 +748,17 @@
+             if (!ok1 && Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;
+             if (!ok2 && Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;
+         }
+-    }
+-    else if (order == 1)
+-    {
+-        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
+-        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
++        /* 到时间还没到位：停住了(被挡住)就让它停在原地，别一直顶着发热 */
++        if (!ok1 && !car_abort)  Servo_StopIfStuck(1, a1);
++        if (!ok2 && !car_abort)  Servo_StopIfStuck(2, a2);
+     }
+     else
+     {
+-        Servo_Move(1, a1, speed, tol, SERVO_EXTRA_MS);
+-        Servo_Move(2, a2, speed, tol, SERVO_EXTRA_MS);
++        uint8_t first = (order == 1) ? Ext_Id() : (uint8_t)(3 - Ext_Id());
++        uint8_t second = (uint8_t)(3 - first);
++
++        Servo_Move(first, (first == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
++        Servo_Move(second, (second == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
+     }
+ }
+ 
+@@ -315,14 +766,27 @@
+ static uint8_t  tt_slot     = 1;
+ static uint32_t tt_ready_at = 0;
+ 
++/* 夹爪张开 / 夹紧(脉宽是参数 CLWO / CLWC) */
++static void Claw_O(void)
++{
++    Claw_Set((uint32_t)g_clwo);
++}
++
++static void Claw_C(void)
++{
++    Claw_Set((uint32_t)g_clwc);
++}
++
+ static void TT_Go(uint8_t slot)
+ {
++    float us = (slot == 1) ? g_tt1 : ((slot == 2) ? g_tt2 : g_tt3);
++
+     if (slot != tt_slot)
+     {
+         tt_slot = slot;
+         tt_ready_at = HAL_GetTick() + (uint32_t)g_ttwait;
+     }
+-    Turntable_GoTo(slot);
++    Turntable_Set((uint32_t)us);
+ }
+ 
+ static int TT_WaitReady(void)
+@@ -359,7 +823,7 @@
+     const char *e = Seq_Ready();
+     if (e) return e;
+ 
+-    if (open_claw)  Claw_Open();
++    if (open_claw)  Claw_O();
+     GO(Lift_Goto(g_zhi));
+     SERVOS(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, g_atolc, g_aspd);
+     GO(Lift_Goto(ring ? g_zobrng : g_zobraw));
+@@ -375,14 +839,14 @@
+     if (!Slot_Ok(slot))  return "ERR ARG";
+ 
+     TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
+-    Claw_Open();                                   /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
++    Claw_O();                                      /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
+     GO(Lift_Goto(z));                              /* 下降 */
+-    Claw_Close();  WAIT(g_clwait);                 /* 夹紧 */
++    Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
+     GO(Lift_Goto(g_zhi));                          /* 抬起 */
+     SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);      /* 缩回，转到转盘上方 */
+     GO(Lift_Goto(g_zdrop));                        /* 下降 */
+     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
+-    Claw_Open();   WAIT(g_clwait);                 /* 松开：物料落进转盘 */
++    Claw_O();      WAIT(g_clwait);                 /* 松开：物料落进转盘 */
+     GO(Lift_Goto(g_zhi));
+     return NULL;
+ }
+@@ -395,28 +859,35 @@
+     if (!Slot_Ok(slot))  return "ERR ARG";
+ 
+     TT_Go(slot);
+-    Claw_Open();
++    Claw_O();
+     GO(Lift_Goto(g_zhi));
+     SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);
+     if (!TT_WaitReady()) return NULL;
+     GO(Lift_Goto(g_zdrop));
+-    Claw_Close();  WAIT(g_clwait);                 /* 夹起 */
++    Claw_C();      WAIT(g_clwait);                 /* 夹起 */
+     GO(Lift_Goto(g_zhi));
+     return NULL;
+ }
+ 
+ /* 手臂夹着物料，已经(用摄像头)对准了目标：下降 -> 松开 -> 抬起 -> ID2 缩回。
+  * stack=1 是码垛(放在已有物料上，下降高度用 ZSTK)。
+- * 最后缩回 ID2(不转 ID1)：之后底盘要沿着圆环板挪动，爪子不能还伸在已经放好的物料上方 */
++ * 最后只把伸缩舵机缩回(不转)：之后底盘要沿着圆环板挪动，爪子不能还伸在已经放好的物料上方 */
+ static const char *Seq_Drop(uint8_t stack)
+ {
+     const char *e = Seq_Ready();
+     if (e) return e;
+ 
+     GO(Lift_Goto(stack ? g_zstk : g_zplc));
+-    Claw_Open();   WAIT(g_clwait);
++    Claw_O();      WAIT(g_clwait);
+     GO(Lift_Goto(g_zhi));
+-    Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
++    if (Ext_Id() == 2)                             /* 只把伸缩舵机缩回，不转 */
++    {
++        Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
++    }
++    else
++    {
++        Servo_Move(1, g_a1h, g_aspd, g_atolc, SERVO_EXTRA_MS);   /* ID1 管伸缩：缩到收起时的位置 */
++    }
+     if (car_abort) return NULL;
+     return NULL;
+ }
+@@ -433,26 +904,89 @@
  }
  
  /* ================= 串口屏 ================= */
@@ -755,7 +1130,7 @@
  /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
  static void Screen_Raw(const char *cmd)
  {
-@@ -594,6 +1090,12 @@
+@@ -594,6 +1128,12 @@
      qr_len = 0;
      qr_end = 0;
      HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
@@ -768,7 +1143,14 @@
  }
  
  /* ================= 树莓派指令 ================= */
-@@ -683,7 +1185,7 @@
+@@ -678,12 +1218,12 @@
+     /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
+     if (strcmp(v, "CLAW") == 0 && n == 2)
+     {
+-        if (strcmp(t[1], "O") == 0)       Claw_Open();
+-        else if (strcmp(t[1], "C") == 0)  Claw_Close();
++        if (strcmp(t[1], "O") == 0)       Claw_O();
++        else if (strcmp(t[1], "C") == 0)  Claw_C();
          else
          {
              long us;
@@ -777,7 +1159,7 @@
              Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
          }
          Wait_Ms((uint32_t)g_clwait);
-@@ -727,6 +1229,7 @@
+@@ -727,6 +1267,7 @@
          if (strcmp(t[1], "ZERO") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -785,7 +1167,7 @@
              Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
              lift_mm = 0.0f;
              lift_known = 1;
-@@ -735,6 +1238,7 @@
+@@ -735,6 +1276,7 @@
          if (strcmp(t[1], "HOME") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -793,7 +1175,7 @@
              Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
              if (!Wait_Ms((uint32_t)g_lhtm))
              {
-@@ -745,11 +1249,45 @@
+@@ -745,11 +1287,53 @@
              lift_known = 1;
              return 1;
          }
@@ -836,23 +1218,60 @@
 +        if (r)  FAIL(r);
 +        return 1;
 +    }
++
++    /* ---- 舵机状态：SV? <id>(电压/电流/功率/温度/堵转标志，查发热、没劲用) ---- */
++    if (strcmp(v, "SV?") == 0 && n == 2)
++    {
++        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
++        Servo_Report((uint8_t)id);
++        return 1;
++    }
  
      /* ---- ID1 / ID2 精确控制：A? <id> / AF <id> <度> / AD <id> <增量度> / AP <ID1度> <ID2度> ---- */
      if (strcmp(v, "A?") == 0 && n == 2)
 --- a/Core/Inc/arm.h
 +++ b/Core/Inc/arm.h
-@@ -5,9 +5,9 @@
+@@ -3,15 +3,18 @@
+  * 树莓派 -> STM32 新增指令(每条一行，和原来的 F/S/R/A/U 一样，做完回 DONE 或 ERR xxx)：
+  *
   *  夹爪 / 转盘 / 升降
-  *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开 / 夹紧 / 直接给脉宽
-  *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位 / 直接给脉宽
+- *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开 / 夹紧 / 直接给脉宽
+- *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位 / 直接给脉宽
 - *   LIFT ZERO                              把"现在的高度"记为 0 (升降最高点)
++ *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开(参数 CLWO) / 夹紧(参数 CLWC) / 直接给脉宽
++ *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位(参数 TT1/TT2/TT3) / 直接给脉宽
 + *   LIFT ZERO                              把"现在的高度"记为 0 (升降最低点)
   *   LIFT HOME                              让 ID5 驱动器自己回零(需先在驱动器里配好回零方式)
 - *   LIFT <mm>                              升降到离零点向下 mm 毫米(只能在 ZERO/HOME 之后)
 + *   LIFT <mm>                              升降到离零点(最低点)往上 mm 毫米(只能在 ZERO/HOME 之后)
   *   LIFT?                                  回 "LIFT <是否已回零> <当前mm>"
   *
-  *  ID1(整臂旋转) / ID2(齿条伸缩)的精确控制，用于摄像头闭环对准
+- *  ID1(整臂旋转) / ID2(齿条伸缩)的精确控制，用于摄像头闭环对准
++ *  ID1 / ID2 两个舵机的精确控制，用于摄像头闭环对准(哪个管伸缩看参数 AEXT，默认 ID2 伸缩、ID1 旋转)
+  *   A? <1|2>                               读角度，回 "ANG <id> <度>"
++ *   SV? <1|2>                              读舵机状态，回 "SV <id> ANG=.. V=..mV I=..mA P=..mW T=..C ST=0x.. [STALL…]"(查发热)
++ *   U <1|2>                                舵机松开(可以用手摆)，下一条转动指令会自动重新出力
++ *   舵机没转到位又停住不动了(被挡住/力气不够)：程序让它停在原地，不再一直顶着发热，并打印 "SERVOn STUCK at=.. target=.."
+  *   AF <1|2> <度>                          转到绝对角度(支持小数，到位误差 ATOL)
+  *   AD <1|2> <增量度>                      在现在的角度上再转(支持小数)，回 "ANG <id> <度>"
+  *   AP <ID1度> <ID2度>                     ID1、ID2 一起转到指定角度(回到记下来的对准姿态用)
+@@ -20,7 +23,7 @@
+  *   OBS RAW [O] | OBS RING [O]             手臂摆到"观察姿态"：原料盘上方 / 地上圆环上方(O=同时张开夹爪)
+  *   GRAB <n> H | PICK <n> H                手臂已经对准：夹起物料放进转盘 n 号位(GRAB 用原料盘夹取高度，PICK 用地面圆环高度)
+  *   TAKE <n>                               从转盘 n 号位取出物料，夹着停在转盘上方
+- *   DROP [S]                               手臂已经对准：下降、松开、抬起、ID2 缩回(S=码垛，放在已有物料上)
++ *   DROP [S]                               手臂已经对准：下降、松开、抬起、伸缩舵机缩回(S=码垛，放在已有物料上)
+  *   STOW                                   收臂待命(升到最高、缩回)
+  *
+  *  不用摄像头的完整流程(调试、应急)
+@@ -35,6 +38,7 @@
+  *   SCMD <淘晶驰指令>                      直接发一条串口屏指令，例如 SCMD page 1
+  *
+  * 另外 SET / GET 可以改/看机械臂参数(名字见 arm.c 的 tun 表)。
++ * 夹爪、转盘、两个舵机的姿态、升降各个高度，用树莓派上的 arm_calib.py 一步一步标定最方便。
+  *
+  * STM32 -> 树莓派 额外会主动发：QR <任务码>   (扫码模块读到合格的任务码时发一次；同时自动把任务码分两行写到串口屏的 t0 和 t7)
+  */
 --- a/Core/Src/chassis.c
 +++ b/Core/Src/chassis.c
 @@ -8,6 +8,8 @@
