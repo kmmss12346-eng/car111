@@ -46,8 +46,6 @@ extern int  Servo_ReadAngle(uint8_t id, float *angle);
 extern void Servo_StopIfStuck(uint8_t id, float target);
 extern void Servo_Report(uint8_t id);
 extern void Servo_SetPower(uint16_t mw);
-extern void Servo_SetHoldPower(uint16_t mw);
-extern void Servo_Hold(uint8_t id, float angle_deg);
 extern void Servo_Params(uint8_t id);
 extern int  Servo_WriteParam(uint8_t id, const char *name, long value);
 extern void Delay_Report(uint32_t ms);
@@ -112,8 +110,7 @@ static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
 static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
-static float g_spow   = 30000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，超过舵机自己的上限 PMAX 时按 PMAX。转不动就加大 */
-static float g_shold  = 8000.0f;   /* SHOLD  ID1/ID2 转到以后(或者转不到停下以后)保持用的功率(mW)。停着发烫就减小，保持不住就加大 */
+static float g_spow   = 30000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，30000 = 当时 set SPOW 30000 的值。发烫就减小 */
 
 typedef struct
 {
@@ -165,7 +162,6 @@ static const ArmTun tun[] =
     { "TT3",    &g_tt3,     500.0f,  2608.0f },
     { "AEXT",   &g_aext,    1.0f,    2.0f },
     { "SPOW",   &g_spow,    1000.0f, 30000.0f },
-    { "SHOLD",  &g_shold,   1000.0f, 30000.0f },
 };
 #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
 
@@ -185,10 +181,6 @@ int Arm_Param_Set(const char *name, float v)
             if (tun[i].p == &g_spow)
             {
                 Servo_SetPower((uint16_t)v);       /* main.c 里的舵机功率马上换 */
-            }
-            if (tun[i].p == &g_shold)
-            {
-                Servo_SetHoldPower((uint16_t)v);   /* 保持功率也马上换 */
             }
             return 1;
         }
@@ -765,12 +757,9 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
             if (!ok1 && Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;
             if (!ok2 && Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;
         }
-        /* 到了的换成小功率保持；到时间还没到位的接着等，停住了(被挡住)就让它停在原地，别一直顶着发热 */
-        if (!car_abort)
-        {
-            if (ok1)  Servo_Hold(1, a1);  else  Servo_StopIfStuck(1, a1);
-            if (ok2)  Servo_Hold(2, a2);  else  Servo_StopIfStuck(2, a2);
-        }
+        /* 到时间还没到位：停住了(被挡住)就让它停在原地，别一直顶着发热 */
+        if (!ok1 && !car_abort)  Servo_StopIfStuck(1, a1);
+        if (!ok2 && !car_abort)  Servo_StopIfStuck(2, a2);
     }
     else
     {
@@ -1150,7 +1139,6 @@ void Arm_Init(void)
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
 
     Servo_SetPower((uint16_t)g_spow);
-    Servo_SetHoldPower((uint16_t)g_shold);
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();
