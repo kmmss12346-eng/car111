@@ -43,6 +43,10 @@ static float block1 = 1e9f;                              /* ID1 被挡住的角�
 void Servo_StopIfStuck(uint8_t id, float t) { EV("stuck%u:%.1f;", id, t); }
 void Servo_Report(uint8_t id) { EV("rep%u;", id); }
 void Servo_SetPower(uint16_t mw) { EV("pow%u;", mw); }
+void Servo_SetComp(uint8_t id, float deg) { EV("comp%u=%.1f;", id, deg); }
+void Servo_Hold(uint8_t id, float a) { EV("H%u:%.1f;", id, a); }
+static float fgoal[3];
+int Servo_Arrived(uint8_t id, float a, float tol) { float e = a - fgoal[id]; return (e < 0 ? -e : e) <= tol; }
 void Servo_Params(uint8_t id) { EV("svp%u;", id); }
 int Servo_WriteParam(uint8_t id, const char *name, long v) {
     EV("svw%u:%s=%ld;", id, name, v);
@@ -52,7 +56,7 @@ int Servo_WriteParam(uint8_t id, const char *name, long v) {
 }
 static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 417.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
-    float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
+    float d; *a = clampa(id, *a); fgoal[id] = *a; d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
 }
 void Servo_Move(uint8_t id, float a, float spd, float tol, uint32_t extra) {
@@ -203,9 +207,9 @@ int main(void) {
 
     /* ---- 舵机被挡住：一起转等到时间还没到位，交给 Servo_StopIfStuck(停在原地，不再顶着发热) ---- */
     ang[1] = 323.0f; ang[2] = -862.0f; block1 = 340.0f; clear();
-    CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)");
+    CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2") && has("H2:-862.0;") && !has("H1"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)；到了的 ID2 马上停住");
     block1 = 1e9f; clear();
-    CHECK(run("AP 330 -860") == 1 && !has("stuck"), "都到位：不叫 Servo_StopIfStuck");
+    CHECK(run("AP 330 -860") == 1 && !has("stuck") && has("H1:330.0;") && has("H2:-860.0;"), "都到位：不叫 Servo_StopIfStuck，两个到了都马上停住");
     clear();
     CHECK(run("SV? 1") == 1 && has("rep1;") && run("SV? 3") == -1, "SV? 1 读舵机状态；ID 不对 ERR ARG");
     /* 舵机功率 SPOW、舵机内部设置 SVP? / SVW */
@@ -213,6 +217,11 @@ int main(void) {
     CHECK(Arm_Param_Set("SPOW", 12000) == 1 && has("pow12000;") && Arm_Param_Set("SPOW", 500) == 2, "SET SPOW 马上换舵机功率，太小拒绝");
     clear(); Arm_Init();
     CHECK(has("pow12000;"), "开机把 SPOW 交给 main.c");
+    CHECK(has("comp1=5.0;") && has("comp2=0.0;"), "开机把补偿 S1COMP=5 / S2COMP=0 交给 main.c");
+    clear();
+    CHECK(Arm_Param_Set("S1COMP", 4.5f) == 1 && has("comp1=4.5;") && Arm_Param_Set("S2COMP", 3) == 1 && has("comp2=3.0;") && Arm_Param_Set("S1COMP", 20) == 2,
+          "SET S1COMP / S2COMP 马上换补偿角度，超范围拒绝");
+    Arm_Param_Set("S1COMP", 5); Arm_Param_Set("S2COMP", 0);
     Arm_Param_Set("SPOW", 30000);
     clear();
     CHECK(run("SVP? 2") == 1 && has("svp2;") && run("SVP? 0") == -1, "SVP? 读舵机内部设置");
