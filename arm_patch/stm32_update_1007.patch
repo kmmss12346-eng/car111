@@ -20,7 +20,22 @@
  
  /* USER CODE END PFP */
  
-@@ -181,6 +187,10 @@
+@@ -168,7 +174,7 @@
+   }
+   yaw_target = HWT101_GetYaw();      /* 开机时的车头方向 */
+ 
+-  /* 开机先关掉两个舵机的"上电锁力"，设置堵转时降功率，再让它们松手 */
++  /* 开机先关掉两个舵机的"上电锁力"，设置堵转时降功率，关掉舵机自己的角度限位，再让它们松手 */
+   {
+       uint8_t v;
+       uint8_t id;
+@@ -176,11 +182,16 @@
+       {
+           v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_POWER_ON_LOCK_SWITCH, &v, 1);
+           v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_STALL_PROTECT, &v, 1);
++          v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_ANGLE_LIMIT_SWITCH, &v, 1);   /* 舵机自己的角度限位会把 ID1 卡在 325/396，程序里有限位 */
+           Servo_Release(id);
+           HAL_Delay(20);
        }
    }
  
@@ -31,7 +46,7 @@
  #if ARM_MODULES_ON
    Arm_Init();                        /* 启动夹爪/转盘 PWM，开始接收二维码 */
    /* 扫码模块、串口屏的中断优先级降到 3，比陀螺仪(1)、树莓派通信(2)低：没接模块时乱码也不会打断陀螺仪 */
-@@ -580,8 +590,10 @@
+@@ -580,8 +591,10 @@
   *   PING | HOME | P2 | YAW? | GET | SET 名字 数值 | CAL [距离mm [速度]]
   *   F <mm> [速度] | S <mm> [速度] | R <度>        前进(负数后退) / 左移(负数右移) / 逆时针转(负数顺时针)
   *   A <id> <度> | U <id>                            舵机
@@ -43,7 +58,7 @@
   * 同一时间只发一条，等到 DONE/ERR 再发下一条。 */
  #define LINK_BUF 48
  
-@@ -660,7 +672,7 @@
+@@ -660,7 +673,7 @@
      Car_TurnBy_Center(-P2_CW_DEG);
  }
  
@@ -52,7 +67,7 @@
  static void Link_Done(uint32_t t0)
  {
      char m[40];
-@@ -672,8 +684,9 @@
+@@ -672,8 +685,9 @@
          Link_Reply("ERR ABORT\r\n");
          return;
      }
@@ -63,7 +78,7 @@
      HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
  }
  
-@@ -696,6 +709,7 @@
+@@ -696,6 +710,7 @@
      strcpy(cmd, (const char *)link_cmd);
      link_ready = 0;
      car_abort = 0;                                 /* 清掉上一条留下的急停标志 */
@@ -71,7 +86,7 @@
      t0 = HAL_GetTick();
  
      if (strcmp(cmd, "PING") == 0)
-@@ -706,10 +720,23 @@
+@@ -706,10 +721,23 @@
      if (strcmp(cmd, "HOME") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
@@ -95,12 +110,12 @@
      if (strcmp(cmd, "P2") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
-@@ -937,14 +964,27 @@
+@@ -937,14 +965,27 @@
  #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
  #define SERVO_ACC_MS          100       /* 加速时间 ms */
  #define SERVO_DEC_MS          100       /* 减速时间 ms */
 -#define SERVO_POWER           8000      /* 最大功率 mW：顶住东西时最多用这么大的力。转不动就加大，还是烫就减小 */
-+#define SERVO_POWER           8000      /* 开机时的最大功率 mW(转不动就加大，还是烫就减小)。可以用 SET SPOW 在线改 */
++#define SERVO_POWER           20000     /* 开机时的最大功率 mW(= 舵机自己的上限 PMAX，和原来程序里填 0 一样)。可以用 SET SPOW 在线改 */
  #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
  #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
  #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
@@ -126,7 +141,7 @@
  #define SERVO2_MIN_DEG   -1220.0f
  #define SERVO2_MAX_DEG    -503.5f
  
-@@ -1004,49 +1044,294 @@
+@@ -1004,49 +1045,294 @@
      if (d < 0.0f) d = -d;
  
      FSUS_SetServoAngleMTurnByVelocity(&usart2, id, *angle_deg, speed_dps,
@@ -559,7 +574,7 @@
 +static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 +static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 +static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
-+static float g_spow   = 8000.0f;   /* SPOW   ID1/ID2 转动时允许的最大功率(mW)。转不动(停住时电流大、ST 有 0x40)就加大，发烫就减小 */
++static float g_spow   = 20000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，20000 = 舵机自己的上限。发烫就减小 */
  
  typedef struct
  {

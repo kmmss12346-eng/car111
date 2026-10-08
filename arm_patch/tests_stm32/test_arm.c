@@ -213,7 +213,7 @@ int main(void) {
     CHECK(Arm_Param_Set("SPOW", 12000) == 1 && has("pow12000;") && Arm_Param_Set("SPOW", 500) == 2, "SET SPOW 马上换舵机功率，太小拒绝");
     clear(); Arm_Init();
     CHECK(has("pow12000;"), "开机把 SPOW 交给 main.c");
-    Arm_Param_Set("SPOW", 8000);
+    Arm_Param_Set("SPOW", 20000);
     clear();
     CHECK(run("SVP? 2") == 1 && has("svp2;") && run("SVP? 0") == -1, "SVP? 读舵机内部设置");
     clear();

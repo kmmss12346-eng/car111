@@ -174,7 +174,7 @@ int main(void)
   }
   yaw_target = HWT101_GetYaw();      /* 开机时的车头方向 */
 
-  /* 开机先关掉两个舵机的"上电锁力"，设置堵转时降功率，再让它们松手 */
+  /* 开机先关掉两个舵机的"上电锁力"，设置堵转时降功率，关掉舵机自己的角度限位，再让它们松手 */
   {
       uint8_t v;
       uint8_t id;
@@ -182,6 +182,7 @@ int main(void)
       {
           v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_POWER_ON_LOCK_SWITCH, &v, 1);
           v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_STALL_PROTECT, &v, 1);
+          v = 0x00;  FSUS_WriteData(&usart2, id, FSUS_PARAM_ANGLE_LIMIT_SWITCH, &v, 1);   /* 舵机自己的角度限位会把 ID1 卡在 325/396，程序里有限位 */
           Servo_Release(id);
           HAL_Delay(20);
       }
@@ -964,7 +965,7 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
 #define SERVO_ACC_MS          100       /* 加速时间 ms */
 #define SERVO_DEC_MS          100       /* 减速时间 ms */
-#define SERVO_POWER           8000      /* 开机时的最大功率 mW(转不动就加大，还是烫就减小)。可以用 SET SPOW 在线改 */
+#define SERVO_POWER           20000     /* 开机时的最大功率 mW(= 舵机自己的上限 PMAX，和原来程序里填 0 一样)。可以用 SET SPOW 在线改 */
 #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
 #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
 #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */

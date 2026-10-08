@@ -110,7 +110,7 @@ static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
 static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
-static float g_spow   = 8000.0f;   /* SPOW   ID1/ID2 转动时允许的最大功率(mW)。转不动(停住时电流大、ST 有 0x40)就加大，发烫就减小 */
+static float g_spow   = 20000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，20000 = 舵机自己的上限。发烫就减小 */
 
 typedef struct
 {
