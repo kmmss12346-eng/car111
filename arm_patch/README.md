@@ -229,7 +229,8 @@ python3 arm_calib.py
    `A1D A2R`(转盘上方)、`A1G A2E`(原料盘上方)、`A1P A2P`(地上圆环上方)、`A1H`(收臂待命)、
    `ZHI`(搬运高度)、`ZDROP`(放进/取出转盘)、`ZGRAB`(夹原料)、`ZPLC`(放圆环)、`ZSTK`(码垛)、`ZOBRAW/ZOBRNG`(摄像头看的高度)。
 6. **不用摄像头先试整套**：`set ARMOK 1`，然后 `arm GRAB 1`、`arm PLACE 1`、`arm PICK 1`。每个姿态都对了再往下。
-7. **摄像头**：`vdbg RING` 存一张 `vdebug.png`，看绿十字(爪子位置)和黄圈(识别到的圆环)对不对。爪子位置不准就改 `mission_cfg.claw_px`（1 像素 ≈ 0.34mm）。
+7. **摄像头**：实时看识别效果用 `python3 vlive.py 1`(在树莓派桌面的终端里运行，先关掉 map_merge_live；1~6 换颜色，r 切换圆环，q 退出)。
+   也可以 `vdbg RING` 存一张 `vdebug.png`，看绿十字(爪子位置)和黄圈(识别到的圆环)对不对。爪子位置不准就改 `mission_cfg.claw_px`（1 像素 ≈ 0.34mm）。
 8. **视觉校准**：把车放在 ROUGH 停车点，`vcal RING`；原料盘物料放稳在画面里，`vcal RAW 1`(颜色号)。会自己动手臂和底盘几下，测出对应关系并存进 `servo_cal.json`，还会告诉您实测的像素/毫米比例。
 9. **单工位测试**：`mtest QR`、`mtest RAW 1`、`mtest ROUGH 1`、`mtest TEMP 1`（需要先 `qr` 或 `mcode 156+123+516+231`）。
 10. **整套**：先 `drive`/`go`，路线里只留第一批。
