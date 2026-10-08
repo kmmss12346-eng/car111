@@ -103,6 +103,9 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发
 void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
 void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了：停在原地，不再一直顶着 */
 void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
+void  Servo_SetPower(uint16_t mw);                   /* 舵机转动时允许的最大功率(参数 SPOW) */
+void  Servo_Params(uint8_t id);                      /* SVP?：舵机内部的保护设置 */
+int   Servo_WriteParam(uint8_t id, const char *name, long value);   /* SVW：改舵机内部设置 */
 
 /* USER CODE END PFP */
 
@@ -961,7 +964,7 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
 #define SERVO_ACC_MS          100       /* 加速时间 ms */
 #define SERVO_DEC_MS          100       /* 减速时间 ms */
-#define SERVO_POWER           8000      /* 最大功率 mW：顶住东西时最多用这么大的力。转不动就加大，还是烫就减小 */
+#define SERVO_POWER           8000      /* 开机时的最大功率 mW(转不动就加大，还是烫就减小)。可以用 SET SPOW 在线改 */
 #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
 #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
 #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
@@ -971,6 +974,13 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_PUSH_MA         200       /* 停住时电流到这么大(或者舵机报堵转) = 在使劲顶着东西，才让它停在原地 */
 #define SERVO_SLOW_EXTRA_MS   2000      /* 到了估计的时间还没到位、但还在动，最多再多等这么久 */
 #define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
+
+static uint16_t servo_power = SERVO_POWER;      /* 现在用的最大功率(SET SPOW 改) */
+
+void Servo_SetPower(uint16_t mw)
+{
+    servo_power = mw;
+}
 
 /* 限位(度，多圈角度)：你之前测好的数 */
 #define SERVO1_MIN_DEG   232.0f
@@ -1034,7 +1044,7 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
     if (d < 0.0f) d = -d;
 
     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, *angle_deg, speed_dps,
-                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
+                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
     return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
 }
 
@@ -1042,7 +1052,7 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
 static void Servo_Hold(uint8_t id, float angle_deg)
 {
     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
-                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);
+                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);
 }
 
 /* 读舵机现在的电流(mA)和状态字节(见 fashion_star_uart_servo.h 的 FSUS_PARAM_SERVO_STATUS)。读不到是 -1 / 0 */
@@ -1227,6 +1237,101 @@ void Servo_Report(uint8_t id)
     }
     n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
     HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
+}
+
+/* 舵机内部的设置(飞特舵机的"用户数据"，存在舵机里，断电不丢)。SVP? 打印，SVW 改。地址见 fashion_star_uart_servo.h */
+typedef struct
+{
+    uint8_t     addr;
+    uint8_t     size;          /* 1 或 2 字节 */
+    uint8_t     sgn;           /* 1 = 有符号 */
+    const char *name;
+} SvParam;
+
+static const SvParam sv_params[] =
+{
+    { FSUS_PARAM_RESPONSE_SWITCH,      1, 0, "RESP"   },   /* 0 = 新指令直接覆盖旧指令(程序要求是 0) */
+    { FSUS_PARAM_STALL_PROTECT,        1, 0, "STALLM" },   /* 堵转保护：0 = 降功率到 STALLP，1 = 松开 */
+    { FSUS_PARAM_STALL_POWER_LIMIT,    2, 0, "STALLP" },   /* 堵转时降到多少 mW */
+    { FSUS_PARAM_OVER_VOLT_LOW,        2, 0, "VLOW"   },   /* 电压低于这个(mV)保护 */
+    { FSUS_PARAM_OVER_VOLT_HIGH,       2, 0, "VHIGH"  },   /* 电压高于这个(mV)保护 */
+    { FSUS_PARAM_OVER_TEMPERATURE,     2, 0, "TMAX"   },   /* 温度上限(℃) */
+    { FSUS_PARAM_OVER_POWER,           2, 0, "PMAX"   },   /* 功率上限(mW)：超过就报 OVERPOWER(ST 的 0x40)并限功率 */
+    { FSUS_PARAM_OVER_CURRENT,         2, 0, "IMAX"   },   /* 电流上限(mA) */
+    { FSUS_PARAM_ACCEL_SWITCH,         1, 0, "ACCEL"  },
+    { FSUS_PARAM_POWER_ON_LOCK_SWITCH, 1, 0, "LOCK"   },
+    { FSUS_PARAM_ANGLE_LIMIT_SWITCH,   1, 0, "ALIM"   },   /* 舵机自己的角度限位开关 */
+    { FSUS_PARAM_SOFT_START_SWITCH,    1, 0, "SOFT"   },
+    { FSUS_PARAM_SOFT_START_TIME,       2, 0, "SOFTT"  },
+    { FSUS_PARAM_ANGLE_LIMIT_HIGH,     2, 1, "AHIGH"  },   /* 0.1 度 */
+    { FSUS_PARAM_ANGLE_LIMIT_LOW,      2, 1, "ALOW"   },
+};
+#define SV_PARAM_N  ((int)(sizeof(sv_params) / sizeof(sv_params[0])))
+
+/* SVP? <id>：例如 "SVP 1 RESP=0 STALLM=0 STALLP=4000 VLOW=4500 … PMAX=8000 IMAX=1500 …"(读不到的是 ?) */
+void Servo_Params(uint8_t id)
+{
+    uint8_t buf[FSUS_PACK_RESPONSE_MAX_SIZE];
+    uint8_t sz;
+    char m[320];
+    int n, i;
+    long v;
+
+    n = snprintf(m, sizeof(m), "SVP %d", (int)id);
+    for (i = 0; i < SV_PARAM_N && n < (int)sizeof(m) - 24; i++)
+    {
+        sz = 0;
+        if (FSUS_ReadData(&usart2, id, sv_params[i].addr, buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 1)
+        {
+            if (sz >= 2)
+            {
+                v = (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+                if (sv_params[i].sgn && v >= 32768L)
+                {
+                    v -= 65536L;
+                }
+            }
+            else
+            {
+                v = (long)buf[0];
+            }
+            n += snprintf(m + n, sizeof(m) - (size_t)n, " %s=%ld", sv_params[i].name, v);
+        }
+        else
+        {
+            n += snprintf(m + n, sizeof(m) - (size_t)n, " %s=?", sv_params[i].name);
+        }
+        HAL_Delay(5);
+    }
+    n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
+    HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 200);
+}
+
+/* SVW <id> <名字> <数值>：改一项舵机内部设置。返回 1 成功，0 没有这个名字，2 数值不对，-1 写失败。
+ * 舵机 ID、波特率不在表里，改不了(改错了 STM32 就再也找不到舵机)；RESP 只能写 0 */
+int Servo_WriteParam(uint8_t id, const char *name, long value)
+{
+    uint8_t b[2];
+    int i;
+
+    for (i = 0; i < SV_PARAM_N; i++)
+    {
+        if (strcmp(sv_params[i].name, name) == 0)
+        {
+            const SvParam *p = &sv_params[i];
+            long lo = p->sgn ? -32768L : 0L;
+            long hi = (p->size == 1) ? 255L : (p->sgn ? 32767L : 65535L);
+
+            if (value < lo || value > hi || (p->addr == FSUS_PARAM_RESPONSE_SWITCH && value != 0))
+            {
+                return 2;
+            }
+            b[0] = (uint8_t)((unsigned long)value & 0xFFu);
+            b[1] = (uint8_t)(((unsigned long)value >> 8) & 0xFFu);
+            return (FSUS_WriteData(&usart2, id, p->addr, b, p->size) == FSUS_STATUS_SUCCESS) ? 1 : -1;
+        }
+    }
+    return 0;
 }
 
 /* 原来的接口：转到绝对角度，到位误差 2°，多等 1 秒 */

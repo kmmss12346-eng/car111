@@ -16,6 +16,24 @@ typedef uint8_t FSUS_STATUS;
 #define FSUS_PARAM_POWER 3
 #define FSUS_PARAM_TEMPRATURE 4
 #define FSUS_PARAM_SERVO_STATUS 5
+#define FSUS_PARAM_RESPONSE_SWITCH 33
+#define FSUS_PARAM_STALL_PROTECT 37
+#define FSUS_PARAM_STALL_POWER_LIMIT 38
+#define FSUS_PARAM_OVER_VOLT_LOW 39
+#define FSUS_PARAM_OVER_VOLT_HIGH 40
+#define FSUS_PARAM_OVER_TEMPERATURE 41
+#define FSUS_PARAM_OVER_POWER 42
+#define FSUS_PARAM_OVER_CURRENT 43
+#define FSUS_PARAM_ACCEL_SWITCH 44
+#define FSUS_PARAM_POWER_ON_LOCK_SWITCH 46
+#define FSUS_PARAM_ANGLE_LIMIT_SWITCH 48
+#define FSUS_PARAM_SOFT_START_SWITCH 49
+#define FSUS_PARAM_SOFT_START_TIME 50
+#define FSUS_PARAM_ANGLE_LIMIT_HIGH 51
+#define FSUS_PARAM_ANGLE_LIMIT_LOW 52
+static long uparam[64];                              /* 假舵机里存的用户数据 */
+static int write_fail = 0;
+static uint16_t last_power = 0;
 Usart_DataTypeDef usart2; UART_HandleTypeDef huart3;
 static uint32_t now = 0;
 static char out[8192];
@@ -42,7 +60,7 @@ void HAL_Delay(uint32_t ms) { uint32_t i; for (i = 0; i < ms; i++) { now++; step
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) { (void)h; (void)t; strncat(out, (char *)b, n); return 0; }
 FSUS_STATUS FSUS_QueryServoAngleMTurn(Usart_DataTypeDef *u, uint8_t id, float *a) { (void)u; HAL_Delay(3); if (read_fail) return FSUS_STATUS_FAIL; *a = (float)(floor(pos[id] * 10 + 0.5) / 10); return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_SetServoAngleMTurnByVelocity(Usart_DataTypeDef *u, uint8_t id, float a, float v, uint16_t ta, uint16_t td, uint16_t p, uint8_t w) {
-    (void)u; (void)ta; (void)td; (void)p; (void)w; tgt[id] = a; vcmd[id] = v; nset++; cmd_at[id] = now;
+    (void)u; (void)ta; (void)td; (void)w; tgt[id] = a; vcmd[id] = v; nset++; cmd_at[id] = now; last_power = p;
     if (id == 1 && !pause_every) paused = 0;          /* 重发指令：停顿的舵机接着转(pause_every=1 的舵机还是不动) */
     return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_ReadData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8_t *val, uint8_t *sz) {
@@ -53,8 +71,16 @@ FSUS_STATUS FSUS_ReadData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8_
     case 3: v = 6300; break;
     case 4: v = 1500; break;
     case 5: val[0] = (uint8_t)((fabs(tgt[id] - pos[id]) > 0.05 ? 1 : 0) | (stall_flag && blocked() ? 4 : 0)); *sz = 1; return 0;
+    default:
+        if (addr == 33 || addr == 37 || addr == 44 || addr == 46 || addr == 48 || addr == 49) { val[0] = (uint8_t)uparam[addr]; *sz = 1; return 0; }
+        v = (uint16_t)(uparam[addr] & 0xFFFF); break;
     }
     val[0] = (uint8_t)v; val[1] = (uint8_t)(v >> 8); *sz = 2; return 0; }
+FSUS_STATUS FSUS_WriteData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8_t *val, uint8_t size) {
+    (void)u; (void)id; HAL_Delay(3); if (write_fail) return FSUS_STATUS_FAIL;
+    uparam[addr] = size == 1 ? val[0] : (long)(int16_t)(val[0] | (val[1] << 8));
+    if (size == 2 && addr != 51 && addr != 52) uparam[addr] = (long)(uint16_t)(val[0] | (val[1] << 8));
+    return FSUS_STATUS_SUCCESS; }
 #include "servo_section.c"
 static int fails = 0, checks = 0;
 #define CHECK(c, m) do { checks++; if (!(c)) { fails++; printf("  FAIL: %s\n    out=[%s] pos1=%.1f tgt1=%.1f now=%u\n", m, out, pos[1], tgt[1], now); } else printf("  ok: %s\n", m); } while (0)
@@ -125,6 +151,21 @@ int main(void) {
     reset1(300); pos[2] = tgt[2] = -862.3; out[0] = 0;
     Servo_Report(2);
     CHECK(strstr(out, "SV 2 ANG=-862.3"), "负角度显示");
+    /* 14. 舵机功率(SPOW) */
+    reset1(300); Servo_SetPower(12000);
+    Servo_Move(1, 320, 40, 0.3f, 400);
+    CHECK(last_power == 12000, "SET SPOW 以后转动指令用新的功率");
+    Servo_SetPower(8000);
+    /* 15. 舵机内部设置 SVP? / SVW */
+    uparam[33] = 0; uparam[37] = 0; uparam[38] = 4000; uparam[42] = 8000; uparam[43] = 1500; uparam[51] = -900; uparam[52] = 1800;
+    out[0] = 0; Servo_Params(1);
+    CHECK(strstr(out, "SVP 1 RESP=0 STALLM=0 STALLP=4000") && strstr(out, "PMAX=8000 IMAX=1500") && strstr(out, "AHIGH=-900 ALOW=1800"), "SVP? 打印舵机内部设置");
+    CHECK(Servo_WriteParam(1, "PMAX", 15000) == 1 && uparam[42] == 15000, "SVW 改功率上限");
+    CHECK(Servo_WriteParam(1, "ALOW", -1200) == 1 && uparam[52] == -1200, "SVW 有符号的数");
+    CHECK(Servo_WriteParam(1, "NOPE", 1) == 0 && Servo_WriteParam(1, "STALLM", 300) == 2 && Servo_WriteParam(1, "RESP", 1) == 2, "SVW 名字/范围检查(RESP 只能 0)");
+    write_fail = 1;
+    CHECK(Servo_WriteParam(1, "IMAX", 2000) == -1, "SVW 写失败返回 -1");
+    write_fail = 0;
     printf("%s: %d 项检查，%d 项失败\n", fails ? "失败" : "通过", checks, fails);
     return fails ? 1 : 0;
 }

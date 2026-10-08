@@ -14,6 +14,9 @@
  *   A? <1|2>                               读角度，回 "ANG <id> <度>"
  *   SV? <1|2>                              读舵机状态，回 "SV <id> ANG=.. V=..mV I=..mA P=..mW T=..C ST=0x.. [STALL…]"(查发热)
  *   U <1|2>                                舵机松开(可以用手摆)，下一条转动指令会自动重新出力
+ *   SVP? <1|2>                             读舵机内部的保护设置，回 "SVP <id> RESP=.. STALLM=.. STALLP=.. … PMAX=.. IMAX=.. …"
+ *   SVW <1|2> <名字> <数值>                改一项舵机内部设置(名字见 SVP?，例如 SVW 1 PMAX 15000)，改完读回来
+ *   舵机转动时允许的最大功率是参数 SPOW(mW，默认 8000)：转不动(停住时电流大、ST 有 0x40)就 SET SPOW 加大
  *   舵机没转到位又停住不动了：电流大(在顶着东西)就让它停在原地、不再顶着发热，打印 "SERVOn STUCK, hold here at=.. target=.. I=..mA ST=..";
  *   电流小(只是停顿)就重发一次目标，打印 "SERVOn PAUSED, resend …"
  *   AF <1|2> <度>                          转到绝对角度(支持小数，到位误差 ATOL)

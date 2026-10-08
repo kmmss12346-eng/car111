@@ -42,6 +42,14 @@ int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
 static float block1 = 1e9f;                              /* ID1 被挡住的角度(转不过去)，1e9 = 没挡 */
 void Servo_StopIfStuck(uint8_t id, float t) { EV("stuck%u:%.1f;", id, t); }
 void Servo_Report(uint8_t id) { EV("rep%u;", id); }
+void Servo_SetPower(uint16_t mw) { EV("pow%u;", mw); }
+void Servo_Params(uint8_t id) { EV("svp%u;", id); }
+int Servo_WriteParam(uint8_t id, const char *name, long v) {
+    EV("svw%u:%s=%ld;", id, name, v);
+    if (strcmp(name, "PMAX") != 0 && strcmp(name, "IMAX") != 0) return 0;
+    if (v < 0 || v > 65535) return 2;
+    return v == 4242 ? -1 : 1;
+}
 static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 417.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
     float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
@@ -200,6 +208,20 @@ int main(void) {
     CHECK(run("AP 330 -860") == 1 && !has("stuck"), "都到位：不叫 Servo_StopIfStuck");
     clear();
     CHECK(run("SV? 1") == 1 && has("rep1;") && run("SV? 3") == -1, "SV? 1 读舵机状态；ID 不对 ERR ARG");
+    /* 舵机功率 SPOW、舵机内部设置 SVP? / SVW */
+    clear();
+    CHECK(Arm_Param_Set("SPOW", 12000) == 1 && has("pow12000;") && Arm_Param_Set("SPOW", 500) == 2, "SET SPOW 马上换舵机功率，太小拒绝");
+    clear(); Arm_Init();
+    CHECK(has("pow12000;"), "开机把 SPOW 交给 main.c");
+    Arm_Param_Set("SPOW", 8000);
+    clear();
+    CHECK(run("SVP? 2") == 1 && has("svp2;") && run("SVP? 0") == -1, "SVP? 读舵机内部设置");
+    clear();
+    CHECK(run("SVW 1 PMAX 15000") == 1 && has("svw1:PMAX=15000;") && has("svp1;"), "SVW 改完读回来");
+    CHECK(run("SVW 1 ID 3") == -1 && pis("ERR NAME"), "SVW 不认识的名字(比如舵机 ID)拒绝");
+    CHECK(run("SVW 1 PMAX 70000") == -1 && pis("ERR RANGE"), "SVW 数值超范围拒绝");
+    CHECK(run("SVW 1 PMAX 4242") == -1 && pis("ERR WRITE"), "SVW 写失败报 ERR WRITE");
+    CHECK(run("SVW 1 PMAX x") == -1 && pis("ERR ARG"), "SVW 数值不是数字");
 
     /* ---- 非并行模式的先后顺序 ---- */
     Arm_Param_Set("PARA", 0);

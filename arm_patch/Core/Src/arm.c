@@ -45,6 +45,9 @@ extern void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_d
 extern int  Servo_ReadAngle(uint8_t id, float *angle);
 extern void Servo_StopIfStuck(uint8_t id, float target);
 extern void Servo_Report(uint8_t id);
+extern void Servo_SetPower(uint16_t mw);
+extern void Servo_Params(uint8_t id);
+extern int  Servo_WriteParam(uint8_t id, const char *name, long value);
 extern void Delay_Report(uint32_t ms);
 
 #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
@@ -107,6 +110,7 @@ static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
 static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
+static float g_spow   = 8000.0f;   /* SPOW   ID1/ID2 转动时允许的最大功率(mW)。转不动(停住时电流大、ST 有 0x40)就加大，发烫就减小 */
 
 typedef struct
 {
@@ -157,6 +161,7 @@ static const ArmTun tun[] =
     { "TT2",    &g_tt2,     500.0f,  2608.0f },
     { "TT3",    &g_tt3,     500.0f,  2608.0f },
     { "AEXT",   &g_aext,    1.0f,    2.0f },
+    { "SPOW",   &g_spow,    1000.0f, 30000.0f },
 };
 #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
 
@@ -173,6 +178,10 @@ int Arm_Param_Set(const char *name, float v)
                 return 2;
             }
             *tun[i].p = v;
+            if (tun[i].p == &g_spow)
+            {
+                Servo_SetPower((uint16_t)v);       /* main.c 里的舵机功率马上换 */
+            }
             return 1;
         }
     }
@@ -1129,6 +1138,8 @@ void Arm_Init(void)
     qr_end = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
 
+    Servo_SetPower((uint16_t)g_spow);
+
     HAL_Delay(300);                                /* 等屏上电启动 */
     Screen_Boot();
 
@@ -1324,6 +1335,27 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (!ParseF(t[2], &f))  FAIL("ERR ARG");
         r = Lift_Cal(f);
         if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 舵机内部设置：SVP? <id> 读；SVW <id> <名字> <数值> 改(名字见 SVP? 的输出) ---- */
+    if (strcmp(v, "SVP?") == 0 && n == 2)
+    {
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
+        Servo_Params((uint8_t)id);
+        return 1;
+    }
+    if (strcmp(v, "SVW") == 0 && n == 4)
+    {
+        long val;
+        int w;
+
+        if (!ParseL(t[1], &id) || (id != 1 && id != 2) || !ParseL(t[3], &val))  FAIL("ERR ARG");
+        w = Servo_WriteParam((uint8_t)id, t[2], val);
+        if (w == 0)  FAIL("ERR NAME");
+        if (w == 2)  FAIL("ERR RANGE");
+        if (w < 0)   FAIL("ERR WRITE");
+        Servo_Params((uint8_t)id);                 /* 改完读回来给人看 */
         return 1;
     }
 

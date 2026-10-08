@@ -8,16 +8,19 @@
  #include "hwt101.h"
  #include "yaw_control.h"
  #include <stdlib.h>
-@@ -100,6 +101,8 @@
+@@ -100,6 +101,11 @@
  int   Servo_ReadAngle(uint8_t id, float *angle);
  uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps);   /* 只发指令不等，返回估计要多少毫秒 */
  void  Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms);   /* 可调到位误差的转动 */
 +void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了：停在原地，不再一直顶着 */
 +void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
++void  Servo_SetPower(uint16_t mw);                   /* 舵机转动时允许的最大功率(参数 SPOW) */
++void  Servo_Params(uint8_t id);                      /* SVP?：舵机内部的保护设置 */
++int   Servo_WriteParam(uint8_t id, const char *name, long value);   /* SVW：改舵机内部设置 */
  
  /* USER CODE END PFP */
  
-@@ -181,6 +184,10 @@
+@@ -181,6 +187,10 @@
        }
    }
  
@@ -28,7 +31,7 @@
  #if ARM_MODULES_ON
    Arm_Init();                        /* 启动夹爪/转盘 PWM，开始接收二维码 */
    /* 扫码模块、串口屏的中断优先级降到 3，比陀螺仪(1)、树莓派通信(2)低：没接模块时乱码也不会打断陀螺仪 */
-@@ -580,8 +587,10 @@
+@@ -580,8 +590,10 @@
   *   PING | HOME | P2 | YAW? | GET | SET 名字 数值 | CAL [距离mm [速度]]
   *   F <mm> [速度] | S <mm> [速度] | R <度>        前进(负数后退) / 左移(负数右移) / 逆时针转(负数顺时针)
   *   A <id> <度> | U <id>                            舵机
@@ -40,7 +43,7 @@
   * 同一时间只发一条，等到 DONE/ERR 再发下一条。 */
  #define LINK_BUF 48
  
-@@ -660,7 +669,7 @@
+@@ -660,7 +672,7 @@
      Car_TurnBy_Center(-P2_CW_DEG);
  }
  
@@ -49,7 +52,7 @@
  static void Link_Done(uint32_t t0)
  {
      char m[40];
-@@ -672,8 +681,9 @@
+@@ -672,8 +684,9 @@
          Link_Reply("ERR ABORT\r\n");
          return;
      }
@@ -60,7 +63,7 @@
      HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
  }
  
-@@ -696,6 +706,7 @@
+@@ -696,6 +709,7 @@
      strcpy(cmd, (const char *)link_cmd);
      link_ready = 0;
      car_abort = 0;                                 /* 清掉上一条留下的急停标志 */
@@ -68,7 +71,7 @@
      t0 = HAL_GetTick();
  
      if (strcmp(cmd, "PING") == 0)
-@@ -706,10 +717,23 @@
+@@ -706,10 +720,23 @@
      if (strcmp(cmd, "HOME") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
@@ -92,7 +95,12 @@
      if (strcmp(cmd, "P2") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
-@@ -941,10 +965,16 @@
+@@ -937,14 +964,27 @@
+ #define SERVO_DEFAULT_SPEED   60.0f     /* 默认转速 度/秒 */
+ #define SERVO_ACC_MS          100       /* 加速时间 ms */
+ #define SERVO_DEC_MS          100       /* 减速时间 ms */
+-#define SERVO_POWER           8000      /* 最大功率 mW：顶住东西时最多用这么大的力。转不动就加大，还是烫就减小 */
++#define SERVO_POWER           8000      /* 开机时的最大功率 mW(转不动就加大，还是烫就减小)。可以用 SET SPOW 在线改 */
  #define SERVO_ARRIVE_TOL      2.0f      /* 离目标多少度以内算到位 */
  #define SERVO_WAIT_EXTRA_MS   1000      /* 按速度算的时间之外最多再等多久，到时间没到位就放弃，不再死等 */
  #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
@@ -102,6 +110,13 @@
 +#define SERVO_PUSH_MA         200       /* 停住时电流到这么大(或者舵机报堵转) = 在使劲顶着东西，才让它停在原地 */
 +#define SERVO_SLOW_EXTRA_MS   2000      /* 到了估计的时间还没到位、但还在动，最多再多等这么久 */
 +#define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
++
++static uint16_t servo_power = SERVO_POWER;      /* 现在用的最大功率(SET SPOW 改) */
++
++void Servo_SetPower(uint16_t mw)
++{
++    servo_power = mw;
++}
  
  /* 限位(度，多圈角度)：你之前测好的数 */
 -#define SERVO1_MIN_DEG   390.0f
@@ -111,26 +126,22 @@
  #define SERVO2_MIN_DEG   -1220.0f
  #define SERVO2_MAX_DEG    -503.5f
  
-@@ -1008,45 +1038,195 @@
+@@ -1004,49 +1044,294 @@
+     if (d < 0.0f) d = -d;
+ 
+     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, *angle_deg, speed_dps,
+-                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
++                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);   /* 最后的 0 = 不用库里会卡死的等待 */
      return (uint32_t)(d / speed_dps * 1000.0f) + SERVO_ACC_MS + SERVO_DEC_MS;
  }
  
--/* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
-- * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
-- * 按角度和速度算好时间，再多等 extra_ms 毫秒，到时间没转到位就放弃。
-- * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印。 */
--void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
 +/* 让舵机就停在 angle_deg(它现在的位置)：目标改成现在的角度，它就不会再使劲往原来的目标顶 */
 +static void Servo_Hold(uint8_t id, float angle_deg)
- {
--    float a, d;
--    uint32_t t0, tmax;
--    int ok = 0;
++{
 +    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
-+                                      SERVO_ACC_MS, SERVO_DEC_MS, SERVO_POWER, 0);
++                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);
 +}
- 
--    if (id != 1 && id != 2)
++
 +/* 读舵机现在的电流(mA)和状态字节(见 fashion_star_uart_servo.h 的 FSUS_PARAM_SERVO_STATUS)。读不到是 -1 / 0 */
 +static void Servo_Load(uint8_t id, long *ma, uint8_t *st)
 +{
@@ -140,20 +151,16 @@
 +    *ma = -1;
 +    *st = 0;
 +    if (FSUS_ReadData(&usart2, id, FSUS_PARAM_CURRENT, buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 2)
-     {
--        return;
++    {
 +        *ma = (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
-     }
--    tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
++    }
 +    sz = 0;
 +    if (FSUS_ReadData(&usart2, id, FSUS_PARAM_SERVO_STATUS, buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 1)
 +    {
 +        *st = buf[0];
 +    }
 +}
- 
--    t0 = HAL_GetTick();
--    while ((HAL_GetTick() - t0) < tmax)
++
 +static void Servo_Say(const char *what, uint8_t id, float a, float target, long ma, uint8_t st)
 +{
 +    char m[112];
@@ -181,18 +188,15 @@
 +    uint8_t st;
 +
 +    for (;;)
-     {
-         HAL_Delay(30);
++    {
++        HAL_Delay(30);
 +        el = HAL_GetTick() - t0;
-         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
-         {
--            d = a - angle_deg;
++        if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
++        {
 +            d = a - target;
-             if (d < 0.0f) d = -d;
-             if (d <= tol_deg)
-             {
--                ok = 1;
--                break;
++            if (d < 0.0f) d = -d;
++            if (d <= tol_deg)
++            {
 +                return 1;
 +            }
 +            d = a - ref;
@@ -202,7 +206,7 @@
 +                ref = a;                           /* 还在动 */
 +                tref = HAL_GetTick();
 +                have = 1;
-             }
++            }
 +            else
 +            {
 +                uint32_t still = HAL_GetTick() - tref;
@@ -240,8 +244,8 @@
 +        if (el >= (uint32_t)SERVO_WAIT_MAX_MS || el >= tmax + (have ? (uint32_t)SERVO_SLOW_EXTRA_MS : 0u))
 +        {
 +            break;
-         }
-     }
++        }
++    }
 +    if (tol_deg >= 1.0f || kicked)
 +    {
 +        Servo_Load(id, &ma, &st);
@@ -249,27 +253,30 @@
 +    }
 +    return 0;
 +}
- 
--    if (!ok && tol_deg >= 1.0f)
-+/* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
++
+ /* 转到绝对角度 angle_deg(度)，speed_dps 速度(度/秒，填 0 用默认值)，离目标 tol_deg 度以内算到位。
+- * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)：
+- * 按角度和速度算好时间，再多等 extra_ms 毫秒，到时间没转到位就放弃。
+- * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印。 */
 + * 不用库里的 FSUS_Wait(它没到位会一直等半个多小时、舵机一直使劲顶着发热)，等法见 Servo_Wait。
 + * tol_deg 大(>=1°)才在没到位时通过串口打印提示；微调用的小误差不打印(卡住/停顿一定打印)。 */
-+void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
-+{
+ void Servo_Move(uint8_t id, float angle_deg, float speed_dps, float tol_deg, uint32_t extra_ms)
+ {
+-    float a, d;
+-    uint32_t t0, tmax;
+-    int ok = 0;
 +    uint32_t tmax;
-+
-+    if (id != 1 && id != 2)
+ 
+     if (id != 1 && id != 2)
      {
--        char m[64];
--        int n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
--                         (int)id, (long)(angle_deg * 10.0f));
--        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
-+        return;
-+    }
-+    tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
+         return;
+     }
+     tmax = Servo_Start(id, &angle_deg, speed_dps) + extra_ms;
 +    Servo_Wait(id, angle_deg, speed_dps, tol_deg, tmax, SERVO_CHECK_AFTER_MS);
 +}
-+
+ 
+-    t0 = HAL_GetTick();
+-    while ((HAL_GetTick() - t0) < tmax)
 +/* 给 arm.c 用(ID1、ID2 一起转，等到时间还没到位的那个)：接着等它到位，处理办法和 Servo_Move 一样
 + * (在使劲顶 = 停在原地；只是停顿 = 重发一次；还在慢慢转 = 多等一会儿) */
 +void Servo_StopIfStuck(uint8_t id, float target)
@@ -302,9 +309,11 @@
 +            v[i] = (sz >= 2) ? (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) : (long)buf[0];
 +        }
 +        HAL_Delay(5);
-     }
++    }
 +    if (v[3] > 0 && v[3] < 4096)                   /* 温度：NTC 10k、B=3435 的分压 ADC 值换算成摄氏度(约) */
-+    {
+     {
+-        HAL_Delay(30);
+-        if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
 +        float r = (float)v[3] / (4096.0f - (float)v[3]);
 +        tc = (long)(1.0f / (logf(r) / 3435.0f + 1.0f / 298.15f) - 273.15f + 0.5f);
 +    }
@@ -319,12 +328,117 @@
 +    for (i = 1; i < 8 && v[4] >= 0; i++)           /* bit0(正在执行)不打印 */
 +    {
 +        if ((v[4] >> i) & 1L)
-+        {
+         {
+-            d = a - angle_deg;
+-            if (d < 0.0f) d = -d;
+-            if (d <= tol_deg)
 +            n += snprintf(m + n, sizeof(m) - (size_t)n, "%s", flag[i]);
 +        }
 +    }
 +    n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
 +    HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
++}
++
++/* 舵机内部的设置(飞特舵机的"用户数据"，存在舵机里，断电不丢)。SVP? 打印，SVW 改。地址见 fashion_star_uart_servo.h */
++typedef struct
++{
++    uint8_t     addr;
++    uint8_t     size;          /* 1 或 2 字节 */
++    uint8_t     sgn;           /* 1 = 有符号 */
++    const char *name;
++} SvParam;
++
++static const SvParam sv_params[] =
++{
++    { FSUS_PARAM_RESPONSE_SWITCH,      1, 0, "RESP"   },   /* 0 = 新指令直接覆盖旧指令(程序要求是 0) */
++    { FSUS_PARAM_STALL_PROTECT,        1, 0, "STALLM" },   /* 堵转保护：0 = 降功率到 STALLP，1 = 松开 */
++    { FSUS_PARAM_STALL_POWER_LIMIT,    2, 0, "STALLP" },   /* 堵转时降到多少 mW */
++    { FSUS_PARAM_OVER_VOLT_LOW,        2, 0, "VLOW"   },   /* 电压低于这个(mV)保护 */
++    { FSUS_PARAM_OVER_VOLT_HIGH,       2, 0, "VHIGH"  },   /* 电压高于这个(mV)保护 */
++    { FSUS_PARAM_OVER_TEMPERATURE,     2, 0, "TMAX"   },   /* 温度上限(℃) */
++    { FSUS_PARAM_OVER_POWER,           2, 0, "PMAX"   },   /* 功率上限(mW)：超过就报 OVERPOWER(ST 的 0x40)并限功率 */
++    { FSUS_PARAM_OVER_CURRENT,         2, 0, "IMAX"   },   /* 电流上限(mA) */
++    { FSUS_PARAM_ACCEL_SWITCH,         1, 0, "ACCEL"  },
++    { FSUS_PARAM_POWER_ON_LOCK_SWITCH, 1, 0, "LOCK"   },
++    { FSUS_PARAM_ANGLE_LIMIT_SWITCH,   1, 0, "ALIM"   },   /* 舵机自己的角度限位开关 */
++    { FSUS_PARAM_SOFT_START_SWITCH,    1, 0, "SOFT"   },
++    { FSUS_PARAM_SOFT_START_TIME,       2, 0, "SOFTT"  },
++    { FSUS_PARAM_ANGLE_LIMIT_HIGH,     2, 1, "AHIGH"  },   /* 0.1 度 */
++    { FSUS_PARAM_ANGLE_LIMIT_LOW,      2, 1, "ALOW"   },
++};
++#define SV_PARAM_N  ((int)(sizeof(sv_params) / sizeof(sv_params[0])))
++
++/* SVP? <id>：例如 "SVP 1 RESP=0 STALLM=0 STALLP=4000 VLOW=4500 … PMAX=8000 IMAX=1500 …"(读不到的是 ?) */
++void Servo_Params(uint8_t id)
++{
++    uint8_t buf[FSUS_PACK_RESPONSE_MAX_SIZE];
++    uint8_t sz;
++    char m[320];
++    int n, i;
++    long v;
++
++    n = snprintf(m, sizeof(m), "SVP %d", (int)id);
++    for (i = 0; i < SV_PARAM_N && n < (int)sizeof(m) - 24; i++)
++    {
++        sz = 0;
++        if (FSUS_ReadData(&usart2, id, sv_params[i].addr, buf, &sz) == FSUS_STATUS_SUCCESS && sz >= 1)
++        {
++            if (sz >= 2)
++            {
++                v = (long)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
++                if (sv_params[i].sgn && v >= 32768L)
++                {
++                    v -= 65536L;
++                }
++            }
++            else
+             {
+-                ok = 1;
+-                break;
++                v = (long)buf[0];
+             }
++            n += snprintf(m + n, sizeof(m) - (size_t)n, " %s=%ld", sv_params[i].name, v);
+         }
++        else
++        {
++            n += snprintf(m + n, sizeof(m) - (size_t)n, " %s=?", sv_params[i].name);
++        }
++        HAL_Delay(5);
+     }
++    n += snprintf(m + n, sizeof(m) - (size_t)n, "\r\n");
++    HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 200);
++}
+ 
+-    if (!ok && tol_deg >= 1.0f)
++/* SVW <id> <名字> <数值>：改一项舵机内部设置。返回 1 成功，0 没有这个名字，2 数值不对，-1 写失败。
++ * 舵机 ID、波特率不在表里，改不了(改错了 STM32 就再也找不到舵机)；RESP 只能写 0 */
++int Servo_WriteParam(uint8_t id, const char *name, long value)
++{
++    uint8_t b[2];
++    int i;
++
++    for (i = 0; i < SV_PARAM_N; i++)
+     {
+-        char m[64];
+-        int n = snprintf(m, sizeof(m), "SERVO%d NOT ARRIVED target=%ld (x0.1deg)\r\n",
+-                         (int)id, (long)(angle_deg * 10.0f));
+-        HAL_UART_Transmit(&huart3, (uint8_t *)m, (uint16_t)n, 100);
++        if (strcmp(sv_params[i].name, name) == 0)
++        {
++            const SvParam *p = &sv_params[i];
++            long lo = p->sgn ? -32768L : 0L;
++            long hi = (p->size == 1) ? 255L : (p->sgn ? 32767L : 65535L);
++
++            if (value < lo || value > hi || (p->addr == FSUS_PARAM_RESPONSE_SWITCH && value != 0))
++            {
++                return 2;
++            }
++            b[0] = (uint8_t)((unsigned long)value & 0xFFu);
++            b[1] = (uint8_t)(((unsigned long)value >> 8) & 0xFFu);
++            return (FSUS_WriteData(&usart2, id, p->addr, b, p->size) == FSUS_STATUS_SUCCESS) ? 1 : -1;
++        }
+     }
++    return 0;
  }
  
  /* 原来的接口：转到绝对角度，到位误差 2°，多等 1 秒 */
@@ -348,7 +462,7 @@
   *
   * 设计思路(为了放得准)：
   *   - 树莓派用摄像头做闭环对准：车到工位后，先用 OBS 把手臂摆到"观察姿态"，
-@@ -28,28 +28,33 @@
+@@ -28,28 +28,36 @@
  #include <stdio.h>
  #include <string.h>
  #include <stdlib.h>
@@ -372,6 +486,9 @@
  extern int  Servo_ReadAngle(uint8_t id, float *angle);
 +extern void Servo_StopIfStuck(uint8_t id, float target);
 +extern void Servo_Report(uint8_t id);
++extern void Servo_SetPower(uint16_t mw);
++extern void Servo_Params(uint8_t id);
++extern int  Servo_WriteParam(uint8_t id, const char *name, long value);
  extern void Delay_Report(uint32_t ms);
  
  #define LIFT_ADDR   5          /* 升降步进电机的 Emm 地址 */
@@ -385,7 +502,7 @@
  #define SCREEN_BAUD    9600u
  #define QR_BAUD        9600u
  
-@@ -61,29 +66,29 @@
+@@ -61,29 +69,29 @@
  
  /* ================= 可调参数(SET 名字 数值) ================= */
  static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
@@ -431,7 +548,7 @@
  static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
  static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
  static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
-@@ -95,6 +100,13 @@
+@@ -95,6 +103,14 @@
  static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
  static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
  static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
@@ -442,10 +559,11 @@
 +static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 +static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
 +static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = ID2 伸缩、ID1 旋转；1 = ID1 伸缩、ID2 旋转 */
++static float g_spow   = 8000.0f;   /* SPOW   ID1/ID2 转动时允许的最大功率(mW)。转不动(停住时电流大、ST 有 0x40)就加大，发烫就减小 */
  
  typedef struct
  {
-@@ -109,7 +121,7 @@
+@@ -109,7 +125,7 @@
      { "LFPPM",  &g_lppm,    1.0f,    500.0f },
      { "LFRPM",  &g_lrpm,    10.0f,   600.0f },
      { "LFACC",  &g_lacc,    0.0f,    255.0f },
@@ -454,7 +572,7 @@
      { "LFDIR",  &g_ldir,    0.0f,    1.0f },
      { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
      { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
-@@ -122,10 +134,10 @@
+@@ -122,10 +138,10 @@
      { "ZSTK",   &g_zstk,    0.0f,    400.0f },
      { "ZOBRAW", &g_zobraw,  0.0f,    400.0f },
      { "ZOBRNG", &g_zobrng,  0.0f,    400.0f },
@@ -469,7 +587,7 @@
      { "A2E",    &g_a2e,    -1220.0f, -503.5f },
      { "A2R",    &g_a2r,    -1220.0f, -503.5f },
      { "A2P",    &g_a2p,    -1220.0f, -503.5f },
-@@ -138,6 +150,13 @@
+@@ -138,6 +154,14 @@
      { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
      { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
      { "ARMOK",  &g_armok,   0.0f,    1.0f },
@@ -480,10 +598,22 @@
 +    { "TT2",    &g_tt2,     500.0f,  2608.0f },
 +    { "TT3",    &g_tt3,     500.0f,  2608.0f },
 +    { "AEXT",   &g_aext,    1.0f,    2.0f },
++    { "SPOW",   &g_spow,    1000.0f, 30000.0f },
  };
  #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
  
-@@ -228,6 +247,10 @@
+@@ -154,6 +178,10 @@
+                 return 2;
+             }
+             *tun[i].p = v;
++            if (tun[i].p == &g_spow)
++            {
++                Servo_SetPower((uint16_t)v);       /* main.c 里的舵机功率马上换 */
++            }
+             return 1;
+         }
+     }
+@@ -228,6 +256,10 @@
  static float   lift_mm    = 0.0f;
  static uint8_t lift_known = 0;
  
@@ -494,7 +624,7 @@
  static uint32_t Lift_Time_Ms(uint32_t pulses)
  {
      float sps = g_lrpm / 60.0f * g_lspr;          /* 每秒多少脉冲 */
-@@ -262,22 +285,449 @@
+@@ -262,22 +294,449 @@
      }
  
      Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -524,9 +654,9 @@
      }
      lift_mm = mm;
 +    Pos_Save(mm);                                  /* 记进 Flash：下次上电从这里找 */
-     return NULL;
- }
- 
++    return NULL;
++}
++
 +/* ================= 升降编码器：开机自动找到准确高度 =================
 + * 升降电机转一圈 = LFSPR/LFPPM 毫米(3200/80 = 40mm)。驱动器能读出电机"一圈里转到哪个角度"，
 + * 这个角度断电也不会丢(磁编码器)，只是分不出是第几圈。所以：
@@ -872,9 +1002,9 @@
 +    snprintf(m, sizeof(m), "LIFTCAL OK ENC0=%s CPM=%s CPR=%ld SRC=%02X\r\n", s1, s2, (long)cpr, (unsigned)lift_src);
 +    Say(m);
 +    Pos_Save(z0);
-+    return NULL;
-+}
-+
+     return NULL;
+ }
+ 
 +/* 开机：用编码器找到准确高度，再走到 LIFT_BOOT_MM。
 + * 以"上次停下的高度"(Flash 里记的)为中心找，所以断电时停在哪都行，只要断电后别用手把它挪开 2cm 以上。
 + * 没标定/读不到编码器时，当作正好在 LIFT_BOOT_MM，不动 */
@@ -947,7 +1077,7 @@
   * tol：到位误差(度)，speed：转速(度/秒) */
  static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
  {
-@@ -298,16 +748,17 @@
+@@ -298,16 +757,17 @@
              if (!ok1 && Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;
              if (!ok2 && Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;
          }
@@ -972,7 +1102,7 @@
      }
  }
  
-@@ -315,14 +766,27 @@
+@@ -315,14 +775,27 @@
  static uint8_t  tt_slot     = 1;
  static uint32_t tt_ready_at = 0;
  
@@ -1001,7 +1131,7 @@
  }
  
  static int TT_WaitReady(void)
-@@ -359,7 +823,7 @@
+@@ -359,7 +832,7 @@
      const char *e = Seq_Ready();
      if (e) return e;
  
@@ -1010,7 +1140,7 @@
      GO(Lift_Goto(g_zhi));
      SERVOS(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, g_atolc, g_aspd);
      GO(Lift_Goto(ring ? g_zobrng : g_zobraw));
-@@ -375,14 +839,14 @@
+@@ -375,14 +848,14 @@
      if (!Slot_Ok(slot))  return "ERR ARG";
  
      TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
@@ -1028,7 +1158,7 @@
      GO(Lift_Goto(g_zhi));
      return NULL;
  }
-@@ -395,28 +859,35 @@
+@@ -395,28 +868,35 @@
      if (!Slot_Ok(slot))  return "ERR ARG";
  
      TT_Go(slot);
@@ -1069,7 +1199,7 @@
      if (car_abort) return NULL;
      return NULL;
  }
-@@ -433,26 +904,89 @@
+@@ -433,26 +913,89 @@
  }
  
  /* ================= 串口屏 ================= */
@@ -1166,10 +1296,12 @@
  /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
  static void Screen_Raw(const char *cmd)
  {
-@@ -594,6 +1128,12 @@
+@@ -594,6 +1137,14 @@
      qr_len = 0;
      qr_end = 0;
      HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
++
++    Servo_SetPower((uint16_t)g_spow);
 +
 +    HAL_Delay(300);                                /* 等屏上电启动 */
 +    Screen_Boot();
@@ -1179,7 +1311,7 @@
  }
  
  /* ================= 树莓派指令 ================= */
-@@ -678,12 +1218,12 @@
+@@ -678,12 +1229,12 @@
      /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
      if (strcmp(v, "CLAW") == 0 && n == 2)
      {
@@ -1195,7 +1327,7 @@
              Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
          }
          Wait_Ms((uint32_t)g_clwait);
-@@ -727,6 +1267,7 @@
+@@ -727,6 +1278,7 @@
          if (strcmp(t[1], "ZERO") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -1203,7 +1335,7 @@
              Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
              lift_mm = 0.0f;
              lift_known = 1;
-@@ -735,6 +1276,7 @@
+@@ -735,6 +1287,7 @@
          if (strcmp(t[1], "HOME") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -1211,7 +1343,7 @@
              Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
              if (!Wait_Ms((uint32_t)g_lhtm))
              {
-@@ -745,11 +1287,53 @@
+@@ -745,11 +1298,74 @@
              lift_known = 1;
              return 1;
          }
@@ -1255,6 +1387,27 @@
 +        return 1;
 +    }
 +
++    /* ---- 舵机内部设置：SVP? <id> 读；SVW <id> <名字> <数值> 改(名字见 SVP? 的输出) ---- */
++    if (strcmp(v, "SVP?") == 0 && n == 2)
++    {
++        if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
++        Servo_Params((uint8_t)id);
++        return 1;
++    }
++    if (strcmp(v, "SVW") == 0 && n == 4)
++    {
++        long val;
++        int w;
++
++        if (!ParseL(t[1], &id) || (id != 1 && id != 2) || !ParseL(t[3], &val))  FAIL("ERR ARG");
++        w = Servo_WriteParam((uint8_t)id, t[2], val);
++        if (w == 0)  FAIL("ERR NAME");
++        if (w == 2)  FAIL("ERR RANGE");
++        if (w < 0)   FAIL("ERR WRITE");
++        Servo_Params((uint8_t)id);                 /* 改完读回来给人看 */
++        return 1;
++    }
++
 +    /* ---- 舵机状态：SV? <id>(电压/电流/功率/温度/堵转标志，查发热、没劲用) ---- */
 +    if (strcmp(v, "SV?") == 0 && n == 2)
 +    {
@@ -1267,7 +1420,7 @@
      if (strcmp(v, "A?") == 0 && n == 2)
 --- a/Core/Inc/arm.h
 +++ b/Core/Inc/arm.h
-@@ -3,15 +3,19 @@
+@@ -3,15 +3,22 @@
   * 树莓派 -> STM32 新增指令(每条一行，和原来的 F/S/R/A/U 一样，做完回 DONE 或 ERR xxx)：
   *
   *  夹爪 / 转盘 / 升降
@@ -1287,12 +1440,15 @@
   *   A? <1|2>                               读角度，回 "ANG <id> <度>"
 + *   SV? <1|2>                              读舵机状态，回 "SV <id> ANG=.. V=..mV I=..mA P=..mW T=..C ST=0x.. [STALL…]"(查发热)
 + *   U <1|2>                                舵机松开(可以用手摆)，下一条转动指令会自动重新出力
++ *   SVP? <1|2>                             读舵机内部的保护设置，回 "SVP <id> RESP=.. STALLM=.. STALLP=.. … PMAX=.. IMAX=.. …"
++ *   SVW <1|2> <名字> <数值>                改一项舵机内部设置(名字见 SVP?，例如 SVW 1 PMAX 15000)，改完读回来
++ *   舵机转动时允许的最大功率是参数 SPOW(mW，默认 8000)：转不动(停住时电流大、ST 有 0x40)就 SET SPOW 加大
 + *   舵机没转到位又停住不动了：电流大(在顶着东西)就让它停在原地、不再顶着发热，打印 "SERVOn STUCK, hold here at=.. target=.. I=..mA ST=..";
 + *   电流小(只是停顿)就重发一次目标，打印 "SERVOn PAUSED, resend …"
   *   AF <1|2> <度>                          转到绝对角度(支持小数，到位误差 ATOL)
   *   AD <1|2> <增量度>                      在现在的角度上再转(支持小数)，回 "ANG <id> <度>"
   *   AP <ID1度> <ID2度>                     ID1、ID2 一起转到指定角度(回到记下来的对准姿态用)
-@@ -20,7 +24,7 @@
+@@ -20,7 +27,7 @@
   *   OBS RAW [O] | OBS RING [O]             手臂摆到"观察姿态"：原料盘上方 / 地上圆环上方(O=同时张开夹爪)
   *   GRAB <n> H | PICK <n> H                手臂已经对准：夹起物料放进转盘 n 号位(GRAB 用原料盘夹取高度，PICK 用地面圆环高度)
   *   TAKE <n>                               从转盘 n 号位取出物料，夹着停在转盘上方
@@ -1301,7 +1457,7 @@
   *   STOW                                   收臂待命(升到最高、缩回)
   *
   *  不用摄像头的完整流程(调试、应急)
-@@ -35,6 +39,7 @@
+@@ -35,6 +42,7 @@
   *   SCMD <淘晶驰指令>                      直接发一条串口屏指令，例如 SCMD page 1
   *
   * 另外 SET / GET 可以改/看机械臂参数(名字见 arm.c 的 tun 表)。
