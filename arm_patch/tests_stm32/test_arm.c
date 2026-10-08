@@ -53,7 +53,8 @@ void Emm_V5_En_Control(uint8_t a, bool s, bool f) { (void)a; (void)s; (void)f; }
 void Emm_V5_Reset_CurPos_To_Zero(uint8_t a) { EV("zero%u;", a); }
 /* 假升降：真实高度 phys_mm(LFDIR=0 时 d=0 往上)，编码器 = (enc_off + 每毫米 enc_cpm × 高度) 对一圈 enc_cpr 取余 */
 static double phys_mm = 60.0, enc_off = 12345.0, enc_cpm = 1638.4, enc_cpr = 65536.0;
-static int enc_ok = 1, enc_frozen = 0;
+static int enc_ok = 1, enc_frozen = 0, enc31_zero = 0;   /* enc31_zero：像现场那样 0x31 总回 0，只有 0x36 实时位置能用 */
+static double pos36_off = -70000.0;                      /* 0x36 实时位置(一圈 65536，多圈累计，可以是负数) */
 uint32_t fake_flash[8] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
 static int flash_fail = 0;
 int HAL_FLASH_Unlock(void) { return 0; }
@@ -62,7 +63,14 @@ int HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *err) { int i; (void)e
 int HAL_FLASH_Program(uint32_t type, uintptr_t addr, uint64_t data) { (void)type; fake_flash[(addr - (uintptr_t)fake_flash) / 4] = (uint32_t)data; return 0; }
 int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
     double e; uint16_t v;
-    if (!enc_ok || addr != 5 || func != 0x31 || len != 5) return 0;
+    if (!enc_ok || addr != 5) return 0;
+    if (func == 0x36 && len == 8) {
+        long p = (long)floor(pos36_off + (enc_frozen ? 0.0 : 65536.0 / 40.0 * phys_mm) + 0.5); unsigned long u = (unsigned long)(p < 0 ? -p : p);
+        out[0] = 5; out[1] = 0x36; out[2] = p < 0 ? 1 : 0; out[3] = (uint8_t)(u >> 24); out[4] = (uint8_t)(u >> 16);
+        out[5] = (uint8_t)(u >> 8); out[6] = (uint8_t)u; out[7] = 0x6B; return 1;
+    }
+    if (func != 0x31 || len != 5) return 0;
+    if (enc31_zero) { out[0] = 5; out[1] = 0x31; out[2] = 0; out[3] = 0; out[4] = 0x6B; return 1; }
     e = fmod(enc_off + (enc_frozen ? 0.0 : enc_cpm * phys_mm), enc_cpr); if (e < 0) e += enc_cpr;
     v = (uint16_t)(e + 0.5) % (uint16_t)(enc_cpr > 65535 ? 65535 : enc_cpr);
     if (enc_cpr > 65535) v = (uint16_t)((long)(e + 0.5) % 65536);
@@ -282,7 +290,7 @@ int main(void) {
     clear();
     CHECK(run("LIFT ENC?") == 1 && pis("LIFTENC ") && pis("NOCAL"), "没标定时 LIFT ENC? 只回原始读数");
     clear();
-    CHECK(run("LIFT CAL 60") == 1 && pis("LIFTCAL OK") && pis("CPR=65536") && fake_flash[0] == 0x4C494654u, "LIFT CAL 60：测出编码器关系并存进 Flash");
+    CHECK(run("LIFT CAL 60") == 1 && pis("LIFTCAL OK") && pis("CPR=65536") && pis("SRC=31") && fake_flash[0] == 0x4C465432u, "LIFT CAL 60：测出编码器关系并存进 Flash");
     CHECK(fabs(phys_mm - 60.0) < 0.05, "标定完回到原来的高度");
     clear();
     phys_mm = 47.3;                                       /* 关机时被人推到 47.3mm */
@@ -308,8 +316,25 @@ int main(void) {
     Arm_Init();
     CHECK(pis("LIFTBOOT NOENC") && !has("L+") && !has("L-"), "读不到编码器：不动，当作在 60");
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
-    enc_ok = 1; enc_frozen = 1; clear();
-    CHECK(run("LIFT CAL 60") == -1 && pis("ERR ENCMOVE"), "电机转了编码器却不变：ERR ENCMOVE，不存");
+    enc_ok = 1; enc_frozen = 1; enc31_zero = 1; pos36_off = 0.0; clear();
+    { double save = phys_mm; phys_mm = 0.0; run("LIFT 0"); phys_mm = 0.0; (void)save; }
+    { int q; for (q = 0; q < 8; q++) fake_flash[q] = 0xFFFFFFFFu; }
+    Arm_Init(); clear();                                  /* 重新上电：Flash 空了，程序里也变成没标定 */
+    CHECK(run("LIFT ENC?") == 1 && pis("31=0 36=0 NOCAL"), "没标定时 LIFT ENC? 两种读数都打出来");
+    /* 现场情况：0x31 一直回 0。程序自动改用 0x36 实时位置；在最低点标定只往上走、不往下撞 */
+    enc_frozen = 0; pos36_off = -70000.0; clear();
+    CHECK(run("LIFT CAL 0") == 1 && pis("LIFTCAL OK") && pis("SRC=36") && pis("CPR=65536"), "0x31 总是 0：自动改用 0x36 标定成功");
+    CHECK(has("L+800;") && !has("L-800;L-") && fabs(phys_mm) < 0.05, "最低点标定：先往上 10mm 再回到 0，不往下走");
+    phys_mm = 55.5; clear(); Arm_Init();
+    CHECK((pis("LIFTBOOT 55.5") || pis("LIFTBOOT 55.49")) && fabs(phys_mm - 60.0) < 0.05, "用 0x36 标定后开机：从 55.5 自动走到 60");
+    phys_mm = 79.0; clear(); Arm_Init();
+    CHECK(fabs(phys_mm - 60.0) < 0.05 && has("L-1520;"), "0x36：开机在 79mm 往下走到 60");
+    clear();
+    CHECK(run("LIFT ENC?") == 1 && pis("SRC=36") && (pis("Z=60.0") || pis("Z=59.99")), "LIFT ENC? 显示用的是 0x36");
+    pos36_off = -1e9; phys_mm = 60.0; enc_cpr = 65536.0; enc_cpm = 1638.4;
+    enc31_zero = 0; enc_frozen = 1; clear();
+    CHECK(run("LIFT CAL 60") == -1 && pis("ERR ENCMOVE") && pis("LIFTCAL RAW"), "两种读数都对不上：ERR ENCMOVE，打印原始读数，不存");
+    enc_frozen = 0; pos36_off = -70000.0;
     enc_frozen = 0; flash_fail = 1; enc_cpr = 65536.0; enc_cpm = 1638.4; clear();
     run("LIFT 60"); phys_mm = 60.0;
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR FLASH"), "Flash 写失败报 ERR FLASH");

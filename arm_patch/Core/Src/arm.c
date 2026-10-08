@@ -294,12 +294,13 @@ static const char *Lift_Goto(float mm)
 #ifndef ARM_CAL_ADDR
 #define ARM_CAL_ADDR   0x08060000u        /* Flash 扇区 7(128KB)。程序只占前面几十 KB，不冲突 */
 #endif
-#define CAL_MAGIC      0x4C494654u        /* "LIFT" */
+#define CAL_MAGIC      0x4C465432u        /* "LFT2"(第 2 版：多存了"读哪个编码器值") */
 
 static float   lift_enc0   = 0.0f;        /* 高度 0mm 时的编码器读数 */
 static float   lift_cpm    = 0.0f;        /* 每升高 1mm 编码器读数变多少(带正负) */
 static float   lift_cpr    = 65536.0f;    /* 编码器一圈的读数(标定时自动判断 65536 / 16384 / 4096) */
 static uint8_t lift_cal_ok = 0;
+static uint8_t lift_src    = 0x31;        /* 读哪个值：0x31 编码器值；有的驱动器 0x31 总回 0，就用 0x36 实时位置(取一圈里的部分) */
 
 /* 把编码器读数差折到 ±半圈 */
 static float Enc_Wrap(float d, float cpr)
@@ -307,15 +308,30 @@ static float Enc_Wrap(float d, float cpr)
     return d - cpr * floorf((d + cpr / 2.0f) / cpr);
 }
 
-/* 读升降电机的编码器(一圈里的角度)。读到返回 1 */
-static int Lift_ReadEnc(uint16_t *v)
+/* 读升降电机一圈里的角度(0~65535)。src = 0x31：回 [05 31 高 低 6B]；
+ * src = 0x36：回 [05 36 符号 4字节位置 6B]，位置一圈 65536，取低 16 位就是一圈里的角度。读到返回 1 */
+static int Lift_ReadSrc(uint8_t src, uint16_t *v)
 {
-    uint8_t r[5];
+    uint8_t r[8];
+    uint32_t p;
     int k;
 
     for (k = 0; k < 3; k++)
     {
-        if (Car_Motor_Query(LIFT_ADDR, 0x31, r, 5))
+        if (src == 0x36)
+        {
+            if (Car_Motor_Query(LIFT_ADDR, 0x36, r, 8))
+            {
+                p = ((uint32_t)r[3] << 24) | ((uint32_t)r[4] << 16) | ((uint32_t)r[5] << 8) | (uint32_t)r[6];
+                if (r[2] != 0)
+                {
+                    p = 0u - p;                    /* 负数：取补码，低 16 位仍是一圈里的角度 */
+                }
+                *v = (uint16_t)(p & 0xFFFFu);
+                return 1;
+            }
+        }
+        else if (Car_Motor_Query(LIFT_ADDR, 0x31, r, 5))
         {
             *v = (uint16_t)(((uint16_t)r[2] << 8) | r[3]);
             return 1;
@@ -323,6 +339,11 @@ static int Lift_ReadEnc(uint16_t *v)
         HAL_Delay(10);
     }
     return 0;
+}
+
+static int Lift_ReadEnc(uint16_t *v)
+{
+    return Lift_ReadSrc(lift_src, v);
 }
 
 /* 用编码器算现在的高度：在 near_mm 上下半圈(±20mm)以内找。没标定或读不到返回 0 */
@@ -342,16 +363,16 @@ static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
 static void Cal_Load(void)
 {
     const volatile uint32_t *f = (const volatile uint32_t *)ARM_CAL_ADDR;
-    uint32_t w[5];
+    uint32_t w[6];
     float e0, c, cpr;
     int i;
 
-    for (i = 0; i < 5; i++)
+    for (i = 0; i < 6; i++)
     {
         w[i] = f[i];
     }
     lift_cal_ok = 0;
-    if (w[0] != CAL_MAGIC || w[4] != (w[0] ^ w[1] ^ w[2] ^ w[3] ^ 0x5A5A5A5Au))
+    if (w[0] != CAL_MAGIC || w[5] != (w[0] ^ w[1] ^ w[2] ^ w[3] ^ w[4] ^ 0x5A5A5A5Au) || (w[4] != 0x31u && w[4] != 0x36u))
     {
         return;
     }
@@ -365,6 +386,7 @@ static void Cal_Load(void)
     lift_enc0 = e0;
     lift_cpm = c;
     lift_cpr = cpr;
+    lift_src = (uint8_t)w[4];
     lift_cal_ok = 1;
 }
 
@@ -372,7 +394,7 @@ static int Cal_Save(void)
 {
     FLASH_EraseInitTypeDef er;
     uint32_t serr = 0;
-    uint32_t w[5];
+    uint32_t w[6];
     int i;
     int ok = 1;
 
@@ -380,7 +402,8 @@ static int Cal_Save(void)
     memcpy(&w[1], &lift_enc0, 4);
     memcpy(&w[2], &lift_cpm, 4);
     memcpy(&w[3], &lift_cpr, 4);
-    w[4] = w[0] ^ w[1] ^ w[2] ^ w[3] ^ 0x5A5A5A5Au;
+    w[4] = lift_src;
+    w[5] = w[0] ^ w[1] ^ w[2] ^ w[3] ^ w[4] ^ 0x5A5A5A5Au;
 
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
@@ -394,7 +417,7 @@ static int Cal_Save(void)
     {
         ok = 0;
     }
-    for (i = 0; ok && i < 5; i++)
+    for (i = 0; ok && i < 6; i++)
     {
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, ARM_CAL_ADDR + 4u * (uint32_t)i, w[i]) != HAL_OK)
         {
@@ -414,14 +437,17 @@ static int Cal_Save(void)
 static const char *Lift_Cal(float z0)
 {
     static const float cands[3] = { 65536.0f, 16384.0f, 4096.0f };
-    uint16_t a;
-    uint16_t b;
+    static const uint8_t srcs[2] = { 0x31, 0x36 };
+    uint16_t a[2];
+    uint16_t b[2];
+    uint8_t ga[2];
+    uint8_t gb[2];
     float step, mm_rev, d = 0.0f, cpr = 0.0f;
     const char *r;
     char m[96];
     char s1[20];
     char s2[20];
-    int i;
+    int i, j;
 
     if (z0 < 0.0f || z0 > g_lmax)
     {
@@ -429,36 +455,53 @@ static const char *Lift_Cal(float z0)
     }
     lift_known = 1;
     lift_mm = z0;
-    if (!Lift_ReadEnc(&a))
+    for (j = 0; j < 2; j++)                        /* 两种值都读：走 10mm 后哪个变化对得上就用哪个 */
+    {
+        ga[j] = (uint8_t)Lift_ReadSrc(srcs[j], &a[j]);
+    }
+    if (!ga[0] && !ga[1])
     {
         return "ERR NOENC";                        /* 读不到：驱动器 TX 没接到 PC11，或 5 号驱动器没回复 */
     }
-    step = (z0 + 15.0f <= g_lmax) ? 10.0f : -10.0f;
+    step = (z0 + 15.0f <= g_lmax) ? 10.0f : -10.0f;   /* 在最低点附近就往上走，离最高点近才往下走，不会撞 */
     r = Lift_Goto(z0 + step);
     if (r != NULL || car_abort)
     {
         return (r != NULL) ? r : "ERR ABORT";
     }
     HAL_Delay(300);
-    if (!Lift_ReadEnc(&b))
+    for (j = 0; j < 2; j++)
     {
-        return "ERR NOENC";
+        gb[j] = (uint8_t)Lift_ReadSrc(srcs[j], &b[j]);
     }
     /* 判断编码器一圈是多少：10mm 应该是 10/40 圈 */
     mm_rev = g_lspr / g_lppm;
-    for (i = 0; i < 3; i++)
+    for (j = 0; j < 2 && cpr == 0.0f; j++)
     {
-        float di = Enc_Wrap((float)b - (float)a, cands[i]);
-        float ratio = Absf(di) / cands[i] * mm_rev / Absf(step);
-        if (ratio > 0.8f && ratio < 1.25f)
+        if (!ga[j] || !gb[j])
         {
-            d = di;
-            cpr = cands[i];
-            break;
+            continue;
+        }
+        for (i = 0; i < 3; i++)
+        {
+            float di = Enc_Wrap((float)b[j] - (float)a[j], cands[i]);
+            float ratio = Absf(di) / cands[i] * mm_rev / Absf(step);
+            if (ratio > 0.8f && ratio < 1.25f)
+            {
+                d = di;
+                cpr = cands[i];
+                lift_src = srcs[j];
+                break;
+            }
         }
     }
     if (cpr == 0.0f)
     {
+        /* 把读数打出来，方便查：走之前 -> 走之后(NO = 没回复) */
+        snprintf(m, sizeof(m), "LIFTCAL RAW 31:%ld->%ld 36:%ld->%ld\r\n",
+                 ga[0] ? (long)a[0] : -1L, gb[0] ? (long)b[0] : -1L, ga[1] ? (long)a[1] : -1L, gb[1] ? (long)b[1] : -1L);
+        Say(m);
+        Lift_Goto(z0);                             /* 回到原来的位置 */
         return "ERR ENCMOVE";                      /* 编码器变化和走的距离对不上：电机没转、或读的不是升降电机 */
     }
     r = Lift_Goto(z0);                             /* 回到原来的位置 */
@@ -467,13 +510,13 @@ static const char *Lift_Cal(float z0)
         return (r != NULL) ? r : "ERR ABORT";
     }
     HAL_Delay(300);
-    if (!Lift_ReadEnc(&a))
+    if (!Lift_ReadEnc(&a[0]))
     {
         return "ERR NOENC";
     }
     lift_cpr = cpr;
     lift_cpm = d / step;
-    lift_enc0 = (float)a - lift_cpm * z0;
+    lift_enc0 = (float)a[0] - lift_cpm * z0;
     lift_enc0 -= cpr * floorf(lift_enc0 / cpr);   /* 折到 0~一圈 */
     if (!Cal_Save())
     {
@@ -481,7 +524,7 @@ static const char *Lift_Cal(float z0)
     }
     FmtF(s1, (int)sizeof(s1), lift_enc0);
     FmtF(s2, (int)sizeof(s2), lift_cpm);
-    snprintf(m, sizeof(m), "LIFTCAL OK ENC0=%s CPM=%s CPR=%ld\r\n", s1, s2, (long)cpr);
+    snprintf(m, sizeof(m), "LIFTCAL OK ENC0=%s CPM=%s CPR=%ld SRC=%02X\r\n", s1, s2, (long)cpr, (unsigned)lift_src);
     Say(m);
     return NULL;
 }
@@ -1078,15 +1121,17 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             {
                 FmtF(s1, (int)sizeof(s1), z);
                 FmtF(s2, (int)sizeof(s2), lift_mm);
-                snprintf(m, sizeof(m), "LIFTENC %u Z=%s NOW=%s\r\n", (unsigned)e, s1, s2);
-            }
-            else if (Lift_ReadEnc(&e))
-            {
-                snprintf(m, sizeof(m), "LIFTENC %u NOCAL\r\n", (unsigned)e);
+                snprintf(m, sizeof(m), "LIFTENC %u Z=%s NOW=%s SRC=%02X\r\n", (unsigned)e, s1, s2, (unsigned)lift_src);
             }
             else
             {
-                FAIL("ERR NOENC");
+                uint16_t e2 = 0;
+                int g1 = Lift_ReadSrc(0x31, &e);          /* 没标定(或读不到)：两种值都打出来，-1 = 没回复 */
+                int g2 = Lift_ReadSrc(0x36, &e2);
+
+                if (!g1 && !g2)  FAIL("ERR NOENC");
+                snprintf(m, sizeof(m), "LIFTENC 31=%ld 36=%ld %s\r\n", g1 ? (long)e : -1L, g2 ? (long)e2 : -1L,
+                         lift_cal_ok ? "READFAIL" : "NOCAL");
             }
             Say(m);
             return 1;

@@ -136,7 +136,8 @@ arm_patch/
   1. 断开电机电源，用手把升降轻轻放到最低点，再上电；
   2. `arm LIFT CAL 0`(告诉程序"现在在 0mm")。它会往上 10mm 再回来，回复 `LIFTCAL OK …`，结果存进 STM32 的 Flash，断电、重新烧录都不丢；
   3. `arm LIFT 60`。以后每次上电都会自动停到 60mm。
-- 检查：`arm LIFT ENC?` 回 `LIFTENC 读数 Z=编码器算的高度 NOW=程序记的高度`，两个数应该一样。
+- 有的驱动器读编码器值(0x31)总是回 0。标定时程序会同时读 0x31 和 0x36(实时位置)，走 10mm 后哪个变化对得上就用哪个，`LIFTCAL OK … SRC=31/36` 显示用的是哪个；两个都对不上会打印 `LIFTCAL RAW 31:走之前->走之后 36:…` 并回 `ERR ENCMOVE`(-1 = 没回复)。
+- 检查：`arm LIFT ENC?` 回 `LIFTENC 读数 Z=编码器算的高度 NOW=程序记的高度 SRC=..`，两个数应该一样；没标定时回 `LIFTENC 31=.. 36=.. NOCAL`。
 - 开机时串口会打印 `LIFTBOOT 47.3 -> 60`(找到的高度)；`LIFTBOOT NOCAL`(还没标定) 或 `LIFTBOOT NOENC`(读不到编码器) 时当作正好在 60mm，不动。
 - 改开机高度：`arm.c` 里的 `LIFT_BOOT_MM`。
 
