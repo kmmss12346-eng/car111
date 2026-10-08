@@ -170,7 +170,18 @@
  };
  #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
  
-@@ -262,6 +270,7 @@
+@@ -228,6 +236,10 @@
+ static float   lift_mm    = 0.0f;
+ static uint8_t lift_known = 0;
+ 
++/* 下面"编码器"那一节里的函数，Lift_Goto 要先用到 */
++static void Pos_Save(float z);
++static int  Lift_EncPos(float near_mm, float *z, uint16_t *raw);
++
+ static uint32_t Lift_Time_Ms(uint32_t pulses)
+ {
+     float sps = g_lrpm / 60.0f * g_lspr;          /* 每秒多少脉冲 */
+@@ -262,18 +274,439 @@
      }
  
      Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -178,7 +189,28 @@
      Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
  
      if (!Wait_Ms(Lift_Time_Ms(pulses)))
-@@ -274,6 +283,290 @@
+     {
++        float z;
++        uint16_t e;
++
+         Emm_V5_Stop_Now(LIFT_ADDR, false);
+-        lift_known = 0;                           /* 停在半路，不知道在哪了，要重新回零 */
++        lift_known = 0;                           /* 停在半路，不知道在哪了 */
++        /* 标定过编码器：停在起点和终点之间，用编码器把准确高度找回来(这一段不超过 36mm 才找得准) */
++        if (Absf(mm - lift_mm) <= 36.0f)
++        {
++            HAL_Delay(50);
++            if (Lift_EncPos((mm + lift_mm) / 2.0f, &z, &e))
++            {
++                lift_mm = z;
++                lift_known = 1;
++                Pos_Save(z);
++            }
++        }
+         return NULL;
+     }
+     lift_mm = mm;
++    Pos_Save(mm);                                  /* 记进 Flash：下次上电从这里找 */
      return NULL;
  }
  
@@ -194,12 +226,22 @@
 +#define ARM_CAL_ADDR   0x08060000u        /* Flash 扇区 7(128KB)。程序只占前面几十 KB，不冲突 */
 +#endif
 +#define CAL_MAGIC      0x4C465432u        /* "LFT2"(第 2 版：多存了"读哪个编码器值") */
++#ifndef ARM_CAL_SIZE
++#define ARM_CAL_SIZE   0x20000u           /* 扇区 7 一共 128KB */
++#endif
++/* 扇区前 256 字节放标定，后面是"升降停下的位置"记录：每停一次追加一条(8 字节)，不用擦除；
++ * 一共能记一万六千多条，用掉四分之三后，开机时擦一次扇区重新开始(擦除要 1~2 秒，只在开机做) */
++#define POS_BASE       (ARM_CAL_ADDR + 0x100u)
++#define POS_N          ((uint32_t)((ARM_CAL_SIZE - 0x100u) / 8u))
 +
 +static float   lift_enc0   = 0.0f;        /* 高度 0mm 时的编码器读数 */
 +static float   lift_cpm    = 0.0f;        /* 每升高 1mm 编码器读数变多少(带正负) */
 +static float   lift_cpr    = 65536.0f;    /* 编码器一圈的读数(标定时自动判断 65536 / 16384 / 4096) */
 +static uint8_t lift_cal_ok = 0;
 +static uint8_t lift_src    = 0x31;        /* 读哪个值：0x31 编码器值；有的驱动器 0x31 总回 0，就用 0x36 实时位置(取一圈里的部分) */
++
++static float   pos_last    = 0.0f;        /* 最后一次记进 Flash 的高度(一样就不重复写) */
++static uint8_t pos_last_ok = 0;
 +
 +/* 把编码器读数差折到 ±半圈 */
 +static float Enc_Wrap(float d, float cpr)
@@ -249,6 +291,7 @@
 +static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
 +{
 +    uint16_t e;
++    float rev;
 +
 +    if (!lift_cal_ok || !Lift_ReadEnc(&e))
 +    {
@@ -256,6 +299,16 @@
 +    }
 +    *raw = e;
 +    *z = near_mm + Enc_Wrap((float)e - (lift_enc0 + lift_cpm * near_mm), lift_cpr) / lift_cpm;
++    /* 算出来的在行程外面(比最低点还低、比最高点还高)，那一定差了整圈：挪回 0~LFMAX 里面 */
++    rev = lift_cpr / Absf(lift_cpm);
++    while (*z < -3.0f && *z + rev <= g_lmax + 3.0f)
++    {
++        *z += rev;
++    }
++    while (*z > g_lmax + 3.0f && *z - rev >= -3.0f)
++    {
++        *z -= rev;
++    }
 +    return 1;
 +}
 +
@@ -324,12 +377,92 @@
 +        }
 +    }
 +    HAL_FLASH_Lock();
++    pos_last_ok = 0;                               /* 扇区擦掉了，位置记录也没了 */
 +    if (ok)
 +    {
 +        Cal_Load();                                /* 读回来校验 */
 +        ok = lift_cal_ok;
 +    }
 +    return ok;
++}
++
++/* ---- 升降位置记录 ---- */
++static int Pos_Empty(uint32_t i)
++{
++    const volatile uint32_t *f = (const volatile uint32_t *)(POS_BASE + 8u * i);
++    return f[0] == 0xFFFFFFFFu && f[1] == 0xFFFFFFFFu;
++}
++
++/* 已经记了多少条(记录是从头往后连续写的，二分查找第一条空的) */
++static uint32_t Pos_Count(void)
++{
++    uint32_t lo = 0;
++    uint32_t hi = POS_N;
++
++    while (lo < hi)
++    {
++        uint32_t mid = (lo + hi) / 2u;
++        if (Pos_Empty(mid))
++        {
++            hi = mid;
++        }
++        else
++        {
++            lo = mid + 1u;
++        }
++    }
++    return lo;
++}
++
++/* 读最后一次记下的高度。没有记录或记录坏了返回 0 */
++static int Pos_Last(float *z)
++{
++    uint32_t n = Pos_Count();
++    const volatile uint32_t *f;
++    uint32_t w0;
++
++    if (n == 0u)
++    {
++        return 0;
++    }
++    f = (const volatile uint32_t *)(POS_BASE + 8u * (n - 1u));
++    w0 = f[0];
++    if (f[1] != ~w0)
++    {
++        return 0;
++    }
++    memcpy(z, &w0, 4);
++    return (*z > -10.0f && *z < 500.0f);
++}
++
++/* 记下升降现在的高度(标定过编码器才记)。每次 8 字节，写一次几十微秒 */
++static void Pos_Save(float z)
++{
++    uint32_t n;
++    uint32_t w0;
++    uintptr_t a;
++
++    if (!lift_cal_ok || (pos_last_ok && Absf(z - pos_last) < 0.01f))
++    {
++        return;
++    }
++    n = Pos_Count();
++    if (n >= POS_N)
++    {
++        return;                                    /* 记满了：下次开机擦掉重来 */
++    }
++    memcpy(&w0, &z, 4);
++    a = POS_BASE + 8u * n;
++    HAL_FLASH_Unlock();
++    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
++                           FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
++    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, a, w0) == HAL_OK &&
++        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, a + 4u, ~w0) == HAL_OK)
++    {
++        pos_last = z;
++        pos_last_ok = 1;
++    }
++    HAL_FLASH_Lock();
 +}
 +
 +/* LIFT CAL <mm>：升降现在离最低点 z0 毫米(尺子量的)。上下动 10mm 测编码器，存进 Flash */
@@ -425,16 +558,21 @@
 +    FmtF(s2, (int)sizeof(s2), lift_cpm);
 +    snprintf(m, sizeof(m), "LIFTCAL OK ENC0=%s CPM=%s CPR=%ld SRC=%02X\r\n", s1, s2, (long)cpr, (unsigned)lift_src);
 +    Say(m);
++    Pos_Save(z0);
 +    return NULL;
 +}
 +
-+/* 开机：用编码器找到准确高度，再走到 LIFT_BOOT_MM。没标定/读不到编码器时，当作正好在 LIFT_BOOT_MM，不动 */
++/* 开机：用编码器找到准确高度，再走到 LIFT_BOOT_MM。
++ * 以"上次停下的高度"(Flash 里记的)为中心找，所以断电时停在哪都行，只要断电后别用手把它挪开 2cm 以上。
++ * 没标定/读不到编码器时，当作正好在 LIFT_BOOT_MM，不动 */
 +static void Lift_Boot(void)
 +{
 +    uint16_t e = 0;
 +    float z = LIFT_BOOT_MM;
-+    char m[64];
++    float near_mm = LIFT_BOOT_MM;
++    char m[80];
 +    char s1[20];
++    char s2[20];
 +    int k;
 +    int got = 0;
 +
@@ -446,9 +584,19 @@
 +        Say("LIFTBOOT NOCAL (assume 60)\r\n");
 +        return;
 +    }
++    pos_last_ok = 0;
++    if (Pos_Last(&near_mm))
++    {
++        pos_last = near_mm;
++        pos_last_ok = 1;
++    }
++    else
++    {
++        near_mm = LIFT_BOOT_MM;                    /* 没有记录：当作在 60 附近 */
++    }
 +    for (k = 0; k < 20 && !got; k++)               /* 驱动器上电要一会儿才能回复，最多等约 3 秒 */
 +    {
-+        got = Lift_EncPos(LIFT_BOOT_MM, &z, &e);
++        got = Lift_EncPos(near_mm, &z, &e);
 +        if (!got)
 +        {
 +            HAL_Delay(100);
@@ -461,15 +609,20 @@
 +    }
 +    lift_mm = z;
 +    FmtF(s1, (int)sizeof(s1), z);
-+    snprintf(m, sizeof(m), "LIFTBOOT %s -> %ld\r\n", s1, (long)LIFT_BOOT_MM);
++    FmtF(s2, (int)sizeof(s2), near_mm);
++    snprintf(m, sizeof(m), "LIFTBOOT %s (last %s) -> %ld\r\n", s1, s2, (long)LIFT_BOOT_MM);
 +    Say(m);
++    if (Pos_Count() > POS_N / 4u * 3u)             /* 位置记录快满了：擦掉扇区，标定重新写回去 */
++    {
++        Cal_Save();
++    }
 +    Lift_Goto(LIFT_BOOT_MM);
 +}
 +
  /* ================= ID1 / ID2 ================= */
  /* ID1、ID2 转到 a1、a2(度)。PARA=1 时两个一起转(省时间)；否则按 order 先后：
   *   order=1：先动 ID2 再动 ID1(缩回时先缩回再转，免得伸着转扫到东西)
-@@ -433,26 +726,89 @@
+@@ -433,26 +866,89 @@
  }
  
  /* ================= 串口屏 ================= */
@@ -566,7 +719,7 @@
  /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
  static void Screen_Raw(const char *cmd)
  {
-@@ -594,6 +950,12 @@
+@@ -594,6 +1090,12 @@
      qr_len = 0;
      qr_end = 0;
      HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
@@ -579,7 +732,7 @@
  }
  
  /* ================= 树莓派指令 ================= */
-@@ -683,7 +1045,7 @@
+@@ -683,7 +1185,7 @@
          else
          {
              long us;
@@ -588,7 +741,7 @@
              Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
          }
          Wait_Ms((uint32_t)g_clwait);
-@@ -727,6 +1089,7 @@
+@@ -727,6 +1229,7 @@
          if (strcmp(t[1], "ZERO") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -596,7 +749,7 @@
              Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
              lift_mm = 0.0f;
              lift_known = 1;
-@@ -735,6 +1098,7 @@
+@@ -735,6 +1238,7 @@
          if (strcmp(t[1], "HOME") == 0)
          {
              Emm_V5_En_Control(LIFT_ADDR, true, false);
@@ -604,7 +757,7 @@
              Emm_V5_Origin_Trigger_Return(LIFT_ADDR, (uint8_t)g_lhmd, false);
              if (!Wait_Ms((uint32_t)g_lhtm))
              {
-@@ -745,11 +1109,45 @@
+@@ -745,11 +1249,45 @@
              lift_known = 1;
              return 1;
          }

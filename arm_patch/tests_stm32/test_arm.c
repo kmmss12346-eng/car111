@@ -55,11 +55,13 @@ void Emm_V5_Reset_CurPos_To_Zero(uint8_t a) { EV("zero%u;", a); }
 static double phys_mm = 60.0, enc_off = 12345.0, enc_cpm = 1638.4, enc_cpr = 65536.0;
 static int enc_ok = 1, enc_frozen = 0, enc31_zero = 0;   /* enc31_zero：像现场那样 0x31 总回 0，只有 0x36 实时位置能用 */
 static double pos36_off = -70000.0;                      /* 0x36 实时位置(一圈 65536，多圈累计，可以是负数) */
-uint32_t fake_flash[8] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+uint32_t fake_flash[256];
+static int erases = 0;
+static void flash_blank(void) { int q; for (q = 0; q < 256; q++) fake_flash[q] = 0xFFFFFFFFu; }
 static int flash_fail = 0;
 int HAL_FLASH_Unlock(void) { return 0; }
 int HAL_FLASH_Lock(void) { return 0; }
-int HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *err) { int i; (void)err; if (flash_fail || e->Sector != 7) return 1; for (i = 0; i < 8; i++) fake_flash[i] = 0xFFFFFFFFu; now += 1000; return 0; }
+int HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *err) { (void)err; if (flash_fail || e->Sector != 7) return 1; flash_blank(); erases++; now += 1000; return 0; }
 int HAL_FLASH_Program(uint32_t type, uintptr_t addr, uint64_t data) { (void)type; fake_flash[(addr - (uintptr_t)fake_flash) / 4] = (uint32_t)data; return 0; }
 int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
     double e; uint16_t v;
@@ -99,6 +101,7 @@ static int pis(const char *s) { return strstr(pi, s) != 0; }
 
 int main(void) {
     int i;
+    flash_blank();
     Arm_Init();
     CHECK(has("pwm3;") && has("pwm2;"), "Arm_Init 启动了夹爪/转盘 PWM");
     CHECK(strstr(scr, "cls 0") && strstr(scr, "\"READY\""), "画模式开机清屏并显示 READY");
@@ -307,6 +310,7 @@ int main(void) {
     run("LIFT 30"); phys_mm = 30.0;
     clear();
     CHECK(run("LIFT CAL 30") == 1 && pis("CPR=16384"), "一圈 16384、方向相反的编码器也能标定");
+    run("LIFT 60");                                      /* 断电前停在 60(程序记下了) */
     clear();
     phys_mm = 68.0;
     Arm_Init();
@@ -318,14 +322,14 @@ int main(void) {
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
     enc_ok = 1; enc_frozen = 1; enc31_zero = 1; pos36_off = 0.0; clear();
     { double save = phys_mm; phys_mm = 0.0; run("LIFT 0"); phys_mm = 0.0; (void)save; }
-    { int q; for (q = 0; q < 8; q++) fake_flash[q] = 0xFFFFFFFFu; }
+    flash_blank();
     Arm_Init(); clear();                                  /* 重新上电：Flash 空了，程序里也变成没标定 */
     CHECK(run("LIFT ENC?") == 1 && pis("31=0 36=0 NOCAL"), "没标定时 LIFT ENC? 两种读数都打出来");
     /* 现场情况：0x31 一直回 0。程序自动改用 0x36 实时位置；在最低点标定只往上走、不往下撞 */
     enc_frozen = 0; pos36_off = -70000.0; clear();
     CHECK(run("LIFT CAL 0") == 1 && pis("LIFTCAL OK") && pis("SRC=36") && pis("CPR=65536"), "0x31 总是 0：自动改用 0x36 标定成功");
     CHECK(has("L+800;") && !has("L-800;L-") && fabs(phys_mm) < 0.05, "最低点标定：先往上 10mm 再回到 0，不往下走");
-    phys_mm = 55.5; clear(); Arm_Init();
+    run("LIFT 60"); phys_mm = 55.5; clear(); Arm_Init();
     CHECK((pis("LIFTBOOT 55.5") || pis("LIFTBOOT 55.49")) && fabs(phys_mm - 60.0) < 0.05, "用 0x36 标定后开机：从 55.5 自动走到 60");
     phys_mm = 79.0; clear(); Arm_Init();
     CHECK(fabs(phys_mm - 60.0) < 0.05 && has("L-1520;"), "0x36：开机在 79mm 往下走到 60");
@@ -341,9 +345,35 @@ int main(void) {
     flash_fail = 0;
     CHECK(run("LIFT CAL 120") == -1 && pis("ERR RANGE"), "LIFT CAL 超出 0~LFMAX 拒绝");
     /* 没标定(Flash 是空的)时开机：当作在 60，不动 */
-    { int q; for (q = 0; q < 8; q++) fake_flash[q] = 0xFFFFFFFFu; }
+    flash_blank();
     clear(); Arm_Init();
     CHECK(pis("LIFTBOOT NOCAL") && !has("L+") && !has("L-"), "没标定：开机不动，当作在 60");
+    run("LIFT 60");
+
+    /* ---- 记住上次停下的位置：断电时停在哪都行 ---- */
+    enc_cpr = 65536.0; enc_cpm = 1638.4; enc_off = 12345.0; enc31_zero = 0; enc_frozen = 0;
+    flash_blank(); Arm_Init(); run("LIFT CAL 60"); phys_mm = 60.0;
+    CHECK(pis("LIFTCAL OK"), "重新标定");
+    run("LIFT 10");
+    CHECK(fabs(phys_mm - 10.0) < 0.05, "走到 10mm");
+    clear(); Arm_Init();                                  /* 断电时停在 10mm(离 60 有 50mm，以前找不回来) */
+    CHECK(pis("LIFTBOOT 10.0") && pis("last 10.0") && fabs(phys_mm - 60.0) < 0.05, "上次停在 10mm：开机从 10 找到并走到 60");
+    run("LIFT 95"); clear(); Arm_Init();
+    CHECK(pis("LIFTBOOT 95.0") && fabs(phys_mm - 60.0) < 0.05, "上次停在 95mm：开机走到 60");
+    run("LIFT 20"); phys_mm = 33.0; clear(); Arm_Init();   /* 断电后被人往上推了 13mm */
+    CHECK((pis("LIFTBOOT 33.0") || pis("LIFTBOOT 32.99")) && fabs(phys_mm - 60.0) < 0.05, "断电后被推了 13mm 也能找回");
+    run("LIFT 5"); phys_mm = 32.0; clear(); Arm_Init();    /* 推了 27mm：按上次位置算出 -8mm，在行程外，挪一整圈到 32 */
+    CHECK((pis("LIFTBOOT 32.0") || pis("LIFTBOOT 31.99")) && fabs(phys_mm - 60.0) < 0.05, "算到最低点以下时自动挪一圈");
+    /* 急停打断升降：用编码器把高度找回来，不用重新回零 */
+    run("LIFT 60"); car_abort = 1; clear();
+    run("LIFT 80"); clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 80.0"), "急停打断后用编码器找回高度");
+    /* 记录快满了：开机时擦掉重来，标定还在 */
+    for (i = 0; i < 40; i++) { run("LIFT 50"); run("LIFT 70"); }
+    erases = 0; clear(); Arm_Init();
+    CHECK(erases == 1 && fake_flash[0] == 0x4C465432u && fabs(phys_mm - 60.0) < 0.05, "位置记录快满：开机擦一次扇区，标定保留");
+    run("LIFT 30"); clear(); Arm_Init();
+    CHECK(pis("LIFTBOOT 30.0") && fabs(phys_mm - 60.0) < 0.05, "擦完以后照样记位置");
     run("LIFT 60");
 
     /* ---- GET/SET 用的接口 ---- */

@@ -36,5 +36,6 @@ int HAL_FLASH_Unlock(void);
 int HAL_FLASH_Lock(void);
 int HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *err);
 int HAL_FLASH_Program(uint32_t type, uintptr_t addr, uint64_t data);
-extern uint32_t fake_flash[8];
+extern uint32_t fake_flash[256];
 #define ARM_CAL_ADDR ((uintptr_t)fake_flash)
+#define ARM_CAL_SIZE 1024u                 /* 假扇区 1KB：位置记录只有 96 条，方便测"记满了擦掉重来" */
