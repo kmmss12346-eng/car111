@@ -12,7 +12,7 @@ volatile uint8_t car_abort = 0;
 
 static uint32_t now = 0;
 static int abort_at = -1;
-static float ang[3] = {0, 495.0f, -862.0f};
+static float ang[3] = {0, 323.0f, -862.0f};
 static char ev[8192];                 /* 事件记录：每个动作追加一小段文字，测试里用 strstr / 下标比较顺序 */
 static char pi[4096];                 /* STM32 发给树莓派的文字 */
 static char scr[1024];                /* 发给串口屏的文字 */
@@ -41,7 +41,7 @@ void Claw_Close(void) { EV("C;"); }
 void Turntable_Set(uint32_t p) { EV("ttus%u;", p); }
 void Turntable_GoTo(uint8_t s) { EV("tt%u;", s); }
 int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
-static float clampa(uint8_t id, float a) { float lo = id == 1 ? 390.0f : -1220.0f, hi = id == 1 ? 600.0f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
+static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 413.6f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
     float d; *a = clampa(id, *a); d = *a - ang[id]; if (d < 0) d = -d; ang[id] = *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
@@ -135,7 +135,7 @@ int main(void) {
     clear();
     CHECK(run("OBS RAW O") == 1, "OBS RAW O");
     CHECK(at("O;") >= 0 && at("O;") < at("S1:") && at("S1:") >= 0 && at("S2:") >= 0, "OBS：先张爪，再 ID1/ID2 一起转");
-    CHECK(has("S1:495.0@90;") && has("S2:-862.0@90;"), "OBS RAW 的姿态和大动作速度");
+    CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "OBS RAW 的姿态和大动作速度");
 
     /* ---- GRAB n H 的完整顺序 ---- */
     clear();
@@ -179,17 +179,17 @@ int main(void) {
     clear();
     CHECK(run("A? 1") == 1 && pis("ANG 1 "), "A? 回角度");
     clear();
-    ang[1] = 495.0f;
-    CHECK(run("AD 1 0.5") == 1 && has("M1:495.5@40/0.30;") && pis("ANG 1 495.5000"), "AD 小增量用微调速度/精度");
+    ang[1] = 323.0f;
+    CHECK(run("AD 1 0.5") == 1 && has("M1:323.5@40/0.30;") && pis("ANG 1 323.5000"), "AD 小增量用微调速度/精度");
     clear();
     CHECK(run("AD 2 -20") == 1 && has("@90/0.30;"), "AD 大增量(>8°)用大动作速度");
     clear();
     CHECK(run("AF 2 -860.5") == 1 && has("M2:-860.5"), "AF 绝对角度");
     clear();
-    ang[1] = 495.0f; ang[2] = -862.0f;
-    CHECK(run("AP 497 -863") == 1 && has("S1:497.0@80;") && has("S2:-863.0@80;"), "AP 小调整：微调速度的 2 倍(80)");
+    ang[1] = 323.0f; ang[2] = -862.0f;
+    CHECK(run("AP 325 -863") == 1 && has("S1:325.0@80;") && has("S2:-863.0@80;"), "AP 小调整：微调速度的 2 倍(80)");
     clear();
-    CHECK(run("AP 500 -900") == 1 && has("@90;"), "AP 大角度变化：改用大动作速度(90)");
+    CHECK(run("AP 340 -900") == 1 && has("@90;"), "AP 大角度变化：改用大动作速度(90)");
     CHECK(pis("ANG 1") && pis("ANG 2"), "AP 回读两个角度");
 
     /* ---- 非并行模式的先后顺序 ---- */

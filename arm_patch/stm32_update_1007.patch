@@ -75,6 +75,17 @@
      if (strcmp(cmd, "P2") == 0)
      {
          if (!HWT101_IsFresh(500)) { Link_Reply("ERR GYRO\r\n"); return; }
+@@ -943,8 +964,8 @@
+ #define SERVO_RELEASE_POWER   0         /* 松手时的阻尼功率 mW：0 = 完全松开；机构会掉下来就调大一点 */
+ 
+ /* 限位(度，多圈角度)：你之前测好的数 */
+-#define SERVO1_MIN_DEG   390.0f
+-#define SERVO1_MAX_DEG   600.0f
++#define SERVO1_MIN_DEG   232.0f
++#define SERVO1_MAX_DEG   413.6f
+ #define SERVO2_MIN_DEG   -1220.0f
+ #define SERVO2_MAX_DEG    -503.5f
+ 
 --- a/Core/Src/arm.c
 +++ b/Core/Src/arm.c
 @@ -9,7 +9,7 @@
@@ -112,7 +123,7 @@
  #define SCREEN_BAUD    9600u
  #define QR_BAUD        9600u
  
-@@ -61,22 +67,22 @@
+@@ -61,27 +67,27 @@
  
  /* ================= 可调参数(SET 名字 数值) ================= */
  static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
@@ -138,13 +149,23 @@
 -static float g_zstk   = 40.0f;     /* ZSTK   码垛时放下的高度(比 ZPLC 抬高一个物料的高度，物料高 60mm) */
 -static float g_zobraw = 0.0f;      /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
 -static float g_zobrng = 0.0f;      /* ZOBRNG 观察地上圆环时的高度 */
+-
+-static float g_a1g    = 495.0f;    /* A1G    ID1 角度：对准原料盘 */
+-static float g_a1d    = 495.0f;    /* A1D    ID1 角度：对准车上转盘 */
+-static float g_a1h    = 495.0f;    /* A1H    ID1 角度：收起/待命 */
+-static float g_a1p    = 495.0f;    /* A1P    ID1 角度：对准地上圆环 */
 +static float g_zplc   = 0.0f;      /* ZPLC   放到地上圆环时的高度 */
 +static float g_zstk   = 60.0f;     /* ZSTK   码垛时放下的高度(= ZPLC + 一个物料的高度，物料高 60mm) */
 +static float g_zobraw = 100.0f;    /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
 +static float g_zobrng = 100.0f;    /* ZOBRNG 观察地上圆环时的高度 */
- 
- static float g_a1g    = 495.0f;    /* A1G    ID1 角度：对准原料盘 */
- static float g_a1d    = 495.0f;    /* A1D    ID1 角度：对准车上转盘 */
++
++static float g_a1g    = 323.0f;    /* A1G    ID1 角度：对准原料盘 */
++static float g_a1d    = 323.0f;    /* A1D    ID1 角度：对准车上转盘 */
++static float g_a1h    = 323.0f;    /* A1H    ID1 角度：收起/待命 */
++static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
+ static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
+ static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
+ static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
 @@ -95,6 +101,7 @@
  static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
  static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
@@ -162,6 +183,21 @@
      { "LFDIR",  &g_ldir,    0.0f,    1.0f },
      { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
      { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
+@@ -122,10 +129,10 @@
+     { "ZSTK",   &g_zstk,    0.0f,    400.0f },
+     { "ZOBRAW", &g_zobraw,  0.0f,    400.0f },
+     { "ZOBRNG", &g_zobrng,  0.0f,    400.0f },
+-    { "A1G",    &g_a1g,     390.0f,  600.0f },
+-    { "A1D",    &g_a1d,     390.0f,  600.0f },
+-    { "A1H",    &g_a1h,     390.0f,  600.0f },
+-    { "A1P",    &g_a1p,     390.0f,  600.0f },
++    { "A1G",    &g_a1g,     232.0f,  413.6f },
++    { "A1D",    &g_a1d,     232.0f,  413.6f },
++    { "A1H",    &g_a1h,     232.0f,  413.6f },
++    { "A1P",    &g_a1p,     232.0f,  413.6f },
+     { "A2E",    &g_a2e,    -1220.0f, -503.5f },
+     { "A2R",    &g_a2r,    -1220.0f, -503.5f },
+     { "A2P",    &g_a2p,    -1220.0f, -503.5f },
 @@ -138,6 +145,7 @@
      { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
      { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },

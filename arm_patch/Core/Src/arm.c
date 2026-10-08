@@ -84,10 +84,10 @@ static float g_zstk   = 60.0f;     /* ZSTK   码垛时放下的高度(= ZPLC + �
 static float g_zobraw = 100.0f;    /* ZOBRAW 观察原料盘时的高度(摄像头标定比例时用的高度) */
 static float g_zobrng = 100.0f;    /* ZOBRNG 观察地上圆环时的高度 */
 
-static float g_a1g    = 495.0f;    /* A1G    ID1 角度：对准原料盘 */
-static float g_a1d    = 495.0f;    /* A1D    ID1 角度：对准车上转盘 */
-static float g_a1h    = 495.0f;    /* A1H    ID1 角度：收起/待命 */
-static float g_a1p    = 495.0f;    /* A1P    ID1 角度：对准地上圆环 */
+static float g_a1g    = 323.0f;    /* A1G    ID1 角度：对准原料盘 */
+static float g_a1d    = 323.0f;    /* A1D    ID1 角度：对准车上转盘 */
+static float g_a1h    = 323.0f;    /* A1H    ID1 角度：收起/待命 */
+static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
 static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
 static float g_a2r    = -862.0f;   /* A2R    ID2 角度：缩回(转盘上方) */
 static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
@@ -129,10 +129,10 @@ static const ArmTun tun[] =
     { "ZSTK",   &g_zstk,    0.0f,    400.0f },
     { "ZOBRAW", &g_zobraw,  0.0f,    400.0f },
     { "ZOBRNG", &g_zobrng,  0.0f,    400.0f },
-    { "A1G",    &g_a1g,     390.0f,  600.0f },
-    { "A1D",    &g_a1d,     390.0f,  600.0f },
-    { "A1H",    &g_a1h,     390.0f,  600.0f },
-    { "A1P",    &g_a1p,     390.0f,  600.0f },
+    { "A1G",    &g_a1g,     232.0f,  413.6f },
+    { "A1D",    &g_a1d,     232.0f,  413.6f },
+    { "A1H",    &g_a1h,     232.0f,  413.6f },
+    { "A1P",    &g_a1p,     232.0f,  413.6f },
     { "A2E",    &g_a2e,    -1220.0f, -503.5f },
     { "A2R",    &g_a2r,    -1220.0f, -503.5f },
     { "A2P",    &g_a2p,    -1220.0f, -503.5f },
