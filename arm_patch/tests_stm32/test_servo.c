@@ -1,4 +1,5 @@
-/* main.c 里舵机那一段(Servo_Move / Servo_StopIfStuck / Servo_Report)在电脑上测：假舵机按限定速度转、可以被挡住。
+/* main.c 里舵机那一段(Servo_Move / Servo_StopIfStuck / Servo_Report)在电脑上测：假舵机按限定速度转，
+ * 可以起步慢(lag)、中途停顿要重发才接着转(pause)、被挡住(block，挡住时电流大)。
  * run.sh 会把 main.c 里 "ID 1、ID 2 串口舵机" 那一节摘出来放进 servo_section.c 再编译 */
 #include <stdio.h>
 #include <stdint.h>
@@ -17,82 +18,111 @@ typedef uint8_t FSUS_STATUS;
 #define FSUS_PARAM_SERVO_STATUS 5
 Usart_DataTypeDef usart2; UART_HandleTypeDef huart3;
 static uint32_t now = 0;
-static char out[4096];
+static char out[8192];
 static double pos[3] = {0, 300, -862}, tgt[3] = {0, 300, -862}, vmax[3] = {0, 1000, 1000}, vcmd[3] = {0, 60, 60};
 static double block_hi = 1e9, block_lo = -1e9;
-static int read_fail = 0, nset = 0;
+static uint32_t cmd_at[3], lag_ms = 0;               /* 舵机收到指令后过 lag_ms 才开始动 */
+static double pause_at = 1e9;                        /* ID1 转到这里就停下，要重发指令才接着转 */
+static int paused = 0, pause_every = 0;              /* pause_every=1：重发以后也不动 */
+static int read_fail = 0, nset = 0, stall_flag = 0;
+static int blocked(void) { return (pos[1] >= block_hi && tgt[1] > block_hi) || (pos[1] <= block_lo && tgt[1] < block_lo); }
 static void step(uint32_t ms) {
     int id; for (id = 1; id <= 2; id++) {
-        double v = vcmd[id] < vmax[id] ? vcmd[id] : vmax[id], d = tgt[id] - pos[id], s = v * ms / 1000.0;
+        double v = vcmd[id] < vmax[id] ? vcmd[id] : vmax[id], d = tgt[id] - pos[id], s = v * ms / 1000.0, before = pos[id];
+        if (now < cmd_at[id] + lag_ms) continue;
+        if (id == 1 && paused) continue;
         if (fabs(d) <= s) pos[id] = tgt[id]; else pos[id] += (d > 0 ? s : -s);
         if (id == 1 && pos[1] > block_hi) pos[1] = block_hi;
         if (id == 1 && pos[1] < block_lo) pos[1] = block_lo;
+        if (id == 1 && ((before < pause_at && pos[1] >= pause_at) || (before > pause_at && pos[1] <= pause_at))) { pos[1] = pause_at; paused = 1; pause_at = 1e9; }
     }
 }
 uint32_t HAL_GetTick(void) { return now; }
 void HAL_Delay(uint32_t ms) { uint32_t i; for (i = 0; i < ms; i++) { now++; step(1); } }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) { (void)h; (void)t; strncat(out, (char *)b, n); return 0; }
-FSUS_STATUS FSUS_QueryServoAngleMTurn(Usart_DataTypeDef *u, uint8_t id, float *a) { (void)u; now += 3; step(3); if (read_fail) return FSUS_STATUS_FAIL; *a = (float)(floor(pos[id] * 10 + 0.5) / 10); return FSUS_STATUS_SUCCESS; }
+FSUS_STATUS FSUS_QueryServoAngleMTurn(Usart_DataTypeDef *u, uint8_t id, float *a) { (void)u; HAL_Delay(3); if (read_fail) return FSUS_STATUS_FAIL; *a = (float)(floor(pos[id] * 10 + 0.5) / 10); return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_SetServoAngleMTurnByVelocity(Usart_DataTypeDef *u, uint8_t id, float a, float v, uint16_t ta, uint16_t td, uint16_t p, uint8_t w) {
-    (void)u; (void)ta; (void)td; (void)p; (void)w; tgt[id] = a; vcmd[id] = v; nset++; return FSUS_STATUS_SUCCESS; }
+    (void)u; (void)ta; (void)td; (void)p; (void)w; tgt[id] = a; vcmd[id] = v; nset++; cmd_at[id] = now;
+    if (id == 1 && !pause_every) paused = 0;          /* 重发指令：停顿的舵机接着转(pause_every=1 的舵机还是不动) */
+    return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_ReadData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8_t *val, uint8_t *sz) {
-    (void)u; (void)id; uint16_t v = 0;
-    switch (addr) { case 1: v = 7412; break; case 2: v = 850; break; case 3: v = 6300; break; case 4: v = 1500; break; case 5: val[0] = 0x05; *sz = 1; return 0; }
+    uint16_t v = 0; (void)u; HAL_Delay(3);
+    switch (addr) {
+    case 1: v = 7412; break;
+    case 2: v = (id == 1 && blocked()) ? 900 : (fabs(tgt[id] - pos[id]) > 0.05 && !paused ? 150 : 14); break;
+    case 3: v = 6300; break;
+    case 4: v = 1500; break;
+    case 5: val[0] = (uint8_t)((fabs(tgt[id] - pos[id]) > 0.05 ? 1 : 0) | (stall_flag && blocked() ? 4 : 0)); *sz = 1; return 0;
+    }
     val[0] = (uint8_t)v; val[1] = (uint8_t)(v >> 8); *sz = 2; return 0; }
 #include "servo_section.c"
 static int fails = 0, checks = 0;
 #define CHECK(c, m) do { checks++; if (!(c)) { fails++; printf("  FAIL: %s\n    out=[%s] pos1=%.1f tgt1=%.1f now=%u\n", m, out, pos[1], tgt[1], now); } else printf("  ok: %s\n", m); } while (0)
+static void reset1(double p) { HAL_Delay(20000); out[0] = 0; pos[1] = tgt[1] = p; vmax[1] = 1000; block_hi = 1e9; block_lo = -1e9; lag_ms = 0; pause_at = 1e9; paused = 0; pause_every = 0; nset = 0; stall_flag = 0; read_fail = 0; }
 int main(void) {
     uint32_t t0;
     /* 1. 正常转：到位就返回，不打印 */
-    out[0] = 0; pos[1] = tgt[1] = 300; vmax[1] = 1000; t0 = now;
+    reset1(300); t0 = now;
     Servo_Move(1, 350, 40, 0.3f, 400);
     CHECK(fabs(pos[1] - 350) < 0.31 && out[0] == 0 && now - t0 < 1700, "正常转 50°：到位返回，不打印");
-    /* 2. 被挡住：很快发现，停在原地，打印 STUCK */
-    out[0] = 0; block_hi = 367.6; t0 = now;
+    /* 2. 被挡住(电流大)：停在原地，打印 STUCK 和电流 */
+    reset1(300); block_hi = 367.6; t0 = now;
     Servo_Move(1, 417, 40, 0.3f, 400);
-    CHECK(strstr(out, "SERVO1 STUCK at=3676 target=4170") && fabs(tgt[1] - 367.6) < 0.05, "挡在 367.6：打印 STUCK，目标改成 367.6(不再顶)");
-    CHECK(now - t0 < 2200, "卡住后不白等到超时");
-    block_hi = 1e9;
-    /* 3. 舵机比设定的慢(实际 20°/s，设定 40°/s)：多等，不当成卡住 */
-    out[0] = 0; pos[1] = tgt[1] = 300; vmax[1] = 20; t0 = now;
+    CHECK(strstr(out, "SERVO1 STUCK, hold here at=3676 target=4170") && strstr(out, "I=900mA") && fabs(tgt[1] - 367.6) < 0.05, "挡在 367.6、电流大：STUCK，目标改成 367.6(不再顶)");
+    CHECK(now - t0 < 3500, "被挡住后不白等到超时");
+    /* 3. 舵机报堵转(电流不大)也算被挡住 */
+    reset1(300); block_hi = 340; stall_flag = 1;
+    Servo_Move(1, 400, 40, 0.3f, 400);
+    CHECK(strstr(out, "STUCK") && fabs(tgt[1] - 340) < 0.05, "舵机报堵转：停在原地");
+    /* 4. 起步慢 0.7 秒(现场 ID1 就像这样)：不当成卡住，等它转到 */
+    reset1(413.3); lag_ms = 700; nset = 0;
+    Servo_Move(1, 250, 40, 0.3f, 400);
+    CHECK(fabs(pos[1] - 250) < 0.31 && !strstr(out, "STUCK") && !strstr(out, "PAUSED") && nset == 1, "起步慢 0.7s：照样转到 250，不打断");
+    /* 5. 中途停顿、电流小：重发一次目标，接着转到 */
+    reset1(400); pause_at = 337.3;
+    Servo_Move(1, 300, 40, 0.3f, 400);
+    CHECK(strstr(out, "SERVO1 PAUSED, resend at=3373 target=3000") && strstr(out, "I=14mA") && fabs(pos[1] - 300) < 0.5 && nset == 2, "中途停在 337.3、没使劲：重发一次，转到 300");
+    /* 6. 重发以后还是停：不再等，也不拦它(目标还是 300)，打印 NOT ARRIVED */
+    reset1(400); pause_at = 337.3; pause_every = 1;
+    Servo_Move(1, 300, 40, 0.3f, 400);
+    CHECK(strstr(out, "PAUSED") && strstr(out, "NOT ARRIVED") && !strstr(out, "STUCK") && fabs(tgt[1] - 300) < 0.01 && nset == 2, "重发后还停：不改目标，打印 NOT ARRIVED");
+    pause_every = 0; pause_at = 1e9; paused = 0;
+    /* 7. 舵机比设定的慢(实际 20°/s，设定 40°/s)：多等，不当成卡住 */
+    reset1(300); vmax[1] = 20;
     Servo_Move(1, 360, 40, 0.3f, 400);
-    CHECK(fabs(pos[1] - 360) < 0.31 && !strstr(out, "STUCK"), "慢舵机 60°：多等一会儿到位，不当成卡住");
-    /* 4. 慢到超过多等的时间：不拦(不改目标)，大误差打印 NOT ARRIVED */
-    out[0] = 0; pos[1] = tgt[1] = 240; vmax[1] = 15; nset = 0;
+    CHECK(fabs(pos[1] - 360) < 0.31 && !strstr(out, "STUCK") && !strstr(out, "PAUSED"), "慢舵机 60°：多等一会儿到位");
+    /* 8. 慢到超过多等的时间：不拦(不改目标)，大误差打印 NOT ARRIVED */
+    reset1(240); vmax[1] = 15; t0 = now;
     Servo_Move(1, 410, 40, 2.0f, 400);
     CHECK(!strstr(out, "STUCK") && strstr(out, "NOT ARRIVED") && nset == 1 && fabs(tgt[1] - 410) < 0.01, "太慢超时：不改目标，让它接着转");
-    vmax[1] = 1000; HAL_Delay(20000);
-    /* 5. 目标就在附近、死区里不动：不当成卡住 */
-    out[0] = 0; pos[1] = 330.0; tgt[1] = 330.0; block_hi = 330.6; nset = 0;
+    CHECK(now - t0 <= 9300, "一次最多等 9 秒左右(树莓派 AF 等 10 秒)");
+    /* 9. 目标就在附近、死区里不动：很快返回，不当成卡住 */
+    reset1(330); block_hi = 330.6; t0 = now;
     Servo_Move(1, 331.0, 40, 0.3f, 400);
-    CHECK(!strstr(out, "STUCK") && nset == 1, "只差 0.4°(挡住也不算)：不改目标");
-    block_hi = 1e9;
-    /* 6. 读不到角度：不改目标 */
-    out[0] = 0; read_fail = 1; nset = 0;
-    Servo_Move(1, 300, 40, 2.0f, 400);
+    CHECK(!strstr(out, "STUCK") && nset == 1 && now - t0 < 1000, "只差 0.4°：很快返回，不改目标");
+    /* 10. 读不到角度：不改目标 */
+    reset1(300); read_fail = 1;
+    Servo_Move(1, 320, 40, 2.0f, 400);
     CHECK(!strstr(out, "STUCK") && nset == 1, "读不到角度：不改目标");
-    read_fail = 0;
-    /* 7. 一起转用的 Servo_StopIfStuck：停住了才拦，还在动不拦 */
-    out[0] = 0; pos[1] = 340; tgt[1] = 400; block_hi = 340; nset = 0;
-    Servo_StopIfStuck(1, 400);
-    CHECK(strstr(out, "SERVO1 STUCK at=3400") && fabs(tgt[1] - 340) < 0.05, "StopIfStuck：停住了 -> 停在原地");
-    block_hi = 1e9; out[0] = 0; pos[1] = 300; tgt[1] = 400; vmax[1] = 40; nset = 0;
-    Servo_StopIfStuck(1, 400);
-    CHECK(!strstr(out, "STUCK") && nset == 0, "StopIfStuck：还在动 -> 不管");
-    vmax[1] = 1000;
-    /* 8. 往负方向被挡住 */
-    out[0] = 0; HAL_Delay(5000); pos[1] = tgt[1] = 300; block_lo = 260;
+    /* 11. 往负方向被挡住 */
+    reset1(300); block_lo = 260;
     Servo_Move(1, 232, 40, 0.3f, 400);
-    CHECK(strstr(out, "SERVO1 STUCK at=2600 target=2320"), "往小的方向被挡在 260");
-    block_lo = -1e9;
-    /* 9. SV? 状态 */
-    out[0] = 0; pos[1] = tgt[1] = 367.6;
+    CHECK(strstr(out, "SERVO1 STUCK, hold here at=2600 target=2320"), "往小的方向被挡在 260");
+    /* 12. 一起转用的 Servo_StopIfStuck */
+    reset1(340); tgt[1] = 400; block_hi = 340;
+    Servo_StopIfStuck(1, 400);
+    CHECK(strstr(out, "SERVO1 STUCK, hold here at=3400") && fabs(tgt[1] - 340) < 0.05, "StopIfStuck：被挡住 -> 停在原地");
+    reset1(300); tgt[1] = 400; vmax[1] = 40;
+    Servo_StopIfStuck(1, 400);
+    CHECK(!strstr(out, "STUCK") && nset == 0 && fabs(pos[1] - 400) < 1.01, "StopIfStuck：还在动 -> 等它转到，不改目标");
+    reset1(330); tgt[1] = 400; paused = 1;
+    Servo_StopIfStuck(1, 400);
+    CHECK(strstr(out, "PAUSED") && fabs(pos[1] - 400) < 1.01, "StopIfStuck：停顿了 -> 重发，转到");
+    /* 13. SV? 状态 */
+    reset1(367.6);
     Servo_Report(1);
-    CHECK(strstr(out, "SV 1 ANG=367.6 V=7412mV I=850mA P=6300mW T=") && strstr(out, "ST=0x05 STALL"), "SV? 打印电压电流功率温度和堵转标志");
-    printf("%s\n", out);
-    /* 10. 负角度显示 */
-    out[0] = 0; pos[2] = tgt[2] = -862.3;
+    CHECK(strstr(out, "SV 1 ANG=367.6 V=7412mV I=14mA P=6300mW T=") && strstr(out, "ST=0x00"), "SV? 打印电压电流功率温度和状态");
+    reset1(300); pos[2] = tgt[2] = -862.3; out[0] = 0;
     Servo_Report(2);
     CHECK(strstr(out, "SV 2 ANG=-862.3"), "负角度显示");
     printf("%s: %d 项检查，%d 项失败\n", fails ? "失败" : "通过", checks, fails);
