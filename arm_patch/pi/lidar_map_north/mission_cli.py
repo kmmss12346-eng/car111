@@ -19,9 +19,11 @@ vdbg [RING | RAW <颜色号>]  存一张带标注的画面到 vdebug.png：爪�
 mtest QR                   单独测读码并显示
 mtest RAW <批次>           单独测原料盘抓取(批次 1 或 2；需要先 qr 或 mcode)
 mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有这批物料，没有就加 force 假定有：mtest ROUGH 1 force)
-mtest TEMP <批次>          单独测暂存区放置/码垛
+mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这批物料；没跑过 mtest RAW 就加 force：mtest TEMP 1 force)
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
+rtest [arm]                圆环识别+对准测试(暂存区/粗加工区)：OBS RING 摆到圆环上方 → 摄像头找圆环 → 手臂(够不着时底盘)对准，
+                             报告误差，不取物料、不放。只动手臂不动底盘：rtest arm
 gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来(不放转盘；要 ARMOK=1，因为先 OBS RAW)
                              颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝；nogo = 只识别和对准，不下降不夹
                              要先标定好：A1G A2E(手臂在原料上方的角度)、ZOBRAW(看的高度)、ZGRAB(夹的高度)、ZHI(抬起高度)，并 arm LIFT ZERO
@@ -161,6 +163,15 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     h = _hooks(link, raw_cfg or {}, log)
 
+    if k == 'rtest':
+        arm_only = any(p.lower() == 'arm' for p in parts[1:])
+
+        def go():
+            h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+            state['abort'] = False
+            _rtest(h, link, arm_only, log)
+        return _run_async(state, log, go)
+
     if k == 'gtest':
         if len(parts) < 2 or not parts[1].isdigit() or not 1 <= int(parts[1]) <= 6:
             raise ValueError('格式：gtest 1(颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝)；只识别对准不夹：gtest 1 nogo')
@@ -200,6 +211,8 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         except TaskError as ex:
             raise ValueError(str(ex))
         log(f'任务码已设置：{h.plan.code}  {h.plan.describe()}')
+        for b in (1, 2):
+            log(f'  第{b}批放在转盘：' + '  '.join(f'{it.slot}号槽={it.color_name}(去环{it.ring})' for it in h.plan.items(b)))
         return None
 
     if k == 'vmask':
@@ -348,6 +361,39 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
     log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+
+
+def _rtest(h, link, arm_only, log):
+    """圆环识别+对准测试：只对准、报告误差，不取物料、不放。"""
+    _tools(h, link)
+    P = h.arm.params(refresh=True)
+    if P.get('ARMOK', 0) < 0.5:
+        raise ValueError('rtest 先 OBS RING 摆到圆环上方，要先把姿态标定好并 set ARMOK 1')
+    known, _mm = h.arm.lift_state()
+    if not known:
+        raise ValueError('升降位置不知道了：先把升降放到最低点，再输入 arm LIFT ZERO')
+    log('① 张开夹爪，手臂摆到圆环上方(OBS RING：升到 ZHI → 转到 A1P/A2P → 降到 ZOBRNG)')
+    h.arm.obs('RING', open_claw=True)
+    log('② 摄像头找圆环……')
+    e0 = h.vision.ring_error()
+    if e0 is None:
+        ok = h.vision.save_debug('vdebug.png', 'RING') if hasattr(h.vision, 'save_debug') else False
+        raise ValueError('看不到圆环。' + ('画面存到了 vdebug.png；' if ok else '') +
+                         '先退出 map_merge_live，用 python3 vlive.py --ring 看看圆环在不在画面里、认不认得出')
+    s = h.vision.scale('RING')
+    r = getattr(h.vision, 'last_ring_rmax', None)
+    log(f'   看到了：离爪子点 {e0[0]:+.0f}, {e0[1]:+.0f} 像素(约 {math.hypot(e0[0], e0[1]) / s:.1f}mm'
+        + (f'，最外圈半径 {r:.0f} 像素' if r else '') + ')')
+    log('③ 对准(第一次会先小幅动几下，测出动作和画面的对应关系)' + ('，只动手臂' if arm_only else '，手臂够不着时会动底盘'))
+    res = h.servo.run('RING', h.vision.ring_error, s, h.cfg['tol_mm']['RING'], allow_chassis=not arm_only,
+                      label='圆环测试', bounds=h.vision.bounds('RING'))
+    log(f'   对准结果：{res}')
+    if h.store is not None and getattr(h.store, 'path', None):
+        h.store.save()
+    from vision import load_vision_cal
+    if 'RING' not in (load_vision_cal(h.cfg.get('vision_cal_file')).get('claw_px') or {}):
+        log('   注意：还没做 vclaw RING，爪子点是配置里的估计值；对准的是这个点，真放的时候可能偏几毫米')
+    log('完成(没有取物料、没有放)。看看爪子是不是在圆环中心正上方；底盘挪过的话要自己推回去')
 
 
 def _warn_blue(h, color, log):

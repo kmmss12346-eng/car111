@@ -173,6 +173,23 @@ class CliTests(unittest.TestCase):
         self.assertIn('CLAW C', sent, text)
         self.assertTrue(any(r.startswith('AP ') for r in sent))
 
+    def test_rtest_aligns_without_placing(self):
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('TEMP', 1)
+        self.w.a1_ref, self.w.a2_ref = self.w.params['A1P'], self.w.params['A2P']
+        self.w.requests.clear()
+        self.lines.clear()
+        self.run_cli('rtest', 'rtest arm')
+        text = '\n'.join(self.lines)
+        self.assertIn('对准结果', text, text)
+        self.assertIn('OBS RING O', self.w.requests)
+        self.assertFalse([r for r in self.w.requests if r.split()[0] in ('TAKE', 'DROP', 'GRAB', 'PICK')], self.w.requests)
+        self.assertFalse([r for r in self.w.requests if r.split()[0] in ('S', 'F')], '只动手臂')
+
+    def test_mcode_lists_slots(self):
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.assertTrue(any('1号槽=' in l for l in self.lines), self.lines)
+
     def test_gtest_nogo_and_needs_zero(self):
         self.w.lift_known = False                            # 模拟急停打断升降后位置丢了
         self.run_cli('gtest', 'gtest 1')

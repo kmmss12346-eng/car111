@@ -54,7 +54,7 @@ def main(argv):
     print(f'  路线(mission)：{stops}')
     if stops and sum(1 for s in stops if str(s).upper().startswith('RAW')) > 1:
         print('  提示：路线里有两批。时间紧的话，先只做第一批：把 "mission" 改成 ["QR","RAW","ROUGH","TEMP","START"]，稳了再加第二批。')
-    print('下一步：1) 把 chengxu 里的 wuliao.py、ring_detect.py 复制到本文件夹；2) 看 README_mission.md 的上车测试步骤。')
+    print('下一步：看 README_mission.md 的上车测试步骤(物料颜色用 wuliao.py 里的范围，没有就用 matdet.py 里一样的默认值)。')
     return 0
 
 
