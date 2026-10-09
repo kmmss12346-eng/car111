@@ -256,6 +256,155 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mission_cli.handle_cli('vwatch', ['vwatch', 'XYZ'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
 
+    # ---------------- 粗加工区 / 暂存区：车是手放到工位上的
+    def _zone_setup(self, zone, code='156+123+516+231'):
+        self.w.code = code
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.run_cli('mcode', f'mcode {code}')
+        self.w.arrive(zone, 1)
+        for it in self.h.plan.items(1):                        # 物料手放进车上转盘
+            self.w.tray[it.slot] = it.color
+        self.w.requests.clear()
+        self.lines.clear()
+
+    def test_mtest_rough_places_and_picks_back(self):
+        self._zone_setup('ROUGH')
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('2 号环正对手臂', text, text)
+        self.assertEqual(self.w.air, 0, text)
+        self.assertEqual(self.w.collisions, 0, text)
+        self.assertEqual(len([p for p in self.w.placed if p[0] == 'ROUGH']), 3, text)
+        self.assertEqual(sorted(c for c in self.w.tray.values() if c), sorted(it.color for it in self.h.plan.items(1)))
+        self.assertTrue(all(not st for (z, k), st in self.w.rings.items() if z == 'ROUGH'))   # 全都夹回来了
+        self.assertIn('现在车上转盘', text)
+
+    def _hide_covered_rings(self):
+        """模拟没量过圆环大小：圆环白心上放着物料时认不出圆环。"""
+        import numpy as np
+        vis, w = self.h.vision, self.w
+        orig = vis.ring_error
+
+        def ring_error(n=None):
+            c = w.claw()
+            k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
+            return None if w.rings.get((w.zone, k)) else orig(n)
+        vis.ring_error = ring_error
+
+    def test_pickback_aligns_on_the_material(self):
+        """取回时白心被物料盖住、认不出圆环：第一个物料放下后自动量 PICK 点，取回时直接认物料对准，全都夹回来。"""
+        self._zone_setup('ROUGH', '234+123+342+213')           # 黄、蓝、绿(没有黑色)
+        self._hide_covered_rings()
+        self.assertFalse(self.h.vision.has_pick())
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('claw_px.PICK = (', text, text)
+        self.assertTrue(self.h.vision.has_pick())
+        pk = self.h.vision.claw('PICK')
+        self.assertLess(abs(pk[0] - self.h.vision.TRUE_PICK[0]) + abs(pk[1] - self.h.vision.TRUE_PICK[1]), 3.0, pk)
+        self.assertEqual(text.count('对准结果(按物料)'), 3, text)
+        self.assertEqual(text.count('claw_px.PICK = ('), 1, text)           # 只量一次
+        self.assertEqual((self.w.air, self.w.collisions), (0, 0), text)
+        self.assertTrue(all(not st for (z, k), st in self.w.rings.items() if z == 'ROUGH'), text)
+        self.assertEqual(sorted(c for c in self.w.tray.values() if c), [2, 3, 4])
+
+    def test_black_material_uses_the_ring_seen_when_placing(self):
+        """黑色物料在黑环上认不出来(不按物料对)：按放物料时认到的圆环对准取回。"""
+        self._zone_setup('ROUGH')                              # 红、黑、浅蓝
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual(text.count('对准结果(按物料)'), 2, text)
+        self.assertEqual(text.count('对准结果(按圆环)'), 1, text)
+        self.assertEqual((self.w.air, self.w.collisions), (0, 0), text)
+
+    def test_pickback_blind_when_nothing_is_visible(self):
+        """物料、圆环都认不到：按放下时记下的位置直接夹(不会卡住、不会报错停下)。"""
+        self._zone_setup('ROUGH')
+        self._hide_covered_rings()
+        self.h.vision.hide_pick = (1, 2, 3, 4, 5, 6)
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('没量成', text, text)
+        self.assertEqual(text.count('物料和圆环都看不到：按放下时记下的位置直接取'), 3, text)
+        self.assertEqual(len([r for r in self.w.requests if r.startswith('PICK ')]), 3)
+
+    def test_mtest_restarts_the_clock(self):
+        """前面摆物料、搬车花了很久：mtest 重新计时，不会一开始就"时间到"。"""
+        self._zone_setup('TEMP')
+        self.h.cfg['time_limit_s'] = 100.0
+        self.h.t0 = self.w.now() - 5000.0
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        text = '\n'.join(self.lines)
+        self.assertNotIn('时间到', text)
+        self.assertEqual(len(self.w.placed), 3, text)
+
+    def test_temp_stacking_aligns_on_the_lower_material(self):
+        """暂存区第二批码垛：下面那层盖住了白心，按物料顶面对准(黑色认圆环外圈)，叠在同色物料上。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        self.assertTrue(self.h.vision.has_pick(), '\n'.join(self.lines))     # 第一批放下时量好了
+        for it in self.h.plan.items(2):                        # 第二批手放进转盘
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 2 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual(self.w.collisions, 0, text)
+        self.assertEqual(rings_summary(self.w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, text)
+        self.assertEqual(text.count('对准结果(按物料)'), 2, text)
+        self.assertEqual(text.count('对准结果(按圆环)'), 1, text)           # 黑色物料在黑环上：认圆环
+
+    def test_stacking_without_material_or_ring_keeps_it_on_the_car(self):
+        """码垛时下面的物料和圆环都认不到：不盲放(会砸倒下面那个)，物料留在车上。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        self._hide_covered_rings()
+        self.h.vision.hide_pick = (5,)
+        for it in self.h.plan.items(2):
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 2 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('下面那层物料和圆环都看不到，物料留在车上', text)
+        self.assertEqual(self.w.collisions, 0, text)
+        self.assertEqual(rings_summary(self.w, 'TEMP')[2], [5], text)
+
+    def test_mtest_temp_places_on_rings(self):
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual(self.w.collisions, 0, text)
+        got = {k: [it['color'] for it in st] for (z, k), st in self.w.rings.items() if z == 'TEMP'}
+        want = {it.ring: [it.color] for it in self.h.plan.items(1)}
+        self.assertEqual(got, want, text)
+        self.assertTrue(max(p[3] for p in self.w.placed) < 3.0)
+
+    def test_mtest_nogo_only_aligns(self):
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force nogo')
+        text = '\n'.join(self.lines)
+        self.assertIn('nogo', text)
+        self.assertFalse([r for r in self.w.requests if r.split()[0] in ('TAKE', 'DROP', 'PICK', 'GRAB')], self.w.requests)
+        self.assertEqual(sorted(c for c in self.w.tray.values() if c), sorted(it.color for it in self.h.plan.items(1)))
+        self.assertTrue(any(r.startswith('OBS RING') for r in self.w.requests))
+
+    def test_mtest_rev_and_fresh_position(self):
+        """rev：圆环前后方向反过来；每次 mtest 车都是手放的，前一次的底盘位移、学到的停车误差都不带过来。"""
+        self._zone_setup('TEMP')
+        moves = []
+        orig = self.w.link.move
+        self.w.link.move = lambda cmd, val, speed=None: (moves.append((cmd, val)), orig(cmd, val, speed))[1]
+        self.run_cli('mtest', 'mtest TEMP 1 force nogo')
+        first = next(v for c, v in moves if c == 'F')
+        self.h.act.disp = {'S': 40.0, 'F': -70.0}
+        self.h.learn = {'S': 12.0, 'F': 9.0}
+        moves.clear()
+        self.run_cli('mtest', 'mtest TEMP 1 force nogo rev')
+        first_rev = next(v for c, v in moves if c == 'F')
+        self.assertEqual(first, -first_rev, (first, first_rev))
+        self.assertEqual(abs(first), 150, moves)
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('mtest', ['mtest', 'TEMP', '1', 'xyz'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
     def test_mcode_lists_slots(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
         self.assertTrue(any('1号槽=' in l for l in self.lines), self.lines)

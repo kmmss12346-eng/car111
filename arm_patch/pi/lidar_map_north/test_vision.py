@@ -206,6 +206,90 @@ class MaterialTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+def pick_scene(top, r_top, color_bgr, R=None, seed=0):
+    """校赛圆环(黑盘+白心)上立着一个物料：顶面圆心 top、半径 r_top；侧面(暗一点)在顶面下方露出来
+    (和真实画面 arm_cam_18/19 一样：摄像头在爪子后上方往前下方看)；下面盖上真实画面里的爪子。R=None：只有物料没有圆环。"""
+    from pathlib import Path
+    import matdet
+    from test_ringdet import school_target
+    cam = cv2.imread(str(Path(__file__).resolve().parent / 'testdata' / 'arm_cam_18.jpg'))
+    claw = matdet.MaterialDetector({'claw_mask': '/nonexistent'}).auto_claw_mask(cv2.cvtColor(cam, cv2.COLOR_BGR2HSV))
+    bot = np.array(top, float) + (0.0, 0.25 * r_top)                            # 底面(和圆环中心)在顶面下方
+    img = school_target(bot[0], bot[1], R, digit='', noise=0) if R else np.full((480, 640, 3), 214, np.uint8)
+    c = np.array(color_bgr, float)
+    for t in np.linspace(0.0, 1.0, 10):                                          # 侧面
+        x, y = bot + (np.array(top, float) - bot) * t
+        cv2.circle(img, (int(round(x)), int(round(y))), int(round(r_top * (0.92 + 0.08 * t))), tuple(int(v) for v in c * 0.7), -1, cv2.LINE_AA)
+    cv2.circle(img, (int(round(top[0] * 16)), int(round(top[1] * 16))), int(round(r_top * 16)), tuple(int(v) for v in c), -1, cv2.LINE_AA, shift=4)
+    img = np.clip(img.astype(float) + np.random.default_rng(seed).normal(0, 3, img.shape), 0, 255).astype(np.uint8)
+    img[claw > 0] = cam[claw > 0]
+    return img, claw, cam
+
+
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
+class PickTests(unittest.TestCase):
+    """取回/码垛：圆环上立着的物料，认它的顶面圆心(claw_px.PICK 对准用)。"""
+    COLS = {1: (40, 40, 210), 2: (40, 200, 230), 4: (60, 170, 40), 3: (190, 70, 20), 6: (230, 200, 120)}
+
+    def test_material_on_ring_found_under_claw(self):
+        for color, bgr in self.COLS.items():
+            for top in ((337, 283), (330, 300), (320, 220), (345, 255)):
+                img, _claw, cam = pick_scene(top, 84, bgr, R=140, seed=top[0])
+                v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view=''))
+                if color in (3, 6):                         # 蓝色：要先有一份干净的爪子区域(对准空圆环时记下的)
+                    v.last_claw = v._pick_det().auto_claw_mask(cv2.cvtColor(cam, cv2.COLOR_BGR2HSV))
+                    v.note_claw_clear()
+                p = v.pick_px(color, n=3)
+                self.assertIsNotNone(p, f'颜色 {color} 顶面 {top} 认不到')
+                self.assertLess(math.hypot(p[0] - top[0], p[1] - top[1]), 2.0, f'颜色 {color} 顶面 {top}：{p}')
+                self.assertAlmostEqual(v.last_pick_r, 84, delta=4)
+
+    def test_pick_point_and_scale(self):
+        img, _c, _cam = pick_scene((340, 260), 84, self.COLS[1], R=140)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view=''))
+        self.assertFalse(v.has_pick())
+        self.assertIsNone(v.pick_error(1))                   # 还没量 PICK：不能按物料对准
+        self.assertEqual(v.claw('PICK'), v.claw('RING'))      # 画图先用圆环的点
+        v.set_pick((330.0, 250.0), 84.0)
+        self.assertTrue(v.has_pick())
+        du, dv = v.pick_error(1, n=3)
+        self.assertAlmostEqual(du, 10.0, delta=1.5)
+        self.assertAlmostEqual(dv, 10.0, delta=1.5)
+        self.assertAlmostEqual(v.scale('PICK'), 2 * 84.0 / 50.0, places=3)
+        v.set_pick(None)
+        self.assertFalse(v.has_pick())
+
+    def test_wrong_size_is_rejected_once_known(self):
+        img, _c, _cam = pick_scene((340, 260), 84, self.COLS[1], R=140)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', pick_r_px=50.0))
+        self.assertIsNone(v.pick_px(1, n=3))
+
+    def test_ring_centre_free(self):
+        empty, _c, _cam = pick_scene((337, 250), 1, (214, 214, 214), R=140)
+        v = quiet_vision(camera=FakeCam(empty), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
+        self.assertIs(v.ring_centre_free(), True)
+        full, _c, _cam = pick_scene((337, 250), 84, self.COLS[2], R=140)
+        v = quiet_vision(camera=FakeCam(full), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
+        self.assertIs(v.ring_centre_free(), False)
+
+    def test_ring_size_seen_on_empty_ring_finds_covered_ring(self):
+        """没做 vclaw RING：放物料时认到的空圆环大小记下来，取回时白心被盖住也认得出外圈。"""
+        img, _c, _cam = pick_scene((337, 250), 84, self.COLS[1], R=140)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view=''))
+        self.assertIsNone(v.ring_px(n=3))
+        v.note_ring_size(141.0)
+        p = v.ring_px(n=3)
+        self.assertIsNotNone(p)
+        self.assertLess(math.hypot(p[0] - 337, p[1] - 250), 30.0)        # 圆环中心(地面)在物料顶面附近
+
+    def test_overlay_pick(self):
+        img, _c, _cam = pick_scene((340, 260), 84, self.COLS[1], R=140)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view=''))
+        p = v.pick_px(1, n=2)
+        out = v.overlay(img, 'PICK', p, color_id=1)
+        self.assertEqual(out.shape, img.shape)
+
+
 class LatestFrameTests(unittest.TestCase):
     def test_fresh_frames_and_close(self):
         from vision import LatestFrame

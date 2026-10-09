@@ -21,6 +21,8 @@ mtest QR                   单独测读码并显示
 mtest RAW <批次>           单独测原料盘抓取(批次 1 或 2；需要先 qr 或 mcode)
 mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有这批物料，没有就加 force 假定有：mtest ROUGH 1 force)
 mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这批物料；没跑过 mtest RAW 就加 force：mtest TEMP 1 force)
+                             ROUGH/TEMP 后面还可以加：nogo = 只认圆环、对准，不取不放(先看对得准不准)；
+                             rev = 这次圆环前后方向反过来(1 号、3 号环跑反了时用)。车是手放到工位上的，位移从 0 算
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
 vwatch RING | RAW <颜色号>  一直识别(圆环/物料)，画面给 python3 vview.py 实时看；这时照常用 arm LIFT / arm AD 调手臂，
@@ -166,7 +168,7 @@ def _watch_start(h, what, log):
 
     def loop():
         last_found, last_print, last_p = None, 0.0, None
-        name = '圆环' if kind == 'RING' else f'{COLOR_NAMES.get(color, color)}色物料'
+        name = '圆环' if kind == 'RING' else (('圆环上的' if kind == 'PICK' else '') + f'{COLOR_NAMES.get(color, color)}色物料')
         while not ev.is_set():
             try:
                 fr = vis._frame(fresh=False)
@@ -184,6 +186,12 @@ def _watch_start(h, what, log):
                     p = None if best is None else (best[0], best[1])
                     vis._live_t = 0.0
                     vis._publish(fr, 'RING', p, rings=rings)
+                elif kind == 'PICK':
+                    res = vis._pick_det().detect(fr, color)
+                    p = None if res is None else (float(res['center'][0]), float(res['center'][1]))
+                    cu, cv_ = vis.claw('PICK')
+                    vis._live_t = 0.0
+                    vis._publish(fr, 'PICK', p, color_id=color)
                 else:
                     p = vis._material_det()(fr, color)
                     cu, cv_ = vis.claw('RAW')
@@ -252,10 +260,11 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             return None
         if sub == 'RING':
             what = ('RING', None)
-        elif sub == 'RAW' and len(parts) > 2 and parts[2].isdigit() and 1 <= int(parts[2]) <= 6:
-            what = ('RAW', int(parts[2]))
+        elif sub in ('RAW', 'PICK') and len(parts) > 2 and parts[2].isdigit() and 1 <= int(parts[2]) <= 6:
+            what = (sub, int(parts[2]))
         else:
-            raise ValueError('格式：vwatch RING(看圆环)  /  vwatch RAW 1(看物料，颜色号 1~6)  /  vwatch off(停)')
+            raise ValueError('格式：vwatch RING(看圆环)  /  vwatch RAW 1(看原料盘上的物料，颜色号 1~6)  /  '
+                             'vwatch PICK 1(看圆环上放着的物料)  /  vwatch off(停)')
         if state.get('busy') or state.get('auto'):
             raise ValueError('正在运行别的命令，等结束再用')
         h._ensure_arm_only(link)
@@ -324,9 +333,14 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         return _run_async(state, log, go, vision=True)
 
     if k == 'vclaw':
-        if len(parts) < 2 or parts[1].upper() not in ('RAW', 'RING'):
-            raise ValueError('格式：vclaw RAW 1(颜色号)   或   vclaw RING 100(黑环外径毫米，可以不写)')
+        if len(parts) < 2 or parts[1].upper() not in ('RAW', 'RING', 'PICK'):
+            raise ValueError('格式：vclaw RAW 1(颜色号)   或   vclaw RING 100(黑环外径毫米，可以不写)   或   vclaw PICK(清掉物料顶面的爪子点，重新量)')
         kind = parts[1].upper()
+        if kind == 'PICK':
+            if state.get('busy') or state.get('auto'):
+                raise ValueError('正在运行别的命令，等结束再用')
+            _forget_pick(h, log, '已清掉')
+            return None
         color = None
         if kind == 'RAW':
             if len(parts) < 3 or not parts[2].isdigit() or not 1 <= int(parts[2]) <= 6:
@@ -375,7 +389,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'mtest':
         if len(parts) < 2:
-            raise ValueError('格式：mtest QR / mtest RAW 1 / mtest ROUGH 1 [force] / mtest TEMP 1 / mtest START / mtest reset')
+            raise ValueError('格式：mtest QR / mtest RAW 1 / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
             release()                                   # 关掉摄像头(后台线程)再丢掉记录，不然摄像头一直被占着
@@ -384,12 +398,25 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         if what not in ('QR', 'RAW', 'ROUGH', 'TEMP', 'START'):
             raise ValueError('mtest 后面是 QR / RAW / ROUGH / TEMP / START / reset')
         batch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-        force = any(p.lower() == 'force' for p in parts[2:])
+        opts = {p.lower() for p in parts[2:]}
+        force, nogo, rev = 'force' in opts, 'nogo' in opts, 'rev' in opts
+        bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in ('force', 'nogo', 'rev')]
+        if bad:
+            raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev')
 
         def go():
             h._ensure(link)
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
+            h.t0 = h.now()                              # 每次 mtest 重新计时(不然前面摆物料、搬车花的时间算进 time_limit_s，一开始就"时间到")
+            if what in ('ROUGH', 'TEMP'):
+                if h.plan is None:
+                    raise ValueError('还没有任务码：先 qr 或者 mcode 156+123+516+231')
+                if h.act is not None:
+                    h.act.reset_disp()                  # 车是手放到这个工位的：底盘位移从 0 算，前面学到的停车误差也清掉
+                h.learn = {'S': 0.0, 'F': 0.0}
+                h.nogo, h.ring_rev = nogo, rev
+                _zone_preflight(h, what, batch, force, log)
             if force and h.plan is not None and what in ('ROUGH', 'TEMP'):
                 for it in h.plan.items(batch):
                     h.in_tray[it.slot] = it
@@ -398,8 +425,14 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     for it in h.plan.items(1):
                         h.on_ring.setdefault(('TEMP', it.ring), []).append(it)
                     log('  (force：假定暂存区已经平放了第一批)')
-            h.run_role(what, batch)
+            try:
+                h.run_role(what, batch)
+            finally:
+                h.nogo, h.ring_rev = False, False
             log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
+            if what in ('ROUGH', 'TEMP'):
+                tray = '  '.join(f'{s}号槽={it.color_name}' for s, it in sorted(h.in_tray.items())) or '空'
+                log(f'  现在车上转盘：{tray}')
         return _run_async(state, log, go, vision=True)
 
     raise ValueError('未知命令 ' + k)
@@ -469,6 +502,40 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
     log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+
+
+def _zone_preflight(h, zone, batch, force, log):
+    """mtest ROUGH/TEMP 开始前说清楚：要放哪几个、往哪边挪、还缺哪些标定。"""
+    from vision import load_vision_cal
+    cal = load_vision_cal(h.cfg.get('vision_cal_file'))
+    items = h.plan.items(batch)
+    offs = h.cfg['ring_offset_mm'].get(zone) or {}
+    sign = -1.0 if h.ring_rev else 1.0
+    log(f'== {zone} 第{batch}批' + ('(nogo：只对准，不取不放)' if h.nogo else '') + '：车要停在 2 号环正对手臂的位置 ==')
+    for it in items:
+        off = sign * float(offs.get(str(it.ring), 0.0))
+        where = '不挪' if abs(off) < 1 else f'底盘{"前进" if off > 0 else "后退"} {abs(off):.0f}mm'
+        log(f'   {it.slot}号槽 {it.color_name} -> 环{it.ring}({where})')
+    if not force and not h.nogo:
+        missing = [it for it in items if it.slot not in h.in_tray]
+        if missing:
+            log('   ★ 转盘里没有记录这些物料：' + '、'.join(f'{it.slot}号槽{it.color_name}' for it in missing) +
+                '(没跑过 mtest RAW 的话加 force，并且按上面手放进转盘)')
+    if 'RING' not in (cal.get('claw_px') or {}):
+        log('   ★ 还没做 vclaw RING：放的位置按估计的爪子点，可能偏几毫米')
+    covered = zone == 'ROUGH' or batch == 2                 # 取回 / 码垛：圆环白心被物料盖住
+    if covered and hasattr(h.vision, 'has_pick') and not h.vision.has_pick():
+        if zone == 'ROUGH':
+            log('   取回时按物料对准要用的 PICK 点还没量：' +
+                ('这次是 nogo，不放物料，量不了' if h.nogo else '第一个物料放下后会自动量一次(多几秒，量好存下来以后不用再量)'))
+        else:
+            log('   码垛时按物料对准要用的 PICK 点还没量(粗加工区、暂存区第一批放下物料时会自动量)：这次认圆环外圈对准')
+    if covered and not cal.get('ring_rmax_px') and not h.vision.cfg.get('ring_rmax_cal'):
+        log('   还没量圆环大小(vclaw RING)：' + ('放物料时会记下空圆环的大小，取回时白心被盖住也按它认外圈' if zone == 'ROUGH'
+                                               else '码垛时下面的物料把白心盖住，认不到物料就认不出圆环'))
+    if h.store is not None and h.store.get('RING', 'arm') is None:
+        log('   第一次对圆环：会先小幅动几下手臂(和底盘)，测出动作和画面的对应关系，存下来以后直接用')
+    log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
 
 
 def _rtest(h, link, arm_only, log):
@@ -563,8 +630,27 @@ def _measure_px(fn, n, log, what):
     return (float(med[0]), float(med[1])), spread, len(pts)
 
 
+def _forget_pick(h, log, what):
+    """清掉 claw_px.PICK(文件里和内存里)：下次放下物料以后自动重新量。"""
+    from vision import forget_vision_cal
+    path = h.cfg.get('vision_cal_file')
+    gone = forget_vision_cal(('PICK',), ('pick_r_px', 'pick_ZOBRNG'), path) if path else False
+    h._ensure_vision()
+    had = hasattr(h.vision, 'has_pick') and h.vision.has_pick()
+    if hasattr(h.vision, 'set_pick'):
+        h.vision.set_pick(None)
+    h._pick_tries = 0
+    if getattr(h, 'store', None) is not None:
+        for g in ('arm', 'ch'):
+            h.store.drop('PICK', g)
+        h.store.save()
+    log(f'  {what}物料顶面的爪子点 claw_px.PICK' + ('' if (gone or had) else '(本来就没有)') +
+        '：下次 mtest ROUGH(或比赛里)第一个物料放下以后自动重新量')
+
+
 def _vclaw(h, link, kind, color, log):
-    from vision import save_vision_cal
+    from vision import save_vision_cal, load_vision_cal
+    prev_cal = load_vision_cal(h.cfg.get('vision_cal_file') or None)
     h._ensure_arm_only(link)
     h._ensure_vision()
     P = h.arm.params(refresh=True)
@@ -648,6 +734,10 @@ def _vclaw(h, link, kind, color, log):
     old = h.vision.claw(kind)
     path = save_vision_cal(kind, uv, h.cfg.get('vision_cal_file') or None, extra)
     h.vision.cfg['claw_px'][kind] = [uv[0], uv[1]]
+    prev = (prev_cal.get('claw_px') or {}).get('RING') if kind == 'RING' else None
+    if prev and math.hypot(uv[0] - prev[0], uv[1] - prev[1]) > 4.0:
+        log(f'  圆环的爪子点比上次量的差了 {math.hypot(uv[0] - prev[0], uv[1] - prev[1]):.0f} 像素(摄像头动过？)')
+        _forget_pick(h, log, '一起清掉了')
     log(f'爪子像素 claw_px.{kind} = ({uv[0]:.1f}, {uv[1]:.1f})  [原来 ({old[0]:.1f}, {old[1]:.1f})，'
         f'{n} 次测量最大跳动 {spread:.1f} 像素]，已存进 {path}')
     if extra.get('r_px'):
@@ -697,6 +787,9 @@ def _vcal(h, kind, color, chassis, log):
                 ('' if diff < 0.1 else f'  → 相差 {diff * 100:.0f}%，{advice}'))
             if abs(ps[0] - ps[1]) / max(meas, 1e-9) > 0.2:
                 log('  注意：横移和前进的比例相差超过 20%，可能底盘走的距离不准或摄像头有畸变')
+        if kind == 'RING':
+            for g in ('arm', 'ch'):
+                h.store.drop('PICK', g)                 # 物料顶面(PICK)的 J 下次按新的圆环 J 重新换算
         h.store.save()
         log('  校准结果已存进 ' + str(h.store.path) + '，以后对准直接用。' if h.store.path else '  (没有配置存储文件，校准结果只在这次运行里有效)')
     except ServoError as ex:

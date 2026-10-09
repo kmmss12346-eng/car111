@@ -96,7 +96,7 @@ class SimWorld:
         self.Rcam = np.array([[c, -s], [s, c]]) @ np.diag([1.0, refl])
         self.k2 = 0.175 * self.rng.choice([-1.0, 1.0])        # ID2 每度动多少毫米(径向)
         self.k1 = 2.6 * self.rng.choice([-1.0, 1.0])          # ID1 每度动多少毫米(切向)
-        self.scale = dict(RAW=4.36, RING=2.96)
+        self.scale = dict(RAW=4.36, RING=2.96, PICK=2.96 * 1.3)   # PICK：圆环上物料的顶面(比地面近，像素/毫米大)
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         self.link = SimLink(self)
         self.vision = SimVision(self)
@@ -379,8 +379,47 @@ class SimVision:
         self.cfg = {'claw_px': {'RAW': [320.0, 240.0], 'RING': [320.0, 240.0]}}
 
     def claw(self, kind):
-        v = self.cfg['claw_px'][kind]
+        cp = self.cfg['claw_px']
+        v = cp.get(kind) or cp['RING']
         return (float(v[0]), float(v[1]))
+
+    def has_pick(self):
+        return self.cfg['claw_px'].get('PICK') is not None
+
+    def set_pick(self, uv, r=None):
+        if uv is None:
+            self.cfg['claw_px'].pop('PICK', None)
+        else:
+            self.cfg['claw_px']['PICK'] = [float(uv[0]), float(uv[1])]
+
+    TRUE_PICK = (338.0, 214.0)          # 物料在爪子正下方时，它顶面圆心在画面里的位置(顶面比圆环高，有视差，不是 TRUE_CLAW)
+    last_pick_r = None
+    hide_pick = ()                      # 测试用：这些颜色的物料在圆环上认不到
+
+    def pick_px(self, color_id, n=None):
+        """圆环上(最上面一层)这个颜色的物料顶面圆心的像素位置。"""
+        w = self.w
+        self.last_pick_r = None
+        tops = [st[-1] for (z, k), st in w.rings.items() if z == w.zone and st and st[-1]['color'] == int(color_id)]
+        if w.zone not in ('ROUGH', 'TEMP') or not tops or int(color_id) in self.hide_pick:
+            w.advance(MEASURE_S)
+            return None
+        c = w.claw()
+        it = min(tops, key=lambda i: np.linalg.norm(i['pos'] - c))
+        e = w.pixel_error(it['pos'], 'PICK')
+        if e is None:
+            return None
+        self.last_pick_r = 25.0 * w.scale['PICK']
+        return (self.TRUE_PICK[0] + e[0], self.TRUE_PICK[1] + e[1])
+
+    def pick_error(self, color_id, n=None):
+        if not self.has_pick():
+            return None
+        p = self.pick_px(color_id, n)
+        if p is None:
+            return None
+        c = self.claw('PICK')
+        return (p[0] - c[0], p[1] - c[1])
 
     def material_px(self, color_id, n=None):
         e = self.material_error(color_id, n)
@@ -464,7 +503,7 @@ def run_mission(world, hooks, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH
 
 
 def make(world, cfg_extra=None, log=lambda m: None):
-    cfg = dict(time_limit_s=1e9, servo_cal_file=None)           # 测试里不限时、不读写文件
+    cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='')     # 测试里不限时、不读写文件
     cfg.update(cfg_extra or {})
     return MissionHooks({'mission_cfg': cfg}, log=log, vision=world.vision, now=world.now, sleep=world.advance)
 

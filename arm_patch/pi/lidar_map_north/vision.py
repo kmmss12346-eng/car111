@@ -12,6 +12,8 @@
   - 输出"偏差像素" = 目标像素 - 爪子像素，交给 visual_servo
 爪子像素 claw_px 是爪子的轴线在画面里的位置：RAW 用于夹原料盘上的物料，RING 用于对准地上圆环。
 改 claw_px.RING 1 个像素，放置位置大约移动 0.34mm(按 2.96 像素/毫米算)；以后实际放偏了，就调这个数。
+claw_px.PICK：圆环上方观察时，物料正好在爪子下面，它顶面圆心在画面里的位置(物料顶面比圆环高，和 RING 不是同一个点)。
+粗加工区第一次放下物料以后自动量一次存起来；取回、码垛时圆环白心被物料盖住，就直接把物料顶面对到这个点。
 """
 import json
 import os
@@ -32,7 +34,9 @@ def _cal_path(path=None):
 
 
 def load_vision_cal(path=None):
-    """读 vision_cal.json：{"claw_px": {"RAW": [u, v], "RING": [u, v]}}。没有或读不了返回 {}。"""
+    """读 vision_cal.json：{"claw_px": {"RAW": [u, v], "RING": [u, v]}}。没有或读不了返回 {}。path='' = 不用文件(模拟测试)。"""
+    if path == '':
+        return {}
     p = _cal_path(path)
     try:
         with open(p, 'r', encoding='utf-8') as f:
@@ -56,6 +60,25 @@ def save_vision_cal(kind, uv, path=None, extra=None):
     return p
 
 
+def forget_vision_cal(kinds=(), keys=(), path=None):
+    """从 vision_cal.json 里删掉几个爪子点(claw_px 里的 kind)和键。返回是否改了文件。"""
+    p = _cal_path(path)
+    d = load_vision_cal(p)
+    cp = d.get('claw_px') or {}
+    gone = [k for k in kinds if k in cp] + [k for k in keys if k in d]
+    if not gone:
+        return False
+    for k in kinds:
+        cp.pop(k, None)
+    for k in keys:
+        d.pop(k, None)
+    tmp = str(p) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+    return True
+
+
 def apply_vision_cal(cfg, path=None):
     """配置(dict)里的 claw_px 用 vision_cal.json 里实测的覆盖。返回同一个 dict。"""
     cal = load_vision_cal(path).get('claw_px') or {}
@@ -71,6 +94,8 @@ def apply_vision_cal(cfg, path=None):
         cfg['ring_rmax_cal'] = float(cal['ring_rmax_px'])     # vclaw RING 量到的圆环最外圈半径(像素)
     if cal.get('ring_outer_diam_mm'):
         cfg['ring_outer_diam_mm'] = float(cal['ring_outer_diam_mm'])   # vclaw RING 时输入的圆环外径(毫米)
+    if cal.get('pick_r_px') and not cfg.get('pick_r_px'):
+        cfg['pick_r_px'] = float(cal['pick_r_px'])            # 圆环上方观察时物料顶面的半径(像素)，和 claw_px.PICK 一起记下
     return cfg
 
 
@@ -323,6 +348,7 @@ class Vision:
         ring_line_mm=0.0,          # 6 条细线那种靶填线宽 1.5(识别出来的最外圈半径是线的外边)；校赛粗黑环靶是 0
         live_view='/tmp/vision_live.jpg',   # 识别时把带标注的画面写到这里，另开终端 python3 vview.py 实时看；''=不写
         live_fps=8.0,              # 最多每秒写几张
+        pick_r_px=None,            # 圆环上方观察时物料顶面半径(像素)：和 claw_px.PICK 一起自动量出来存进 vision_cal.json
     )
 
     def __init__(self, cfg=None, camera=None, material_detector=None, ring_detector=None, log=print, sleep=time.sleep):
@@ -343,6 +369,8 @@ class Vision:
         self._mask_md = None            # 只用来找爪子区域的 matdet(物料识别不是 matdet 时)
         self.last_claw = None           # 最近一次认圆环时用的爪子区域(画图用)
         self.last_ring_rmax = None      # 最近一次 ring_px 认到的圆环最外圈半径(像素)
+        self._pick = None               # 认圆环上物料用的 matdet(和原料盘的分开)
+        self.last_pick_r = None         # 最近一次 pick_px 认到的物料顶面半径(像素)
         self._live_t = 0.0
 
     # ------------------------------------------------------------ 基础
@@ -361,7 +389,14 @@ class Vision:
     def scale(self, kind):
         """每毫米多少像素。RAW：配置了物料直径(material_diam_mm)并且已经认到过没被挡住的物料时，
         用认到的物料半径现算(观察高度变了也准)；RING：vclaw RING 量过圆环最外圈半径时用它和 ring_outer_diam_mm 算；
+        PICK(圆环上放着的物料的顶面)：用量到的物料顶面半径和物料直径算；
         否则用配置里的 px_per_mm。"""
+        if kind == 'PICK':
+            r = self.cfg.get('pick_r_px') or self.last_pick_r
+            if r and self.cfg.get('material_diam_mm'):
+                return 2.0 * float(r) / float(self.cfg['material_diam_mm'])
+            pp = (self.cfg.get('px_per_mm') or {}).get('PICK')
+            return float(pp) if pp else 1.3 * self.scale('RING')         # 物料顶面比地面近，像素/毫米大一些(估计)
         if kind == 'RING' and self.cfg.get('ring_rmax_cal') and self.cfg.get('ring_outer_diam_mm'):
             d = float(self.cfg['ring_outer_diam_mm']) + float(self.cfg.get('ring_line_mm') or 0.0)   # 量到的是最外圈线的外边
             return 2.0 * float(self.cfg['ring_rmax_cal']) / d
@@ -381,8 +416,26 @@ class Vision:
         return ((inset - cu, inset - cv_), (W - inset - cu, H - inset - cv_))
 
     def claw(self, kind):
-        v = self.cfg['claw_px'][kind]
+        cp = self.cfg['claw_px']
+        v = cp.get(kind)
+        if v is None and kind == 'PICK':
+            v = cp['RING']              # PICK 还没量过：画图、算画面范围先用圆环的点(对准前要先 has_pick())
         return (float(v[0]), float(v[1]))
+
+    def has_pick(self):
+        """claw_px.PICK 量过没有(没量过就不能按物料对准取回/码垛)。"""
+        return (self.cfg.get('claw_px') or {}).get('PICK') is not None
+
+    def set_pick(self, uv, r=None):
+        """记下 claw_px.PICK 和物料顶面半径；认圆环上物料的 matdet 按新的半径重建。uv=None：忘掉(下次放下物料时重新量)。"""
+        if uv is None:
+            self.cfg.get('claw_px', {}).pop('PICK', None)
+            self.cfg.pop('pick_r_px', None)
+        else:
+            self.cfg.setdefault('claw_px', {})['PICK'] = [float(uv[0]), float(uv[1])]
+            if r:
+                self.cfg['pick_r_px'] = float(r)
+        self._pick = None
 
     def _material_det(self):
         if self._material is None:
@@ -503,6 +556,9 @@ class Vision:
             rexp = None
             if not any_size and (self.cfg.get('ring_rmax_px') or self.cfg.get('ring_rmax_cal')):
                 rexp = self._ring_rmax_range()          # 圆环大小已知：中间被物料盖住、只剩最外圈时也能认
+            elif not any_size and self.cfg.get('ring_rmax_seen'):
+                r = float(self.cfg['ring_rmax_seen'])   # 没量过，但这次放物料时认到过空圆环：按那个大小认
+                rexp = (0.85 * r, 1.2 * r)
             rings = det(fr, self.last_claw, r_expect=rexp)
         else:
             rings = det(fr)
@@ -533,12 +589,121 @@ class Vision:
             return None
         return _robust_mean(pts, self.cfg['reject_px'])
 
+    def note_ring_size(self, r):
+        """对准空圆环时认到的最外圈半径(像素)。没做 vclaw RING 量圆环大小时记下来(只在这次运行里有效)：
+        取回、码垛时白心被物料盖住、只剩黑环外圈，也能按这个大小认出来。"""
+        if not r:
+            return
+        seen = self._ring_seen = (getattr(self, '_ring_seen', []) + [float(r)])[-5:]
+        self.cfg['ring_rmax_seen'] = sorted(seen)[len(seen) // 2]
+
+    def note_claw_clear(self):
+        """刚对准过空圆环(爪子是空的，附近只有黑白圆环)：这时找到的爪子区域是干净的，记给认圆环上物料的 matdet 用。
+        这样取回蓝色/浅蓝物料时，挨着蓝色爪子的物料不会被当成爪子去掉。"""
+        m = self.last_claw
+        if m is None or not getattr(m, 'any', lambda: False)():
+            return
+        try:
+            md = self._pick_det()
+        except VisionError:
+            return
+        if md._auto_cache is None:
+            md._auto_cache = m
+
+    def ring_centre_free(self, n=2):
+        """爪子点附近那个圆环的白心是不是空的(没放着物料)：True 空 / False 有东西 / None 看不清(被爪子挡住太多、没认到圆环)。
+        白心里白色(亮、颜色淡)的像素占多少：印的数字是黑的，占得不多；放着物料就基本没有白的了。"""
+        import cv2
+        import numpy as np
+        votes = []
+        cu, cv_ = self.claw('RING')
+        for fr in self._frames(int(n)):
+            if fr is None:
+                continue
+            rings = self._rings_in_frame(fr)
+            if not rings:
+                continue
+            best = min(rings, key=lambda r: (r[0] - cu) ** 2 + (r[1] - cv_) ** 2)
+            R = float(best[3]) if len(best) >= 4 else float(best[2])
+            h, w = fr.shape[:2]
+            yy, xx = np.ogrid[:h, :w]
+            inside = (xx - best[0]) ** 2 + (yy - best[1]) ** 2 <= (0.4 * R) ** 2
+            claw = self.last_claw
+            if claw is not None and claw.shape[:2] == (h, w):
+                inside &= cv2.dilate(claw, np.ones((9, 9), np.uint8)) == 0
+            npx = int(inside.sum())
+            if npx < 120:
+                continue
+            hsv = cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)
+            white = (hsv[:, :, 2] > 140) & (hsv[:, :, 1] < 70)
+            frac = float((white & inside).sum()) / npx
+            votes.append(True if frac >= 0.55 else (False if frac < 0.4 else None))
+        votes = [v for v in votes if v is not None]
+        if not votes:
+            return None
+        return sum(votes) * 2 > len(votes) if len(votes) > 1 else votes[0]
+
     def ring_error(self, n=None):
         """圆环中心偏差像素 = 圆环中心 - 爪子(RING)。看不到返回 None。"""
         p = self.ring_px(n)
         if p is None:
             return None
         cu, cv_ = self.claw('RING')
+        return (p[0] - cu, p[1] - cv_)
+
+    # ------------------------------------------------------------ 圆环上放着的物料(取回、码垛)
+    def _pick_det(self):
+        """认圆环上物料用的 matdet。和原料盘的分开：观察高度不一样，物料看起来大小不一样，原料盘学到的半径不能用。"""
+        if self._pick is None:
+            try:
+                from matdet import MaterialDetector
+            except ImportError as ex:
+                raise VisionError('找不到 matdet.py(或者没装 numpy/opencv)：把 matdet.py 复制到 lidar_map_north 文件夹') from ex
+            self._pick = MaterialDetector(self.cfg.get('matdet'))
+            if self.cfg.get('pick_r_px'):
+                self._pick.seed_radius(float(self.cfg['pick_r_px']))
+        md = self._pick
+        if md._auto_cache is None:
+            # 原料盘那边记下过爪子区域就拿来用(爪子在画面里的位置不随姿态变)：蓝色物料挨着爪子时不会和爪子连成一块
+            try:
+                main = self.material_detector_obj()
+            except VisionError:
+                main = None
+            if getattr(main, '_auto_cache', None) is not None:
+                md._auto_cache = main._auto_cache
+        return md
+
+    def pick_px(self, color_id, n=None):
+        """圆环上(取回时)或下面一层(码垛时)这个颜色的物料，顶面圆心的像素位置，多帧稳健平均；看不到返回 None。
+        量过物料顶面半径(pick_r_px)时，大小差得多的不算。self.last_pick_r = 这几帧里顶面半径的中值。"""
+        n = int(n or self.cfg['frames'])
+        md = self._pick_det()
+        r0 = self.cfg.get('pick_r_px')
+        pts, rr = [], []
+        for fr in self._frames(n):
+            if fr is None:
+                continue
+            res = md.detect(fr, int(color_id))
+            if res is not None and r0 and not 0.8 * float(r0) <= res['radius'] <= 1.25 * float(r0):
+                res = None
+            p = None if res is None else (float(res['center'][0]), float(res['center'][1]))
+            self._publish(fr, 'PICK', p, color_id=color_id)
+            if p is not None:
+                pts.append(p)
+                rr.append(float(res['radius']))
+        self.last_pick_r = sorted(rr)[len(rr) // 2] if rr else None
+        if len(pts) < max(2, n // 2 + 1):
+            return None
+        return _robust_mean(pts, self.cfg['reject_px'])
+
+    def pick_error(self, color_id, n=None):
+        """物料顶面偏差像素 = 物料顶面圆心 - claw_px.PICK。PICK 还没量过、或者看不到，返回 None。"""
+        if not self.has_pick():
+            return None
+        p = self.pick_px(color_id, n)
+        if p is None:
+            return None
+        cu, cv_ = self.claw('PICK')
         return (p[0] - cu, p[1] - cv_)
 
     # ------------------------------------------------------------ 调试
@@ -570,7 +735,7 @@ class Vision:
             claw = self.last_claw
         else:
             try:
-                md = self.material_detector_obj()
+                md = self._pick if kind == 'PICK' else self.material_detector_obj()
             except VisionError:
                 md = None
             claw = getattr(md, 'last_claw', None) if md is not None else None
@@ -601,6 +766,8 @@ class Vision:
                 cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
                 info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
             what = f'MATERIAL {color_id}'
+            if kind == 'PICK':
+                what += ' on ring' + ('' if self.has_pick() else ' (PICK point not learned)')
         if target is not None:
             cv2.drawMarker(out, (int(round(target[0])), int(round(target[1]))), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 28, 2)
             cv2.line(out, (int(cu), int(cv_)), (int(round(target[0])), int(round(target[1]))), (255, 0, 255), 1)

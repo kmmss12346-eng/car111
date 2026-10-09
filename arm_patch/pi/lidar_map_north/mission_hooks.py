@@ -11,7 +11,10 @@
   1 底盘沿车头方向挪到目标圆环旁边(圆环间隔 150mm 的整数倍，位置已知)
   2 手臂摆到观察姿态，爪子是空的，圆环不会被挡住；摄像头闭环对准圆环中心
   3 记下这时 ID1/ID2 的角度，去转盘取物料，再回到记下的角度(舵机回到同一角度的重复精度高)，下降、松手
-码垛也是对准圆环中心(下面那个物料就放在这个圆环上)，只是下降高度浅一个物料。
+取回(粗加工区)和码垛(暂存区第二批)时圆环白心被物料盖住了：直接认物料顶面，把它对到 claw_px.PICK
+(物料在爪子正下方时顶面在画面里的位置；第一次放下物料后自动量一次，存进 vision_cal.json)；
+认不到物料(黑色物料在黑环上、还没量过 PICK)再认圆环；都看不到时取回按放下时记下的位置直接夹。
+码垛的下降高度浅一个物料。
 
 出错处理：
   - 机械臂还没标定(ARMOK=0)、升降没回零：整轮不做夹放，路线照走，并在串口屏提示
@@ -19,6 +22,7 @@
   - 收到急停(abort)：立刻抛 Abort，路线停止
   - 超过 time_limit_s：不再做夹放，让车尽快回家
 """
+import math
 import time
 
 from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
@@ -59,12 +63,16 @@ DEFAULTS = dict(
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': -150.0, '2': 0.0, '3': 150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
+    learn_pick=True,                    # 还没量过 claw_px.PICK 时，放下第一个物料后回到对准姿态量一次(多花几秒，只做一次)
     stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
+
+
+PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
 
 
 def deep_merge(base, extra):
@@ -85,6 +93,18 @@ def vision_cfg(cfg):
     vc.setdefault('detector', 'circle')
     vc['matdet'] = cfg.get('matdet') or {}
     return vc
+
+
+def _first(p, measure):
+    """第一次返回已经测好的 p(刚测过、还没动，不用再拍一遍)，以后每次调 measure()。"""
+    box = [p]
+
+    def m():
+        if box[0] is not None:
+            q, box[0] = box[0], None
+            return q
+        return measure()
+    return m
 
 
 class MissionHooks:
@@ -112,6 +132,9 @@ class MissionHooks:
         self._inited = False
         self.placements = []                # 记录每次放置：(区, 环, 是否码垛, 对准误差 mm)
         self._warned_vmask = False          # 蓝色物料没做 vmask 的提醒只说一次
+        self.nogo = False                   # mtest ... nogo：只认圆环、对准，不取物料、不放、不夹回
+        self.ring_rev = False               # mtest ... rev：这一次圆环的前后方向反过来(车头朝向和配置的相反)
+        self._pick_tries = 0                # 量 claw_px.PICK 试了几次(认不到就下一个物料再试，最多 3 次)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -178,6 +201,12 @@ class MissionHooks:
                 self.log(f'★ {key} 现在是 {float(P[key]):g}，vclaw {kind} 时是 {float(cal[key]):g}：爪子点已经不准，重做 vclaw {kind}')
                 if kind == 'RING' and self.vision is not None and hasattr(self.vision, 'cfg'):
                     self.vision.cfg.pop('ring_rmax_cal', None)     # 圆环大小变了：别按旧的大小过滤掉
+        v = self.vision
+        if ('pick_ZOBRNG' in cal and 'ZOBRNG' in P and abs(float(cal['pick_ZOBRNG']) - float(P['ZOBRNG'])) > 0.5
+                and v is not None and hasattr(v, 'set_pick') and v.has_pick()):
+            v.set_pick(None)
+            self.log(f'  ZOBRNG 现在是 {float(P["ZOBRNG"]):g}，量 PICK 时是 {float(cal["pick_ZOBRNG"]):g}：物料顶面的爪子点作废，'
+                     '下次放下物料时自动重新量(或者 vclaw PICK 颜色号)')
 
     def _init_arm(self):
         try:
@@ -418,16 +447,30 @@ class MissionHooks:
         self.log(f'  ▶ 从{zone}取回 {item.color_name}(环{item.ring}) -> 转盘 {item.slot} 号槽')
         self._ui('stage', f'{zone[:5]} PICK {item.index + 1}/3 R{item.ring}')
         try:
-            if not self._goto_recorded(zone, item):
+            recorded = self._goto_recorded(zone, item)
+            if not recorded:
                 self._goto_ring(zone, item.ring)
                 self.arm.obs('RING', open_claw=True)
-            res = self.servo.run('RING', self.vision.ring_error, self.vision.scale('RING'),
-                                 cfg['tol_mm']['PICK'], allow_chassis=True, label=f'取回{item.color_short}', bounds=self.vision.bounds('RING'), confirm=False)
-            self.log(f'    对准结果：{res}')
-            if not res.ok and res.err_mm > cfg['accept_mm']['PICK']:
-                self._recover(f'没对准({res.reason})，不取，免得夹歪碰倒')
-                return False
-            self._learn_from(zone, item.ring)
+            res, how = self._align_covered(item.color, 'PICK', f'取回{item.color_short}', confirm=False)
+            if res is None:
+                if not recorded:
+                    self._recover('物料和圆环都看不到，不取')
+                    return False
+                self.log('    物料和圆环都看不到：按放下时记下的位置直接取')
+            else:
+                self.log(f'    对准结果(按{how})：{res}')
+                if not res.ok and res.err_mm > cfg['accept_mm']['PICK']:
+                    if recorded and not math.isfinite(res.err_mm):
+                        self.log('    对准时目标丢了：回到放下时记下的位置直接取')
+                        self._goto_recorded(zone, item)
+                    else:
+                        self._recover(f'没对准({res.reason})，不取，免得夹歪碰倒')
+                        return False
+                else:
+                    self._learn_from(zone, item.ring)
+            if self.nogo:
+                self.log('    (nogo：到了取回的位置，不夹)')
+                return True
             self.arm.pick_here(item.slot)
         except ArmAbort:
             raise
@@ -482,19 +525,34 @@ class MissionHooks:
         try:
             self._goto_ring(zone, ring)
             self.arm.obs('RING', open_claw=True)                 # 空爪到圆环上方：圆环不会被挡住
-            res = self.servo.run('RING', self.vision.ring_error, self.vision.scale('RING'),
-                                 cfg['tol_mm'][key], allow_chassis=True, label=label, bounds=self.vision.bounds('RING'))
-            self.log(f'    对准结果：{res}')
-            err_mm = res.err_mm
-            if not res.ok and res.err_mm > cfg['accept_mm'][key]:
+            if stack:                                            # 下面那层物料盖住了白心：先认它的顶面对准
+                res, how = self._align_covered(item.color, key, label, confirm=None)
+            else:
+                res, how = self.servo.run('RING', self.vision.ring_error, self.vision.scale('RING'), cfg['tol_mm'][key],
+                                          allow_chassis=True, label=label, bounds=self.vision.bounds('RING')), '圆环'
+            if res is not None:
+                self.log('    对准结果' + (f'(按{how})' if stack else '') + f'：{res}')
+                err_mm = res.err_mm
+            if res is None:
+                self._recover('下面那层物料和圆环都看不到，物料留在车上，不放')
+            elif not res.ok and res.err_mm > cfg['accept_mm'][key]:
                 self._recover(f'没对准({res.reason})，物料留在车上，不放')
+            elif not stack and cfg.get('check_ring_empty', True) and self._ring_taken():
+                self._recover(f'环{ring} 的白心里已经有东西了(别的物料？)，不放，免得砸上去；物料留在车上')
             else:
                 self._learn_from(zone, ring)                     # 底盘为了对准挪了多少，下一个圆环直接带上
+                if not stack and hasattr(self.vision, 'note_ring_size'):
+                    self.vision.note_ring_size(getattr(self.vision, 'last_ring_rmax', None))   # 空圆环的大小：取回时白心被盖住也认得出
+                if not stack and hasattr(self.vision, 'note_claw_clear'):
+                    self.vision.note_claw_clear()                # 爪子空着时的爪子区域：取回蓝色物料时用
                 a1, a2 = self.arm.read_angles()                  # 记下对准时 ID1、ID2 的角度
                 if a1 is None or a2 is None:
                     raise ArmError('读不到对准时的手臂角度(A? 没回复)，不去取物料')
                 d = self.act.disp
                 self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2)
+                if self.nogo:
+                    self.log('    (nogo：对准好了，不取物料、不放)')
+                    return True
                 self.arm.take(item.slot)                         # 去转盘取物料
                 self._return_to_pose(a1, a2)                     # 回到记下的角度
                 self.arm.drop(stack)                             # 下降、松手、抬起
@@ -509,7 +567,119 @@ class MissionHooks:
             self.on_ring.setdefault((zone, ring), []).append(item)
             self.placements.append((zone, ring, bool(stack), err_mm))
         self._show_stats()
+        if ok and not stack and self._want_pick(item):
+            self._learn_pick(item, self.pose_at[(zone, item.slot)])
         return ok
+
+    # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
+    def _align_covered(self, color, key, label, confirm):
+        """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
+        1 claw_px.PICK 量过、认得到这个颜色的物料：把物料顶面对到 PICK 点(最准，不用认圆环)
+        2 否则认圆环(vclaw RING 量过圆环大小时，白心被盖住也能认最外圈)
+        返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
+        v, cfg = self.vision, self.cfg
+        tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
+        if int(color) in PICK_COLORS and hasattr(v, 'has_pick') and v.has_pick():
+            e = v.pick_error(color)
+            if e is not None:
+                self._seed_pick_jac()
+                res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color)), v.scale('PICK'), tol, allow_chassis=True,
+                                     label=label, bounds=v.bounds('PICK'), confirm=confirm)
+                if res.ok or res.err_mm <= acc:
+                    return res, '物料'
+                self.log(f'    按物料没对准({res.reason})，改认圆环')
+            else:
+                self.log('    认不到圆环上的物料，改认圆环')
+        e = v.ring_error()
+        if e is None:
+            return None, None
+        return self.servo.run('RING', _first(e, v.ring_error), v.scale('RING'), tol, allow_chassis=True, label=label,
+                              bounds=v.bounds('RING'), confirm=confirm), '圆环'
+
+    def _seed_pick_jac(self):
+        """PICK(物料顶面)还没有自己的 J：用圆环的 J 按两个高度的像素/毫米之比换算一份，省得再小幅动几下探测。"""
+        st = self.store
+        if st is None:
+            return
+        try:
+            k = float(self.vision.scale('PICK')) / float(self.vision.scale('RING'))
+        except Exception:
+            return
+        if not (0.3 < k < 4.0):
+            return
+        for g in ('arm', 'ch'):
+            J = st.get('RING', g)
+            if st.get('PICK', g) is None and J is not None:
+                st.put('PICK', g, J * k)
+
+    def _want_pick(self, item):
+        v = self.vision
+        if self.nogo or not self.cfg.get('learn_pick', True) or int(item.color) not in PICK_COLORS:
+            return False
+        if not hasattr(v, 'pick_px') or not hasattr(v, 'has_pick') or v.has_pick():
+            return False
+        return self._pick_tries < 3
+
+    def _learn_pick(self, item, rec):
+        """刚放下的物料就在爪子正下方：回到对准时的姿态、降到观察高度，量它顶面圆心在画面里的位置 = claw_px.PICK。
+        以后取回、码垛时白心被物料盖住，就把物料顶面对到这个点。量完收臂(爪子伸在刚放的物料上方，不能这样挪底盘)。"""
+        from vision import save_vision_cal
+        self._pick_tries += 1
+        v = self.vision
+        self.log(f'    顺便量一次：{item.color_name}物料在爪子正下方时，它的顶面在画面里的位置(claw_px.PICK)。'
+                 '以后取回、码垛直接认物料对准；只量这一次')
+        try:
+            self._return_to_pose(rec['a1'], rec['a2'])
+            P = self.arm.params() or {}
+            if 'ZOBRNG' in P:
+                self.arm.lift(float(P['ZOBRNG']))
+            self.sleep(0.3)
+            p = v.pick_px(item.color, n=7)
+            r = getattr(v, 'last_pick_r', None)
+            why = self._pick_bad(p, r)
+            if why:
+                self.log(f'    ★ 没量成：{why}；下一个物料放下以后再量')
+            else:
+                path = self.cfg.get('vision_cal_file')
+                extra = {'pick_r_px': round(float(r), 2)}
+                if 'ZOBRNG' in P:
+                    extra['pick_ZOBRNG'] = float(P['ZOBRNG'])
+                if path:
+                    save_vision_cal('PICK', p, path, extra)
+                v.set_pick(p, r)
+                rc = v.claw('RING')
+                self.log(f'    claw_px.PICK = ({p[0]:.1f}, {p[1]:.1f})(圆环的爪子点 ({rc[0]:.1f}, {rc[1]:.1f}))，'
+                         f'物料顶面半径 {r:.0f} 像素' + (f'，已存进 {path}' if path else ''))
+        except ArmAbort:
+            raise
+        except (ArmError, VisionError) as ex:
+            self.log(f'    ★ 量物料顶面位置出错：{ex}')
+        self._stow_quiet()
+
+    def _pick_bad(self, p, r):
+        """刚量的 PICK 点哪里不对(返回原因)，没问题返回 None。"""
+        if p is None or not r:
+            return '认不到刚放下的物料(看看 vview 画面：物料是不是被爪子挡住太多、蓝色物料是不是和蓝色爪子连成了一块)'
+        rc = self.vision.claw('RING')
+        d = math.hypot(p[0] - rc[0], p[1] - rc[1])
+        if d > 200.0:
+            return f'认到的物料离圆环的爪子点 {d:.0f} 像素，太远，可能认错了'
+        vc = getattr(self.vision, 'cfg', {}) or {}
+        if vc.get('ring_rmax_cal') and vc.get('ring_outer_diam_mm') and vc.get('material_diam_mm'):
+            r_ground = float(vc['material_diam_mm']) / 2.0 * float(self.vision.scale('RING'))
+            if r < 0.85 * r_ground:
+                return f'认到的物料顶面半径 {r:.0f} 像素，比放在地上应有的 {r_ground:.0f} 像素还小，可能认错了'
+        return None
+
+    def _ring_taken(self):
+        """对准的那个圆环白心里明显放着东西(返回 True)；空的或看不清都返回 False(看不清就照常放)。"""
+        f = getattr(self.vision, 'ring_centre_free', None)
+        if f is None:
+            return False
+        try:
+            return f() is False
+        except Exception:
+            return False
 
     def _return_to_pose(self, a1, a2):
         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。"""
@@ -546,7 +716,8 @@ class MissionHooks:
     # ------------------------------------------------------------------ 底盘沿车头方向在圆环间挪动
     def _ring_nominal(self, zone, ring):
         offs = self.cfg['ring_offset_mm'].get(zone) or {}
-        return float(offs.get(str(ring), 0.0))
+        v = float(offs.get(str(ring), 0.0))
+        return -v if self.ring_rev else v
 
     def _goto_ring(self, zone, ring):
         """底盘挪到这个圆环旁边：目标位置 = 圆环的名义位置 + 前面圆环对准时学到的停车误差；按累计位移算差多少。"""
