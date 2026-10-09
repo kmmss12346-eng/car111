@@ -24,7 +24,7 @@ import time
 from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
 from task_plan import parse_code, TaskError, role_of, Stats
 from visual_servo import VisualServo, JacStore
-from vision import Vision, VisionError
+from vision import Vision, VisionError, apply_vision_cal
 
 try:
     from auto_run import Abort
@@ -42,12 +42,16 @@ DEFAULTS = dict(
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
     frames=5,                                                    # 每次测量取几帧(多帧取中值；少一点快一点，噪声会大一点)
+    detector='circle',                                           # 物料识别：'circle' = matdet.py 抗遮挡圆拟合；'wuliao' = 原来的 wuliao.py
+    matdet=dict(),                                               # matdet 的参数(r_px 半径范围、claw_mask 爪子区域文件…)，一般不用改
     claw_px=dict(RAW=[336.8, 282.9], RING=[336.8, 282.9]),      # 爪子轴线在画面里的位置
-    px_per_mm=dict(RAW=4.36, RING=2.96),                         # 每毫米多少像素(只用来换算容差)
-    tol_mm=dict(RAW=3.0, RING=1.0, PICK=2.5, STACK=2.0),         # 对准到多小算好
-    accept_mm=dict(RAW=6.0, RING=2.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过
+    px_per_mm=dict(RAW=1.97, RING=2.96),                         # 每毫米多少像素(只用来换算容差)。RAW：现场画面物料半径 49 像素 = 25mm
+    material_diam_mm=50.0,                                       # 物料顶面直径(毫米)：有它就用认到的物料半径现算 RAW 的每毫米像素(观察高度变了也准)；0 = 用 px_per_mm.RAW
+    tol_mm=dict(RAW=2.0, RING=1.0, PICK=2.5, STACK=2.0),         # 对准到多小算好
+    accept_mm=dict(RAW=4.0, RING=2.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量)
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
+    vision_cal_file='vision_cal.json',  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
     chassis_fine_rpm=60,
     # 圆环相对停车点、沿车头方向的位置(毫米，正=在车头前方)。车头朝向见 map_config 的 stops：
     #   ROUGH 车头朝东，圆环板 3-2-1 从西到东 -> 1 号在前方 +150
@@ -55,6 +59,7 @@ DEFAULTS = dict(
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': -150.0, '2': 0.0, '3': 150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
+    return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
@@ -97,6 +102,7 @@ class MissionHooks:
         self.disabled = None                # 不为 None = 整轮不做夹放，原因在里面
         self._inited = False
         self.placements = []                # 记录每次放置：(区, 环, 是否码垛, 对准误差 mm)
+        self._warned_vmask = False          # 蓝色物料没做 vmask 的提醒只说一次
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -124,7 +130,12 @@ class MissionHooks:
     def _ensure_vision(self):
         if self.vision is None:
             cfg = self.cfg
-            self.vision = Vision(dict(camera=cfg['camera'], claw_px=cfg['claw_px'], px_per_mm=cfg['px_per_mm'], frames=cfg['frames']), log=self.log)
+            vc = dict(camera=cfg['camera'], claw_px=cfg['claw_px'], px_per_mm=cfg['px_per_mm'], frames=cfg['frames'],
+                      detector=cfg.get('detector', 'circle'), matdet=cfg.get('matdet') or {},
+                      material_diam_mm=cfg.get('material_diam_mm'))
+            if cfg.get('vision_cal_file'):
+                apply_vision_cal(vc, cfg['vision_cal_file'])        # vclaw 实测的爪子像素优先
+            self.vision = Vision(vc, log=self.log)
 
     def _ensure(self, link):
         if self._inited:
@@ -289,6 +300,10 @@ class MissionHooks:
         self._ui('stage', f'RAW GRAB {item.index + 1}/3 {item.color_short}')
         self._recenter(min_mm=20.0)                 # 上一个物料对准时底盘挪过的话先挪回停车点，免得这个物料出了视野
         self.arm.obs('RAW', open_claw=True)
+        md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
+        if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(item.color) and not self._warned_vmask:
+            self._warned_vmask = True
+            self.log(f'    ★ 没标定爪子区域(claw_mask.png)：{item.color_name}物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
         still, last = self.vision.wait_still(item.color, timeout_s=cfg['raw_wait_s'])
         if last is None and self._recenter(min_mm=3.0):
             self.log('    看不到，底盘挪回停车点再找一次')
@@ -463,10 +478,21 @@ class MissionHooks:
         return ok
 
     def _return_to_pose(self, a1, a2):
+        """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。"""
+        if a1 is None or a2 is None:
+            raise ArmError('读不到对准时的手臂角度(A? 没回复)，不知道回哪里')
         pre = self.cfg.get('return_preload_deg') or [0.0, 0.0]
         if abs(pre[0]) > 1e-6 or abs(pre[1]) > 1e-6:
             self.arm.ap(a1 + pre[0], a2 + pre[1])                # 先从反方向靠近，再回来，消除齿轮间隙
         self.arm.ap(a1, a2)
+        tol = float(self.cfg.get('return_tol_deg') or 0.4)
+        for _ in range(2):
+            self.sleep(0.2)
+            b1, b2 = self.arm.read_angles()
+            if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= tol):
+                return
+            self.log(f'    回到对准姿态差了 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°，再转一次')
+            self.arm.ap(a1, a2)
 
     # ------------------------------------------------------------------ 底盘沿车头方向在圆环间挪动
     def _ring_nominal(self, zone, ring):

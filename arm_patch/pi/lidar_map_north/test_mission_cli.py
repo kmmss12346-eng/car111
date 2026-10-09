@@ -106,6 +106,49 @@ class CliTests(unittest.TestCase):
         self.assertIsNotNone(self.h.store.get('RING', 'arm'))
         self.assertEqual(abs(self.w.off_s) + abs(self.w.off_f), 0.0)
 
+    def test_vclaw_raw_measures_and_saves(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
+            self.run_cli('arm', 'arm LIFT ZERO')
+            self.w.arrive('RAW', 1)
+            self.lines.clear()
+            self.run_cli('vclaw', 'vclaw RAW 1')
+            text = '\n'.join(self.lines)
+            self.assertIn('claw_px.RAW', text, text)
+            saved = load(self.h.cfg['vision_cal_file'])['claw_px']['RAW']
+            self.assertEqual(len(saved), 2)
+            for got, want in zip(self.h.vision.claw('RAW'), saved):
+                self.assertAlmostEqual(got, want, delta=0.01)
+
+    def test_vclaw_ring_saves_ring_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
+            self.run_cli('arm', 'arm LIFT ZERO')
+            self.w.arrive('ROUGH', 1)
+            self.lines.clear()
+            self.run_cli('vclaw', 'vclaw RING')
+            text = '\n'.join(self.lines)
+            self.assertIn('claw_px.RING', text, text)
+            self.assertIn('圆环最外圈半径', text, text)
+            saved = load(self.h.cfg['vision_cal_file'])
+            self.assertEqual(len(saved['claw_px']['RING']), 2)
+            self.assertGreater(saved['ring_rmax_px'], 10)
+            self.assertIn('ZOBRNG', saved)
+
+    def test_vclaw_bad_args_and_needs_zero(self):
+        for bad in ('vclaw', 'vclaw RAW', 'vclaw RAW 9', 'vclaw XYZ'):
+            with self.assertRaises(ValueError):
+                mission_cli.handle_cli('vclaw', bad.split(), link=self.w.link, raw_cfg={}, state={}, log=self.log)
+        self.lines.clear()
+        self.w.lift_known = False                            # 升降位置丢了：不动，提示
+        self.run_cli('vclaw', 'vclaw RAW 1')
+        self.assertTrue(any('LIFT ZERO' in l for l in self.lines), self.lines)
+
+    def test_vmask_without_matdet(self):
+        self.lines.clear()
+        self.run_cli('vmask', 'vmask')
+        self.assertTrue(any('不是 matdet' in l for l in self.lines), self.lines)
+
     def test_vcal_bad_args(self):
         with self.assertRaises(ValueError):
             self.run_cli('vcal', 'vcal FOO')
@@ -122,6 +165,7 @@ class CliTests(unittest.TestCase):
         text = '\n'.join(self.lines)
         self.assertIn('对准结果', text, text)
         sent = [r for r in self.w.requests]
+        self.assertIn('OBS RAW O', sent, text)                  # 先升高再摆过去(OBS)，不在低处横扫
         self.assertIn('CLAW C', sent, text)
         self.assertTrue(any(r.startswith('AP ') for r in sent))
 

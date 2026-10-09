@@ -980,6 +980,9 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
 #define SERVO_COMP1_DEG       5.0f      /* ID1 补偿：手臂有摩擦，舵机总停在离目标差 4~5° 的地方，就往前多给 5°，到了目标马上停(SET S1COMP 改) */
 #define SERVO_COMP2_DEG       0.0f      /* ID2 补偿(SET S2COMP 改，0 = 不补) */
+#define SERVO_FINE_DEG        3.0f      /* 离目标这么近的小动作(摄像头微调)：转慢一点、查得勤一点，到了马上停，停得准 */
+#define SERVO_FINE_SPEED      15.0f     /* 小动作的最高转速 度/秒 */
+#define SERVO_POLL_FINE_MS    8u        /* 离目标 SERVO_FINE_DEG 以内时多久查一次角度(平时 30ms) */
 
 static uint16_t servo_power = SERVO_POWER;      /* 现在用的最大功率(SET SPOW 改) */
 static float servo_comp[3] = { 0.0f, SERVO_COMP1_DEG, SERVO_COMP2_DEG };   /* 每个舵机往前多给的角度 */
@@ -1069,6 +1072,10 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
     }
     d = *angle_deg - start;
     if (d < 0.0f) d = -d;
+    if (d < SERVO_FINE_DEG && speed_dps > SERVO_FINE_SPEED)
+    {
+        speed_dps = SERVO_FINE_SPEED;            /* 小动作慢一点：多给了补偿角度，转得快到了来不及停会转过头 */
+    }
 
     cmd = Servo_Clamp(id, *angle_deg + servo_dir[id] * servo_comp[id]);   /* 往前多给几度，但不超出限位 */
     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, cmd, speed_dps,
@@ -1154,18 +1161,22 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
     int kicked = 0;
     long ma;
     uint8_t st;
+    uint32_t poll = 30u;
+    float left;
 
     for (;;)
     {
-        HAL_Delay(30);
+        HAL_Delay(poll);
         el = HAL_GetTick() - t0;
         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
         {
-            if (Servo_Left(id, a, target) <= tol_deg)
+            left = Servo_Left(id, a, target);
+            if (left <= tol_deg)
             {
                 Servo_Hold(id, a);                 /* 到了(或者刚转过一点)：就停在这里，不再往多给的补偿角度使劲 */
                 return 1;
             }
+            poll = (left < SERVO_FINE_DEG) ? SERVO_POLL_FINE_MS : 30u;   /* 快到了查勤一点，到了马上停 */
             d = a - ref;
             if (d < 0.0f) d = -d;
             if (!have || d > 0.5f)

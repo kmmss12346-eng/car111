@@ -39,6 +39,7 @@ void tim_set(uint32_t ch, uint32_t v) { (void)ch; (void)v; }
 void Claw_Set(uint32_t p) { if (p == 2090u) EV("O;"); else if (p == 2910u) EV("C;"); else EV("claw%u;", p); }
 void Turntable_Set(uint32_t p) { if (p == 2608u) EV("tt1;"); else if (p == 1708u) EV("tt2;"); else if (p == 808u) EV("tt3;"); else EV("ttus%u;", p); }
 int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
+static void away(void);
 static float block1 = 1e9f;                              /* ID1 被挡住的角度(转不过去)，1e9 = 没挡 */
 void Servo_StopIfStuck(uint8_t id, float t) { EV("stuck%u:%.1f;", id, t); }
 void Servo_Report(uint8_t id) { EV("rep%u;", id); }
@@ -62,6 +63,7 @@ uint32_t Servo_Start(uint8_t id, float *a, float spd) {
 void Servo_Move(uint8_t id, float a, float spd, float tol, uint32_t extra) {
     (void)extra; a = clampa(id, a); EV("M%u:%.1f@%.0f/%.2f;", id, a, spd, tol); ang[id] = a; now += 300;
 }
+static void away(void) { ang[1] = 300.0f; ang[2] = -700.0f; }   /* 手臂先摆到别处，下一个动作一定要转 */
 void Emm_V5_En_Control(uint8_t a, bool s, bool f) { (void)a; (void)s; (void)f; }
 void Emm_V5_Reset_CurPos_To_Zero(uint8_t a) { EV("zero%u;", a); }
 /* 假升降：真实高度 phys_mm(LFDIR=0 时 d=0 往上)，编码器 = (enc_off + 每毫米 enc_cpm × 高度) 对一圈 enc_cpr 取余 */
@@ -145,13 +147,13 @@ int main(void) {
     CHECK(run("FOO") == 0 && run("") == 0 && run("CLAW") == 0, "不认识的指令返回 0(交给后面)");
 
     /* ---- OBS ---- */
-    clear();
+    away(); clear();
     CHECK(run("OBS RAW O") == 1, "OBS RAW O");
     CHECK(at("O;") >= 0 && at("O;") < at("S1:") && at("S1:") >= 0 && at("S2:") >= 0, "OBS：先张爪，再 ID1/ID2 一起转");
     CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "OBS RAW 的姿态和大动作速度");
 
     /* ---- GRAB n H 的完整顺序 ---- */
-    clear();
+    away(); clear();
     CHECK(run("GRAB 2 H") == 1, "GRAB 2 H");
     {
         int tt = at("tt2;"), open0 = at("O;"), down = at("L+6400;"), close = at("C;"), up = at("L-6400;"), sw = at("S1:"), drop_dn = at("L+4800;"), open1 = -1, up2 = -1;
@@ -181,11 +183,13 @@ int main(void) {
     CHECK(run("DROP S") == 1 && has("L+3200;"), "DROP S 下降到 ZSTK(40mm=3200 脉冲)");
 
     /* ---- PLACE = TAKE + OBS RING + DROP ---- */
-    clear();
+    Arm_Param_Set("A1P", 350);                     /* 圆环姿态和转盘姿态不一样，ID1 才会转 */
+    away(); clear();
     CHECK(run("PLACE 1") == 1 && at("C;") >= 0 && at("C;") < last("S1:") && last("S1:") < last("O;"), "PLACE：先取(夹紧)，再转到圆环上方，再放(松开)");
+    Arm_Param_Set("A1P", 323);
 
     /* ---- STOW ---- */
-    clear();
+    away(); clear();
     CHECK(run("STOW") == 1 && has("S1:") && has("S2:"), "STOW");
 
     /* ---- 精确控制 ---- */
@@ -207,7 +211,9 @@ int main(void) {
 
     /* ---- 舵机被挡住：一起转等到时间还没到位，交给 Servo_StopIfStuck(停在原地，不再顶着发热) ---- */
     ang[1] = 323.0f; ang[2] = -862.0f; block1 = 340.0f; clear();
-    CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2") && has("H2:-862.0;") && !has("H1"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)；到了的 ID2 马上停住");
+    CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2") && !has("S2:") && !has("H1"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)；ID2 本来就在 -862，不发指令");
+    ang[1] = 323.0f; ang[2] = -700.0f; clear();
+    CHECK(run("AP 323 -862") == 1 && !has("S1:") && has("S2:-862.0") && has("H2:-862.0;"), "AP 只动 ID2：ID1 已经在目标上不发指令(不会白动一下)，ID2 到了马上停住");
     block1 = 1e9f; clear();
     CHECK(run("AP 330 -860") == 1 && !has("stuck") && has("H1:330.0;") && has("H2:-860.0;"), "都到位：不叫 Servo_StopIfStuck，两个到了都马上停住");
     clear();

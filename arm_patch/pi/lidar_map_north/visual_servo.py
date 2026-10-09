@@ -36,6 +36,7 @@ DEFAULTS = dict(
     settle_ch_s=0.35,           # 底盘动完等多久
     arm_limit_deg=dict(id2=150.0, id1=12.0),    # 手臂相对开始对准时的姿态，最多再偏多少度
     step_limit_deg=dict(id2=45.0, id1=4.0),     # 手臂每次最多动多少度
+    min_step_deg=dict(id2=0.35, id1=0.35),      # 舵机比这小的一步动不了(STM32 的到位误差 ATOL=0.3°)：小于它的一步要么放大到它，要么不动
     chassis_step_max_mm=60.0,   # 底盘每次最多动多少毫米
     chassis_min_mm=6.0,         # 偏差小于这个就不动底盘(底盘只能到几毫米精度)
     arm_cover_mm=18.0,          # 偏差大于这个，并且允许动底盘，就先用底盘
@@ -47,6 +48,7 @@ DEFAULTS = dict(
     confirm=True,               # 误差够小时再测一次确认
     broyden_min_px=6.0,         # 预计移动超过这么多像素才用来在线修正 J
     broyden_gain=0.5,
+    broyden_max_rel=0.5,        # 实际移动和预计差太多(比如原料盘自己在转)就不拿来修正 J
     max_cond=40.0,              # J 的条件数超过这个说明两个轴在画面里几乎平行，没法解
 )
 
@@ -171,6 +173,20 @@ class VisualServo:
                 sat = True
             out[i] = v
         return out, sat
+
+    def _min_step(self, J, p, du):
+        """太小的一步舵机动不了：放大到 min_step 能让偏差更小就放大，否则这个轴这次不动。"""
+        out = np.array(du, float)
+        for i, key in enumerate(('id2', 'id1')):
+            m = float(self.cfg['min_step_deg'].get(key, 0.0))
+            if m <= 0 or abs(out[i]) < 1e-9 or abs(out[i]) >= m:
+                continue
+            big = out.copy()
+            big[i] = math.copysign(m, out[i])
+            zero = out.copy()
+            zero[i] = 0.0
+            out = big if _norm(p + J @ big) < _norm(p + J @ zero) else zero
+        return out
 
     def _apply_arm(self, du):
         du, sat = self._clip_arm(du)
@@ -318,6 +334,16 @@ class VisualServo:
         tag = f'[{label or kind}]'
         p = np.zeros(2)
         e = float('inf')
+        fresh = [False]                 # p 是不是最后一次动作以后测的(动了以后没测到 = 不知道现在偏多少)
+        stalls = 0
+
+        def meas():
+            v = self._measure(measure)
+            fresh[0] = True
+            return v
+
+        def moved():
+            fresh[0] = False
 
         def finish(ok, reason=''):
             if ok or probed:
@@ -325,10 +351,11 @@ class VisualServo:
                     if J[g] is not None:
                         self.store.put(kind, g, J[g])
                 self.store.save()
-            return Result(ok, e, moves, p, reason, self.clock() - t0, hist, used_ch, probed)
+            # 动了以后没测到：不能拿动之前的偏差当结果(会按一个没人测过的位置去夹)
+            return Result(ok, e if (ok or fresh[0]) else float('inf'), moves, p, reason, self.clock() - t0, hist, used_ch, probed)
 
         try:
-            p = self._measure(measure)
+            p = meas()
             while True:
                 passes += 1
                 if passes > 4 * max_iter + 6:
@@ -340,7 +367,7 @@ class VisualServo:
                 if e <= tol_mm:
                     if do_confirm and not confirmed:
                         confirmed = True
-                        p = self._measure(measure)
+                        p = meas()
                         e2 = _norm(p) / scale_px_per_mm
                         if e2 <= tol_mm * 1.15:
                             e = e2
@@ -373,28 +400,44 @@ class VisualServo:
 
                 group = self._decide(J, p, e, allow_chassis)
                 if J[group] is None:
+                    moved()
                     J[group] = self._probe(measure, group, bounds)
                     probed = True
-                    p = self._measure(measure)               # 探测动过了，重新测，下一圈再决定
+                    p = meas()                               # 探测动过了，重新测，下一圈再决定
                     prev_e = None
                     continue
 
+                cmd = None
                 if group == 'arm':
-                    applied, sat = self._apply_arm(-c['gain_arm'] * np.linalg.solve(J['arm'], p))
+                    du = self._min_step(J['arm'], p, -c['gain_arm'] * np.linalg.solve(J['arm'], p))
+                    cmd, _s = self._clip_arm(du)
+                    if _norm(cmd) < 1e-9 and _norm(du) < 1e-9:
+                        return finish(False, f'剩下的偏差 {e:.2f}mm 比舵机能动的最小一步还小，没法再修')
+                    moved()
+                    applied, sat = self._apply_arm(du)
                 else:
                     sf = -c['gain_ch'] * np.linalg.solve(J['ch'], p)
+                    moved()
                     applied = self._apply_chassis(float(sf[0]), float(sf[1]))
                     used_ch = True
+                if group == 'arm' and cmd is not None and _norm(cmd) > 1e-6 and _norm(applied) < 1e-9:
+                    stalls += 1                              # 指令发了，角度读回来没变
+                    if stalls >= 2:
+                        return finish(False, '手臂指令发了但没动(ID1/ID2 卡住、或者这一步太小舵机动不了)')
+                    p = meas()
+                    continue
                 if _norm(applied) < 1e-9:
                     if group == 'arm' and allow_chassis and e >= c['chassis_min_mm']:
                         # 手臂一点都动不了(到头了)：这一圈改用底盘
                         if J['ch'] is None:
+                            moved()
                             J['ch'] = self._probe(measure, 'ch', bounds)
                             probed = True
-                            p = self._measure(measure)
+                            p = meas()
                             prev_e = None
                             continue
                         sf = -c['gain_ch'] * np.linalg.solve(J['ch'], p)
+                        moved()
                         applied = self._apply_chassis(float(sf[0]), float(sf[1]))
                         used_ch = True
                         group = 'ch'
@@ -403,11 +446,11 @@ class VisualServo:
                 prev_e = e
                 moves += 1
 
-                p_new = self._measure(measure)
-                # 在线修正 J：用这次实际的"动了多少 → 画面变了多少"
+                p_new = meas()
+                # 在线修正 J：用这次实际的"动了多少 → 画面变了多少"(差得太多说明是别的原因，比如原料盘在转，不拿来修)
                 dp = p_new - p
                 pred = J[group] @ applied
-                if _norm(pred) >= c['broyden_min_px']:
+                if _norm(pred) >= c['broyden_min_px'] and _norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred):
                     J[group] = J[group] + c['broyden_gain'] * np.outer(dp - pred, applied) / float(applied @ applied)
                 p = p_new
         except ServoError as ex:

@@ -45,7 +45,7 @@ static double pause_at = 1e9;                        /* ID1 转到这里就停�
 static int paused = 0, pause_every = 0;              /* pause_every=1：重发以后也不动 */
 static int read_fail = 0, nset = 0, stall_flag = 0;
 static double fric[3] = {0, 0, 0}, stop_at[3] = {0, 300, -862};   /* 有摩擦时舵机实际会停的位置 */
-static double cmdv[64]; static int ncmd = 0;         /* 每条转动指令发的角度 */
+static double cmdv[64], cmdspd[64]; static int ncmd = 0;         /* 每条转动指令发的角度 */
 static int blocked(void) { return (pos[1] >= block_hi && tgt[1] > block_hi) || (pos[1] <= block_lo && tgt[1] < block_lo); }
 static void step(uint32_t ms) {
     int id; for (id = 1; id <= 2; id++) {
@@ -65,7 +65,7 @@ int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t)
 FSUS_STATUS FSUS_QueryServoAngleMTurn(Usart_DataTypeDef *u, uint8_t id, float *a) { (void)u; HAL_Delay(3); if (read_fail) return FSUS_STATUS_FAIL; *a = (float)(floor(pos[id] * 10 + 0.5) / 10); return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_SetServoAngleMTurnByVelocity(Usart_DataTypeDef *u, uint8_t id, float a, float v, uint16_t ta, uint16_t td, uint16_t p, uint8_t w) {
     (void)u; (void)ta; (void)td; (void)w; tgt[id] = a; vcmd[id] = v; nset++; cmd_at[id] = now; last_power = p;
-    if (ncmd < 64) cmdv[ncmd++] = a;
+    if (ncmd < 64) { cmdspd[ncmd] = v; cmdv[ncmd++] = a; }
     { double dd = a - pos[id]; stop_at[id] = fabs(dd) <= fric[id] ? pos[id] : a - (dd > 0 ? fric[id] : -fric[id]); }
     if (id == 1 && !pause_every) paused = 0;          /* 重发指令：停顿的舵机接着转(pause_every=1 的舵机还是不动) */
     return FSUS_STATUS_SUCCESS; }
@@ -191,6 +191,16 @@ int main(void) {
     reset1(300); fric[1] = 4.3;
     Servo_Move(1, 300.5, 40, 0.3f, 400);
     CHECK(pos[1] > 300.15 && pos[1] < 301.25 && fabs(tgt[1] - pos[1]) < 0.2, "补偿：微调 0.5° 也能动，到了就停");
+    /* 小动作(摄像头微调)：转慢一点(<=15°/s)、快到了 8ms 查一次，到了马上停，不会转过头 */
+    reset1(300); fric[1] = 4.3;
+    Servo_Move(1, 300.5, 40, 0.3f, 400);
+    CHECK(fabs(cmdspd[0] - 15.0) < 0.01 && pos[1] > 300.15 && pos[1] < 300.75, "补偿 + 小动作：微调 0.5° 用 15°/s，停在 300.2~300.75");
+    reset1(300); fric[1] = 4.3;
+    Servo_Move(1, 301.5, 40, 0.3f, 400);
+    CHECK(pos[1] > 301.15 && pos[1] < 301.75, "微调 1.5°：停在 301.2~301.75");
+    reset1(300); fric[1] = 4.3;
+    Servo_Move(1, 330, 40, 0.3f, 400);
+    CHECK(fabs(cmdv[0] - 335) < 0.01 && fabs(cmdspd[0] - 40.0) < 0.01 && fabs(pos[1] - 330) < 0.8, "大动作照常用设定的速度");
     /* 读不到起点：不知道往哪边转，不补偿 */
     reset1(300); read_fail = 1;
     Servo_Move(1, 320, 40, 2.0f, 400);

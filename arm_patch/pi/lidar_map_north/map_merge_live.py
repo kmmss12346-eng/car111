@@ -542,7 +542,7 @@ def main():
             if sp is None and c in ('F','S'):sp=int(raw_cfg.get('route_speed_rpm',220) if c=='F' else raw_cfg.get('strafe_speed_rpm',170))
             t0=time.monotonic();print(f'发送 {c} {v}'+(f' 速度{sp}' if sp else '')+' …',flush=True)
             ok_,rep_=link.move(c,v,sp);print(f'{c} {v} ->',rep_,f'  (往返用时{time.monotonic()-t0:.1f}秒)',flush=True);return
-        if k in ('arm','vcal','mtest','vdbg','qr','mcode','mot','gtest'):
+        if k in ('arm','vcal','vclaw','vmask','mtest','vdbg','qr','mcode','mot','gtest'):
             # 机械臂/视觉测试命令、mot(看电机驱动器状态)，见 mission_cli.py 开头的说明
             # STM32 重启(断电、重新烧录)后参数回到编译进去的默认值：第一次用这些命令前也把配置里存的参数(SPOW、CLWO…)发一遍
             sync_now()

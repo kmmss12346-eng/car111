@@ -159,7 +159,9 @@ class ArmLink:
         return self.angle[1], self.angle[2]
 
     def ap(self, a1, a2):
-        """ID1、ID2 一起转到指定角度，回读实际角度。"""
+        """ID1、ID2 一起转到指定角度，回读实际角度(没回读到就是 None = 不知道，不能当成"没动")。"""
+        self.angle[1] = None
+        self.angle[2] = None
         self.do(f'AP {a1:.3f} {a2:.3f}')
 
     # ------------------------------------------------------------ 参数

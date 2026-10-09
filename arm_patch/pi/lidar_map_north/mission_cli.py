@@ -7,6 +7,11 @@ arm <指令>                 直接给 STM32 发一条机械臂指令并打印�
                              arm GET              看全部参数(含机械臂的)
 qr                         读 STM32 里存的任务码
 mcode <任务码>             手动设置任务码(不扫码也能测)，例如：mcode 156+123+516+231
+vmask                      标定爪子在画面里占的区域(存 claw_mask.png)：手臂在原料盘上方、爪子张开、爪子附近没有物料时用
+vclaw RAW <颜色号>         实测"爪子夹物料时，物料在画面里的位置"(claw_px.RAW，存 vision_cal.json)：
+                             先 arm OBS RAW O，把一个物料放在爪子正下方，再输入 vclaw RAW 1(颜色号)；
+                             程序会降下去夹一下(物料会被夹正)、松开、升回观察高度，测出物料圆心
+vclaw RING                 实测"放下的物料落在画面哪里"(claw_px.RING)：圆环纸摆好、物料拿走以后用(步骤见 README)
 vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小动作，测出"动作量 ↔ 画面移动量"，存进 servo_cal.json
 vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
                              只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
@@ -23,6 +28,7 @@ gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 �
 mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)的电压、是否使能、是否触发堵转保护——车不动时先用它
 mot en                     让 5 个驱动器解除堵转保护并使能，然后再看一次状态
 """
+import math
 import re
 import threading
 
@@ -196,6 +202,27 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         log(f'任务码已设置：{h.plan.code}  {h.plan.describe()}')
         return None
 
+    if k == 'vmask':
+        def go():
+            h._ensure_arm_only(link)
+            h._ensure_vision()
+            _vmask(h, log)
+        return _run_async(state, log, go)
+
+    if k == 'vclaw':
+        if len(parts) < 2 or parts[1].upper() not in ('RAW', 'RING'):
+            raise ValueError('格式：vclaw RAW 1(颜色号)   或   vclaw RING')
+        kind = parts[1].upper()
+        color = None
+        if kind == 'RAW':
+            if len(parts) < 3 or not parts[2].isdigit() or not 1 <= int(parts[2]) <= 6:
+                raise ValueError('vclaw RAW 要给颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝，例如 vclaw RAW 1')
+            color = int(parts[2])
+
+        def go():
+            _vclaw(h, link, kind, color, log)
+        return _run_async(state, log, go)
+
     if k == 'vdbg':
         def go():
             h._ensure_arm_only(link)
@@ -284,10 +311,9 @@ def _gtest(h, link, color, nogo, log):
     if not known:
         raise ValueError('升降位置不知道了(急停打断过？)：先把升降放到最低点，再输入 arm LIFT ZERO')
     log(f'夹取测试：{name}色物料。用的参数 A1G={P["A1G"]:g} A2E={P["A2E"]:g} ZOBRAW={P["ZOBRAW"]:g} ZGRAB={P["ZGRAB"]:g} ZHI={P["ZHI"]:g}')
-    log('① 张开夹爪，手臂摆到原料上方')
-    h.arm.do('CLAW O')
-    h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
-    h.arm.do(f'AP {P["A1G"]:g} {P["A2E"]:g}')
+    log('① 张开夹爪，手臂先升到最高再摆到原料上方(OBS RAW，和比赛时一样)')
+    h.arm.obs('RAW', open_claw=True)
+    _warn_blue(h, color, log)
     log(f'② 摄像头找{name}色物料……')
     still, last = h.vision.wait_still(color, timeout_s=h.cfg['raw_wait_s'])
     if last is None:
@@ -295,7 +321,11 @@ def _gtest(h, link, color, nogo, log):
         raise ValueError(f'看不到{name}色物料。' + ('画面存到了 vdebug.png，看看物料在不在画面里、颜色认得对不对。' if ok else '摄像头没有画面？'))
     e0 = h.vision.material_error(color)
     if e0 is not None:
-        log(f'   看到了：离爪子 {e0[0]:+.0f}, {e0[1]:+.0f} 像素(约 {(e0[0] ** 2 + e0[1] ** 2) ** 0.5 / h.vision.scale("RAW"):.1f}mm)')
+        md = h.vision.material_detector_obj() if hasattr(h.vision, 'material_detector_obj') else None
+        res = getattr(md, 'last', None) if md is not None else None
+        extra = f'，物料半径 {res["radius"]:.0f} 像素，被挡住 {res["occluded"] * 100:.0f}%' if res else ''
+        log(f'   看到了：离爪子 {e0[0]:+.0f}, {e0[1]:+.0f} 像素(约 {(e0[0] ** 2 + e0[1] ** 2) ** 0.5 / h.vision.scale("RAW"):.1f}mm{extra}，'
+            f'按 {h.vision.scale("RAW"):.2f} 像素/毫米)')
     log('③ 手臂对准(第一次会先小幅动几下，测出手臂和画面的对应关系)')
     res = h.servo.run('RAW', lambda: h.vision.material_error(color), h.vision.scale('RAW'), h.cfg['tol_mm']['RAW'],
                       allow_chassis=False, label=f'测试{name}', bounds=h.vision.bounds('RAW'), confirm=False)
@@ -313,6 +343,134 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
     log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+
+
+def _warn_blue(h, color, log):
+    """蓝色/浅蓝物料和蓝色爪子颜色一样：没做 vmask 时可能把爪子当物料，提醒一下。"""
+    md = h.vision.material_detector_obj() if hasattr(h.vision, 'material_detector_obj') else None
+    if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(color):
+        log(f'  ★ 找{COLOR_NAMES.get(color, color)}色物料，但还没标定爪子区域(claw_mask.png)：物料挨着蓝色爪子时可能认错。'
+            '先做一次 vmask(手臂 OBS RAW O、爪子附近没有物料时输入 vmask)')
+
+
+def _vmask(h, log):
+    md = h.vision.material_detector_obj()
+    if md is None:
+        raise ValueError('现在用的不是 matdet 识别(detector=wuliao)，不用标定爪子区域')
+    frames = []
+    for _ in range(10):
+        frames.append(h.vision._frame())
+        h.sleep(0.05)
+    res = md.save_claw_mask(frames)
+    if res is None:
+        raise ValueError('摄像头没有画面')
+    path, frac = res
+    log(f'爪子区域已存：{path}(占画面 {frac * 100:.0f}%)。用 python3 vlive.py 看：画面里变暗的部分就是爪子区域。')
+    if frac < 0.03:
+        log('  ★ 几乎没找到爪子：爪子不是蓝色，或者画面里看不到爪子。可以删掉 claw_mask.png，程序会每帧自动找')
+
+
+def _measure_px(fn, n, log, what):
+    pts = []
+    for _ in range(n):
+        p = fn()
+        if p is not None:
+            pts.append(p)
+    if len(pts) < max(3, n // 2):
+        raise ValueError(f'{what}：{n} 次里只认到 {len(pts)} 次，认不稳，没有保存。用 python3 vlive.py 看看画面')
+    import numpy as np
+    a = np.array(pts, float)
+    med = np.median(a, axis=0)
+    spread = float(np.max(np.abs(a - med)))
+    return (float(med[0]), float(med[1])), spread, len(pts)
+
+
+def _vclaw(h, link, kind, color, log):
+    from vision import save_vision_cal
+    h._ensure_arm_only(link)
+    h._ensure_vision()
+    P = h.arm.params(refresh=True)
+    extra = {}
+    if kind == 'RAW':
+        need = ['ZGRAB', 'ZOBRAW']
+        if any(n not in P for n in need):
+            raise ValueError('STM32 里没有 ZGRAB/ZOBRAW 参数：是不是没烧新的 arm.c')
+        known, _mm = h.arm.lift_state()
+        if not known:
+            raise ValueError('升降位置不知道了：先把升降放到最低点，再输入 arm LIFT ZERO')
+        name = COLOR_NAMES.get(color, str(color))
+        h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
+        h.sleep(0.4)
+        p0 = h.vision.material_px(color, n=5)
+        if p0 is None:
+            raise ValueError(f'看不到{name}色物料：先 arm OBS RAW O，把物料放在爪子正下方(原料盘要停住)')
+        old = h.vision.claw('RAW')
+        if math.hypot(p0[0] - old[0], p0[1] - old[1]) > 60:
+            log(f'  注意：物料离现在的爪子点 {math.hypot(p0[0] - old[0], p0[1] - old[1]):.0f} 像素，'
+                '如果下面夹的时候把物料推歪了，就把物料放得更靠近爪子中间再做一次')
+        pts = []
+        for k in range(2):                              # 夹正、松开、升回去测；做两遍，两遍要一致
+            log(f'{"①②"[k]} 降到 ZGRAB={P["ZGRAB"]:g} 夹一下把{name}色物料夹正，松开，升回 ZOBRAW={P["ZOBRAW"]:g} 测圆心')
+            h.arm.do('CLAW O')
+            h.arm.do(f'LIFT {P["ZGRAB"]:g}')
+            h.arm.do('CLAW C')
+            h.sleep(0.5)
+            h.arm.do('CLAW O')
+            h.sleep(0.3)
+            h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
+            h.sleep(0.4)
+            pts.append(_measure_px(lambda: h.vision.material_px(color, n=3), 10, log, '测物料'))
+        (u1, v1), _s1, _n1 = pts[0]
+        uv, spread, n = pts[1]
+        if math.hypot(uv[0] - u1, uv[1] - v1) > 2.5:
+            raise ValueError(f'两遍测的不一致(差 {math.hypot(uv[0] - u1, uv[1] - v1):.1f} 像素)：物料被夹歪/推动了，没有保存。放正以后再做一次')
+        md = h.vision.material_detector_obj() if hasattr(h.vision, 'material_detector_obj') else None
+        r = (getattr(md, 'r_ref', {}) or {}).get(color) if md is not None else None
+        last = getattr(md, 'last', None) if md is not None else None
+        if r is None and last:
+            r = last.get('radius')
+        if r:
+            extra['r_px'] = round(float(r), 2)
+        extra['ZOBRAW'] = float(P['ZOBRAW'])
+    else:
+        known, _mm = h.arm.lift_state()
+        if not known:
+            raise ValueError('升降位置不知道了：先把升降放到最低点，再输入 arm LIFT ZERO')
+        log('手臂回到圆环上方的观察姿态(OBS RING：和刚才 DROP 放物料时同一个 ID1/ID2 角度)')
+        h.arm.obs('RING', open_claw=True)
+        h.sleep(0.5)
+        if 'ZOBRNG' in P:
+            extra['ZOBRNG'] = float(P['ZOBRNG'])
+        log('测圆环圆心(圆环纸已经按放下的物料摆正、物料已经拿走)……')
+        any_size = h.vision.ring_px(n=3) is None and not h.vision.cfg.get('ring_rmax_px')
+        if any_size:
+            log('  按配置的大小没认到圆环，不限大小再找一次(第一次标定时圆环大小还不知道)')
+        rmax = []
+
+        def one():
+            p = h.vision.ring_px(n=3, any_size=any_size)
+            if p is not None and getattr(h.vision, 'last_ring_rmax', None):
+                rmax.append(h.vision.last_ring_rmax)
+            return p
+        uv, spread, n = _measure_px(one, 12, log, '测圆环')
+        if rmax:
+            rmax.sort()
+            r = rmax[len(rmax) // 2]
+            extra['ring_rmax_px'] = round(float(r), 2)
+            h.vision.cfg['ring_rmax_cal'] = float(r)
+    old = h.vision.claw(kind)
+    path = save_vision_cal(kind, uv, h.cfg.get('vision_cal_file') or None, extra)
+    h.vision.cfg['claw_px'][kind] = [uv[0], uv[1]]
+    log(f'爪子像素 claw_px.{kind} = ({uv[0]:.1f}, {uv[1]:.1f})  [原来 ({old[0]:.1f}, {old[1]:.1f})，'
+        f'{n} 次测量最大跳动 {spread:.1f} 像素]，已存进 {path}')
+    if extra.get('r_px'):
+        log(f'  物料半径 {extra["r_px"]:.1f} 像素(物料被挡住时用它固定半径拟合，也用来算每毫米多少像素)')
+    if extra.get('ring_rmax_px'):
+        d = h.vision.cfg.get('ring_outer_diam_mm') or 95.0
+        log(f'  圆环最外圈半径 {extra["ring_rmax_px"]:.1f} 像素 -> 每毫米 {h.vision.scale("RING"):.2f} 像素'
+            f'(按最外圈直径 {d:g}mm 算；圆环不是这么大的话改 mission_cfg.ring_outer_diam_mm)')
+    if spread > 3.0:
+        log('  ★ 测量跳动比较大：物料/圆环可能没放稳，或者光线不好，可以再做一次')
 
 
 def _vcal(h, kind, color, chassis, log):

@@ -8,10 +8,13 @@
 |---|---|
 | `mission_hooks.py` | **整场任务**：挂在 `auto_run.drive` 每个停车点上，按停车点分发 QR / RAW / ROUGH / TEMP / START |
 | `visual_servo.py` | **摄像头闭环对准**：测偏差 → 动 ID1/ID2(精调)或底盘(粗调) → 再测；自己探测动作和画面的对应关系 |
-| `vision.py` | 摄像头(只开一次)、物料和圆环识别(复用您的 `wuliao`、`ring_detect`；圆环检测改成了亚像素) |
+| `vision.py` | 摄像头(只开一次，后台线程一直取最新一帧)、爪子点/物料半径标定文件 `vision_cal.json` |
+| `matdet.py` | 物料识别(抗爪子遮挡)：只用没被挡住的那段圆边拟合整个圆，被挡住 80% 圆心也只差 1~2 像素；颜色范围用 `wuliao.py` 里的 |
+| `ringdet.py` | 圆环识别(抗爪子遮挡)：每段边缘拟合圆弧，同心的合成一个圆环，被挡掉一截也能认，圆心误差零点几像素 |
+| `vlive.py` | 摄像头实时预览(在树莓派桌面终端运行)：画出识别到的圆、爪子区域、离爪子点多少毫米 |
 | `arm_link.py` | STM32 机械臂指令封装、给视觉闭环用的手臂/底盘动作(含底盘位移记账) |
 | `task_plan.py` | 任务码解析、每批物料的颜色/圆环/转盘槽位、码垛目标(同色匹配) |
-| `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vcal` `vdbg` `mtest` `mot` |
+| `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vmask` `vclaw` `vcal` `vdbg` `gtest` `mtest` `mot` |
 | `apply_mission_config.py` | 给配置文件加 `mission_cfg`(只补缺的，自动备份) |
 | `route_plan.py` | v14 的路线规划，加了**离黄色区硬性余量** `yellow_margin_mm`(默认 30)：某段按 30mm 走不通(如 400mm 宽的中间车道)时这一段自动减半/放到 0 并在终端提示 |
 | `auto_run.py` `map_merge_live.py` | v14 的文件，各加了几行(见 `../v14_integration.patch`)；v4：车没转到位(`ERR STALL`/车头还差 10° 以上)时停下并提示 |
@@ -25,7 +28,7 @@
    - `map_merge_live.mission_thread`：配置里 `mission_cfg.enabled` 为 true 时创建 `MissionHooks` 并传给 `run_mission`
    - `map_merge_live.command`：加 `arm vcal mtest vdbg qr mcode mot` 几个命令
    - v4 `auto_run`：第二站或路线里某条指令回 `ERR STALL`、或做完车头还差 10° 以上，马上停下并提示怎么查(以前会带着错的车位继续扫描、走路线)
-2. 把 `chengxu` 里的 **`wuliao.py`、`ring_detect.py`** 复制到这个文件夹（识别就是用它们的）。
+2. 把 `chengxu` 里的 **`wuliao.py`** 复制到这个文件夹(物料颜色范围用它里面调好的；没有就用 matdet.py 里一样的默认值)。
 3. `python3 apply_mission_config.py`。
 4. 需要 `numpy` 和 `opencv`（树莓派上识别代码本来就要用）。
 5. 跑测试确认环境没问题：`python3 -m unittest test_task_plan test_visual_servo test_vision test_mission_cli test_auto_run test_route_margin sim_mission`
@@ -60,10 +63,14 @@
 | `qr_timeout_s` / `raw_wait_s` | 6 / 10 | 等二维码 / 等原料盘停稳最多多久 |
 | `lift_init` | `"zero"` | 升降零点：`zero`(现在就是最低点，数字越大越高) / `home`(驱动器回零) / `skip` |
 | `camera` | /dev/video0 640x480 | `flip` 可设 -1/0/1(cv2.flip)，None 不翻 |
-| `claw_px` | RAW、RING 都是 [336.8, 282.9] | 爪子轴线在画面里的位置。**调它微调放置位置**，1 像素≈0.34mm(圆环)/0.23mm(原料盘) |
-| `px_per_mm` | RAW 4.36 / RING 2.96 | 每毫米多少像素，只用来把像素换成毫米判断容差；`vcal` 会告诉您实测值 |
-| `tol_mm` | RAW 3.0、RING 1.0、PICK 2.5、STACK 2.0 | 对准到多小算好。想拿 1 环就 ≤1.0 |
-| `accept_mm` | RAW 6.0、RING 2.5、PICK 5.0、STACK 4.0 | 修正次数用完后，误差不超过这个仍然夹/放，超过就跳过这个物料 |
+| `claw_px` | RAW、RING 都是 [336.8, 282.9] | 爪子点(物料夹正时圆心在画面里的位置)。**用 `vclaw RAW <颜色>` / `vclaw RING` 实测**，存在 `vision_cal.json`，比这里的优先 |
+| `px_per_mm` | RAW 1.97 / RING 2.96 | 每毫米多少像素，只用来把像素换成毫米判断容差。RAW 认到物料后按物料半径和 `material_diam_mm`(50) 现算；RING 在 `vclaw RING` 量过圆环后按 `ring_outer_diam_mm`(95) 算 |
+| `tol_mm` | RAW 2.0、RING 1.0、PICK 2.5、STACK 2.0 | 对准到多小算好。想拿 1 环就 ≤1.0 |
+| `accept_mm` | RAW 4.0、RING 2.5、PICK 5.0、STACK 4.0 | 修正次数用完后，误差不超过这个仍然夹/放，超过就跳过这个物料(爪子每边只有约 5mm 余量) |
+| `detector` / `ring_detector` | `circle` / `arcs` | 识别方法：换回原来的写 `wuliao` / `contour` |
+| `matdet` / `ringdet` | {} | 识别参数(一般不用改)，比如 `matdet.claw_mask` 爪子区域文件名 |
+| `vision_cal_file` | vision_cal.json | `vclaw` 实测结果文件 |
+| `return_tol_deg` | 0.4 | 取完物料回到对准姿态后回读角度，差得比这个多就再转一次(最多 2 次) |
 | `ring_offset_mm` | 见总 README | 圆环相对停车点沿车头的位置，**要现场核对编号方向** |
 | `pickback_fast` | true | 取回时回到放下时的姿态，不重新对准 |
 | `pickback_order` | `"code"` | `code` 按任务码 / `reverse` 倒序 / `near` 就近(最省底盘移动) |
@@ -83,6 +90,9 @@
 | `arm <指令>` | 直接给 STM32 发机械臂指令并打印回复：`arm LIFT ZERO`、`arm OBS RING O`、`arm AD 1 0.5`、`arm GET`… |
 | `qr` | 读 STM32 里存的任务码 |
 | `mcode 156+123+516+231` | 手动设任务码(不扫码也能测) |
+| `vmask` | 标定爪子在画面里占的区域(存 `claw_mask.png`)：`arm OBS RAW O`、爪子附近没有物料时用。**蓝色/浅蓝物料必须先做** |
+| `vclaw RAW <颜色号>` | 实测原料爪子点：原料盘停住、物料放在爪子正下方。会降下去夹正、松开、升回去测，两遍一致才存 |
+| `vclaw RING` | 实测圆环爪子点：先 `arm DROP` 放一个物料、圆环纸挪到物料正好在中心、物料拿走，再输入。会自己回 OBS RING 再测 |
 | `vcal RING` / `vcal RAW <颜色号>` | 视觉校准。加 `arm` 只校准手臂不动底盘：`vcal RING arm` |
 | `vdbg [RING\|RAW <颜色号>]` | 存 `vdebug.png`：爪子位置(绿十字)、识别到的圆环(黄)/物料(红叉) |
 | `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force` |

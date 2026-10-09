@@ -376,6 +376,29 @@ class SimWorld:
 class SimVision:
     def __init__(self, world):
         self.w = world
+        self.cfg = {'claw_px': {'RAW': [320.0, 240.0], 'RING': [320.0, 240.0]}}
+
+    def claw(self, kind):
+        v = self.cfg['claw_px'][kind]
+        return (float(v[0]), float(v[1]))
+
+    def material_px(self, color_id, n=None):
+        e = self.material_error(color_id, n)
+        if e is None:
+            return None
+        c = self.claw('RAW')
+        return (c[0] + float(e[0]), c[1] + float(e[1]))
+
+    def ring_px(self, n=None, expect=None, any_size=False):
+        e = self.ring_error(n)
+        self.last_ring_rmax = None if e is None else 48.25 * self.scale('RING')
+        if e is None:
+            return None
+        c = self.claw('RING')
+        return (c[0] + float(e[0]), c[1] + float(e[1]))
+
+    def material_detector_obj(self):
+        return None
 
     def open(self):
         return self
@@ -597,6 +620,34 @@ class MissionSimTests(unittest.TestCase):
         print(f'\n  [校准缓存] 第一次 AP {aps_cold} 次(含探测)，第二次 {aps_warm} 次')
         self.assertLessEqual(aps_warm, aps_cold)
         self.assertEqual(w.air, 0)
+
+
+    def test_return_to_pose_retries_when_short(self):
+        """取完物料回到对准姿态：回读差 0.4° 以上就再转一次(最多再 2 次)；读不到对准角度就报错不乱转。"""
+        class Arm:
+            def __init__(self, short):
+                self.short, self.cmds, self.at = list(short), [], (0.0, 0.0)
+
+            def ap(self, a1, a2):
+                self.cmds.append((a1, a2))
+                d = self.short.pop(0) if self.short else (0.0, 0.0)
+                self.at = (a1 - d[0], a2 - d[1])
+
+            def read_angles(self):
+                return self.at
+        h = make(SimWorld(seed=3, code=self.CODE))
+        h.arm = Arm([(0.9, 0.0), (0.0, -0.5)])
+        h._return_to_pose(300.0, -500.0)
+        self.assertEqual(len(h.arm.cmds), 3)
+        h.arm = Arm([(0.2, 0.1)])                              # 差得不多：不再转
+        h._return_to_pose(300.0, -500.0)
+        self.assertEqual(len(h.arm.cmds), 1)
+        h.arm = Arm([(2.0, 0.0)] * 5)                          # 一直到不了：最多再转 2 次
+        h._return_to_pose(300.0, -500.0)
+        self.assertEqual(len(h.arm.cmds), 3)
+        from arm_link import ArmError
+        with self.assertRaises(ArmError):
+            h._return_to_pose(None, -500.0)
 
 
 def _demo(fast, batches=2, extra=None):

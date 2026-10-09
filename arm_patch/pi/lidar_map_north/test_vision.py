@@ -77,6 +77,35 @@ class RingTests(unittest.TestCase):
         self.assertIsNotNone(p)
         self.assertLess(math.hypot(p[0] - 336, p[1] - 283), 3.0)
 
+    def test_ring_half_hidden_by_claw(self):
+        """圆环中心在爪子点上、外面几圈被爪子挡住一截：还能认到，而且准(爪子从真实画面里自动找)。"""
+        from pathlib import Path
+        import matdet
+        cam = cv2.imread(str(Path(__file__).resolve().parent / 'testdata' / 'arm_cam_18.jpg'))
+        claw = matdet.MaterialDetector({'claw_mask': '/nonexistent'}).auto_claw_mask(cv2.cvtColor(cam, cv2.COLOR_BGR2HSV))
+        img = draw_rings(336.8, 282.9, 2.96)
+        img[claw > 0] = cam[claw > 0]
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(matdet={'claw_mask': '/nonexistent'}))
+        du, dv = v.ring_error(n=3)
+        self.assertLess(math.hypot(du, dv), 0.6)
+        self.assertIsNotNone(v.last_claw)
+        self.assertAlmostEqual(v.last_ring_rmax, 48.25 * 2.96, delta=4.0)
+        v2 = quiet_vision(camera=FakeCam(img), cfg=dict(ring_detector='contour'))
+        self.assertIsNone(v2.ring_px(n=3))                      # 原来的办法认不到
+
+    def test_ring_size_filter_and_calibration(self):
+        img = draw_rings(320, 200, 1.6)                          # 圆环比配置的 2.96 像素/毫米小很多
+        v = quiet_vision(camera=FakeCam(img))
+        self.assertIsNone(v.ring_px(n=3))                        # 按配置的大小过滤掉了
+        p = v.ring_px(n=3, any_size=True)                        # vclaw RING 第一次：不限大小
+        self.assertLess(math.hypot(p[0] - 320, p[1] - 200), 0.6)
+        r = v.last_ring_rmax
+        self.assertAlmostEqual(r, 48.25 * 1.6, delta=3.0)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(ring_rmax_cal=r))   # 量过以后按量到的大小过滤
+        self.assertIsNotNone(v.ring_px(n=3))
+        self.assertAlmostEqual(v.scale('RING'), 2 * r / 95.0, places=6)
+        self.assertAlmostEqual(quiet_vision().scale('RING'), 2.96)
+
     def test_blank_image_returns_none(self):
         v = quiet_vision(camera=FakeCam(np.full((480, 640, 3), 235, np.uint8)))
         self.assertIsNone(v.ring_px(n=3))
@@ -129,6 +158,36 @@ class MaterialTests(unittest.TestCase):
                    sleep=lambda s: time.sleep(0.001), material_detector=det)
         ok, _ = v.wait_still(1, timeout_s=0.3, period_s=0.001)
         self.assertFalse(ok)
+
+
+class LatestFrameTests(unittest.TestCase):
+    def test_fresh_frames_and_close(self):
+        from vision import LatestFrame
+
+        class FakeCap:                      # 100 帧/秒，grab 要等到下一帧
+            def __init__(self):
+                self.t0, self.k = time.monotonic(), 0
+
+            def grab(self):
+                nxt = self.t0 + (int((time.monotonic() - self.t0) * 100) + 1) / 100.0
+                time.sleep(max(0.0, nxt - time.monotonic()))
+                self.k += 1
+                return True
+
+            def retrieve(self):
+                return True, np.full((2, 2, 3), self.k % 250, np.uint8)
+        lf = LatestFrame(FakeCap(), 0.01)
+        try:
+            t_req = time.monotonic()
+            fr, t = lf.read()
+            self.assertIsNotNone(fr)
+            self.assertGreaterEqual(t, t_req + 0.01)              # 一定是要的时候以后才拍的
+            fr2, t2 = lf.read(after=t, fresh=False)
+            self.assertGreater(t2, t)                              # 下一帧比上一帧新
+        finally:
+            lf.close()
+        self.assertFalse(lf.th.is_alive())
+        self.assertEqual(lf.read(timeout=0.05), (None, None))
 
 
 class MathTests(unittest.TestCase):

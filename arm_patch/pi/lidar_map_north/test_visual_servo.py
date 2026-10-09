@@ -170,6 +170,46 @@ class ServoTests(unittest.TestCase):
         res = make_servo(pl).run('RING', pl.measure, pl.scale, 1.0, allow_chassis=False)
         self.assertFalse(res.ok)
 
+    def test_lost_after_move_reports_no_stale_error(self):
+        """动了以后看不到了：不能把动之前测的偏差当结果(会按没人测过的位置去夹)。"""
+        rng = np.random.default_rng(17)
+        pl = SimPlant(rng, err_mm=5.0)
+        store = JacStore(None)
+        store.put('RAW', 'arm', pl.A)                          # J 已知，第一次测完就动
+        pl.lose_after = 1
+        res = make_servo(pl, store=store).run('RAW', pl.measure, pl.scale, 1.0, allow_chassis=False)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.err_mm, float('inf'))
+
+    def test_small_step_is_rounded_up_to_min_step(self):
+        """剩下一点点偏差：太小的一步(舵机动不了)放大到最小步，还能接着收敛。"""
+        rng = np.random.default_rng(18)
+        pl = SimPlant(rng, err_mm=0.8, noise_px=0.05, arm_noise_deg=0.0, arm_gain_err=0.0)
+        store = JacStore(None)
+        store.put('RAW', 'arm', pl.A)
+        calls = []
+        real = pl.arm_move
+
+        def arm_move(d2, d1):
+            calls.append((d2, d1))
+            return real(d2, d1)
+        pl.arm_move = arm_move
+        res = make_servo(pl, store=store).run('RAW', pl.measure, pl.scale, 0.3, allow_chassis=False)
+        for d2, d1 in calls:
+            for v in (d2, d1):
+                self.assertTrue(v == 0 or abs(v) >= 0.35 - 1e-9, calls)
+        self.assertTrue(res.ok or res.err_mm < 1.0, res)
+
+    def test_commanded_but_not_moved_is_reported(self):
+        rng = np.random.default_rng(19)
+        pl = SimPlant(rng, err_mm=6.0)
+        store = JacStore(None)
+        store.put('RAW', 'arm', pl.A)
+        pl.dead_arm = True
+        res = make_servo(pl, store=store).run('RAW', pl.measure, pl.scale, 1.0, allow_chassis=False)
+        self.assertFalse(res.ok)
+        self.assertIn('没动', res.reason)
+
     def test_probe_fails_if_arm_does_not_move(self):
         rng = np.random.default_rng(8)
         pl = SimPlant(rng, dead_arm=True)

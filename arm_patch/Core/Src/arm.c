@@ -757,26 +757,40 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 {
     if (g_para > 0.5f)
     {
-        uint32_t t1 = Servo_Start(1, &a1, speed);
-        uint32_t t2 = Servo_Start(2, &a2, speed);
-        uint32_t tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
-        uint32_t t0 = HAL_GetTick();
+        uint32_t t1 = 0;
+        uint32_t t2 = 0;
+        uint32_t tmax;
+        uint32_t t0;
         uint8_t ok1 = 0;
         uint8_t ok2 = 0;
+        float a;
+        float rem1 = 1e9f;
+        float rem2 = 1e9f;
 
+        /* 已经在目标上的那个就不发指令(发了会往前多给补偿角度，白白动一下) */
+        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;  else  t1 = Servo_Start(1, &a1, speed);
+        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;  else  t2 = Servo_Start(2, &a2, speed);
+        tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
+        t0 = HAL_GetTick();
         while ((HAL_GetTick() - t0) < tmax && !(ok1 && ok2) && !car_abort)
         {
-            float a;
-
-            HAL_Delay(30);
-            /* 到了(或者刚转过一点)就马上停住：发给舵机的目标往前多给了补偿角度，不停会多转过去 */
-            if (!ok1 && Servo_ReadAngle(1, &a) && Servo_Arrived(1, a, tol))  { ok1 = 1; Servo_Hold(1, a); }
-            if (!ok2 && Servo_ReadAngle(2, &a) && Servo_Arrived(2, a, tol))  { ok2 = 1; Servo_Hold(2, a); }
+            /* 快到了查勤一点(8ms)，到了马上停住：发给舵机的目标往前多给了补偿角度，停晚了会转过头 */
+            HAL_Delay((rem1 < 3.0f || rem2 < 3.0f) ? 8u : 30u);
+            if (!ok1 && Servo_ReadAngle(1, &a))
+            {
+                if (Servo_Arrived(1, a, tol))  { ok1 = 1; Servo_Hold(1, a); }
+                else  rem1 = Absf(a - a1);
+            }
+            if (!ok2 && Servo_ReadAngle(2, &a))
+            {
+                if (Servo_Arrived(2, a, tol))  { ok2 = 1; Servo_Hold(2, a); }
+                else  rem2 = Absf(a - a2);
+            }
+            if (ok1)  rem1 = 1e9f;
+            if (ok2)  rem2 = 1e9f;
         }
         if (car_abort)
-        {
-            float a;                               /* 急停：没到的也停在现在的位置 */
-
+        {                                          /* 急停：没到的也停在现在的位置 */
             if (!ok1 && Servo_ReadAngle(1, &a))  Servo_Hold(1, a);
             if (!ok2 && Servo_ReadAngle(2, &a))  Servo_Hold(2, a);
             return;
