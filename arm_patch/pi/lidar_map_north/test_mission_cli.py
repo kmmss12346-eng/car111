@@ -219,6 +219,43 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mission_cli.handle_cli('vclaw', ['vclaw', 'RING', 'abc'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
 
+    def test_vwatch_shows_live_and_steps_aside(self):
+        """vwatch：后台一直识别、写实时画面；用摄像头的命令(vdbg)运行时先停、做完接着看；vwatch off 停。"""
+        import numpy as np
+        import cv2
+        from vision import Vision
+        img = np.full((480, 640, 3), 225, np.uint8)
+        for d in (53, 58, 65, 75, 85, 95):
+            cv2.circle(img, (330, 200), int(d / 2 * 2.0), (20, 20, 20), 3, cv2.LINE_AA)
+
+        class Cam:
+            def read(self):
+                return img.copy()
+        with tempfile.TemporaryDirectory() as td:
+            live = os.path.join(td, 'live.jpg')
+            self.h._ensure_arm_only(self.w.link)
+            self.h.vision = Vision(dict(live_view=live, matdet={'claw_mask': '/nonexistent'}, px_per_mm=dict(RING=2.0)),
+                                   camera=Cam(), log=lambda m: None, sleep=lambda s: None)
+            self.lines.clear()
+            self.run_cli('vwatch', 'vwatch RING')
+            for _ in range(100):
+                if any('[vwatch] 认到圆环' in l for l in self.lines):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(any('[vwatch] 认到圆环' in l for l in self.lines), self.lines)
+            self.assertTrue(os.path.exists(live))
+            self.run_cli('vdbg', 'vdbg RING')                              # 要用摄像头的命令：vwatch 先停，做完接着看
+            for _ in range(60):
+                if mission_cli._W['thread'] is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(mission_cli._W['thread'])
+            self.run_cli('vwatch', 'vwatch off')
+            self.assertIsNone(mission_cli._W['thread'])
+            self.assertTrue(any('vwatch 已停' in l for l in self.lines))
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('vwatch', ['vwatch', 'XYZ'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
     def test_mcode_lists_slots(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
         self.assertTrue(any('1号槽=' in l for l in self.lines), self.lines)

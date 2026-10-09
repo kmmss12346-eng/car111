@@ -214,6 +214,40 @@ class WizardTests(unittest.TestCase):
         self.assertNotIn('ZGRAB', saved)
         self.assertIn('退出。', self.lines)
 
+    def test_camera_view_opens_on_camera_steps(self):
+        """原料盘/圆环那几步自动打开 vlive.py(看物料 / --ring)，离开这几步就关掉；v 手动开关。"""
+        started = []
+
+        class FakeProc:
+            def __init__(self, args, **kw):
+                self.args, self.alive = args, True
+                started.append(self)
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def terminate(self):
+                self.alive = False
+
+            def wait(self, timeout=None):
+                return 0
+        import arm_calib
+        self.stm = FakeStm32()
+        self.cfg = make_cfg()
+        self.lines = []
+        self.inp = Script(self.stm, ['', 'v', 'v', '', 'q'])               # ZOBRAW 回车 → A1P 里 v 关、v 开 → 回车 → q
+        self.wiz = arm_calib.Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, view=True, popen=FakeProc)
+        self.wiz.run(STEP_KEYS.index('ZOBRAW'))
+        modes = [('--ring' in p.args) for p in started]
+        self.assertEqual(modes, [False, True, True], [p.args for p in started])   # 物料 → 圆环 → (关了再开)圆环
+        self.assertTrue(all(not p.alive for p in started))                 # 退出时都关了
+        self.assertTrue(any('摄像头画面已打开' in l for l in self.lines))
+        self.assertTrue(any('摄像头画面已关' in l for l in self.lines))
+
+    def test_no_view_by_default(self):
+        self.run_wiz(['', 'q'], start=STEP_KEYS.index('ZOBRNG'))
+        self.assertFalse(any('摄像头画面已打开' in l for l in self.lines))
+
     def test_back_and_quit(self):
         saved = self.run_wiz(['2', '-50', '', 'b', '+10', '', 'q'])
         self.assertEqual(saved['CLWO'], 2050)                              # 回到上一步重新调了

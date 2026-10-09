@@ -23,6 +23,8 @@ mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有�
 mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这批物料；没跑过 mtest RAW 就加 force：mtest TEMP 1 force)
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
+vwatch RING | RAW <颜色号>  一直识别(圆环/物料)，画面给 python3 vview.py 实时看；这时照常用 arm LIFT / arm AD 调手臂，
+                             边调边看(调 ZOBRNG、ZOBRAW、A1P 这些用)。vwatch off 停。rtest/gtest 这些命令运行时会自动让开
 rtest [arm]                圆环识别+对准测试(暂存区/粗加工区)：OBS RING 摆到圆环上方 → 摄像头找圆环 → 手臂(够不着时底盘)对准，
                              报告误差，不取物料、不放。只动手臂不动底盘：rtest arm
 gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来(不放转盘；要 ARMOK=1，因为先 OBS RAW)
@@ -130,16 +132,89 @@ def _hooks(link, raw_cfg, log):
 
 def release():
     """释放测试命令占着的摄像头和记录(go 开始前由 map_merge_live 调用，免得两个地方同时开 /dev/video0)。"""
+    _watch_stop()
     h = _S.get('hooks')
     _S['hooks'] = None
     if h is not None:
         h.close()
 
 
-def _run_async(state, log, fn):
+# ---------------------------------------------------------------- vwatch：一边手动调手臂，一边实时看识别
+_W = {'thread': None, 'stop': None, 'what': None, 'resume': None}
+VISION_CMDS = ('vclaw', 'vcal', 'vdbg', 'gtest', 'rtest', 'mtest', 'vmask')    # 这些命令自己要用摄像头识别
+
+
+def _watch_stop(join=True):
+    th, ev = _W['thread'], _W['stop']
+    if ev is not None:
+        ev.set()
+    if join and th is not None and th.is_alive() and th is not threading.current_thread():
+        th.join(timeout=3.0)
+    was = _W['what']
+    _W['thread'], _W['stop'], _W['what'] = None, None, None
+    return was
+
+
+def _watch_start(h, what, log):
+    """后台一直识别(圆环或某个颜色的物料)，每一帧画好写给 vview.py 看；认到/看不到变了才在终端说一句。"""
+    import time
+    _watch_stop()
+    h._ensure_vision()
+    vis = h.vision
+    kind, color = what
+    ev = threading.Event()
+
+    def loop():
+        last_found, last_print, last_p = None, 0.0, None
+        name = '圆环' if kind == 'RING' else f'{COLOR_NAMES.get(color, color)}色物料'
+        while not ev.is_set():
+            try:
+                fr = vis._frame(fresh=False)
+            except Exception as ex:
+                log(f'vwatch 停了：摄像头读不到画面({ex})')
+                return
+            if fr is None:
+                time.sleep(0.05)
+                continue
+            try:
+                if kind == 'RING':
+                    rings = vis._rings_in_frame(fr)
+                    cu, cv_ = vis.claw('RING')
+                    best = min(rings, key=lambda r: (r[0] - cu) ** 2 + (r[1] - cv_) ** 2) if rings else None
+                    p = None if best is None else (best[0], best[1])
+                    vis._live_t = 0.0
+                    vis._publish(fr, 'RING', p, rings=rings)
+                else:
+                    p = vis._material_det()(fr, color)
+                    cu, cv_ = vis.claw('RAW')
+                    vis._live_t = 0.0
+                    vis._publish(fr, 'RAW', p, color_id=color)
+            except Exception as ex:
+                log(f'vwatch 识别出错：{ex!r}')
+                return
+            now = time.monotonic()
+            found = p is not None
+            moved = found and last_p is not None and math.hypot(p[0] - last_p[0], p[1] - last_p[1]) > 4.0
+            if found != last_found or (found and moved and now - last_print > 2.0):
+                if found:
+                    du, dv = p[0] - cu, p[1] - cv_
+                    log(f'  [vwatch] 认到{name}：离爪子点 {du:+.0f}, {dv:+.0f} 像素(约 {math.hypot(du, dv) / vis.scale(kind):.1f}mm)')
+                    last_p = p
+                else:
+                    log(f'  [vwatch] 看不到{name}')
+                last_found, last_print = found, now
+            time.sleep(0.08)
+
+    th = threading.Thread(target=loop, daemon=True)
+    _W['thread'], _W['stop'], _W['what'] = th, ev, what
+    th.start()
+
+
+def _run_async(state, log, fn, vision=False):
     if state.get('auto') or state.get('busy'):
         raise ValueError('正在运行或扫描，等结束再用')
     state['busy'] = True
+    paused = _watch_stop() if vision else None     # 要用摄像头识别的命令：vwatch 先让开，做完再接着看
 
     def worker():
         try:
@@ -148,6 +223,12 @@ def _run_async(state, log, fn):
             log(f'出错/停止：{ex!r}')
         finally:
             state['busy'] = False
+            h = _S.get('hooks')
+            if paused is not None and h is not None and _W['thread'] is None:
+                try:
+                    _watch_start(h, paused, log)
+                except Exception:
+                    pass
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -164,6 +245,25 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     h = _hooks(link, raw_cfg or {}, log)
 
+    if k == 'vwatch':
+        sub = parts[1].upper() if len(parts) > 1 else 'RING'
+        if sub in ('OFF', 'STOP', 'Q'):
+            log('vwatch 已停' if _watch_stop() else 'vwatch 本来就没开')
+            return None
+        if sub == 'RING':
+            what = ('RING', None)
+        elif sub == 'RAW' and len(parts) > 2 and parts[2].isdigit() and 1 <= int(parts[2]) <= 6:
+            what = ('RAW', int(parts[2]))
+        else:
+            raise ValueError('格式：vwatch RING(看圆环)  /  vwatch RAW 1(看物料，颜色号 1~6)  /  vwatch off(停)')
+        if state.get('busy') or state.get('auto'):
+            raise ValueError('正在运行别的命令，等结束再用')
+        h._ensure_arm_only(link)
+        _watch_start(h, what, log)
+        log('vwatch 开了：另开桌面终端运行 python3 vview.py 看画面；这时照常输入 arm LIFT 90、arm AD 1 +1 这些调手臂，画面会跟着变。'
+            '停：vwatch off')
+        return None
+
     if k == 'rtest':
         arm_only = any(p.lower() == 'arm' for p in parts[1:])
 
@@ -171,7 +271,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
             _rtest(h, link, arm_only, log)
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'gtest':
         if len(parts) < 2 or not parts[1].isdigit() or not 1 <= int(parts[1]) <= 6:
@@ -183,7 +283,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
             _gtest(h, link, color, nogo, log)
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'arm':
         if len(parts) < 2:
@@ -221,7 +321,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h._ensure_arm_only(link)
             h._ensure_vision()
             _vmask(h, log)
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'vclaw':
         if len(parts) < 2 or parts[1].upper() not in ('RAW', 'RING'):
@@ -242,7 +342,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
         def go():
             _vclaw(h, link, kind, color, log)
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'vdbg':
         def go():
@@ -252,7 +352,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h._ensure_vision()
             ok = h.vision.save_debug('vdebug.png', kind, color)
             log('已存 vdebug.png' if ok else '存图失败(摄像头没有画面？)')
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'vcal':
         if len(parts) < 2 or parts[1].upper() not in ('RING', 'RAW'):
@@ -271,7 +371,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             if h.disabled:
                 raise ValueError(h.disabled)
             _vcal(h, kind, color, chassis, log)
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     if k == 'mtest':
         if len(parts) < 2:
@@ -300,7 +400,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     log('  (force：假定暂存区已经平放了第一批)')
             h.run_role(what, batch)
             log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
-        return _run_async(state, log, go)
+        return _run_async(state, log, go, vision=True)
 
     raise ValueError('未知命令 ' + k)
 

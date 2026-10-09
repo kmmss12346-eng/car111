@@ -16,6 +16,8 @@
     o   c         夹爪张开 / 夹紧
     u             两个舵机松开，用手直接摆；摆好以后回车 = 读出角度并保存
     r             重新读一下两个舵机现在的角度
+    v             打开/关掉摄像头画面(vlive.py 的窗口：看物料、圆环认得怎么样)。原料盘上方姿态、ZGRAB、ZOBRAW、
+                  圆环上方姿态、ZPLC、ZOBRNG 这几步会自动打开(要在树莓派桌面的终端里运行向导)
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
@@ -32,7 +34,9 @@
 """
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -110,6 +114,14 @@ STEPS = [
 ]
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
 
+# 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
+VIEW_LOG = '/tmp/vlive_wizard.log'
+
+
+def has_display():
+    return bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+
 
 def _num(text):
     try:
@@ -170,8 +182,13 @@ class SerialLink:
 
 
 class Wizard:
-    def __init__(self, link, cfg_path, inp=input, out=print):
+    def __init__(self, link, cfg_path, inp=input, out=print, view=False, popen=None):
         self.link = link
+        self.view = view                 # 摄像头那几步自动打开 vlive.py 的窗口
+        self._popen = popen or subprocess.Popen
+        self._viewer = None              # vlive.py 进程
+        self._view_mode = None
+        self._view_told = False
         self.cfg_path = Path(cfg_path) if cfg_path else None
         self.inp = inp
         self.out = out
@@ -356,6 +373,50 @@ class Wizard:
             return None
         return None
 
+    # ------------------------------------------------------------ 摄像头画面(另开一个 vlive.py 进程，向导只用串口，不冲突)
+    def _view_open(self, mode):
+        if self._viewer is not None and self._viewer.poll() is None and self._view_mode == mode:
+            return
+        self._view_close()
+        args = [sys.executable, str(ROOT / 'vlive.py')] + (['--ring'] if mode == 'ring' else ['1'])
+        try:
+            with open(VIEW_LOG, 'w') as logf:              # 子进程自己拿着这个文件，这边可以关
+                self._viewer = self._popen(args, stdout=logf, stderr=subprocess.STDOUT, cwd=str(ROOT))
+        except Exception as e:
+            self.out(f'  (打不开摄像头画面：{e})')
+            self._viewer = None
+            return
+        self._view_mode, self._view_told = mode, False
+        self.out('  摄像头画面已打开(另一个窗口' + ('，看圆环' if mode == 'ring' else '，看物料，窗口里按 1~6 换颜色') +
+                 ')；输入 v 关掉/再打开')
+
+    def _view_close(self):
+        v = self._viewer
+        self._viewer, self._view_mode = None, None
+        if v is not None and v.poll() is None:
+            try:
+                v.terminate()
+                v.wait(timeout=3)
+            except Exception:
+                try:
+                    v.kill()
+                except Exception:
+                    pass
+
+    def _view_check(self):
+        """vlive 窗口自己退出了(摄像头被占、不在桌面终端里…)：说一次原因。"""
+        v = self._viewer
+        if v is None or self._view_told or v.poll() is None:
+            return
+        self._view_told = True
+        why = ''
+        try:
+            lines = [l.strip() for l in open(VIEW_LOG, encoding='utf-8', errors='ignore') if l.strip()]
+            why = lines[-1] if lines else ''
+        except Exception:
+            pass
+        self.out(f'  (摄像头画面关了{("：" + why) if why else ""}。输入 v 再打开)')
+
     def _read_servos(self):
         self.cur = {1: self.angle(1), 2: self.angle(2)}
 
@@ -368,6 +429,12 @@ class Wizard:
         self.out(f'==== 第 {i + 1}/{len(STEPS)} 步：{st["title"]} ====')
         self.out(st['text'])
         self._setup(st)
+        mode = CAM_STEPS.get(st['key'] if isinstance(st['key'], str) else st['key'][0])
+        if self.view and mode:
+            self._view_open(mode)
+        elif self._viewer is not None:
+            self._view_close()
+        self._step_mode = mode
         self.z = self.lift_now()
         if self.z is None:
             self.z = P['ZHI']
@@ -382,6 +449,7 @@ class Wizard:
         if k == 'lift' and st['key'] in ('ZHI', 'ZOBRAW', 'ZOBRNG'):
             self.z = self.lift_to(P[st['key']])
         while True:
+            self._view_check()
             self.out('  现在：' + self._show(st))
             try:
                 raw = self.inp('  调整(回车=保存，h=说明)> ')
@@ -425,6 +493,13 @@ class Wizard:
         if line == 'u':
             self.release()
             self.out('  两个舵机松开了，用手摆好以后直接回车(会读出角度)。想先看看读数就输入 r。')
+            return None
+        if line == 'v':
+            if self._viewer is not None and self._viewer.poll() is None:
+                self._view_close()
+                self.out('  摄像头画面已关')
+            else:
+                self._view_open(getattr(self, '_step_mode', None) or 'raw')
             return None
         if line == 'r':
             self._read_servos()
@@ -512,6 +587,8 @@ class Wizard:
                     i = 0
         except Quit:
             self.out('退出。')
+        finally:
+            self._view_close()
         try:
             self.lift_to(self.P['ZHI'])
             self.pose(self.P['A1H'], self.P['A2R'])
@@ -538,6 +615,7 @@ def main(argv=None):
     ap.add_argument('--port', default='/dev/serial0')
     ap.add_argument('--config', default=None, help='默认：run_live.sh 里的 --config，没有就用 map_config_start2_roi.json')
     ap.add_argument('--from', dest='start', default=None, help='从哪一步开始，例如 --from ZGRAB')
+    ap.add_argument('--no-view', action='store_true', help='摄像头那几步不自动打开画面')
     args = ap.parse_args(argv)
 
     cfg = Path(args.config) if args.config else (config_from_run_live() or ROOT / 'map_config_start2_roi.json')
@@ -558,7 +636,10 @@ def main(argv=None):
     except Exception as e:
         print(f'打不开串口 {args.port}：{e}\n是不是 map_merge_live 还开着？先在它里面输入 q 退出再运行。')
         return 1
-    wiz = Wizard(link, cfg)
+    view = not args.no_view and has_display() and (ROOT / 'vlive.py').exists()
+    if not args.no_view and not has_display():
+        print('(不是在树莓派桌面的终端里运行：摄像头那几步不会自动打开画面)')
+    wiz = Wizard(link, cfg, view=view)
     try:
         wiz.run(start)
     except CalError as e:
