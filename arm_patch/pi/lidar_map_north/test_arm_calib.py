@@ -205,6 +205,15 @@ class WizardTests(unittest.TestCase):
         self.run_wiz(['2', 's', 's', 's', 'u', ('hand', 300.0, -900.0)][:-1] + ['r', 'q'])
         self.assertTrue(any('ID1=323°  ID2=-862°' in l for l in self.lines))
 
+    def test_quit_with_unsaved_change_warns_first(self):
+        start = STEP_KEYS.index('ZGRAB')
+        saved = self.run_wiz(['-10', 'q', '', 'q'], start=start)          # 调了没回车就 q：先提醒，回车才保存
+        self.assertTrue(any('还没保存' in l for l in self.lines), self.lines)
+        self.assertIn('ZGRAB', saved)
+        saved = self.run_wiz(['-10', 'q', 'q'], start=start)              # 再 q 一次：不保存直接退出
+        self.assertNotIn('ZGRAB', saved)
+        self.assertIn('退出。', self.lines)
+
     def test_back_and_quit(self):
         saved = self.run_wiz(['2', '-50', '', 'b', '+10', '', 'q'])
         self.assertEqual(saved['CLWO'], 2050)                              # 回到上一步重新调了

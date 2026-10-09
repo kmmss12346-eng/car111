@@ -19,7 +19,7 @@
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
-    q             退出(已经保存的都保留)
+    q             退出(已经保存的都保留；这一步调过还没按回车的不保存，会先提醒一次)
     h             再看一遍这个说明
 
 保存 = 发给 STM32(SET) + 写进配置文件的 stm32_params(备份原文件为 .json.bak)。
@@ -334,6 +334,28 @@ class Wizard:
             return f'升降 {self.z:g}mm   (原来 {st["key"]}={P[st["key"]]:g}{extra})'
         return f'AEXT={P["AEXT"]:g}(2 = ID2 管伸缩，1 = ID1 管伸缩)'
 
+    def _pending(self, st):
+        """这一步调过、但还没按回车保存的值(文字)；没改过返回 None。"""
+        P, k = self.P, st['kind']
+        try:
+            if k == 'lift' and self.z is not None and abs(self.z - P[st['key']]) > 0.05:
+                return f'{st["key"]}={self.z:g}'
+            if k == 'claw' and self.claw is not None and abs(self.claw - P[st['key']]) > 0.5:
+                return f'{st["key"]}={self.claw:g}'
+            if k == 'tt' and self.tt is not None and abs(self.tt - P[st['key']]) > 0.5:
+                return f'{st["key"]}={self.tt:g}'
+            if k == 'pose':
+                n1, n2 = st['key']
+                if any(self.cur[i] is not None and abs(self.cur[i] - P[n]) > 0.2 for i, n in ((1, n1), (2, n2))):
+                    return f'{n1}={self.cur[1]:g} {n2}={self.cur[2]:g}'
+            if k == 'servo':
+                a = self.cur[st['sid']]
+                if a is not None and abs(a - P[st['key']]) > 0.2:
+                    return f'{st["key"]}={a:g}'
+        except (KeyError, TypeError):
+            return None
+        return None
+
     def _read_servos(self):
         self.cur = {1: self.angle(1), 2: self.angle(2)}
 
@@ -350,6 +372,7 @@ class Wizard:
         if self.z is None:
             self.z = P['ZHI']
         self.cur = {1: None, 2: None}
+        self._q_warned = False
         if k in ('pose', 'servo'):
             self._read_servos()
         if k == 'claw':
@@ -379,6 +402,11 @@ class Wizard:
         if line in ('', 'ok', 'y'):
             return self._accept(st)
         if line == 'q':
+            pend = self._pending(st)
+            if pend and not self._q_warned:
+                self._q_warned = True
+                self.out(f'  ★ 这一步改成了 {pend}，还没保存：按回车 = 保存(再输入 q 退出)；再输入 q = 不保存直接退出')
+                return None
             raise Quit()
         if line == 's':
             self.out(f'  跳过，保持原来的值。')
