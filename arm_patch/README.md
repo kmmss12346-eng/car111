@@ -253,7 +253,8 @@ python3 arm_calib.py
 | ⑤ 圆环爪子点 | 车停在粗加工区 → `arm OBS RING O` → 爪子里夹一个物料(`arm CLAW C`) → `arm DROP`(放到地上) → 挪圆环纸让物料正好在圆环中心 → 物料拿走(纸别动) → `vclaw RING 100`(100 换成尺子量的黑环外径毫米) | 会自己回到圆环上方(OBS RING)再测，记下"放下的物料落在画面哪里"和圆环最外圈半径。第一次按配置大小认不到时会自动不限大小再找 |
 | ⑥ 圆环手臂/底盘校准 | 圆环在画面里 → `vcal RING` | 只想动手臂不动底盘：`vcal RING arm` |
 | ⑥' 圆环对准测试 | 圆环在爪子下方 → `rtest arm` | 只对准、不取不放，最后报告误差。另开终端 `python3 vview.py` 实时看摄像头画面 |
-| ⑦ 单工位 | `mtest RAW 1`、`mtest ROUGH 1` | 见下面第 9 步 |
+| ⑦ 单工位 | `mtest RAW 1`、`mtest ROUGH 1` | 见下面第 9 步。先 `mtest ROUGH 1 nogo` 只对准不放，看准了再正式放 |
+| ⑧ 物料顶面点(PICK) | 不用手动做：`mtest ROUGH 1`(或比赛里)第一个物料放下后自动量 | 取回、码垛时白心被物料盖住，就按物料顶面对准。要重量：`vclaw PICK`，再放一次物料 |
 
 - 每一步的结果都存在 `~/lidar_map_north` 里：`claw_mask.png`(爪子区域)、`vision_cal.json`(爪子点、物料半径、圆环大小、当时的观察高度)、
   `servo_cal.json`(手臂/底盘和画面的关系)。爪子或摄像头动过、改过 `ZOBRAW`/`ZOBRNG`，重做对应的步骤。
