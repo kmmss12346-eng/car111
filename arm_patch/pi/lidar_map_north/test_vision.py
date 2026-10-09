@@ -272,6 +272,30 @@ class PickTests(unittest.TestCase):
         v = quiet_vision(camera=FakeCam(full), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
         self.assertIs(v.ring_centre_free(), False)
 
+    def test_ring_centre_free_in_dim_light(self):
+        """光线暗/曝光低：白心只有灰白(亮度 120~130)，也不能当成"放了东西"而不放。"""
+        for b in (0.75, 0.6, 0.5):
+            empty, _c, _cam = pick_scene((337, 250), 1, (214, 214, 214), R=140)
+            dim = np.clip(empty.astype(float) * b, 0, 255).astype(np.uint8)
+            v = quiet_vision(camera=FakeCam(dim), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
+            self.assertIsNot(v.ring_centre_free(), False, f'亮度 x{b}：空圆环被当成有东西')
+        for col in ((40, 40, 210), (30, 30, 30)):              # 真放着物料(红、黑)，暗一点也认得出
+            full, _c, _cam = pick_scene((337, 250), 84, col, R=140)
+            dim = np.clip(full.astype(float) * 0.6, 0, 255).astype(np.uint8)
+            v = quiet_vision(camera=FakeCam(dim), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
+            self.assertIs(v.ring_centre_free(), False, f'{col}')
+
+    def test_ring_centre_taken_by_blue_material_next_to_claw(self):
+        """白心里放着蓝色物料、挨着蓝色爪子：现找的爪子区域会把物料算进去(白心"看不见" -> 照常放 -> 砸上去)。
+        用对准空圆环时记下的干净爪子区域，就认得出白心被占了。"""
+        empty, _c, _cam = pick_scene((337, 250), 1, (214, 214, 214), R=140)
+        full, _c, _cam = pick_scene((337, 250), 84, self.COLS[3], R=140)
+        v = quiet_vision(camera=FakeCam(empty), cfg=dict(matdet={'claw_mask': '/nonexistent'}, live_view='', ring_rmax_cal=140.0))
+        self.assertIsNotNone(v.ring_px(n=2))                    # 对准空圆环(会记下这一帧的爪子区域)
+        v.note_claw_clear()
+        v.camera.img = full
+        self.assertIs(v.ring_centre_free(), False)
+
     def test_ring_size_seen_on_empty_ring_finds_covered_ring(self):
         """没做 vclaw RING：放物料时认到的空圆环大小记下来，取回时白心被盖住也认得出外圈。"""
         img, _c, _cam = pick_scene((337, 250), 84, self.COLS[1], R=140)

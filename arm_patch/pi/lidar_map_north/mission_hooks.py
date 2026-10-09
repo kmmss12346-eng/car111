@@ -286,6 +286,31 @@ class MissionHooks:
         except ArmError as ex:
             raise Abort(f'收臂也失败了({ex})，停止路线')
 
+    def _put_back(self, item, why):
+        """从转盘取出物料以后出错(回不到对准姿态、DROP 失败…)：把物料放回它的转盘槽，再收臂。
+        不能夹着物料直接收臂：后面任何一步一张开爪子(OBS … O、TAKE、GRAB)，物料就掉在半路上。
+        DROP 中途出错时爪子里可能已经空了，照样走一遍也没坏处(空爪在转盘上方张开)。
+        放回也失败：爪子保持夹紧收臂，本轮不再做夹放(不再张开爪子)。"""
+        self.log(f'    ★ {why}；爪子里夹着{item.color_name}，先放回转盘 {item.slot} 号槽')
+        try:
+            P = self.arm.params() or {}
+            self.arm.lift(float(P['ZHI']))
+            self.arm.ap(float(P['A1D']), float(P['A2R']))
+            self.arm.tt(item.slot)
+            self.arm.lift(float(P['ZDROP']))
+            self.arm.claw(True)
+            self.arm.lift(float(P['ZHI']))
+        except ArmAbort as ex:
+            raise Abort(str(ex))
+        except (ArmError, KeyError, TypeError, ValueError) as ex:
+            self.disabled = f'{item.color_name}可能还夹在爪子里(放回转盘失败：{ex})，本轮不再夹放，免得张开爪子把它掉在半路'
+            self.log(f'    ★ {self.disabled}')
+            self._ui('msg', 'ARM OFF')
+            self._recover('放回转盘失败')
+            return
+        self.in_tray[item.slot] = item
+        self._recover(f'{item.color_name}已放回转盘 {item.slot} 号槽')
+
     # ------------------------------------------------------------------ 分发
     def run_role(self, role, visit):
         self._check_abort()
@@ -339,6 +364,8 @@ class MissionHooks:
         batch = 1 if visit <= 1 else 2
         for item in self.plan.items(batch):
             self._check_abort()
+            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
+                break
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再抓取')
                 break
@@ -393,6 +420,8 @@ class MissionHooks:
         placed = []
         for item in items:
             self._check_abort()
+            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
+                break
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再放置')
                 break
@@ -403,6 +432,8 @@ class MissionHooks:
                 placed.append(item)
         for item in self._pickback_sequence('ROUGH', placed):
             self._check_abort()
+            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
+                break
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再取回(物料留在粗加工区)')
                 break
@@ -457,6 +488,7 @@ class MissionHooks:
                     self._recover('物料和圆环都看不到，不取')
                     return False
                 self.log('    物料和圆环都看不到：按放下时记下的位置直接取')
+                self._goto_recorded(zone, item)                  # 按物料对准时可能已经动过手臂/底盘：先回到记下的位置
             else:
                 self.log(f'    对准结果(按{how})：{res}')
                 if not res.ok and res.err_mm > cfg['accept_mm']['PICK']:
@@ -490,6 +522,8 @@ class MissionHooks:
         batch = 1 if visit <= 1 else 2
         for item in self.plan.items(batch):
             self._check_abort()
+            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
+                break
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再放置')
                 break
@@ -522,6 +556,7 @@ class MissionHooks:
         self._ui('stage', f'{zone[:5]} PLACE {item.index + 1}/3 R{ring}' + (' S' if stack else ''))
         err_mm = None
         ok = False
+        held = False                                             # 爪子里夹着从转盘取出来的物料
         try:
             self._goto_ring(zone, ring)
             self.arm.obs('RING', open_claw=True)                 # 空爪到圆环上方：圆环不会被挡住
@@ -537,7 +572,7 @@ class MissionHooks:
                 self._recover('下面那层物料和圆环都看不到，物料留在车上，不放')
             elif not res.ok and res.err_mm > cfg['accept_mm'][key]:
                 self._recover(f'没对准({res.reason})，物料留在车上，不放')
-            elif not stack and cfg.get('check_ring_empty', True) and self._ring_taken():
+            elif not stack and cfg.get('check_ring_empty', True) and self._ring_taken(zone, ring):
                 self._recover(f'环{ring} 的白心里已经有东西了(别的物料？)，不放，免得砸上去；物料留在车上')
             else:
                 self._learn_from(zone, ring)                     # 底盘为了对准挪了多少，下一个圆环直接带上
@@ -554,13 +589,18 @@ class MissionHooks:
                     self.log('    (nogo：对准好了，不取物料、不放)')
                     return True
                 self.arm.take(item.slot)                         # 去转盘取物料
+                held = True
                 self._return_to_pose(a1, a2)                     # 回到记下的角度
                 self.arm.drop(stack)                             # 下降、松手、抬起
+                held = False
                 ok = True
         except ArmAbort:
             raise
         except (ArmError, VisionError) as ex:
-            self._recover(f'放置出错：{ex}')
+            if held:
+                self._put_back(item, f'放置出错：{ex}')
+            else:
+                self._recover(f'放置出错：{ex}')
         self.stats.place(ok)
         if ok:
             self.in_tray.pop(item.slot, None)
@@ -671,8 +711,11 @@ class MissionHooks:
                 return f'认到的物料顶面半径 {r:.0f} 像素，比放在地上应有的 {r_ground:.0f} 像素还小，可能认错了'
         return None
 
-    def _ring_taken(self):
-        """对准的那个圆环白心里明显放着东西(返回 True)；空的或看不清都返回 False(看不清就照常放)。"""
+    def _ring_taken(self, zone=None, ring=None):
+        """对准的那个圆环白心里明显放着东西(返回 True)；空的或看不清都返回 False(看不清就照常放)。
+        记录里这个环上还留着我们放的物料(比如取回失败)：不用看，一定是占着的。"""
+        if zone is not None and self.on_ring.get((zone, ring)):
+            return True
         f = getattr(self.vision, 'ring_centre_free', None)
         if f is None:
             return False

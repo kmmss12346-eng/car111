@@ -86,6 +86,7 @@ class SimWorld:
         self.placed = []                      # 每次放置：(区, 环, 颜色, 误差mm, 是否码垛)
         self.air = 0
         self.collisions = 0
+        self.loose = 0                        # 夹着物料在不该松手的地方张开了爪子(物料掉在半路上)
         self.off_s = self.off_f = 0.0
         self.stop_err = np.zeros(2)
         self.missing_batch1 = set(missing_batch1)
@@ -131,6 +132,20 @@ class SimWorld:
             tol = P['ATOLC']
             self.a1 = a1 + self.rng.uniform(-0.8 * tol, 0.8 * tol)
             self.a2 = a2 + self.rng.uniform(-0.8 * tol, 0.8 * tol)
+
+    def _open_claw(self):
+        """张开爪子。夹着物料时：在转盘上方(ZDROP、转盘姿态)张开 = 放回转盘；在别处张开 = 物料掉在半路上。"""
+        P = self.params
+        if self.held is not None:
+            at_tray = (abs(self.lift_mm - P['ZDROP']) < 1.0 and abs(self.a1 - P['A1D']) < 3.0 and abs(self.a2 - P['A2R']) < 3.0)
+            if at_tray:
+                if self.tray[self.tt_slot] is not None:
+                    self.collisions += 1
+                self.tray[self.tt_slot] = self.held
+            else:
+                self.loose += 1
+            self.held = None
+        self.claw_open = True
 
     def _tt_go(self, slot):
         if slot != self.tt_slot:
@@ -246,7 +261,10 @@ class SimWorld:
                 self.screen[parts[1]] = text.split(' ', 2)[2]
             return True, 'DONE', info
         if verb == 'CLAW':
-            self.claw_open = parts[1] == 'O'
+            if parts[1] == 'O':
+                self._open_claw()
+            else:
+                self.claw_open = False
             self._claw_wait()
             return True, 'DONE', info
         if verb == 'TT':
@@ -288,7 +306,7 @@ class SimWorld:
             self.a1_ref = P['A1P'] if ring else P['A1G']
             self.a2_ref = P['A2P'] if ring else P['A2E']
             if len(parts) == 3:
-                self.claw_open = True
+                self._open_claw()
             self._lift_to(P['ZHI'])
             self._servos_to(self.a1_ref, self.a2_ref, P['ASPD'])
             self._lift_to(P['ZOBRNG'] if ring else P['ZOBRAW'])
@@ -297,6 +315,7 @@ class SimWorld:
             slot = int(parts[1])
             if len(parts) != 3 or parts[2] != 'H':
                 return False, 'ERR ARG', info
+            self._open_claw()                                      # arm.c 下降前先张开爪子
             c = self.claw()                                        # 夹的那一刻爪子在哪
             got = None
             if verb == 'GRAB' and self.zone == 'RAW':
@@ -329,10 +348,10 @@ class SimWorld:
             return True, 'DONE', info
         if verb == 'TAKE':
             slot = int(parts[1])
+            self._open_claw()                                      # arm.c 一开始就张开爪子
             self.held = self.tray[slot]
             self.tray[slot] = None
             self._tt_go(slot)
-            self.claw_open = True
             self._lift_to(P['ZHI'])
             self._servos_to(P['A1D'], P['A2R'], P['ASPD'])
             self._tt_wait()
@@ -527,6 +546,7 @@ class MissionSimTests(unittest.TestCase):
             h = make(w)
             run_mission(w, h)
             self.assertEqual(w.air, 0, f'seed {seed}: 夹空了 {w.air} 次')
+            self.assertEqual(w.loose, 0, f"seed {seed}: 物料掉在半路上 {w.loose} 次")
             self.assertEqual(w.collisions, 0, f'seed {seed}: 碰倒/叠错 {w.collisions} 次')
             self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), f'seed {seed}')
             self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()), f'seed {seed}: {rings_summary(w, "ROUGH")}')
@@ -668,6 +688,89 @@ class MissionSimTests(unittest.TestCase):
         self.assertLessEqual(aps_warm, aps_cold)
         self.assertEqual(w.air, 0)
 
+
+    def _fail_after_take(self, w, verbs):
+        """从转盘取出物料(TAKE)以后，下面这几条指令各失败一次(按顺序)：模拟回不到对准姿态、升降出错。"""
+        orig, st = w._handle, {'took': False, 'left': list(verbs)}
+
+        def handle(text):
+            v = text.split(' ', 1)[0]
+            if v == 'TAKE' and not st['took']:
+                st['took'] = True
+            elif st['took'] and st['left'] and v == st['left'][0]:
+                st['left'].pop(0)
+                return False, 'ERR TIMEOUT', []
+            return orig(text)
+        w._handle = handle
+        return st
+
+    def test_material_put_back_when_placing_fails_after_take(self):
+        """取出物料以后回不到对准姿态(AP 出错)：放回转盘再收臂。原来直接夹着物料收臂，下一个物料 OBS RING O 一张开爪子它就掉在半路上。"""
+        w = SimWorld(seed=12, code=self.CODE)
+        h = make(w)
+        st = self._fail_after_take(w, ['AP'])
+        run_mission(w, h)
+        self.assertEqual(st['left'], [])
+        self.assertEqual(w.loose, 0, '物料掉在半路上了')
+        self.assertEqual(w.collisions, 0)
+        self.assertIsNone(h.disabled)
+        self.assertEqual(h.stats.place_ok, 11)                  # 只有出错的那一次没放成
+        self.assertEqual(w.tray, {1: None, 2: None, 3: None})   # 放回转盘的那个后来在暂存区照常放了
+
+    def test_put_back_failure_keeps_claw_closed_and_stops_arm_work(self):
+        """放回转盘也失败了：爪子保持夹紧收臂，本轮不再夹放(不再张开爪子)。"""
+        w = SimWorld(seed=12, code=self.CODE)
+        h = make(w)
+        st = self._fail_after_take(w, ['AP', 'LIFT'])
+        n_obs = []
+        orig = w._handle
+
+        def handle(text):
+            if text.startswith('OBS') and h.disabled:
+                n_obs.append(text)
+            return orig(text)
+        w._handle = handle
+        run_mission(w, h)
+        self.assertEqual(st['left'], [])
+        self.assertIsNotNone(h.disabled)
+        self.assertEqual(w.loose, 0)
+        self.assertIsNotNone(w.held)                            # 还夹在爪子里，没有乱放
+        self.assertEqual(n_obs, [])
+
+    def test_ring_with_our_leftover_material_counts_as_taken(self):
+        """取回失败、物料还留在环上(记录里有)：这个环一定是占着的，不用看画面也不往上放。"""
+        w = SimWorld(seed=14, code=self.CODE)
+        h = make(w)
+        h.on_ring[('ROUGH', 2)] = [object()]
+        self.assertTrue(h._ring_taken('ROUGH', 2))
+        self.assertFalse(h._ring_taken('ROUGH', 1))              # 假摄像头没有 ring_centre_free：看不清 = 照常放
+
+    def test_blind_pickback_starts_from_the_recorded_pose(self):
+        """取回时先按物料对准，手臂动过以后物料和圆环都认不到了：要回到放下时记下的位置再直接夹，不能在动过的位置夹。"""
+        w = SimWorld(seed=13, code=self.CODE)
+
+        def exact_move(cmd, val):                               # 底盘走得准(不然回到记下的位置本身就差几毫米，测不出手臂的问题)
+            w.advance(1.0 + abs(val) / 150.0)
+            if cmd == 'S':
+                w.off_s += val
+            else:
+                w.off_f += val
+            return True, 'DONE'
+        w.move = exact_move
+        h = make(w)
+        real = h._align_covered
+
+        def lost_after_moving(color, key, label, confirm):
+            if key != 'PICK':
+                return real(color, key, label, confirm)
+            a1, a2 = h.arm.read_angles()
+            h.arm.ap(a1 + 4.0, a2 + 25.0)                       # 对准过程中手臂挪开了
+            return None, None
+        h._align_covered = lost_after_moving
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'))
+        self.assertEqual(w.air, 0, '在挪开的位置夹空了')
+        self.assertEqual(rings_summary(w, 'ROUGH'), {1: [], 2: [], 3: []})
+        self.assertEqual(w.loose + w.collisions, 0)
 
     def test_return_to_pose_retries_when_short(self):
         """取完物料回到对准姿态：回读差 0.4° 以上就再转一次(最多再 2 次)；读不到对准角度就报错不乱转。"""

@@ -600,6 +600,7 @@ class Vision:
     def note_claw_clear(self):
         """刚对准过空圆环(爪子是空的，附近只有黑白圆环)：这时找到的爪子区域是干净的，记给认圆环上物料的 matdet 用。
         这样取回蓝色/浅蓝物料时，挨着蓝色爪子的物料不会被当成爪子去掉。"""
+        import numpy as np
         m = self.last_claw
         if m is None or not getattr(m, 'any', lambda: False)():
             return
@@ -607,12 +608,37 @@ class Vision:
             md = self._pick_det()
         except VisionError:
             return
-        if md._auto_cache is None:
-            md._auto_cache = m
+        if md._auto_cache is None or (md._auto_cache.shape == m.shape and
+                                      int(np.count_nonzero(m)) < int(np.count_nonzero(md._auto_cache))):
+            md._auto_cache = m          # 原料盘那边记下的爪子区域可能连着蓝色物料(只会偏大)：空圆环上方这份更小就用这份
+
+    def _clean_claw(self, shape):
+        """不会把物料算进去的爪子区域：标定过的 claw_mask.png 优先；没有就用之前记下的(蓝色物料连进去只会偏大，取最小的那份)。
+        都没有返回 None。爪子在画面里的位置不随姿态变，所以哪个工位记下的都能用。"""
+        import numpy as np
+        cands = []
+        for md in (self._pick, getattr(self._material, 'detector', None), self._mask_md):
+            if md is None:
+                continue
+            try:
+                st = md._load_static(shape)
+            except Exception:
+                st = None
+            if st is not None and st.shape[:2] == tuple(shape[:2]) and st.any():
+                return st                                   # 标定过的最准
+            m = getattr(md, '_auto_cache', None)
+            if m is not None and m.shape[:2] == tuple(shape[:2]) and m.any():
+                cands.append(m)
+        if not cands:
+            return None
+        return min(cands, key=lambda m: int(np.count_nonzero(m)))
 
     def ring_centre_free(self, n=2):
         """爪子点附近那个圆环的白心是不是空的(没放着物料)：True 空 / False 有东西 / None 看不清(被爪子挡住太多、没认到圆环)。
-        白心里白色(亮、颜色淡)的像素占多少：印的数字是黑的，占得不多；放着物料就基本没有白的了。"""
+        白心里白色(亮、颜色淡)的像素占多少：印的数字是黑的，占得不多；放着物料就基本没有白的了。
+        "白"按这一帧圆环外面的白纸/白板有多亮来定(光线暗、摄像头曝光低时白心也只有灰白，不能当成"放了东西")；
+        爪子区域用干净的那份(蓝色物料挨着爪子时，现找的爪子区域会把它算进去，白心就"看不见"了)。
+        几帧意见不一致返回 None(照常放)。"""
         import cv2
         import numpy as np
         votes = []
@@ -627,19 +653,30 @@ class Vision:
             R = float(best[3]) if len(best) >= 4 else float(best[2])
             h, w = fr.shape[:2]
             yy, xx = np.ogrid[:h, :w]
-            inside = (xx - best[0]) ** 2 + (yy - best[1]) ** 2 <= (0.4 * R) ** 2
-            claw = self.last_claw
+            d2 = (xx - best[0]) ** 2 + (yy - best[1]) ** 2
+            inside = d2 <= (0.4 * R) ** 2
+            claw = self._clean_claw((h, w))
+            if claw is None:
+                claw = self.last_claw
+            free = np.ones((h, w), bool)
             if claw is not None and claw.shape[:2] == (h, w):
-                inside &= cv2.dilate(claw, np.ones((9, 9), np.uint8)) == 0
+                free = cv2.dilate(claw, np.ones((9, 9), np.uint8)) == 0
+            inside &= free
             npx = int(inside.sum())
             if npx < 120:
                 continue
             hsv = cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)
-            white = (hsv[:, :, 2] > 140) & (hsv[:, :, 1] < 70)
+            val, sat = hsv[:, :, 2], hsv[:, :, 1]
+            pale = sat < 70
+            ref_px = val[(d2 >= (1.08 * R) ** 2) & (d2 <= (1.45 * R) ** 2) & free & pale]   # 圆环外面一圈的白纸/白板
+            if ref_px.size < 200:
+                ref_px = val[free & pale]
+            ref = float(np.percentile(ref_px, 75)) if ref_px.size else 255.0
+            white = (val > max(60.0, min(140.0, 0.65 * ref))) & pale
             frac = float((white & inside).sum()) / npx
             votes.append(True if frac >= 0.55 else (False if frac < 0.4 else None))
         votes = [v for v in votes if v is not None]
-        if not votes:
+        if not votes or (len(votes) > 1 and sum(votes) * 2 == len(votes)):
             return None
         return sum(votes) * 2 > len(votes) if len(votes) > 1 else votes[0]
 
