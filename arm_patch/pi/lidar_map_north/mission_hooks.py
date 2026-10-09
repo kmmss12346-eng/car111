@@ -59,6 +59,7 @@ DEFAULTS = dict(
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': -150.0, '2': 0.0, '3': 150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
+    stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
@@ -194,6 +195,9 @@ class MissionHooks:
                     self.log('  升降：驱动器回零完成')
                 else:
                     self.disabled = '升降位置不知道了(急停打断过升降？)：把升降放到最低点，输入 arm LIFT ZERO'
+                if not self.disabled and self.cfg.get('stow_at_start', True):
+                    self.arm.stow()                 # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
+                    self.log('  手臂已收到待机姿态')
         except ArmAbort as ex:
             raise Abort(str(ex))
         except (ArmError, Exception) as ex:
