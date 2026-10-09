@@ -18,6 +18,10 @@ NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调�
         'time_limit_s=超过这个时间不再做夹放，留时间回家。详见 README_mission.md')
 
 
+# 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的
+OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0), ('accept_mm', 'RAW'): (6.0, 4.0)}
+
+
 def main(argv):
     disable = '--disable' in argv
     paths = [a for a in argv if not a.startswith('--')]
@@ -28,6 +32,10 @@ def main(argv):
     cfg = json.loads(path.read_text(encoding='utf-8'))
     old = cfg.get('mission_cfg') or {}
     new = deep_merge(DEFAULTS, old)          # DEFAULTS 打底，已有的值覆盖它(不会改你已经设的)
+    for (sec, k), (was, now) in OLD_DEFAULTS.items():     # 以前的默认值、没改过的：换成新的默认值
+        if (old.get(sec) or {}).get(k) == was:
+            new[sec][k] = now
+            print(f'  {sec}.{k}：旧的默认值 {was} -> 新的默认值 {now}')
     if disable:
         new['enabled'] = False
     elif 'enabled' not in old:

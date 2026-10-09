@@ -980,7 +980,6 @@ void Servo2_MoveRelative(float delta_angle)
 #define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
 #define SERVO_COMP1_DEG       5.0f      /* ID1 补偿：手臂有摩擦，舵机总停在离目标差 4~5° 的地方，就往前多给 5°，到了目标马上停(SET S1COMP 改) */
 #define SERVO_COMP2_DEG       0.0f      /* ID2 补偿(SET S2COMP 改，0 = 不补) */
-#define SERVO_FINE_DEG        3.0f      /* 离目标这么近的小动作(摄像头微调)：转慢一点、查得勤一点，到了马上停，停得准 */
 #define SERVO_FINE_SPEED      15.0f     /* 小动作的最高转速 度/秒 */
 #define SERVO_POLL_FINE_MS    8u        /* 离目标 SERVO_FINE_DEG 以内时多久查一次角度(平时 30ms) */
 

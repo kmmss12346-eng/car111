@@ -767,15 +767,15 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
         float rem1 = 1e9f;
         float rem2 = 1e9f;
 
-        /* 已经在目标上的那个就不发指令(发了会往前多给补偿角度，白白动一下) */
-        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  ok1 = 1;  else  t1 = Servo_Start(1, &a1, speed);
-        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  ok2 = 1;  else  t2 = Servo_Start(2, &a2, speed);
+        /* 已经在目标上的那个不发转动指令(发了会往前多给补偿角度，白白动一下)，只让它在原地保持(松开过的舵机也重新上力) */
+        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, speed);
+        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, speed);
         tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
         t0 = HAL_GetTick();
         while ((HAL_GetTick() - t0) < tmax && !(ok1 && ok2) && !car_abort)
         {
             /* 快到了查勤一点(8ms)，到了马上停住：发给舵机的目标往前多给了补偿角度，停晚了会转过头 */
-            HAL_Delay((rem1 < 3.0f || rem2 < 3.0f) ? 8u : 30u);
+            HAL_Delay((rem1 < SERVO_FINE_DEG || rem2 < SERVO_FINE_DEG) ? 8u : 30u);
             if (!ok1 && Servo_ReadAngle(1, &a))
             {
                 if (Servo_Arrived(1, a, tol))  { ok1 = 1; Servo_Hold(1, a); }

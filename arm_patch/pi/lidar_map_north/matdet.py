@@ -134,7 +134,7 @@ def fit_circle(pts, rmin, rmax, r_ref=None, thr=2.0, iters=160, seed=7):
     cov = _coverage(inl, cx, cy)
     if r_ref:
         # 看到的圆弧短(被挡得多)半径就不准：固定成学到的半径，只拟合圆心
-        if cov < 0.5 or abs(r - r_ref) > 0.12 * r_ref:
+        if cov < 0.5 or (abs(r - r_ref) > 0.12 * r_ref and cov < 0.8):
             cx, cy, r = _refine(inl, cx, cy, r_ref, fixed_r=r_ref)
             d = np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)
             inl = pts[d < thr * 1.25]
@@ -182,7 +182,9 @@ class MaterialDetector:
             if p.exists():
                 m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
                 if m is not None:
-                    self._claw_static = (m > 127).astype(np.uint8) * 255
+                    m = (m > 127).astype(np.uint8) * 255
+                    if m.mean() / 255.0 >= self.cfg['claw_min_area_frac']:       # 空的/几乎没有爪子的文件不用
+                        self._claw_static = m
         m = self._claw_static
         if m is not None and shape is not None and m.shape[:2] != tuple(shape[:2]):
             m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -226,7 +228,9 @@ class MaterialDetector:
             return self.auto_claw_mask(hsv)
         m = self.auto_claw_mask(hsv)
         if color_id is not None and m.any():
-            self._auto_cache = m
+            # 蓝色物料挨着爪子会连成一块，爪子区域只会变大：明显变大的不记(更小的总是记，记错了也能自己恢复)
+            if cache is None or cache.shape != m.shape or np.count_nonzero(m) <= 1.03 * np.count_nonzero(cache):
+                self._auto_cache = m
         return m
 
     def has_static_mask(self):
@@ -236,8 +240,9 @@ class MaterialDetector:
         """找蓝色/浅蓝物料，但既没有 claw_mask.png 也没有记下的爪子区域：可能把爪子当物料，要先 vmask。"""
         return int(color_id) in (3, 6) and self._auto_cache is None and not self.has_static_mask()
 
-    def save_claw_mask(self, frames):
-        """标定爪子区域：手臂抬高、爪子张开、画面里爪子附近没有物料时拍几帧，取"大多数帧都是爪子"的像素。"""
+    def save_claw_mask(self, frames, keep_clear=None):
+        """标定爪子区域：手臂抬高、爪子张开、画面里爪子附近没有物料时拍几帧，取"大多数帧都是爪子"的像素。
+        keep_clear = 爪子点(夹物料的位置)：它落在爪子区域里说明爪子没张开或者爪子里有蓝色物料，不保存(抛 ValueError)。"""
         acc = None
         n = 0
         for fr in frames:
@@ -250,10 +255,19 @@ class MaterialDetector:
         if not n:
             return None
         mask = ((acc / n) >= 0.5).astype(np.uint8) * 255
+        frac = float(mask.mean() / 255.0)
+        if frac < self.cfg['claw_min_area_frac']:
+            raise ValueError(f'画面里几乎没找到爪子(占 {frac * 100:.0f}%)：没有保存。手臂要在 OBS RAW 姿态、爪子在画面下方')
+        if keep_clear is not None:
+            u, v = int(round(keep_clear[0])), int(round(keep_clear[1]))
+            if mask[max(0, v - 6):v + 7, max(0, u - 6):u + 7].any():
+                raise ValueError('爪子点被算成了爪子区域(爪子没张开，或者爪子里/旁边有蓝色物料)：没有保存。'
+                                 'arm CLAW O 张开、把爪子附近的物料拿开再做')
         p = self.claw_path()
-        cv2.imwrite(str(p), mask)
+        if not cv2.imwrite(str(p), mask):
+            raise ValueError(f'写不了 {p}')
         self._claw_static, self._claw_loaded = mask, True
-        return p, float(mask.mean() / 255.0)
+        return p, frac
 
     # ---------------------------------------------------------- 颜色
     def color_mask(self, hsv, color_id):
@@ -267,8 +281,11 @@ class MaterialDetector:
         if color_id not in (3, 6) or len(hsv_px) == 0:
             return True
         s = float(np.median(hsv_px[:, 1]))
-        v = float(np.median(hsv_px[:, 2]))
-        light = (s < 150 and v > 165)
+        try:
+            s_light = float(self.ranges[6][0][1][1])          # 浅蓝范围的饱和度上限(wuliao 里是 180)
+        except Exception:
+            s_light = 180.0
+        light = s <= s_light                                  # 只看饱和度(亮度随光线变，饱和度不怎么变)
         return light if color_id == 6 else not light
 
     # ---------------------------------------------------------- 主函数
@@ -366,6 +383,12 @@ class MaterialDetector:
             return None
         if not self._blue_ok(hsv[vis_disk > 0], color_id):
             return None
+        if color_id == 5:                                  # 黑色：光线暗时深色的有色物料也落进黑色范围，看彩度(S*V)区分
+            px = hsv[vis_disk > 0].astype(np.float32)
+            if float(np.median(px[:, 1] * px[:, 2] / 255.0)) > 35.0:
+                return None
+        if math.pi * r * r > 0 and np.count_nonzero(disk) < 0.45 * math.pi * (0.9 * r) ** 2:
+            return None                                    # 圆心跑到画面外、圆大半在画面外：不可信
         score = 0.35 * fill + 0.25 * inl_ratio + 0.25 * min(1.0, cov / 0.8) + 0.15 * min(1.0, k / 120.0)
         if r_ref:
             score -= 0.5 * min(1.0, abs(r - r_ref) / r_ref)

@@ -111,12 +111,16 @@ class CliTests(unittest.TestCase):
             self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
             self.run_cli('arm', 'arm LIFT ZERO')
             self.w.arrive('RAW', 1)
+            for it in self.w.raw_items:                          # 物料放在爪子正下方(用户就是这么做的)
+                if it['color'] == 1:
+                    it['pos'] = self.w.claw().copy()
             self.lines.clear()
             self.run_cli('vclaw', 'vclaw RAW 1')
             text = '\n'.join(self.lines)
             self.assertIn('claw_px.RAW', text, text)
             saved = load(self.h.cfg['vision_cal_file'])['claw_px']['RAW']
             self.assertEqual(len(saved), 2)
+            self.assertLess(abs(saved[0] - 320.0) + abs(saved[1] - 240.0), 3.0, saved)   # 测到的是真的爪子点
             for got, want in zip(self.h.vision.claw('RAW'), saved):
                 self.assertAlmostEqual(got, want, delta=0.01)
 
@@ -182,6 +186,13 @@ class CliTests(unittest.TestCase):
         self.assertNotIn('CLAW C', self.w.requests)
         with self.assertRaises(ValueError):
             mission_cli.handle_cli('gtest', ['gtest', '9'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
+    def test_mtest_reset_closes_camera(self):
+        closed = []
+        self.h.close = lambda: closed.append(1)
+        self.run_cli('mtest', 'mtest reset')
+        self.assertEqual(closed, [1])
+        self.assertIsNone(mission_cli._S['hooks'])
 
     def test_busy_refused(self):
         self.state['busy'] = True
@@ -283,6 +294,18 @@ class ConfigScriptTests(unittest.TestCase):
         before = read(path)
         apply_mission_config.main([path, '--disable'])
         self.assertEqual(before, read(path))
+
+    def test_old_defaults_are_upgraded(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'cfg.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'px_per_mm': {'RAW': 4.36, 'RING': 2.96}, 'tol_mm': {'RAW': 3.0},
+                                       'accept_mm': {'RAW': 5.0}}}, f)
+        apply_mission_config.main([path])
+        mc = load(path)['mission_cfg']
+        self.assertEqual(mc['px_per_mm']['RAW'], 1.97)              # 没改过的旧默认值 -> 新默认值
+        self.assertEqual(mc['tol_mm']['RAW'], 2.0)
+        self.assertEqual(mc['accept_mm']['RAW'], 5.0)               # 用户自己改过的不动
 
     def test_missing_file(self):
         self.assertEqual(apply_mission_config.main(['/nonexistent/x.json']), 1)

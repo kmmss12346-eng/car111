@@ -89,14 +89,14 @@ class LatestFrame:
         while self.run:
             try:
                 ok = self.cap.grab()
-            except Exception:
-                ok = False
-            if not ok:
-                time.sleep(0.01)
-                continue
-            t = time.monotonic()
-            ok, fr = self.cap.retrieve()
+                if not self.run:
+                    break
+                t = time.monotonic()
+                ok, fr = self.cap.retrieve() if ok else (False, None)
+            except Exception:                       # 读一帧出错不能让线程死掉(死了以后就再也没有画面)
+                ok, fr = False, None
             if not ok or fr is None:
+                time.sleep(0.01)
                 continue
             with self.cv:
                 self.frame, self.t = fr, t
@@ -117,8 +117,12 @@ class LatestFrame:
             return self.frame.copy(), self.t
 
     def close(self):
+        """停线程；返回线程是否已经停了(没停就不能关摄像头，线程还在用它)。"""
         self.run = False
-        self.th.join(timeout=1.0)
+        with self.cv:
+            self.cv.notify_all()                    # 正在等帧的马上返回
+        self.th.join(timeout=3.0)
+        return not self.th.is_alive()
 
 
 class Camera:
@@ -184,11 +188,15 @@ class Camera:
         return fr
 
     def close(self):
+        stopped = True
         if self._lf is not None:
-            self._lf.close()                # 先停线程再关摄像头
+            stopped = self._lf.close()      # 先停线程再关摄像头
             self._lf = None
         if self.cap is not None:
-            self.cap.release()
+            if stopped:
+                self.cap.release()
+            else:
+                self.log('  摄像头读帧卡住了，线程没停下来：先不关摄像头(程序退出时会关)')
             self.cap = None
 
 
@@ -309,7 +317,8 @@ class Vision:
         ring_r_px=None,            # [最小, 最大] 圆环(组)的平均半径像素，None=不限制
         ring_rmax_px=None,         # [最小, 最大] 圆环(组)里最大的圆的半径像素；None=vclaw RING 量过就用量到的 0.85~1.2 倍，
                                    #   没量过按 px_per_mm.RING 估(最外圈直径 ring_outer_diam_mm 的 0.6~1.6 倍，放得比较宽)
-        ring_outer_diam_mm=95.0,   # 圆环最外圈直径(毫米)：vclaw RING 量到最外圈半径以后，用它算 RING 的每毫米像素数
+        ring_outer_diam_mm=95.0,   # 圆环最外圈直径(毫米，线的中间)：vclaw RING 量到最外圈半径以后，用它算 RING 的每毫米像素数
+        ring_line_mm=1.5,          # 圆环线宽(毫米)：识别出来的最外圈半径是线的外边
     )
 
     def __init__(self, cfg=None, camera=None, material_detector=None, ring_detector=None, log=print, sleep=time.sleep):
@@ -349,7 +358,8 @@ class Vision:
         用认到的物料半径现算(观察高度变了也准)；RING：vclaw RING 量过圆环最外圈半径时用它和 ring_outer_diam_mm 算；
         否则用配置里的 px_per_mm。"""
         if kind == 'RING' and self.cfg.get('ring_rmax_cal') and self.cfg.get('ring_outer_diam_mm'):
-            return 2.0 * float(self.cfg['ring_rmax_cal']) / float(self.cfg['ring_outer_diam_mm'])
+            d = float(self.cfg['ring_outer_diam_mm']) + float(self.cfg.get('ring_line_mm') or 0.0)   # 量到的是最外圈线的外边
+            return 2.0 * float(self.cfg['ring_rmax_cal']) / d
         if kind == 'RAW' and self.cfg.get('material_diam_mm'):
             md = self.material_detector_obj() if (self._material is not None or self.cfg.get('detector', 'circle') != 'wuliao') else None
             rr = list(getattr(md, 'r_ref', {}).values()) if md is not None else []
@@ -399,6 +409,9 @@ class Vision:
                     return None
                 self._mask_md = MaterialDetector(self.cfg.get('matdet'))
             md = self._mask_md
+        cache = getattr(md, '_auto_cache', None)
+        if cache is not None and not md.has_static_mask() and cache.shape[:2] == fr.shape[:2]:
+            return cache            # 找物料时记下的爪子区域(蓝色圆环/蓝色物料挨着爪子时，现找会把它们也当成爪子)
         return md.claw_mask(frame=fr)
 
     def _frame(self, after=None, fresh=True):

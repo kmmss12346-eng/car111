@@ -201,6 +201,60 @@ class ClawCacheTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_CV, '没有 opencv')
+class ReviewFixTests(unittest.TestCase):
+    def setUp(self):
+        import matdet
+        self.matdet = matdet
+
+    def test_vmask_refuses_blue_material_in_jaws(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'claw_mask.png')
+            d = self.matdet.MaterialDetector({'claw_mask': path})
+            frames = [scene([(3, 330, 300, 45)], claw_top=300, seed=s) for s in range(3)]   # 蓝色物料夹在爪子里
+            with self.assertRaises(ValueError):
+                d.save_claw_mask(frames, keep_clear=(330, 300))
+            self.assertFalse(os.path.exists(path))
+            with self.assertRaises(ValueError):                                          # 画面里没有爪子
+                d.save_claw_mask([scene([], claw_top=None)])
+            d.save_claw_mask([scene([], claw_top=300)], keep_clear=(330, 250))           # 正常的能存
+            self.assertTrue(os.path.exists(path))
+
+    def test_cache_not_poisoned_by_blue_touching_claw(self):
+        d = self.matdet.MaterialDetector(NO_MASK)
+        d.detect(scene([(1, 200, 120, 45)], claw_top=300), 1)
+        n0 = int(np.count_nonzero(d._auto_cache))
+        d.detect(scene([(1, 200, 120, 45), (3, 330, 290, 48)], claw_top=300), 1)       # 这一帧蓝色物料挨着爪子
+        self.assertLessEqual(int(np.count_nonzero(d._auto_cache)), int(1.03 * n0))
+        r = d.detect(scene([(3, 330, 290, 48)], claw_top=300), 3)
+        self.assertIsNotNone(r)
+        self.assertLess(err(r, 330, 290), 3.0)
+
+    def test_light_blue_with_high_saturation_is_not_blue(self):
+        d = self.matdet.MaterialDetector(NO_MASK)
+        hsv = np.uint8([[[100, 165, 225]]])
+        bgr = tuple(int(v) for v in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
+        im = scene([], claw_top=330)
+        cv2.circle(im, (320, 170), 48, bgr, -1, cv2.LINE_AA)
+        self.assertIsNotNone(d.detect(im, 6))
+        self.assertIsNone(d.detect(im, 3))
+
+    def test_dark_blue_is_not_black(self):
+        d = self.matdet.MaterialDetector(NO_MASK)
+        im = scene([], claw_top=330)
+        cv2.circle(im, (320, 170), 48, (90, 30, 5), -1, cv2.LINE_AA)      # 很暗的蓝色(光线暗时)
+        self.assertIsNone(d.detect(im, 5))
+        im2 = scene([(5, 320, 170, 48)], claw_top=330)
+        self.assertIsNotNone(d.detect(im2, 5))
+
+    def test_wrong_radius_seed_does_not_lock_detection(self):
+        d = self.matdet.MaterialDetector(NO_MASK)
+        d.seed_radius(38.0)                                               # 存的半径是错的(观察高度改过)
+        r = d.detect(scene([(1, 320, 180, 48)], claw_top=330), 1)
+        self.assertIsNotNone(r)
+        self.assertLess(err(r, 320, 180), 2.0)
+
+
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
 class FitTests(unittest.TestCase):
     def test_fit_circle_arc(self):
         import matdet

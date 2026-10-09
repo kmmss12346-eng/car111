@@ -412,6 +412,14 @@ class SimVision:
     def bounds(self, kind, inset=8.0):
         return ((-280.0 + inset, -200.0 + inset), (280.0 - inset, 200.0 - inset))
 
+    TRUE_CLAW = (320.0, 240.0)          # 真的爪子点；配置里的 claw_px 不对，对准就会偏(vclaw 测的就是它)
+
+    def _off(self, kind, e):
+        if e is None:
+            return None
+        c = self.claw(kind)
+        return (float(e[0]) + self.TRUE_CLAW[0] - c[0], float(e[1]) + self.TRUE_CLAW[1] - c[1])
+
     def material_error(self, color_id, n=None):
         w = self.w
         items = [it for it in w.raw_items if it['color'] == int(color_id)]
@@ -420,7 +428,7 @@ class SimVision:
             return None
         c = w.claw()
         it = min(items, key=lambda i: np.linalg.norm(i['pos'] - c))
-        return w.pixel_error(it['pos'], 'RAW')
+        return self._off('RAW', w.pixel_error(it['pos'], 'RAW'))
 
     def wait_still(self, color_id, timeout_s=10.0, **kw):
         """和真的 Vision.wait_still 一样：要在画面里检测到才算(不在画面里 = 看不到)。"""
@@ -442,7 +450,7 @@ class SimVision:
             return None
         c = w.claw()
         k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
-        return w.pixel_error(w.ring_center(k), 'RING')
+        return self._off('RING', w.pixel_error(w.ring_center(k), 'RING'))
 
 
 # ======================================================================================================
@@ -648,6 +656,13 @@ class MissionSimTests(unittest.TestCase):
         from arm_link import ArmError
         with self.assertRaises(ArmError):
             h._return_to_pose(None, -500.0)
+
+        class BadRead(Arm):                                    # 回读失败：物料已经在爪子里，照常放，不报错
+            def read_angles(self):
+                raise ArmError('A? 1 失败：ERR READ')
+        h.arm = BadRead([(2.0, 0.0)])
+        h._return_to_pose(300.0, -500.0)
+        self.assertEqual(len(h.arm.cmds), 1)
 
 
 def _demo(fast, batches=2, extra=None):

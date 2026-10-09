@@ -210,6 +210,45 @@ class ServoTests(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn('没动', res.reason)
 
+    def test_not_moved_keeps_last_measured_error(self):
+        """回读说手臂一点没动：上次测的偏差还是对的，报告它(不是 inf)，调用的地方才能按 accept_mm 照常夹。"""
+        rng = np.random.default_rng(23)
+        pl = SimPlant(rng, err_mm=2.0)
+        store = JacStore(None)
+        store.put('RAW', 'arm', pl.A)
+        pl.dead_arm = True
+        res = make_servo(pl, store=store).run('RAW', pl.measure, pl.scale, 1.0, allow_chassis=False)
+        self.assertFalse(res.ok)
+        self.assertTrue(math.isfinite(res.err_mm), res)
+        self.assertAlmostEqual(res.err_mm, 2.0, delta=0.5)
+
+    def test_isolated_zero_moves_do_not_abort(self):
+        """偶尔一次没动(舵机停顿一下)，中间动成了：不算"连着两次没动"。"""
+        rng = np.random.default_rng(24)
+        pl = SimPlant(rng, err_mm=8.0)
+        store = JacStore(None)
+        store.put('RAW', 'arm', pl.A)
+        real, n = pl.arm_move, [0]
+
+        def flaky(d2, d1):
+            n[0] += 1
+            return (0.0, 0.0) if n[0] in (1, 3) else real(d2, d1)
+        pl.arm_move = flaky
+        res = make_servo(pl, store=store).run('RAW', pl.measure, pl.scale, 1.0, allow_chassis=False, max_iter=10)
+        self.assertTrue(res.ok, res)
+
+    def test_jacobian_too_small_is_corrected(self):
+        """存的 J 比实际小一半多(观察高度改过没重新 vcal)：在线修正能把比例修回来。"""
+        rng = np.random.default_rng(25)
+        ok = 0
+        for _ in range(40):
+            pl = SimPlant(rng, err_mm=10.0)
+            store = JacStore(None)
+            store.put('RING', 'arm', 0.4 * pl.A)
+            res = make_servo(pl, store=store).run('RING', pl.measure, pl.scale, 1.0, allow_chassis=False, max_iter=10)
+            ok += res.ok
+        self.assertGreaterEqual(ok, 34)
+
     def test_probe_fails_if_arm_does_not_move(self):
         rng = np.random.default_rng(8)
         pl = SimPlant(rng, dead_arm=True)

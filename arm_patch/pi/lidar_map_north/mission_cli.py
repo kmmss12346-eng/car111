@@ -22,7 +22,7 @@ mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有�
 mtest TEMP <批次>          单独测暂存区放置/码垛
 mtest START                单独测回家后的显示
 mtest reset                清空任务码和记录，重新开始
-gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来(不放转盘，不需要 ARMOK)
+gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来(不放转盘；要 ARMOK=1，因为先 OBS RAW)
                              颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝；nogo = 只识别和对准，不下降不夹
                              要先标定好：A1G A2E(手臂在原料上方的角度)、ZOBRAW(看的高度)、ZGRAB(夹的高度)、ZHI(抬起高度)，并 arm LIFT ZERO
 mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)的电压、是否使能、是否触发堵转保护——车不动时先用它
@@ -257,7 +257,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             raise ValueError('格式：mtest QR / mtest RAW 1 / mtest ROUGH 1 [force] / mtest TEMP 1 / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
-            _S['hooks'] = None
+            release()                                   # 关掉摄像头(后台线程)再丢掉记录，不然摄像头一直被占着
             log('已清空 mtest 的任务码和记录')
             return None
         if what not in ('QR', 'RAW', 'ROUGH', 'TEMP', 'START'):
@@ -298,6 +298,8 @@ def _tools(h, link):
             h.store = JacStore(h.cfg.get('servo_cal_file'))
         h.act = ArmActuators(h.arm, link, h.cfg['chassis_fine_rpm'], log=h.log)
         h.servo = VisualServo(h.act, h.store, cfg=h.cfg['servo'], log=h.log, sleep=h.sleep)
+        if hasattr(h, 'sync_params'):
+            h.sync_params()
 
 
 def _gtest(h, link, color, nogo, log):
@@ -307,6 +309,8 @@ def _gtest(h, link, color, nogo, log):
     need = ['A1G', 'A2E', 'ZOBRAW', 'ZGRAB', 'ZHI']
     if any(n not in P for n in need):
         raise ValueError('STM32 里没有机械臂参数，是不是没烧带 arm.c 的正式程序？')
+    if P.get('ARMOK', 0) < 0.5:
+        raise ValueError('gtest 和比赛一样先 OBS RAW 摆到原料上方，要先把姿态标定好并 set ARMOK 1')
     known, mm = h.arm.lift_state()
     if not known:
         raise ValueError('升降位置不知道了(急停打断过？)：先把升降放到最低点，再输入 arm LIFT ZERO')
@@ -336,7 +340,8 @@ def _gtest(h, link, color, nogo, log):
         log('nogo：只对准，不夹。看看爪子是不是在物料正上方。')
         return
     if not res.ok and res.err_mm > h.cfg['accept_mm']['RAW']:
-        log(f'   ★ 偏差 {res.err_mm:.1f}mm 太大，不夹(免得夹偏)。可以先 gtest {color} nogo 看看对准情况')
+        why = f'偏差 {res.err_mm:.1f}mm 太大' if math.isfinite(res.err_mm) else f'没对准({res.reason})'
+        log(f'   ★ {why}，不夹(免得夹偏)。可以先 gtest {color} nogo 看看对准情况')
         return
     log('④ 下降、夹紧、抬起')
     h.arm.do(f'LIFT {P["ZGRAB"]:g}')
@@ -361,7 +366,7 @@ def _vmask(h, log):
     for _ in range(10):
         frames.append(h.vision._frame())
         h.sleep(0.05)
-    res = md.save_claw_mask(frames)
+    res = md.save_claw_mask(frames, keep_clear=h.vision.claw('RAW'))   # 爪子点被算进爪子区域(爪子没张开/里面有蓝色物料)就不存
     if res is None:
         raise ValueError('摄像头没有画面')
     path, frac = res
@@ -399,6 +404,13 @@ def _vclaw(h, link, kind, color, log):
         if not known:
             raise ValueError('升降位置不知道了：先把升降放到最低点，再输入 arm LIFT ZERO')
         name = COLOR_NAMES.get(color, str(color))
+        md = h.vision.material_detector_obj() if hasattr(h.vision, 'material_detector_obj') else None
+        if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(color):
+            raise ValueError(f'{name}色物料和蓝色爪子颜色一样，没标定爪子区域会认错：先做 vmask(爪子张开、附近没有物料)，'
+                             '或者换红/黄/绿/黑色物料做 vclaw RAW')
+        if md is not None:                              # 物料半径重新量，不用以前存的(观察高度可能改过)
+            md.r_ref.pop(color, None)
+            md._r_hist.pop(color, None)
         h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
         h.sleep(0.4)
         p0 = h.vision.material_px(color, n=5)
@@ -424,7 +436,6 @@ def _vclaw(h, link, kind, color, log):
         uv, spread, n = pts[1]
         if math.hypot(uv[0] - u1, uv[1] - v1) > 2.5:
             raise ValueError(f'两遍测的不一致(差 {math.hypot(uv[0] - u1, uv[1] - v1):.1f} 像素)：物料被夹歪/推动了，没有保存。放正以后再做一次')
-        md = h.vision.material_detector_obj() if hasattr(h.vision, 'material_detector_obj') else None
         r = (getattr(md, 'r_ref', {}) or {}).get(color) if md is not None else None
         last = getattr(md, 'last', None) if md is not None else None
         if r is None and last:
@@ -491,7 +502,7 @@ def _vcal(h, kind, color, chassis, log):
         h.store.put(kind, 'arm', Ja)
         mm_ps = np.linalg.norm(Ja, axis=0) / scale_cfg
         log(f'  手臂：ID2 每转 1° ≈ {mm_ps[0]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 0]):.2f} 像素)；'
-            f'ID1 每转 1° ≈ {mm_ps[1]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 1]):.2f} 像素)  [按配置的 {scale_cfg} 像素/毫米换算]')
+            f'ID1 每转 1° ≈ {mm_ps[1]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 1]):.2f} 像素)  [按 {scale_cfg:.3f} 像素/毫米换算]')
         if chassis:
             Jc = h.servo._probe(measure, 'ch')
             h.store.put(kind, 'ch', Jc)
@@ -499,8 +510,14 @@ def _vcal(h, kind, color, chassis, log):
             log(f'  底盘：横移 1mm 画面移动 {ps[0]:.3f} 像素；前进 1mm 画面移动 {ps[1]:.3f} 像素')
             meas = float(ps.mean())
             diff = abs(meas - scale_cfg) / scale_cfg
-            log(f'  实测比例 ≈ {meas:.3f} 像素/毫米(配置里 px_per_mm.{kind} = {scale_cfg})' +
-                ('' if diff < 0.1 else f'  → 相差 {diff * 100:.0f}%，建议把 mission_cfg.px_per_mm.{kind} 改成 {meas:.2f}'))
+            if kind == 'RING' and h.vision.cfg.get('ring_rmax_cal'):
+                src, advice = '按 vclaw RING 量到的圆环大小', '圆环最外圈没认全，或者 ring_outer_diam_mm 不对：重做 vclaw RING'
+            elif kind == 'RAW' and h.vision.cfg.get('material_diam_mm'):
+                src, advice = '按物料半径', '检查 material_diam_mm(物料直径)，或者重做 vclaw RAW'
+            else:
+                src, advice = f'配置 px_per_mm.{kind}', f'建议把 mission_cfg.px_per_mm.{kind} 改成 {meas:.2f}'
+            log(f'  实测比例 ≈ {meas:.3f} 像素/毫米(现在用的 {scale_cfg:.3f}，{src})' +
+                ('' if diff < 0.1 else f'  → 相差 {diff * 100:.0f}%，{advice}'))
             if abs(ps[0] - ps[1]) / max(meas, 1e-9) > 0.2:
                 log('  注意：横移和前进的比例相差超过 20%，可能底盘走的距离不准或摄像头有畸变')
         h.store.save()

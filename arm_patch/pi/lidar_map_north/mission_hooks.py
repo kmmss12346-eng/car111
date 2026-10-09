@@ -24,7 +24,7 @@ import time
 from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
 from task_plan import parse_code, TaskError, role_of, Stats
 from visual_servo import VisualServo, JacStore
-from vision import Vision, VisionError, apply_vision_cal
+from vision import Vision, VisionError, apply_vision_cal, load_vision_cal
 
 try:
     from auto_run import Abort
@@ -76,6 +76,14 @@ def deep_merge(base, extra):
         else:
             out[k] = v
     return out
+
+
+def vision_cfg(cfg):
+    """mission_cfg -> 给 vision.Vision 的配置：Vision.DEFAULT 里有的键都带过去(圆环识别的设置也在里面)。"""
+    vc = {k: cfg[k] for k in Vision.DEFAULT if cfg.get(k) is not None}
+    vc.setdefault('detector', 'circle')
+    vc['matdet'] = cfg.get('matdet') or {}
+    return vc
 
 
 class MissionHooks:
@@ -130,9 +138,7 @@ class MissionHooks:
     def _ensure_vision(self):
         if self.vision is None:
             cfg = self.cfg
-            vc = dict(camera=cfg['camera'], claw_px=cfg['claw_px'], px_per_mm=cfg['px_per_mm'], frames=cfg['frames'],
-                      detector=cfg.get('detector', 'circle'), matdet=cfg.get('matdet') or {},
-                      material_diam_mm=cfg.get('material_diam_mm'))
+            vc = vision_cfg(cfg)
             if cfg.get('vision_cal_file'):
                 apply_vision_cal(vc, cfg['vision_cal_file'])        # vclaw 实测的爪子像素优先
             self.vision = Vision(vc, log=self.log)
@@ -149,6 +155,28 @@ class MissionHooks:
         self.servo = VisualServo(self.act, self.store, cfg=cfg['servo'], log=self.log, sleep=self.sleep)
         self._inited = True
         self._init_arm()
+        self.sync_params()
+
+    def sync_params(self):
+        """按 STM32 现在的参数调整视觉这边：
+        - 视觉闭环的最小一步要比舵机的到位误差 ATOL 大(不然那一步舵机根本不动)；
+        - vclaw 时的观察高度(ZOBRAW/ZOBRNG)和现在不一样：提示重做 vclaw，圆环大小不再按旧的过滤。"""
+        try:
+            P = self.arm.params() or {}
+        except ArmAbort:
+            raise
+        except Exception:
+            return
+        if self.servo is not None and 'ATOL' in P:
+            ms = self.servo.cfg.setdefault('min_step_deg', {})
+            for k in ('id1', 'id2'):
+                ms[k] = max(float(ms.get(k, 0.0)), float(P['ATOL']) + 0.05)
+        cal = load_vision_cal(self.cfg.get('vision_cal_file'))
+        for key, kind in (('ZOBRAW', 'RAW'), ('ZOBRNG', 'RING')):
+            if key in cal and key in P and abs(float(cal[key]) - float(P[key])) > 0.5:
+                self.log(f'★ {key} 现在是 {float(P[key]):g}，vclaw {kind} 时是 {float(cal[key]):g}：爪子点已经不准，重做 vclaw {kind}')
+                if kind == 'RING' and self.vision is not None and hasattr(self.vision, 'cfg'):
+                    self.vision.cfg.pop('ring_rmax_cal', None)     # 圆环大小变了：别按旧的大小过滤掉
 
     def _init_arm(self):
         try:
@@ -459,6 +487,8 @@ class MissionHooks:
             else:
                 self._learn_from(zone, ring)                     # 底盘为了对准挪了多少，下一个圆环直接带上
                 a1, a2 = self.arm.read_angles()                  # 记下对准时 ID1、ID2 的角度
+                if a1 is None or a2 is None:
+                    raise ArmError('读不到对准时的手臂角度(A? 没回复)，不去取物料')
                 d = self.act.disp
                 self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2)
                 self.arm.take(item.slot)                         # 去转盘取物料
@@ -486,10 +516,25 @@ class MissionHooks:
             self.arm.ap(a1 + pre[0], a2 + pre[1])                # 先从反方向靠近，再回来，消除齿轮间隙
         self.arm.ap(a1, a2)
         tol = float(self.cfg.get('return_tol_deg') or 0.4)
-        for _ in range(2):
+        try:
+            tol = max(tol, float((self.arm.params() or {}).get('ATOL', 0.0)) + 0.05)   # 比 ATOL 还小的差舵机不会再动
+        except ArmAbort:
+            raise
+        except Exception:
+            pass
+        for k in range(3):
             self.sleep(0.2)
-            b1, b2 = self.arm.read_angles()
+            try:
+                b1, b2 = self.arm.read_angles()
+            except ArmAbort:
+                raise
+            except ArmError as ex:                               # 物料已经在爪子里：读不到角度也照常放，不能带着物料收臂
+                self.log(f'    回读角度失败({ex})，按已经回到位继续')
+                return
             if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= tol):
+                return
+            if k == 2:
+                self.log(f'    ★ 回不到对准姿态：还差 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°，照常放')
                 return
             self.log(f'    回到对准姿态差了 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°，再转一次')
             self.arm.ap(a1, a2)

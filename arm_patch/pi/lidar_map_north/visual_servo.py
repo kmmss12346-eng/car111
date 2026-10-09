@@ -420,6 +420,10 @@ class VisualServo:
                     moved()
                     applied = self._apply_chassis(float(sf[0]), float(sf[1]))
                     used_ch = True
+                if _norm(applied) < 1e-9:
+                    fresh[0] = True                          # 回读说一点没动：上次测的偏差还是现在的
+                else:
+                    stalls = 0                               # 只算连着两次没动
                 if group == 'arm' and cmd is not None and _norm(cmd) > 1e-6 and _norm(applied) < 1e-9:
                     stalls += 1                              # 指令发了，角度读回来没变
                     if stalls >= 2:
@@ -442,6 +446,7 @@ class VisualServo:
                         used_ch = True
                         group = 'ch'
                     if _norm(applied) < 1e-9:
+                        fresh[0] = True
                         return finish(False, f'手臂已到行程极限、底盘也不用动，还差 {e:.2f}mm')
                 prev_e = e
                 moves += 1
@@ -450,7 +455,11 @@ class VisualServo:
                 # 在线修正 J：用这次实际的"动了多少 → 画面变了多少"(差得太多说明是别的原因，比如原料盘在转，不拿来修)
                 dp = p_new - p
                 pred = J[group] @ applied
-                if _norm(pred) >= c['broyden_min_px'] and _norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred):
+                ratio = _norm(dp) / max(_norm(pred), 1e-9)
+                cosang = float(dp @ pred) / max(_norm(dp) * _norm(pred), 1e-9)
+                # 方向对、只是大小差几倍(J 的比例不对，比如观察高度改过)也修；方向不对的(原料盘在转)不修
+                if _norm(pred) >= c['broyden_min_px'] and (_norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred)
+                                                            or (cosang >= 0.9 and 0.3 <= ratio <= 3.0)):
                     J[group] = J[group] + c['broyden_gain'] * np.outer(dp - pred, applied) / float(applied @ applied)
                 p = p_new
         except ServoError as ex:

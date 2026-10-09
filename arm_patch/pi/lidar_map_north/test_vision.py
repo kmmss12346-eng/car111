@@ -103,7 +103,8 @@ class RingTests(unittest.TestCase):
         self.assertAlmostEqual(r, 48.25 * 1.6, delta=3.0)
         v = quiet_vision(camera=FakeCam(img), cfg=dict(ring_rmax_cal=r))   # 量过以后按量到的大小过滤
         self.assertIsNotNone(v.ring_px(n=3))
-        self.assertAlmostEqual(v.scale('RING'), 2 * r / 95.0, places=6)
+        self.assertAlmostEqual(v.scale('RING'), 2 * r / 96.5, places=6)
+        self.assertAlmostEqual(v.scale('RING'), 1.6, delta=0.03)          # 和画图用的真实比例一致
         self.assertAlmostEqual(quiet_vision().scale('RING'), 2.96)
 
     def test_blank_image_returns_none(self):
@@ -188,6 +189,38 @@ class LatestFrameTests(unittest.TestCase):
             lf.close()
         self.assertFalse(lf.th.is_alive())
         self.assertEqual(lf.read(timeout=0.05), (None, None))
+
+    def test_one_bad_frame_does_not_kill_thread(self):
+        from vision import LatestFrame
+
+        class BadOnce:
+            def __init__(self):
+                self.n = 0
+
+            def grab(self):
+                time.sleep(0.01)
+                return True
+
+            def retrieve(self):
+                self.n += 1
+                if self.n == 1:
+                    raise RuntimeError('坏帧')
+                return True, np.zeros((2, 2, 3), np.uint8)
+        lf = LatestFrame(BadOnce(), 0.01)
+        try:
+            fr, _t = lf.read(timeout=1.0)
+            self.assertIsNotNone(fr)
+            self.assertTrue(lf.th.is_alive())
+        finally:
+            self.assertTrue(lf.close())
+
+    def test_ring_settings_reach_vision(self):
+        from mission_hooks import vision_cfg, DEFAULTS, deep_merge
+        cfg = deep_merge(DEFAULTS, {'ring_detector': 'contour', 'ring_outer_diam_mm': 85.0, 'ring_rmax_px': [50, 300]})
+        v = Vision(vision_cfg(cfg), camera=object(), log=lambda m: None)
+        self.assertEqual(v.cfg['ring_detector'], 'contour')
+        self.assertEqual(v.cfg['ring_outer_diam_mm'], 85.0)
+        self.assertEqual(v._ring_rmax_range(), (50.0, 300.0))
 
 
 class MathTests(unittest.TestCase):

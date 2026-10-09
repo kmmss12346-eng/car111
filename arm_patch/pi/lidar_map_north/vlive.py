@@ -39,14 +39,12 @@ COLOR_EN = {1: 'red', 2: 'yellow', 3: 'blue', 4: 'green', 5: 'black', 6: 'light 
 
 def load_vision_cfg(cfg_path):
     """和 map_merge_live 用同一份配置：mission_cfg 里的 camera / claw_px / px_per_mm(没写的用默认值)。"""
-    from mission_hooks import DEFAULTS, deep_merge
+    from mission_hooks import DEFAULTS, deep_merge, vision_cfg
     raw = {}
     if cfg_path is not None and Path(cfg_path).exists():
         raw = json.loads(Path(cfg_path).read_text(encoding='utf-8'))
     cfg = deep_merge(DEFAULTS, raw.get('mission_cfg'))
-    vc = dict(camera=cfg['camera'], claw_px=cfg['claw_px'], px_per_mm=cfg['px_per_mm'], frames=cfg['frames'],
-              detector=cfg.get('detector', 'circle'), matdet=cfg.get('matdet') or {},
-              material_diam_mm=cfg.get('material_diam_mm'))
+    vc = vision_cfg(cfg)
     from vision import apply_vision_cal
     if cfg.get('vision_cal_file'):
         apply_vision_cal(vc, cfg['vision_cal_file'])
@@ -184,8 +182,11 @@ def main(argv=None):
                     print('现在用的不是 matdet 识别，不用标定爪子区域', flush=True)
                 else:
                     frs = [vis.camera.read() for _ in range(10)]
-                    res = md.save_claw_mask(frs)
-                    print('没有画面，没存' if res is None else f'爪子区域已存：{res[0]}(占画面 {res[1] * 100:.0f}%)', flush=True)
+                    try:
+                        res = md.save_claw_mask(frs, keep_clear=vis.claw('RAW'))
+                        print('没有画面，没存' if res is None else f'爪子区域已存：{res[0]}(占画面 {res[1] * 100:.0f}%)', flush=True)
+                    except ValueError as ex:
+                        print(f'没存：{ex}', flush=True)
             elif key == ord('s'):
                 cv2.imwrite(str(ROOT / 'vlive.png'), out)
                 print(f'已存：{ROOT / "vlive.png"}', flush=True)

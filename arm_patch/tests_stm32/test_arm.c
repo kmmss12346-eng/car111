@@ -213,9 +213,12 @@ int main(void) {
     ang[1] = 323.0f; ang[2] = -862.0f; block1 = 340.0f; clear();
     CHECK(run("AP 400 -862") == 1 && has("stuck1:400.0;") && !has("stuck2") && !has("S2:") && !has("H1"), "ID1 被挡在 340：到时间没到位，叫 Servo_StopIfStuck(1)；ID2 本来就在 -862，不发指令");
     ang[1] = 323.0f; ang[2] = -700.0f; clear();
-    CHECK(run("AP 323 -862") == 1 && !has("S1:") && has("S2:-862.0") && has("H2:-862.0;"), "AP 只动 ID2：ID1 已经在目标上不发指令(不会白动一下)，ID2 到了马上停住");
+    CHECK(run("AP 323 -862") == 1 && !has("S1:") && has("H1:323.0;") && has("S2:-862.0") && has("H2:-862.0;"), "AP 只动 ID2：ID1 已经在目标上不发转动指令(不会白动一下)，只在原地保持；ID2 到了马上停住");
     block1 = 1e9f; clear();
     CHECK(run("AP 330 -860") == 1 && !has("stuck") && has("H1:330.0;") && has("H2:-860.0;"), "都到位：不叫 Servo_StopIfStuck，两个到了都马上停住");
+    ang[1] = 330.1f; ang[2] = -850.6f; clear();
+    CHECK(run("AP 330.1 -850.6") == 1 && !has("S1:") && !has("S2:") && has("H1:330.1;") && has("H2:-850.6;"),
+          "手松开后摆好，AP 到现在的角度：不转，但两个舵机都重新上力保持(标定向导靠这个)");
     clear();
     CHECK(run("SV? 1") == 1 && has("rep1;") && run("SV? 3") == -1, "SV? 1 读舵机状态；ID 不对 ERR ARG");
     /* 舵机功率 SPOW、舵机内部设置 SVP? / SVW */

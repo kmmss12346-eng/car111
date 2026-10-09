@@ -37,6 +37,7 @@ DEFAULTS = dict(
     min_r_gap=2.0,               # 半径差这么多以上才算不同的圆
     min_circles=2,               # 一个圆环至少几个不同半径的圆
     min_cov=0.35,                # 一个圆环所有圆加起来至少看到圆周多少(比例)
+    min_r_ratio=0.45,            # 一组里比最大的圆小这么多倍的圆不算(真圆环最里圈/最外圈 >= 0.53)
     claw_margin_px=5,            # 爪子区域往外扩几像素(爪子的边不是圆环的边)
 )
 
@@ -190,7 +191,8 @@ class RingDetector:
 
     def _fit_group(self, g):
         cfg = self.cfg
-        arcs = sorted(g['arcs'], key=lambda q: q['r'])
+        rbig = max(a['r'] for a in g['arcs'])
+        arcs = sorted((a for a in g['arcs'] if a['r'] >= cfg['min_r_ratio'] * rbig), key=lambda q: q['r'])
         # 半径相近的圆弧是同一个圆(比如被爪子切成两段)
         circles = []
         for a in arcs:

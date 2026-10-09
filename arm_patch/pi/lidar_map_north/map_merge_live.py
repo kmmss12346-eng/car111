@@ -551,6 +551,7 @@ def main():
         if k in ('go','drive','p2'):
             if link is None:raise ValueError('没有连接 STM32（--stm-port），不能用 '+k)
             if state['auto']:raise ValueError('一键流程正在运行；输入 abort 可以中止')
+            if state.get('busy'):raise ValueError('测试命令(vclaw/gtest/vcal…)还在运行，等它结束再用 '+k)
             if k=='p2':
                 sync_now()
                 print('第二站动作 ->',link.second_move(None if raw_cfg.get('second_use_p2',False) else rel,log=lambda m:print(m,flush=True)),flush=True);return

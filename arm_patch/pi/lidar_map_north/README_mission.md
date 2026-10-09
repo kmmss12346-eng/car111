@@ -97,7 +97,7 @@
 | `vdbg [RING\|RAW <颜色号>]` | 存 `vdebug.png`：爪子位置(绿十字)、识别到的圆环(黄)/物料(红叉) |
 | `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force` |
 | `mtest reset` | 清空任务码和记录 |
-| `gtest <颜色号>` / `gtest <颜色号> nogo` | 夹取测试(不需要 ARMOK、不用转盘)：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来。nogo = 只对准不夹。要先标定 A1G A2E ZOBRAW ZGRAB ZHI，并 `arm LIFT ZERO` |
+| `gtest <颜色号>` / `gtest <颜色号> nogo` | 夹取测试(不用转盘；要 ARMOK=1)：摄像头找这个颜色的物料 → 手臂对准 → 下降夹住 → 抬起来。nogo = 只对准不夹。要先标定 A1G A2E ZOBRAW ZGRAB ZHI，并 `arm LIFT ZERO` |
 | `mot` | 看 5 个电机驱动器(1 右前、2 左前、3 右后、4 左后、5 升降)的电压、是否使能、是否触发堵转保护，并给出中文建议。**车不动时先用它** |
 | `mot en` | 5 个驱动器解除堵转保护并使能，再看一次状态(开机和每次 `go` 时 STM32 也会自动做一次) |
 

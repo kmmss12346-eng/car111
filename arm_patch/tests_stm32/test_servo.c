@@ -88,6 +88,7 @@ FSUS_STATUS FSUS_WriteData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8
     uparam[addr] = size == 1 ? val[0] : (long)(int16_t)(val[0] | (val[1] << 8));
     if (size == 2 && addr != 51 && addr != 52) uparam[addr] = (long)(uint16_t)(val[0] | (val[1] << 8));
     return FSUS_STATUS_SUCCESS; }
+#define SERVO_FINE_DEG 4.5f      /* 正式程序里在 arm.h */
 #include "servo_section.c"
 static int fails = 0, checks = 0;
 #define CHECK(c, m) do { checks++; if (!(c)) { fails++; printf("  FAIL: %s\n    out=[%s] pos1=%.1f tgt1=%.1f now=%u\n", m, out, pos[1], tgt[1], now); } else printf("  ok: %s\n", m); } while (0)
