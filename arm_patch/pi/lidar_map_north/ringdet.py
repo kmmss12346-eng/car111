@@ -9,11 +9,14 @@
   3. 圆心靠得很近的圆弧归成一组(同心圆)；一组里至少有 2 个不同半径的圆才算圆环
      (被爪子切成两段的单个圆、物料顶面的圆都只有一个半径，不算)；
   4. 一组里所有圆弧的点一起做"同心圆"最小二乘：共用一个圆心、每个圆自己的半径，圆心精确到零点几像素。
+  5. 校赛那种"粗黑环 + 中间白色满分区"的靶：中间被物料盖住(取回、码垛)或者被爪子挡住时只剩最外圈一个圆。
+     知道圆环大概多大(r_expect，vclaw RING 量过)时，外圈大小对、而且圈里面紧挨着的一圈是黑的、外面是白的，也算圆环。
 被爪子挡住一半时圆心误差也在 0.5 像素以内。
 
 接口：
   det = RingDetector(cfg)
-  rings = det(frame, claw_mask)   -> [(x, y, 平均半径, 最大半径), ...]，从左到右(和原来的一样)
+  rings = det(frame, claw_mask, r_expect=None)   -> [(x, y, 平均半径, 最大半径), ...]，从左到右(和原来的一样)
+                                  r_expect = (最小, 最大) 最外圈半径像素，给了才允许"只看到最外圈"的情况
   det.last                        -> 最近一次的详细结果 [dict(center, radii, r_max, n_circles, coverage, rms, ...)]
 """
 import math
@@ -37,7 +40,13 @@ DEFAULTS = dict(
     min_r_gap=2.0,               # 半径差这么多以上才算不同的圆
     min_circles=2,               # 一个圆环至少几个不同半径的圆
     min_cov=0.35,                # 一个圆环所有圆加起来至少看到圆周多少(比例)
-    min_r_ratio=0.45,            # 一组里比最大的圆小这么多倍的圆不算(真圆环最里圈/最外圈 >= 0.53)
+    min_r_ratio=0.3,             # 一组里比最大的圆小这么多倍的圆不算(校赛靶白心/外圈 约 0.5；6 环靶最里圈/最外圈 0.53)
+    group_rel=0.06,              # 大圆弧的圆心没那么准：归组距离放宽到 半径 x 这个(不小于 group_px)
+    single_ok=True,              # 只看到最外圈一个圆时，大小对(r_expect)、圈里一圈黑外面白，也算圆环
+    single_min_cov=0.22,         # 只看到一个圆时，这个圆至少看到多少圆周(圆心在爪子下面时只露出上面一小段)
+    dark_min=40.0,               # 外圈里面紧挨着的一圈要比外面暗这么多(灰度)
+    dark_frac=0.7,               # 至少这么多方向满足上面这条(物料盖住一部分也没关系)
+    dark_max_sat=90.0,           # 那一圈黑环颜色要淡(饱和度低)：红/蓝/绿色物料的边不算
     claw_margin_px=5,            # 爪子区域往外扩几像素(爪子的边不是圆环的边)
 )
 
@@ -121,11 +130,14 @@ class RingDetector:
         lo, hi = cfg['canny']
         edge = cv2.Canny(blur, int(lo), int(hi))
         h, w = edge.shape
+        self._gray, self._bad = blur, None
+        self._sat = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1] if frame.ndim == 3 else None
         if claw_mask is not None and claw_mask.any():
             if claw_mask.shape[:2] != (h, w):
                 claw_mask = cv2.resize(claw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
             k = 2 * int(cfg['claw_margin_px']) + 1
-            edge[cv2.dilate(claw_mask, np.ones((k, k), np.uint8)) > 0] = 0
+            self._bad = cv2.dilate(claw_mask, np.ones((k, k), np.uint8))
+            edge[self._bad > 0] = 0
         edge[:3, :] = 0
         edge[-3:, :] = 0
         edge[:, :3] = 0
@@ -158,15 +170,18 @@ class RingDetector:
         return out
 
     # ---------------------------------------------------------- 第 3、4 步：同心圆
-    def detect(self, frame, claw_mask=None):
+    def _tol(self, r):
+        return max(float(self.cfg['group_px']), float(self.cfg['group_rel']) * float(r))
+
+    def detect(self, frame, claw_mask=None, r_expect=None):
         cfg = self.cfg
         arcs = self.arcs(frame, claw_mask)
-        gpx = float(cfg['group_px'])
         groups = []
         for a in sorted(arcs, key=lambda t: -t['n'] * t['r']):          # 大圆、长弧的圆心最准，先放
             ax, ay = a['center']
             for g in groups:
-                if (ax - g['cx']) ** 2 + (ay - g['cy']) ** 2 < gpx * gpx:
+                tol = self._tol(max(a['r'], max(q['r'] for q in g['arcs'])))
+                if (ax - g['cx']) ** 2 + (ay - g['cy']) ** 2 < tol * tol:
                     g['arcs'].append(a)
                     wsum = sum(q['n'] * q['r'] for q in g['arcs'])
                     g['cx'] = sum(q['center'][0] * q['n'] * q['r'] for q in g['arcs']) / wsum
@@ -177,13 +192,16 @@ class RingDetector:
         rings = []
         for g in groups:
             res = self._fit_group(g)
+            if res is None and r_expect is not None and cfg.get('single_ok', True):
+                res = self._fit_single(g, r_expect)
             if res is not None:
                 rings.append(res)
         # 两组精修以后圆心重合了(同一个圆环被分成了两组)：留圆多的那个
-        rings.sort(key=lambda t: -t['n_circles'])
+        rings.sort(key=lambda t: (-t['n_circles'], -t['coverage']))
         keep = []
         for r in rings:
-            if all(math.hypot(r['center'][0] - q['center'][0], r['center'][1] - q['center'][1]) > gpx for q in keep):
+            if all(math.hypot(r['center'][0] - q['center'][0], r['center'][1] - q['center'][1]) > self._tol(max(r['r_max'], q['r_max']))
+                   for q in keep):
                 keep.append(r)
         keep.sort(key=lambda t: t['center'][0])
         self.last = keep
@@ -218,7 +236,7 @@ class RingDetector:
         if len(pts2) < cfg['min_circles']:
             return None
         cx, cy, r, res, idx = _concentric_refine(pts2, cx, cy, r2)
-        if math.hypot(cx - g['cx'], cy - g['cy']) > 2.0 * float(cfg['group_px']):
+        if math.hypot(cx - g['cx'], cy - g['cy']) > 2.0 * self._tol(max(r2)):
             return None
         rs = np.sort(r)
         n_circles = 1 + int(np.count_nonzero(np.diff(rs) >= cfg['min_r_gap']))
@@ -233,5 +251,61 @@ class RingDetector:
                     r_max=float(rs[-1]), n_circles=n_circles, coverage=float(cov), rms=rms,
                     n_pts=int(sum(len(p) for p in pts2)))
 
-    def __call__(self, frame, claw_mask=None):
-        return [(r['center'][0], r['center'][1], r['r_mean'], r['r_max']) for r in self.detect(frame, claw_mask)]
+    def _fit_single(self, g, r_expect):
+        """只剩最外圈一个圆(中间被物料盖住/被爪子挡住)：大小在 r_expect 里，而且圈里黑外面白，才算圆环。"""
+        cfg = self.cfg
+        lo, hi = float(r_expect[0]), float(r_expect[1])
+        big = [a for a in g['arcs'] if lo * 0.95 <= a['r'] <= hi * 1.05]
+        if not big:
+            return None
+        rb = max(a['r'] for a in big)
+        same = [a for a in big if abs(a['r'] - rb) <= max(float(cfg['min_r_gap']), 0.04 * rb)]
+        pts = np.vstack([a['pts'] for a in same])
+        cx, cy, r = _refine(pts, g['cx'], g['cy'], rb, iters=15)
+        d = np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)
+        pts = pts[d < 2.5 * float(cfg['inlier_px'])]
+        if len(pts) < cfg['min_arc_pts']:
+            return None
+        cx, cy, r = _refine(pts, cx, cy, r, iters=15)
+        if not (lo <= r <= hi):
+            return None
+        cov = _coverage(pts, cx, cy)
+        if cov < cfg['single_min_cov'] or not self._dark_inside(cx, cy, r):
+            return None
+        res = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r
+        return dict(center=(float(cx), float(cy)), radii=[float(r)], r_mean=float(r), r_max=float(r), n_circles=1,
+                    coverage=float(cov), rms=float(np.sqrt(np.mean(res * res))), n_pts=int(len(pts)), single=True)
+
+    def _dark_inside(self, cx, cy, r):
+        """圆周里面紧挨着的一圈(0.88r~0.94r)比外面(1.06r~1.12r)暗：校赛靶的黑环外边。爪子区域、画面外的方向不算。"""
+        g = getattr(self, '_gray', None)
+        if g is None:
+            return False
+        h, w = g.shape[:2]
+        bad = getattr(self, '_bad', None)
+        ang = np.linspace(0.0, 2.0 * math.pi, 72, endpoint=False)
+        ca, sa = np.cos(ang), np.sin(ang)
+        ks_in, ks_out = (0.88, 0.94), (1.06, 1.12)
+        xs = np.stack([cx + k * r * ca for k in ks_in + ks_out])
+        ys = np.stack([cy + k * r * sa for k in ks_in + ks_out])
+        xi, yi = np.round(xs).astype(int), np.round(ys).astype(int)
+        ok = ((xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)).all(axis=0)
+        xi, yi = np.clip(xi, 0, w - 1), np.clip(yi, 0, h - 1)
+        if bad is not None:
+            ok &= ~(bad[yi, xi] > 0).any(axis=0)
+        if int(ok.sum()) < 10:
+            return False
+        v = g[yi, xi].astype(np.float32)
+        inside, outside = v[:2].mean(axis=0), v[2:].mean(axis=0)
+        good = (outside - inside) >= float(self.cfg['dark_min'])
+        if float(good[ok].mean()) < float(self.cfg['dark_frac']):
+            return False
+        sat = getattr(self, '_sat', None)
+        if sat is not None:                                   # 黑环是灰黑色的；彩色物料(红、蓝、绿…)的边不是圆环
+            s_in = sat[yi[:2], xi[:2]].astype(np.float32).mean(axis=0)
+            if float(np.median(s_in[ok & good])) > float(self.cfg['dark_max_sat']):
+                return False
+        return True
+
+    def __call__(self, frame, claw_mask=None, r_expect=None):
+        return [(r['center'][0], r['center'][1], r['r_mean'], r['r_max']) for r in self.detect(frame, claw_mask, r_expect)]

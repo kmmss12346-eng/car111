@@ -94,18 +94,63 @@ class RingTests(unittest.TestCase):
         self.assertIsNone(v2.ring_px(n=3))                      # 原来的办法认不到
 
     def test_ring_size_filter_and_calibration(self):
-        img = draw_rings(320, 200, 1.6)                          # 圆环比配置的 2.96 像素/毫米小很多
+        img = draw_rings(320, 200, 0.9)                          # 圆环比配置的 2.96 像素/毫米小很多(最外圈 43 像素)
         v = quiet_vision(camera=FakeCam(img))
         self.assertIsNone(v.ring_px(n=3))                        # 按配置的大小过滤掉了
         p = v.ring_px(n=3, any_size=True)                        # vclaw RING 第一次：不限大小
         self.assertLess(math.hypot(p[0] - 320, p[1] - 200), 0.6)
         r = v.last_ring_rmax
-        self.assertAlmostEqual(r, 48.25 * 1.6, delta=3.0)
-        v = quiet_vision(camera=FakeCam(img), cfg=dict(ring_rmax_cal=r))   # 量过以后按量到的大小过滤
+        self.assertAlmostEqual(r, 48.25 * 0.9, delta=2.0)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(ring_rmax_cal=r, ring_line_mm=1.5))   # 量过以后按量到的大小过滤
         self.assertIsNotNone(v.ring_px(n=3))
-        self.assertAlmostEqual(v.scale('RING'), 2 * r / 96.5, places=6)
-        self.assertAlmostEqual(v.scale('RING'), 1.6, delta=0.03)          # 和画图用的真实比例一致
+        self.assertAlmostEqual(v.scale('RING'), 2 * r / 96.5, places=6)   # 6 条细线的靶：最外圈半径是线的外边
+        self.assertAlmostEqual(v.scale('RING'), 0.9, delta=0.03)          # 和画图用的真实比例一致
         self.assertAlmostEqual(quiet_vision().scale('RING'), 2.96)
+        v = quiet_vision(camera=FakeCam(img), cfg=dict(ring_rmax_cal=50.0, ring_outer_diam_mm=100.0))
+        self.assertAlmostEqual(v.scale('RING'), 1.0)                       # 校赛粗黑环靶：外径 100mm、半径 50 像素
+
+    def test_school_target_with_material_after_calibration(self):
+        """校赛粗黑环靶上放着物料(取回/码垛)：vclaw RING 量过大小以后，Vision 会让识别只看外圈也算。"""
+        import tempfile
+        from pathlib import Path
+        import matdet
+        from test_ringdet import school_target
+        cam = cv2.imread(str(Path(__file__).resolve().parent / 'testdata' / 'arm_cam_18.jpg'))
+        claw = matdet.MaterialDetector({'claw_mask': '/nonexistent'}).auto_claw_mask(cv2.cvtColor(cam, cv2.COLOR_BGR2HSV))
+        img = school_target(337, 283, 100, material=(40, 40, 210))
+        img[claw > 0] = cam[claw > 0]
+        with tempfile.TemporaryDirectory() as td:
+            base = dict(matdet={'claw_mask': '/nonexistent'}, live_view=str(Path(td) / 'live.jpg'))
+            v = quiet_vision(camera=FakeCam(img), cfg=base)
+            self.assertIsNone(v.ring_px(n=3))                           # 没量过大小：只看到一圈不算
+            v = quiet_vision(camera=FakeCam(img), cfg=dict(base, ring_rmax_cal=100.0))
+            p = v.ring_px(n=3)
+            self.assertIsNotNone(p)
+            self.assertLess(math.hypot(p[0] - 337, p[1] - 283), 1.5)
+            self.assertTrue((Path(td) / 'live.jpg').exists())           # 实时画面写出来了(给 vview.py 看)
+
+    def test_overlay_and_live_view(self):
+        import tempfile
+        from pathlib import Path
+        img = draw_rings(330, 200, 2.0)
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / 'live.jpg')
+            v = quiet_vision(camera=FakeCam(img), cfg=dict(live_view=path, matdet={'claw_mask': '/nonexistent'}))
+            self.assertIsNotNone(v.ring_px(n=2))
+            out = cv2.imread(path)
+            self.assertEqual(out.shape, img.shape)
+            self.assertGreater(int(np.abs(out.astype(int) - img.astype(int)).sum()), 0)   # 画了东西
+            v.cfg['live_view'] = ''                                     # 关掉：不写
+            os_mtime = Path(path).stat().st_mtime
+            v._live_t = 0.0
+            v.ring_px(n=2)
+            self.assertEqual(Path(path).stat().st_mtime, os_mtime)
+            out2 = v.overlay(img, 'RAW', None, color_id=1)
+            self.assertEqual(out2.shape, img.shape)
+
+    def test_vview_reads_the_same_file(self):
+        import vview
+        self.assertEqual(vview.DEFAULT_PATH, Vision.DEFAULT['live_view'])
 
     def test_blank_image_returns_none(self):
         v = quiet_vision(camera=FakeCam(np.full((480, 640, 3), 235, np.uint8)))

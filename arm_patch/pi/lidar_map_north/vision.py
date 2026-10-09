@@ -69,6 +69,8 @@ def apply_vision_cal(cfg, path=None):
         cfg['r_px_seed'] = float(cal['r_px'])                 # vclaw 量到的物料半径(像素)
     if cal.get('ring_rmax_px') and not cfg.get('ring_rmax_cal'):
         cfg['ring_rmax_cal'] = float(cal['ring_rmax_px'])     # vclaw RING 量到的圆环最外圈半径(像素)
+    if cal.get('ring_outer_diam_mm'):
+        cfg['ring_outer_diam_mm'] = float(cal['ring_outer_diam_mm'])   # vclaw RING 时输入的圆环外径(毫米)
     return cfg
 
 
@@ -317,8 +319,10 @@ class Vision:
         ring_r_px=None,            # [最小, 最大] 圆环(组)的平均半径像素，None=不限制
         ring_rmax_px=None,         # [最小, 最大] 圆环(组)里最大的圆的半径像素；None=vclaw RING 量过就用量到的 0.85~1.2 倍，
                                    #   没量过按 px_per_mm.RING 估(最外圈直径 ring_outer_diam_mm 的 0.6~1.6 倍，放得比较宽)
-        ring_outer_diam_mm=95.0,   # 圆环最外圈直径(毫米，线的中间)：vclaw RING 量到最外圈半径以后，用它算 RING 的每毫米像素数
-        ring_line_mm=1.5,          # 圆环线宽(毫米)：识别出来的最外圈半径是线的外边
+        ring_outer_diam_mm=95.0,   # 圆环最外圈(黑环外边)直径(毫米)：vclaw RING 100 这样输入实测值；用它算 RING 的每毫米像素数
+        ring_line_mm=0.0,          # 6 条细线那种靶填线宽 1.5(识别出来的最外圈半径是线的外边)；校赛粗黑环靶是 0
+        live_view='/tmp/vision_live.jpg',   # 识别时把带标注的画面写到这里，另开终端 python3 vview.py 实时看；''=不写
+        live_fps=8.0,              # 最多每秒写几张
     )
 
     def __init__(self, cfg=None, camera=None, material_detector=None, ring_detector=None, log=print, sleep=time.sleep):
@@ -339,6 +343,7 @@ class Vision:
         self._mask_md = None            # 只用来找爪子区域的 matdet(物料识别不是 matdet 时)
         self.last_claw = None           # 最近一次认圆环时用的爪子区域(画图用)
         self.last_ring_rmax = None      # 最近一次 ring_px 认到的圆环最外圈半径(像素)
+        self._live_t = 0.0
 
     # ------------------------------------------------------------ 基础
     def open(self):
@@ -443,6 +448,7 @@ class Vision:
         for fr in self._frames(n):
             if fr is not None:
                 p = det(fr, color_id)
+                self._publish(fr, 'RAW', p, color_id=color_id)
                 if p is not None:
                     pts.append(p)
         if len(pts) < max(2, n // 2 + 1):
@@ -486,7 +492,7 @@ class Vision:
             r = float(self.cfg['ring_rmax_cal'])
             return 0.85 * r, 1.2 * r
         outer = float(self.cfg.get('ring_outer_diam_mm') or 95.0) / 2.0 * float(self.cfg['px_per_mm']['RING'])   # 最外圈半径，像素(估计)
-        return 0.6 * outer, 1.6 * outer
+        return 0.35 * outer, 2.0 * outer             # 还没量过：放宽(要看到两圈同心圆才算，不会把别的圆当成圆环)
 
     def _rings_in_frame(self, fr, any_size=False):
         """检测到的圆环列表 [(x, y, r, ...)]。只保留"最外圈够大"的，物料自己的圆(小)和别的杂圆不算圆环。
@@ -494,7 +500,10 @@ class Vision:
         det = self._ring_det()
         if getattr(det, 'wants_claw', False):
             self.last_claw = self.claw_mask(fr)
-            rings = det(fr, self.last_claw)
+            rexp = None
+            if not any_size and (self.cfg.get('ring_rmax_px') or self.cfg.get('ring_rmax_cal')):
+                rexp = self._ring_rmax_range()          # 圆环大小已知：中间被物料盖住、只剩最外圈时也能认
+            rings = det(fr, self.last_claw, r_expect=rexp)
         else:
             rings = det(fr)
         rr = self.cfg.get('ring_r_px')
@@ -513,8 +522,9 @@ class Vision:
         for fr in self._frames(n):
             if fr is not None:
                 rings = self._rings_in_frame(fr, any_size)
-                if rings:
-                    best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2)
+                best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2) if rings else None
+                self._publish(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
+                if best is not None:
                     pts.append((best[0], best[1]))
                     if len(best) >= 4:
                         rmax.append(float(best[3]))
@@ -533,30 +543,97 @@ class Vision:
 
     # ------------------------------------------------------------ 调试
     def save_debug(self, path, kind='RING', color_id=None):
-        """存一张带标注的图：爪子位置(绿十字)、检测到的圆环(黄)/物料(红十字)。"""
+        """存一张带标注的图(和 vview 看到的一样)：爪子点(绿十字)、圆环(黄；大小不对被过滤掉的是灰色)/物料(青色圆、红叉)。"""
         import cv2
         fr = self._frame()
         if fr is None:
             return False
-        out = fr.copy()
-        cu, cv_ = self.claw(kind)
-        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
         try:
-            for ring in self._rings_in_frame(fr):
-                x, y, r = ring[0], ring[1], ring[2]
-                cv2.circle(out, (int(x), int(y)), int(r), (0, 255, 255), 2)
-                cv2.drawMarker(out, (int(x), int(y)), (0, 255, 255), cv2.MARKER_CROSS, 16, 2)
+            if color_id is not None:
+                out = self.overlay(fr, 'RAW', self._material_det()(fr, color_id), color_id=color_id)
+            else:
+                rings = self._rings_in_frame(fr)
+                cu, cv_ = self.claw('RING')
+                best = min(rings, key=lambda r: (r[0] - cu) ** 2 + (r[1] - cv_) ** 2) if rings else None
+                out = self.overlay(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
         except VisionError:
-            pass
-        if color_id is not None:
-            try:
-                p = self._material_det()(fr, color_id)
-                if p is not None:
-                    md = self.material_detector_obj()
-                    res = getattr(md, 'last', None) if md is not None else None
-                    if res is not None:
-                        cv2.circle(out, (int(round(p[0])), int(round(p[1]))), int(round(res['radius'])), (255, 255, 0), 2)
-                    cv2.drawMarker(out, (int(p[0]), int(p[1])), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
-            except VisionError:
-                pass
+            out = fr
         return bool(cv2.imwrite(path, out))
+
+    # ------------------------------------------------------------ 实时画面(给 vview.py 看)
+    def overlay(self, fr, kind, target=None, color_id=None, rings=None):
+        """在一帧上画出识别结果，返回新图。kind='RAW' 物料 / 'RING' 圆环；target = 认到的中心(像素)或 None。"""
+        import cv2
+        out = fr.copy()
+        md = None
+        if kind == 'RING':
+            claw = self.last_claw
+        else:
+            try:
+                md = self.material_detector_obj()
+            except VisionError:
+                md = None
+            claw = getattr(md, 'last_claw', None) if md is not None else None
+        if claw is not None and getattr(claw, 'shape', None) is not None and claw.shape[:2] == out.shape[:2] and claw.any():
+            out[claw > 0] = (out[claw > 0] * 0.5).astype(out.dtype)               # 爪子区域变暗(这块不用来识别)
+        cu, cv_ = self.claw(kind)
+        info = ''
+        if kind == 'RING':
+            details = getattr(self._ring, 'last', None) or []
+            kept = [(r[0], r[1]) for r in (rings or [])]
+            for d in details:
+                x, y = d['center']
+                ok = any(abs(x - kx) < 0.05 and abs(y - ky) < 0.05 for kx, ky in kept)
+                col = (0, 255, 255) if ok else (150, 150, 150)
+                for r in (d['radii'] if ok else [d['r_max']]):
+                    cv2.circle(out, (int(round(x)), int(round(y))), int(round(r)), col, 1)
+                if not ok:
+                    cv2.putText(out, f'r={d["r_max"]:.0f} size?', (int(x) + 6, int(y) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+                elif target is not None and abs(x - target[0]) < 0.05 and abs(y - target[1]) < 0.05:
+                    info = f' rmax={d["r_max"]:.0f}px {d["n_circles"]} circles seen {d["coverage"] * 100:.0f}%'
+            if not details:
+                for r in rings or []:
+                    cv2.circle(out, (int(round(r[0])), int(round(r[1]))), int(round(r[2])), (0, 255, 255), 1)
+            what = f'RING ({len(kept)} found' + (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
+        else:
+            res = getattr(md, 'last', None) if md is not None else None
+            if target is not None and res is not None:
+                cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
+                info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
+            what = f'MATERIAL {color_id}'
+        if target is not None:
+            cv2.drawMarker(out, (int(round(target[0])), int(round(target[1]))), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 28, 2)
+            cv2.line(out, (int(cu), int(cv_)), (int(round(target[0])), int(round(target[1]))), (255, 0, 255), 1)
+            du, dv = target[0] - cu, target[1] - cv_
+            try:
+                mm = (du * du + dv * dv) ** 0.5 / self.scale(kind)
+            except Exception:
+                mm = float('nan')
+            msg = f'{what}: off {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm{info}'
+        else:
+            msg = f'{what}: NOT FOUND'
+        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
+        msg += time.strftime('   %H:%M:%S')
+        cv2.putText(out, msg, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
+        cv2.putText(out, msg, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        return out
+
+    def _publish(self, fr, kind, target=None, color_id=None, rings=None):
+        """把带标注的这一帧写到 live_view 文件(限速)，另一个终端里 python3 vview.py 就能实时看。出错也不影响识别。"""
+        path = self.cfg.get('live_view')
+        if not path or fr is None:
+            return
+        now = time.monotonic()
+        if now - self._live_t < 1.0 / max(0.5, float(self.cfg.get('live_fps') or 8.0)):
+            return
+        self._live_t = now
+        try:
+            import cv2
+            ok, buf = cv2.imencode('.jpg', self.overlay(fr, kind, target, color_id, rings), [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                tmp = path + '.tmp'
+                with open(tmp, 'wb') as f:
+                    f.write(buf.tobytes())
+                os.replace(tmp, path)                   # 一次换掉，看的那边不会读到写了一半的图
+        except Exception:
+            pass

@@ -186,6 +186,39 @@ class CliTests(unittest.TestCase):
         self.assertFalse([r for r in self.w.requests if r.split()[0] in ('TAKE', 'DROP', 'GRAB', 'PICK')], self.w.requests)
         self.assertFalse([r for r in self.w.requests if r.split()[0] in ('S', 'F')], '只动手臂')
 
+    def test_rtest_falls_back_to_any_size(self):
+        """按配置的大小认不到、不限大小认得到：提示做 vclaw RING，这次先接着测。"""
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('TEMP', 1)
+        self.w.a1_ref, self.w.a2_ref = self.w.params['A1P'], self.w.params['A2P']
+        vis = self.h.vision
+        true_err = vis.ring_error
+        cu, cv_ = vis.claw('RING')
+
+        def ring_px(n=None, expect=None, any_size=False):
+            if not any_size:
+                return None
+            e = true_err(n)
+            return None if e is None else (cu + e[0], cv_ + e[1])
+        vis.ring_px = ring_px
+        vis.ring_error = lambda n=None: None
+        vis._ring_rmax_range = lambda: (84.0, 225.0)
+        self.lines.clear()
+        self.run_cli('rtest', 'rtest arm')
+        text = '\n'.join(self.lines)
+        self.assertIn('不在现在认的范围', text, text)
+        self.assertIn('对准结果', text, text)
+
+    def test_vclaw_ring_with_diameter(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
+            self.run_cli('arm', 'arm LIFT ZERO')
+            self.w.arrive('ROUGH', 1)
+            self.run_cli('vclaw', 'vclaw RING 100')
+            self.assertEqual(load(self.h.cfg['vision_cal_file'])['ring_outer_diam_mm'], 100.0)
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('vclaw', ['vclaw', 'RING', 'abc'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
     def test_mcode_lists_slots(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
         self.assertTrue(any('1号槽=' in l for l in self.lines), self.lines)

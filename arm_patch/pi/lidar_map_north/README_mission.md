@@ -11,7 +11,8 @@
 | `vision.py` | 摄像头(只开一次，后台线程一直取最新一帧)、爪子点/物料半径标定文件 `vision_cal.json` |
 | `matdet.py` | 物料识别(抗爪子遮挡)：只用没被挡住的那段圆边拟合整个圆，被挡住 80% 圆心也只差 1~2 像素；颜色范围用 `wuliao.py` 里的 |
 | `ringdet.py` | 圆环识别(抗爪子遮挡)：每段边缘拟合圆弧，同心的合成一个圆环，被挡掉一截也能认，圆心误差零点几像素 |
-| `vlive.py` | 摄像头实时预览(在树莓派桌面终端运行)：画出识别到的圆、爪子区域、离爪子点多少毫米 |
+| `vlive.py` | 摄像头实时预览(在树莓派桌面终端运行，自己开摄像头，map_merge_live 要先退出)：画出识别到的圆、爪子区域、离爪子点多少毫米 |
+| `vview.py` | 实时看 map_merge_live 正在用的摄像头画面(rtest / gtest / mtest / vclaw / go 时)，不用退出 map_merge_live |
 | `arm_link.py` | STM32 机械臂指令封装、给视觉闭环用的手臂/底盘动作(含底盘位移记账) |
 | `task_plan.py` | 任务码解析、每批物料的颜色/圆环/转盘槽位、码垛目标(同色匹配) |
 | `mission_cli.py` | 终端测试命令：`arm` `qr` `mcode` `vmask` `vclaw` `vcal` `vdbg` `gtest` `mtest` `mot` |
@@ -92,7 +93,8 @@
 | `mcode 156+123+516+231` | 手动设任务码(不扫码也能测) |
 | `vmask` | 标定爪子在画面里占的区域(存 `claw_mask.png`)：`arm OBS RAW O`、爪子附近没有物料时用。**蓝色/浅蓝物料必须先做** |
 | `vclaw RAW <颜色号>` | 实测原料爪子点：原料盘停住、物料放在爪子正下方。会降下去夹正、松开、升回去测，两遍一致才存 |
-| `vclaw RING` | 实测圆环爪子点：先 `arm DROP` 放一个物料、圆环纸挪到物料正好在中心、物料拿走，再输入。会自己回 OBS RING 再测 |
+| `vclaw RING [外径mm]` | 实测圆环爪子点：先 `arm DROP` 放一个物料、圆环纸挪到物料正好在中心、物料拿走，再输入。会自己回 OBS RING 再测；后面写上尺子量的黑环外径(如 `vclaw RING 100`)，像素才能换成准确的毫米 |
+| `rtest [arm]` | 圆环识别+对准测试：OBS RING → 找圆环 → 手臂(够不着时底盘)对准，报告误差，不取不放。`arm` = 只动手臂。同时开 `python3 vview.py` 看画面 |
 | `vcal RING` / `vcal RAW <颜色号>` | 视觉校准。加 `arm` 只校准手臂不动底盘：`vcal RING arm` |
 | `vdbg [RING\|RAW <颜色号>]` | 存 `vdebug.png`：爪子位置(绿十字)、识别到的圆环(黄)/物料(红叉) |
 | `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force` |

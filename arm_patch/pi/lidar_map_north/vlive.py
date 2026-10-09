@@ -21,8 +21,9 @@
     变暗的区域  爪子(识别时不算)
     左上角   偏差：目标离爪子多少像素、约多少毫米，物料被挡住多少，每秒处理几帧
 
-摄像头同一时间只能被一个程序打开：map_merge_live 里用过 vdbg / gtest / mtest 的话，
-先在 map_merge_live 里输入 q 退出(或者重启它)，再运行这个。
+摄像头同一时间只能被一个程序打开：map_merge_live 里用过 vdbg / gtest / rtest / mtest 的话，
+先在 map_merge_live 里输入 q 退出(或者输入 mtest reset 让它放开摄像头)，再运行这个。
+想在 map_merge_live 做 rtest / gtest / mtest 的同时看画面，用 python3 vview.py(不用退出 map_merge_live)。
 """
 import argparse
 import json

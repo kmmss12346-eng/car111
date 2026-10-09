@@ -28,6 +28,81 @@ def rings(cx, cy, scale, bg=None, noise=0.0, seed=0):
     return img
 
 
+def school_target(cx, cy, R, digit='2', material=None, mat_off=(6, 4), noise=3.0, seed=0):
+    """校赛的靶：黑色圆盘(半径 R) + 中间白色满分区(半径 R/2，里面印着数字)。material = 物料颜色(BGR)，盖在中间(取回、码垛时)。"""
+    img = np.full((480, 640, 3), 214, np.uint8)
+    cv2.circle(img, (int(round(cx * 16)), int(round(cy * 16))), int(round(R * 16)), (38, 40, 42), -1, cv2.LINE_AA, shift=4)
+    cv2.circle(img, (int(round(cx * 16)), int(round(cy * 16))), int(round(R * 8)), (222, 226, 224), -1, cv2.LINE_AA, shift=4)
+    if digit:
+        fs, th = R / 40.0, max(2, int(R / 14))
+        (tw, tht), _ = cv2.getTextSize(digit, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+        cv2.putText(img, digit, (int(cx - tw / 2), int(cy + tht / 2)), cv2.FONT_HERSHEY_SIMPLEX, fs, (38, 40, 42), th, cv2.LINE_AA)
+    if material is not None:
+        col = np.array(material, float)
+        cv2.circle(img, (int(cx + mat_off[0]), int(cy + mat_off[1])), int(0.62 * R), tuple(int(v) for v in col * 0.8), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(cx + 2 * mat_off[0]), int(cy + 2 * mat_off[1])), int(0.62 * R), tuple(int(v) for v in col), -1, cv2.LINE_AA)
+    if noise:
+        img = np.clip(img.astype(float) + np.random.default_rng(seed).normal(0, noise, img.shape), 0, 255).astype(np.uint8)
+    return img
+
+
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
+class SchoolTargetTests(unittest.TestCase):
+    """校赛的粗黑环靶(黑环 + 中间白色满分区)。"""
+    @classmethod
+    def setUpClass(cls):
+        import matdet
+        cls.cam = cv2.imread(str(HERE / 'testdata' / 'arm_cam_18.jpg'))
+        cls.claw = matdet.MaterialDetector({'claw_mask': '/nonexistent'}).auto_claw_mask(cv2.cvtColor(cls.cam, cv2.COLOR_BGR2HSV))
+
+    def with_claw(self, img):
+        img = img.copy()
+        img[self.claw > 0] = self.cam[self.claw > 0]
+        return img
+
+    def find(self, img, c, r_expect=None):
+        import ringdet
+        res = ringdet.RingDetector().detect(img, self.claw, r_expect=r_expect)
+        near = [r for r in res if math.hypot(r['center'][0] - c[0], r['center'][1] - c[1]) < 15]
+        return (near[0], math.hypot(near[0]['center'][0] - c[0], near[0]['center'][1] - c[1])) if near else (None, None)
+
+    def test_empty_target_near_and_under_claw(self):
+        for R in (60, 90, 130):
+            for c in ((320, 150), (337, 260), (337, 283), (380, 290)):
+                best, e = self.find(self.with_claw(school_target(*c, R, seed=R)), c)
+                self.assertIsNotNone(best, f'R={R} 中心 {c} 认不到')
+                self.assertLess(e, 0.6)
+                self.assertAlmostEqual(best['r_max'], R, delta=2.0)
+
+    def test_material_covering_the_centre_needs_known_size(self):
+        """取回/码垛时物料盖住白心，只剩黑环外圈：知道圆环大小(vclaw RING 量过)才认，认到的圆心要准。"""
+        for mat in ((40, 40, 210), (28, 28, 30), (40, 200, 230)):           # 红、黑、黄色物料
+            for R in (70, 100, 130):
+                for c in ((337, 250), (337, 283), (337, 320)):
+                    img = self.with_claw(school_target(*c, R, material=mat, seed=R))
+                    best, e = self.find(img, c, r_expect=(0.85 * R, 1.2 * R))
+                    self.assertIsNotNone(best, f'物料 {mat} R={R} 中心 {c} 认不到')
+                    self.assertLess(e, 1.5)
+
+    def test_coloured_material_alone_is_not_a_ring(self):
+        """只有一个物料(没有圆环)：就算它的大小正好在圆环大小范围里，也不能当成圆环。"""
+        import ringdet
+        for mat in ((40, 40, 210), (190, 70, 20), (60, 170, 40)):
+            img = np.full((480, 640, 3), 214, np.uint8)
+            cv2.circle(img, (320, 170), 80, mat, -1, cv2.LINE_AA)
+            res = ringdet.RingDetector().detect(self.with_claw(img), self.claw, r_expect=(68, 96))
+            self.assertEqual(res, [], f'物料 {mat} 被当成了圆环')
+
+    def test_real_frames_no_ring_even_with_size_hint(self):
+        import matdet, ringdet
+        for name in ('arm_cam_18.jpg', 'arm_cam_19.jpg'):
+            im = cv2.imread(str(HERE / 'testdata' / name))
+            claw = matdet.MaterialDetector({'claw_mask': '/nonexistent'}).auto_claw_mask(cv2.cvtColor(im, cv2.COLOR_BGR2HSV))
+            for band in ((30, 70), (40, 250)):
+                res = [r for r in ringdet.RingDetector().detect(im, claw, r_expect=band) if band[0] <= r['r_max'] <= band[1]]
+                self.assertEqual(res, [], f'{name} {band}：{res}')
+
+
 @unittest.skipUnless(HAVE_CV, '没有 opencv')
 class RingDetTests(unittest.TestCase):
     @classmethod

@@ -11,7 +11,8 @@ vmask                      标定爪子在画面里占的区域(存 claw_mask.pn
 vclaw RAW <颜色号>         实测"爪子夹物料时，物料在画面里的位置"(claw_px.RAW，存 vision_cal.json)：
                              先 arm OBS RAW O，把一个物料放在爪子正下方，再输入 vclaw RAW 1(颜色号)；
                              程序会降下去夹一下(物料会被夹正)、松开、升回观察高度，测出物料圆心
-vclaw RING                 实测"放下的物料落在画面哪里"(claw_px.RING)：圆环纸摆好、物料拿走以后用(步骤见 README)
+vclaw RING [外径mm]        实测"放下的物料落在画面哪里"(claw_px.RING)：圆环纸摆好、物料拿走以后用(步骤见 README)；
+                             后面写上用尺子量的黑环外径(毫米)，例如 vclaw RING 100，用来把像素换成毫米
 vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小动作，测出"动作量 ↔ 画面移动量"，存进 servo_cal.json
 vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
                              只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
@@ -224,13 +225,20 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'vclaw':
         if len(parts) < 2 or parts[1].upper() not in ('RAW', 'RING'):
-            raise ValueError('格式：vclaw RAW 1(颜色号)   或   vclaw RING')
+            raise ValueError('格式：vclaw RAW 1(颜色号)   或   vclaw RING 100(黑环外径毫米，可以不写)')
         kind = parts[1].upper()
         color = None
         if kind == 'RAW':
             if len(parts) < 3 or not parts[2].isdigit() or not 1 <= int(parts[2]) <= 6:
                 raise ValueError('vclaw RAW 要给颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝，例如 vclaw RAW 1')
             color = int(parts[2])
+        elif len(parts) >= 3:
+            try:
+                color = float(parts[2])                   # RING：圆环外径(毫米)
+            except ValueError:
+                color = -1.0
+            if not 30.0 <= color <= 400.0:
+                raise ValueError('vclaw RING 后面是黑环外径(毫米，30~400)，例如 vclaw RING 100；不知道就只输入 vclaw RING')
 
         def go():
             _vclaw(h, link, kind, color, log)
@@ -374,18 +382,33 @@ def _rtest(h, link, arm_only, log):
         raise ValueError('升降位置不知道了：先把升降放到最低点，再输入 arm LIFT ZERO')
     log('① 张开夹爪，手臂摆到圆环上方(OBS RING：升到 ZHI → 转到 A1P/A2P → 降到 ZOBRNG)')
     h.arm.obs('RING', open_claw=True)
-    log('② 摄像头找圆环……')
+    log('② 摄像头找圆环……(另开终端 python3 vview.py 可以实时看摄像头画面)')
     e0 = h.vision.ring_error()
+    measure = h.vision.ring_error
+    if e0 is None and hasattr(h.vision, '_ring_rmax_range'):
+        p = h.vision.ring_px(n=3, any_size=True)
+        if p is not None:
+            r = getattr(h.vision, 'last_ring_rmax', None) or 0.0
+            lo, hi = h.vision._ring_rmax_range()
+            log(f'   认到了圆环，但大小(最外圈半径 {r:.0f} 像素)不在现在认的范围 {lo:.0f}~{hi:.0f} 像素里，比赛时会当成"看不到"。'
+                '这次先不限大小接着测；做一次 vclaw RING 会记下真实大小，以后就按它认')
+            cu, cv_ = h.vision.claw('RING')
+
+            def measure():
+                q = h.vision.ring_px(any_size=True)
+                return None if q is None else (q[0] - cu, q[1] - cv_)
+            e0 = (p[0] - cu, p[1] - cv_)
     if e0 is None:
         ok = h.vision.save_debug('vdebug.png', 'RING') if hasattr(h.vision, 'save_debug') else False
         raise ValueError('看不到圆环。' + ('画面存到了 vdebug.png；' if ok else '') +
-                         '先退出 map_merge_live，用 python3 vlive.py --ring 看看圆环在不在画面里、认不认得出')
+                         '另开终端运行 python3 vview.py 看看摄像头画面里有没有圆环(圆环要在爪子上方露出来)，'
+                         '看不全就调高 ZOBRNG(set ZOBRNG 数字，越大越高)或者挪车')
     s = h.vision.scale('RING')
     r = getattr(h.vision, 'last_ring_rmax', None)
     log(f'   看到了：离爪子点 {e0[0]:+.0f}, {e0[1]:+.0f} 像素(约 {math.hypot(e0[0], e0[1]) / s:.1f}mm'
         + (f'，最外圈半径 {r:.0f} 像素' if r else '') + ')')
     log('③ 对准(第一次会先小幅动几下，测出动作和画面的对应关系)' + ('，只动手臂' if arm_only else '，手臂够不着时会动底盘'))
-    res = h.servo.run('RING', h.vision.ring_error, s, h.cfg['tol_mm']['RING'], allow_chassis=not arm_only,
+    res = h.servo.run('RING', measure, s, h.cfg['tol_mm']['RING'], allow_chassis=not arm_only,
                       label='圆环测试', bounds=h.vision.bounds('RING'))
     log(f'   对准结果：{res}')
     if h.store is not None and getattr(h.store, 'path', None):
@@ -519,6 +542,9 @@ def _vclaw(h, link, kind, color, log):
             r = rmax[len(rmax) // 2]
             extra['ring_rmax_px'] = round(float(r), 2)
             h.vision.cfg['ring_rmax_cal'] = float(r)
+        if color:                                       # vclaw RING 100：用尺子量的黑环外径
+            extra['ring_outer_diam_mm'] = float(color)
+            h.vision.cfg['ring_outer_diam_mm'] = float(color)
     old = h.vision.claw(kind)
     path = save_vision_cal(kind, uv, h.cfg.get('vision_cal_file') or None, extra)
     h.vision.cfg['claw_px'][kind] = [uv[0], uv[1]]
@@ -529,7 +555,8 @@ def _vclaw(h, link, kind, color, log):
     if extra.get('ring_rmax_px'):
         d = h.vision.cfg.get('ring_outer_diam_mm') or 95.0
         log(f'  圆环最外圈半径 {extra["ring_rmax_px"]:.1f} 像素 -> 每毫米 {h.vision.scale("RING"):.2f} 像素'
-            f'(按最外圈直径 {d:g}mm 算；圆环不是这么大的话改 mission_cfg.ring_outer_diam_mm)')
+            f'(按黑环外径 {d:g}mm 算' + ('' if extra.get('ring_outer_diam_mm') else
+                                       '；不是这么大的话用尺子量一下黑环外径，再输入 vclaw RING 外径毫米数') + ')')
     if spread > 3.0:
         log('  ★ 测量跳动比较大：物料/圆环可能没放稳，或者光线不好，可以再做一次')
 
