@@ -82,6 +82,7 @@ arm_patch/
 ├─ MDK-ARM/startup_stm32f407xx.s  car_2027.ioc   覆盖(v4)：栈 1KB → 4KB(.ioc 也改了，CubeMX 重新生成也不会变回去)
 ├─ stm32_changes.patch                 上面这些覆盖文件相对 10 月 6 日那份(加机械臂之前)工程的全部改动
 ├─ stm32_update_1007.patch             只有 v4 这次的改动：相对您 10 月 7 日发来的工程
+├─ stm32_update_1009.patch             相对您 10 月 9 日发来的工程(05:16 编译的那份)的改动：只有 main.c、arm.c、arm.h(舵机小步更准、AP 原地保持)
 ├─ tests_stm32/                        arm.c、chassis.c 的电脑端回归测试 (bash tests_stm32/run.sh)
 ├─ run_tests.sh                        一条命令跑全部测试
 └─ pi/

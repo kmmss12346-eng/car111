@@ -1,0 +1,123 @@
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -980,6 +980,8 @@
+ #define SERVO_WAIT_MAX_MS     9000      /* 一次转动最多等这么久(树莓派那边 AF 最多等 10 秒) */
+ #define SERVO_COMP1_DEG       5.0f      /* ID1 补偿：手臂有摩擦，舵机总停在离目标差 4~5° 的地方，就往前多给 5°，到了目标马上停(SET S1COMP 改) */
+ #define SERVO_COMP2_DEG       0.0f      /* ID2 补偿(SET S2COMP 改，0 = 不补) */
++#define SERVO_FINE_SPEED      15.0f     /* 小动作的最高转速 度/秒 */
++#define SERVO_POLL_FINE_MS    8u        /* 离目标 SERVO_FINE_DEG 以内时多久查一次角度(平时 30ms) */
+ 
+ static uint16_t servo_power = SERVO_POWER;      /* 现在用的最大功率(SET SPOW 改) */
+ static float servo_comp[3] = { 0.0f, SERVO_COMP1_DEG, SERVO_COMP2_DEG };   /* 每个舵机往前多给的角度 */
+@@ -1069,6 +1071,10 @@
+     }
+     d = *angle_deg - start;
+     if (d < 0.0f) d = -d;
++    if (d < SERVO_FINE_DEG && speed_dps > SERVO_FINE_SPEED)
++    {
++        speed_dps = SERVO_FINE_SPEED;            /* 小动作慢一点：多给了补偿角度，转得快到了来不及停会转过头 */
++    }
+ 
+     cmd = Servo_Clamp(id, *angle_deg + servo_dir[id] * servo_comp[id]);   /* 往前多给几度，但不超出限位 */
+     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, cmd, speed_dps,
+@@ -1154,18 +1160,22 @@
+     int kicked = 0;
+     long ma;
+     uint8_t st;
++    uint32_t poll = 30u;
++    float left;
+ 
+     for (;;)
+     {
+-        HAL_Delay(30);
++        HAL_Delay(poll);
+         el = HAL_GetTick() - t0;
+         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
+         {
+-            if (Servo_Left(id, a, target) <= tol_deg)
++            left = Servo_Left(id, a, target);
++            if (left <= tol_deg)
+             {
+                 Servo_Hold(id, a);                 /* 到了(或者刚转过一点)：就停在这里，不再往多给的补偿角度使劲 */
+                 return 1;
+             }
++            poll = (left < SERVO_FINE_DEG) ? SERVO_POLL_FINE_MS : 30u;   /* 快到了查勤一点，到了马上停 */
+             d = a - ref;
+             if (d < 0.0f) d = -d;
+             if (!have || d > 0.5f)
+--- a/Core/Src/arm.c
++++ b/Core/Src/arm.c
+@@ -757,26 +757,40 @@
+ {
+     if (g_para > 0.5f)
+     {
+-        uint32_t t1 = Servo_Start(1, &a1, speed);
+-        uint32_t t2 = Servo_Start(2, &a2, speed);
+-        uint32_t tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
+-        uint32_t t0 = HAL_GetTick();
++        uint32_t t1 = 0;
++        uint32_t t2 = 0;
++        uint32_t tmax;
++        uint32_t t0;
+         uint8_t ok1 = 0;
+         uint8_t ok2 = 0;
++        float a;
++        float rem1 = 1e9f;
++        float rem2 = 1e9f;
+ 
++        /* 已经在目标上的那个不发转动指令(发了会往前多给补偿角度，白白动一下)，只让它在原地保持(松开过的舵机也重新上力) */
++        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, speed);
++        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, speed);
++        tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
++        t0 = HAL_GetTick();
+         while ((HAL_GetTick() - t0) < tmax && !(ok1 && ok2) && !car_abort)
+         {
+-            float a;
+-
+-            HAL_Delay(30);
+-            /* 到了(或者刚转过一点)就马上停住：发给舵机的目标往前多给了补偿角度，不停会多转过去 */
+-            if (!ok1 && Servo_ReadAngle(1, &a) && Servo_Arrived(1, a, tol))  { ok1 = 1; Servo_Hold(1, a); }
+-            if (!ok2 && Servo_ReadAngle(2, &a) && Servo_Arrived(2, a, tol))  { ok2 = 1; Servo_Hold(2, a); }
++            /* 快到了查勤一点(8ms)，到了马上停住：发给舵机的目标往前多给了补偿角度，停晚了会转过头 */
++            HAL_Delay((rem1 < SERVO_FINE_DEG || rem2 < SERVO_FINE_DEG) ? 8u : 30u);
++            if (!ok1 && Servo_ReadAngle(1, &a))
++            {
++                if (Servo_Arrived(1, a, tol))  { ok1 = 1; Servo_Hold(1, a); }
++                else  rem1 = Absf(a - a1);
++            }
++            if (!ok2 && Servo_ReadAngle(2, &a))
++            {
++                if (Servo_Arrived(2, a, tol))  { ok2 = 1; Servo_Hold(2, a); }
++                else  rem2 = Absf(a - a2);
++            }
++            if (ok1)  rem1 = 1e9f;
++            if (ok2)  rem2 = 1e9f;
+         }
+         if (car_abort)
+-        {
+-            float a;                               /* 急停：没到的也停在现在的位置 */
+-
++        {                                          /* 急停：没到的也停在现在的位置 */
+             if (!ok1 && Servo_ReadAngle(1, &a))  Servo_Hold(1, a);
+             if (!ok2 && Servo_ReadAngle(2, &a))  Servo_Hold(2, a);
+             return;
+--- a/Core/Inc/arm.h
++++ b/Core/Inc/arm.h
+@@ -21,6 +21,8 @@
+  *   电流小(只是停顿)就重发一次目标，打印 "SERVOn PAUSED, resend …"
+  *   补偿 S1COMP / S2COMP(度，默认 ID1 5、ID2 0)：手臂有摩擦，舵机总停在离目标差几度的地方，发给舵机的目标就往转的方向多给这么多，
+  *   一到真正的目标(或者刚转过一点)马上让它停在那里，不再往前使劲。总差一点就加大，总转过头就减小
++ *   小步(< 4.5°)自动慢转(15°/s)、到位前每 8ms 查一次角度，0.5° 这样的小调整也能停准；AP 和整套动作里已经在目标附近(ATOL 内)的舵机
++ *   不再转、只在原地保持(松开过的也重新上力)；AF/AD 照常转
+  *   AF <1|2> <度>                          转到绝对角度(支持小数，到位误差 ATOL)
+  *   AD <1|2> <增量度>                      在现在的角度上再转(支持小数)，回 "ANG <id> <度>"
+  *   AP <ID1度> <ID2度>                     ID1、ID2 一起转到指定角度(回到记下来的对准姿态用)
+@@ -53,6 +55,8 @@
+ 
+ #include "main.h"
+ 
++#define SERVO_FINE_DEG  4.5f   /* 离目标这么近的小动作(摄像头微调，一步最多 4°)：转慢一点、查得勤一点，到了马上停，停得准 */
++
+ void Arm_Init(void);                 /* 开机调用一次：启动夹爪/转盘 PWM，开始接收二维码 */
+ void Arm_Poll(void);                 /* 主循环里反复调用：处理扫码模块收到的数据 */
+ 
