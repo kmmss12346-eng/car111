@@ -183,7 +183,9 @@ def main(argv=None):
                 else:
                     frs = [vis.camera.read() for _ in range(10)]
                     try:
-                        res = md.save_claw_mask(frs, keep_clear=vis.claw('RAW'))
+                        from vision import load_vision_cal
+                        measured = 'RAW' in (load_vision_cal().get('claw_px') or {})     # 没 vclaw 过就不按爪子点检查
+                        res = md.save_claw_mask(frs, keep_clear=vis.claw('RAW') if measured else None)
                         print('没有画面，没存' if res is None else f'爪子区域已存：{res[0]}(占画面 {res[1] * 100:.0f}%)', flush=True)
                     except ValueError as ex:
                         print(f'没存：{ex}', flush=True)

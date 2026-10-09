@@ -366,7 +366,11 @@ def _vmask(h, log):
     for _ in range(10):
         frames.append(h.vision._frame())
         h.sleep(0.05)
-    res = md.save_claw_mask(frames, keep_clear=h.vision.claw('RAW'))   # 爪子点被算进爪子区域(爪子没张开/里面有蓝色物料)就不存
+    from vision import load_vision_cal
+    measured = 'RAW' in (load_vision_cal(h.cfg.get('vision_cal_file')).get('claw_px') or {})
+    # 爪子点已经用 vclaw 实测过：它被算进爪子区域(爪子没张开/里面有蓝色物料)就不存。
+    # 还没 vclaw 时爪子点只是配置里的估计值，可能本来就落在爪子上，不拿它检查
+    res = md.save_claw_mask(frames, keep_clear=h.vision.claw('RAW') if measured else None)
     if res is None:
         raise ValueError('摄像头没有画面')
     path, frac = res

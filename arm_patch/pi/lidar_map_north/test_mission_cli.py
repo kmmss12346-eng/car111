@@ -194,6 +194,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(closed, [1])
         self.assertIsNone(mission_cli._S['hooks'])
 
+    def test_vmask_before_vclaw_ignores_guessed_claw_point(self):
+        """还没 vclaw：配置里的爪子点只是估计值，落在爪子区域里也照样存。"""
+        calls = []
+
+        class MD:
+            def save_claw_mask(self, frames, keep_clear=None):
+                calls.append(keep_clear)
+                return ('claw_mask.png', 0.4)
+        with tempfile.TemporaryDirectory() as td:
+            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
+            self.h.vision.material_detector_obj = lambda: MD()
+            self.h.vision._frame = lambda: None
+            mission_cli._vmask(self.h, self.log)
+            self.assertEqual(calls, [None])
+            from vision import save_vision_cal
+            save_vision_cal('RAW', (330, 250), self.h.cfg['vision_cal_file'])
+            mission_cli._vmask(self.h, self.log)
+            self.assertIsNotNone(calls[-1])
+
     def test_busy_refused(self):
         self.state['busy'] = True
         with self.assertRaises(ValueError):
