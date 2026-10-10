@@ -75,7 +75,8 @@ DEFAULTS = dict(
     qr_zone_margin_mm=30.0,             # 找码挪车时车身离黄色区、工位、原料转盘、场地边至少多远
     qr_move_rpm=None,                   # 找码时底盘挪的速度(转/分)；None = 和视觉微调一样(60mm 以内 chassis_fine_rpm，再远用 STM32 默认)
     qr_retry_at_stops=True,             # 到 QR 点也没读到：后面每个停车点再问一次 QR?(STM32 可能在路上读到了)
-    code_plus=True,                     # 屏上任务码带上两组之间的 +(t0 = '156+123+'，t7 = '516+231')；屏上放不下 8 个大字时改 false
+    code_plus=True,                     # 屏上任务码带上两组之间的 +(t0 = '156+123+'，t7 = '516+231')。只在新 STM32 程序上带
+                                        #   (LIFT? 回 BOOT=…：t0 加宽到放得下 8 个大字)；旧程序 t0 只有 7 个字宽，自动不带(不然两头被裁掉)。false = 一律不带
     raw_wait_s=10.0,                    # 等原料盘停稳最多多久(规则：等转盘最多多停 8 秒)
     raw_chassis='off',                  # 原料区对准时车轮能不能动：'off' = 只动手臂，车轮不动(不会压进原料区)；
                                         #   'F' = 只许沿车头方向前后挪，最多 raw_fix_max_mm；'SF' = 前后、横着都能挪(以前的做法，可能压进原料区)
@@ -229,6 +230,8 @@ class MissionHooks:
         self.holding = None                 # 爪子里现在夹着的物料(从转盘取出来、还没放下)
         self.maybe_holding = None           # 不为 None = 爪子里可能还夹着东西(原因)：不降升降、不张爪子
         self._aborted = False               # 急停过：park() 不自动做(人手可能在附近)
+        self._boot_asked = False            # 为了看 STM32 是不是新程序(屏上任务码带不带 +)问过 LIFT? 了
+        self._plus_warned = False
         self._tilt = None                   # 看三个圆环时量的车身斜度和远近(提前补手臂伸缩用)，见 _survey
         self._a2_hint = None                # 刚 OBS RING 过：ID2 在 A2P、ID1 在 A1P(OBS 不回报角度)
         self._a1_hint = None
@@ -874,8 +877,28 @@ class MissionHooks:
         self._show_code()
         return True
 
+    def _code_plus(self):
+        """屏上任务码带不带两组之间的 +：配置要带、而且 STM32 是新程序(t0 放得下 8 个大字)。
+        新程序的 LIFT? 回复带 BOOT=…(和加宽 t0 是同一版)；还没问过就问一次。旧程序：不带(7 个字，和以前一样)。"""
+        if not self.cfg.get('code_plus', True) or self.arm is None:
+            return False
+        if getattr(self.arm, 'lift_boot', None) is None and not self._boot_asked:
+            self._boot_asked = True
+            try:
+                self.arm.lift_state()
+            except ArmAbort:
+                raise
+            except Exception:
+                pass
+        if getattr(self.arm, 'lift_boot', None) is not None:
+            return True
+        if not self._plus_warned:
+            self._plus_warned = True
+            self.log('    (STM32 是旧程序：屏上 t0 只放得下 7 个大字，任务码中间的 + 不显示；烧录新程序以后自动带上)')
+        return False
+
     def _show_code(self):
-        l0, l1 = self.plan.screen_code(bool(self.cfg.get('code_plus', True)))
+        l0, l1 = self.plan.screen_code(self._code_plus())
         self._ui('code', l0)
         self._ui('code2', l1)
         b1, b2 = self.plan.screen_lines()

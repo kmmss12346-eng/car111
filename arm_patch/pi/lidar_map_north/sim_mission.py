@@ -62,7 +62,7 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot=None):
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC'):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -139,7 +139,7 @@ class SimWorld:
         self.park_cmd = bool(park_cmd)                         # STM32 认识 PARK(新程序)
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
-        self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…；None = 旧程序不带
+        self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
         self.move_speeds = []                                  # 底盘每条指令的速度(转/分；None = 默认)，和 moves 一一对应
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         self.link = SimLink(self)

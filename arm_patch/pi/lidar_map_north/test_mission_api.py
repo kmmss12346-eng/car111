@@ -455,6 +455,27 @@ class QrSearchTests(unittest.TestCase):
 class AuditTests(unittest.TestCase):
     """审查时补的：急停以后 keepalive 不动手臂；没读到码先再问一次 QR? 再决定回家；QR CLR 偶尔失败再清；机械臂准备出错也清旧码。"""
 
+    def test_code_plus_only_on_new_firmware(self):
+        """屏上任务码带 +(8 个大字)要新 STM32 程序(t0 加宽了；LIFT? 带 BOOT=)；旧程序 t0 只放得下 7 个字：不带 +，不被裁掉。"""
+        for boot, want in (('ENC', ('156+123+', '516+231')), (None, ('156+123', '516+231'))):
+            w = SimWorld(seed=1, code=CODE, lift_boot=boot, park_cmd=boot is not None)
+            h, lines = hooks(w)
+            h.prepare(w.link, lines.append)
+            w.arrive('QR')
+            h.task('QR', w.link, lines.append)
+            self.assertEqual((w.screen['t0'], w.screen['t7']), want, boot)
+            self.assertEqual(('旧程序' in '\n'.join(lines)), boot is None)
+        w = SimWorld(seed=1, code=CODE, armok=False)                # 机械臂没标定(没问过 LIFT?)：问一次再定
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        w.arrive('QR')
+        h.task('QR', w.link, lines.append)
+        self.assertEqual(w.screen['t0'], '156+123+')
+        h2, _ = hooks(w, dict(code_plus=False))
+        h2._ensure_arm_only(w.link)
+        h2._use_code(CODE)
+        self.assertEqual(w.screen['t0'], '156+123')
+
     def test_keepalive_never_moves_after_abort(self):
         w = SimWorld(seed=1, code=CODE)
         h, lines = hooks(w)
