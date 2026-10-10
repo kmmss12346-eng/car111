@@ -797,7 +797,7 @@ LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=Tr
 
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
     """raw：配置文件里 mission_cfg 以外的东西(stops、car_length_mm…)，QR 前后挪着找码要用 stops。"""
-    cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='',      # 测试里不限时、不读写文件
+    cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),      # 测试里不限时、不读写文件
                ring_order={z: world.ring_order(z) for z in ('ROUGH', 'TEMP')})  # 假摄像头装的方向是随机的
     # 以前的测试是按"按任务码顺序抓、先动手臂"写的：这里固定成那样；测比赛默认(不按顺序、先动车轮)的用 LIVE_DEFAULTS
     cfg.update(LEGACY)
@@ -1005,7 +1005,7 @@ class MissionSimTests(unittest.TestCase):
         w.placed.clear()
         w.rings.clear()
         w.tray = {1: None, 2: None, 3: None}
-        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None)}, log=lambda m: None, vision=w.vision,
+        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None, place_shift_mm=dict(F=0.0, S=0.0))}, log=lambda m: None, vision=w.vision,
                           now=w.now, sleep=w.advance, store=h.store)
         run_mission(w, h2)
         aps_warm = sum(1 for r in w.requests[n0:] if r.startswith('AP'))
@@ -1275,7 +1275,7 @@ class ZoneFlowTests(unittest.TestCase):
             st = JacStore(None)
             jf = -w.scale['RING'] * (w.Rcam @ np.array([0.0, 1.0]))          # 底盘前进 1mm，圆环在画面里动多少像素
             st.put('RING', 'ch', [[-jf[1], jf[0]], [jf[0], jf[1]]])
-            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', ring_survey=False, ring_offset_mm=bad,
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), ring_survey=False, ring_offset_mm=bad,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             lines = []
             h = MissionHooks({'mission_cfg': cfg}, log=lines.append, vision=w.vision, now=w.now, sleep=w.advance, store=st)
@@ -1487,7 +1487,7 @@ class TiltTests(unittest.TestCase):
                     first[cur[0]] = abs(float((w.ring_center(k) - c)[0]))
                 return orig(n, max_px)
             w.vision.ring_error = ring_error
-            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', tilt_precorrect=pre, take_first=False,
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
@@ -1535,7 +1535,7 @@ class NavFlowTests(unittest.TestCase):
             st.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
             st.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
             lines = []
-            cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='',
+            cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
                              sleep=w.advance, store=st)

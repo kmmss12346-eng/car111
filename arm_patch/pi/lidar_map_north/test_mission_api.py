@@ -568,6 +568,30 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(w.requests[n:], [])
 
 
+
+class PlaceShiftTests(unittest.TestCase):
+    """10-10 实测物料都放偏前约 20mm(爪子点没量准)：place_shift_mm F=-20 把放下的位置整体往后挪 20mm。"""
+
+    def _run(self, shift):
+        import numpy as np
+        w = SimWorld(seed=3, code=CODE, cam_deg=90.0)
+        d = w.scale['RING'] * (w.Rcam @ np.array([0.0, -20.0]))      # 配置里的爪子点错了：对准后实际落点偏前 20mm
+        tc = w.vision.TRUE_CLAW
+        w.vision.cfg['claw_px']['RING'] = [tc[0] + float(d[0]), tc[1] + float(d[1])]
+        h, lines = hooks(w, dict(place_shift_mm=dict(F=shift, S=0.0)))
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
+        flat = [e for z, k, c, e, st in w.placed if not st]
+        return w, flat, '\n'.join(lines)
+
+    def test_shift_brings_drops_back_onto_the_rings(self):
+        w0, flat0, _t0 = self._run(0.0)
+        self.assertTrue(flat0 and min(flat0) > 12.0 or w0.collisions > 0, flat0)     # 不挪：都偏 20mm 左右
+        w, flat, text = self._run(-20.0)
+        self.assertTrue(flat, text)
+        self.assertLess(max(flat), 4.0, text)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
+        self.assertIn('place_shift_mm', text)
+
 class ArmLinkTests(unittest.TestCase):
     class Link:
         def __init__(self, replies):

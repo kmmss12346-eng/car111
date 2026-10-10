@@ -122,6 +122,11 @@ DEFAULTS = dict(
     zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
     take_first=True,                    # (10-10 用户：B) 平放时先去转盘取物料，再到圆环上方带着物料对准一次就放下(不再"空爪先对准、
                                         #   去取、再回到原位")。看不到圆环/对不准：物料放回转盘，这个环按以前的做法。码垛照旧
+    take_first_iter=4,                  # take_first：带着物料最多修正几次(用存好的 J，不现场探测)；修完按当时的位置放下
+    take_first_drop_mm=12.0,
+    take_first_retry_max_mm=40.0,       # take_first：第一次修完还差这么多以上(可能看成了旁边的环)就不接着追，放回转盘按空爪做法            # take_first：修正次数用完、偏差不超过这个就照样放下(还在 4~5 环里，有分)；物料绝不放回车上
+    place_shift_mm=dict(F=-20.0, S=0.0),   # 放下的位置整体挪多少(毫米，F=车头方向，正=往前；S=往左)。10-10 实测物料都偏前约 20mm → F=-20。
+                                        #   做了 vclaw RING 把爪子点量准以后改回 0
     take_first_clear_mm=15.0,           # take_first：观察高度 ZOBRNG 时手里物料底面离地至少这么多(ZOBRNG-ZPLC)，不够就按以前的做法
     wheels_first=True,                  # (10-10 用户要的：尽量先慢慢动车)True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
                                         #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)。
@@ -1705,19 +1710,41 @@ class MissionHooks:
             self.arm.ap(a1, a2)                                  # 搬运高度转过去
             self.arm.lift(float(P['ZOBRNG']))                    # 降到看圆环的高度(物料底面离地 clear mm)
             self._a1_hint, self._a2_hint = a1, a2
+            kw = self._zone_servo_kw()
+            kw['max_iter'] = int(cfg.get('take_first_iter') or 4)
+            has_j = self.store is not None and self.store.get('RING', 'arm') is not None
             res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
                                  allow_chassis=True, label=label, bounds=self.vision.bounds('RING'),
-                                 confirm=bool(cfg.get('place_confirm', False)), **self._zone_servo_kw())
+                                 confirm=bool(cfg.get('place_confirm', False)), fixed_j=has_j, **kw)
             self.log(f'    对准结果(手里带着物料)：{res}')
-            aligned = res is not None and math.isfinite(res.err_mm) and (res.ok or res.err_mm <= cfg['accept_mm']['RING'])
-            if aligned and cfg.get('check_ring_empty', True) and self._ring_taken_why(zone, ring):
-                aligned = False
-                self.log(f'    ★ 环{ring} 的白心里好像有东西：不放')
-            if not aligned:
-                self._put_back(item, '带着物料看不清圆环/对不准：物料放回转盘，这个环按以前的做法(空爪先对准)')
+            # 物料已经在爪子里：尽量不放回车上(放回去这个环就是 0 分)。对得准就放；差一些就接着修(这次允许现场测 J)；
+            # 偏差在 take_first_drop_mm 以内照样放(还在内几环，有分)。圆环一直看不到、或者差得太远(会砸到旁边的环/物料，
+            # 碰到已经放好的物料本轮直接结束)才放回转盘，这个环再按空爪先对准的做法放
+            drop_mm = float(cfg.get('take_first_drop_mm') or 12.0)
+            if not self.ring_gate_px:                            # 没看清三个环(不知道旁边的环在哪)：偏差大时可能对的是旁边那个环，放宽不安全
+                drop_mm = min(drop_mm, float(cfg['accept_mm']['RING']))
+
+            def good(r):
+                return r is not None and math.isfinite(r.err_mm) and (r.ok or r.err_mm <= drop_mm)
+
+            far = res is None or not math.isfinite(res.err_mm) or res.err_mm > float(cfg.get('take_first_retry_max_mm') or 40.0)
+            if not good(res) and not far and self.ring_gate_px:                        # 差得太远(可能对到旁边那个环)不追，免得放错环
+                kw2 = self._zone_servo_kw()
+                res2 = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+                                      allow_chassis=True, label=label, bounds=self.vision.bounds('RING'),
+                                      confirm=False, **kw2)
+                self.log(f'    接着修(手里带着物料)：{res2}')
+                if res2 is not None and math.isfinite(res2.err_mm):
+                    res = res2
+            err = res.err_mm if (res is not None and math.isfinite(res.err_mm)) else None
+            if err is None or err > drop_mm:
+                why = '看不到圆环' if err is None else f'还差 {err:.1f}mm'
+                self.log(f'    ★ 带着物料{why}：放下去会砸到旁边，只好放回转盘，这个环再按空爪先对准的做法放')
+                self._put_back(item, f'带着物料{why}')
                 self.holding = None
-                self._tf_off = True                              # 这个工位剩下的也按以前的做法，免得每个都白取一趟
                 return False, False, None
+            if not res.ok:
+                self.log(f'    带着物料还差 {err:.1f}mm(在 {drop_mm:.0f}mm 以内)：照样放下')
             self._learn_from(zone, ring)
             if hasattr(self.vision, 'note_ring_size'):
                 self.vision.note_ring_size(getattr(self.vision, 'last_ring_rmax', None))   # 圆环外圈大小：取回时白心被盖住也认得出
@@ -1729,12 +1756,25 @@ class MissionHooks:
             self._drop(False)                                    # 下降、松手、抬起
             self.holding = None
             self._ring_ready = True
-            return True, True, res.err_mm
+            return True, True, err
         except ArmAbort:
             raise
-        except (ArmError, VisionError) as ex:
+        except VisionError as ex:
+            if self.holding is None:
+                return False, False, None
+            self.log(f'    ★ 带着物料对准时摄像头出错({ex})：按算出来的位置直接放下(不放回车上)')
+            try:
+                self._drop(False)
+                self.holding = None
+                self._ring_ready = True
+                return True, True, None
+            except ArmError as ex2:
+                self._put_back(item, f'放下出错：{ex2}')
+                self.holding = None
+                return False, False, None
+        except ArmError as ex:
             if self.holding is not None:
-                self._put_back(item, f'先取物料再对准时出错：{ex}')
+                self._put_back(item, f'先取物料再对准时机械臂出错：{ex}')
                 self.holding = None
             return False, False, None
 
@@ -2260,12 +2300,46 @@ class MissionHooks:
         return float(cam.get('height', 480)), float(cam.get('width', 640))
 
     def _ring_measure(self):
-        """对准圆环用的测量：只认离爪子点 ring_gate_px 以内的圆环(看清过三个环以后才有)，不去追旁边那个。"""
+        """对准圆环用的测量：只认离爪子点 ring_gate_px 以内的圆环(看清过三个环以后才有)，不去追旁边那个。
+        place_shift_mm：放下的位置整体挪一点(爪子点没量准时的实测修正)——把"要对到的点"在画面里挪过去。"""
         gate = self.ring_gate_px
         n = self.cfg.get('zone_frames') or None
         if gate:
-            return lambda: self.vision.ring_error(n=n, max_px=gate)
-        return lambda: self.vision.ring_error(n=n)
+            base = lambda: self.vision.ring_error(n=n, max_px=gate)
+        else:
+            base = lambda: self.vision.ring_error(n=n)
+        off = self._place_shift_px()
+        if off is None:
+            return base
+
+        def shifted():
+            e = base()
+            return None if e is None else (float(e[0]) - off[0], float(e[1]) - off[1])
+        return shifted
+
+    def _place_shift_px(self):
+        """place_shift_mm 换成画面里的像素偏移(对准时要让"圆环 - 爪子点"等于它)。用底盘 J：车往前走 1mm 地上的东西在画面里动 J[:,1]；
+        要放的点往前挪 d(车往前走 d 才对准)，对准时"圆环 - 爪子点"就该是 J[:,1]·d。没有底盘 J 或者挪 0 返回 None。"""
+        sh = self.cfg.get('place_shift_mm') or {}
+        try:
+            f, sl = float(sh.get('F', 0.0) or 0.0), float(sh.get('S', 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if abs(f) < 0.5 and abs(sl) < 0.5:
+            return None
+        J = self.store.get('RING', 'ch') if self.store is not None else None
+        if J is None:
+            if not getattr(self, '_shift_said', False):
+                self._shift_said = True
+                self.log('    (place_shift_mm：还没有底盘和画面的对应关系，这次不挪)')
+            return None
+        import numpy as np
+        J = np.asarray(J, float)
+        off = J[:, 1] * f + J[:, 0] * sl
+        if not getattr(self, '_shift_said', False):
+            self._shift_said = True
+            self.log(f'    放下位置按 place_shift_mm 挪：前后 {f:+.0f}mm、左右 {sl:+.0f}mm(画面里 {off[0]:+.1f},{off[1]:+.1f} 像素)')
+        return (float(off[0]), float(off[1]))
 
     def _zone_servo_kw(self):
         """工位里对准的底盘限制：前后挪最多 ring_fix_max_mm；横移只在手臂伸缩够不着时用，离停车点累计不超过 ring_strafe_max_mm。"""
