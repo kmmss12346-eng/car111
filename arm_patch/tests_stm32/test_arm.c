@@ -315,8 +315,16 @@ int main(void) {
         run("CLAW O"); clear(); t0 = now; run("CLAW C");
         CHECK(has("claw2009;") && has("claw2777;") && now - t0 >= 700u + (uint32_t)400, "CLSPD 1000：夹爪一点点转过去，约 0.8 秒(再加 CLWAIT)");
         Arm_Param_Set("CLSPD", 0);
+        Arm_Param_Set("CLSPO", 0);
         run("CLAW O"); clear(); t0 = now; run("CLAW C");
         CHECK(!has("claw2009;") && has("claw2777;") && now - t0 < 500u, "CLSPD 0：和以前一样一下子到");
+        /* 张开用 CLSPO、合上用 CLSPD：张开慢(1100)、合上一下子(0) */
+        Arm_Param_Set("CLSPO", 1100);
+        clear(); t0 = now; run("CLAW O");
+        CHECK(has("claw2766;") && has("claw1999;") && now - t0 >= 600u + 400u, "CLSPO 1100：张开慢慢转(约 0.7 秒)");
+        clear(); t0 = now; run("CLAW C");
+        CHECK(!has("claw2009;") && has("claw2777;") && now - t0 < 500u, "合上用 CLSPD(0)：一下子到");
+        Arm_Param_Set("CLSPO", 0);
     }
     CHECK(Arm_Param_Set("TT2", 1650) == 1 && Arm_Param_Set("TT3", 400) == 2, "TT1~3 可以改，超出转盘限位拒绝");
     clear(); run("TT 2"); run("TT 1");

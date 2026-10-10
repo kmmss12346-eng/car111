@@ -65,7 +65,7 @@ class Quit(Exception):
 
 
 # ---------------------------------------------------------------- 每一步
-# kind：choice 选一个数 / claw 夹爪脉宽 / tt 转盘脉宽 / lift 升降高度 / pose 两个舵机 / servo 一个舵机
+# kind：choice 选一个数 / claw 夹爪脉宽 / speed 夹爪速度 / tt 转盘脉宽 / lift 升降高度 / pose 两个舵机 / servo 一个舵机
 # setup：这一步开始前把机械臂摆成什么样(见 Wizard._setup)
 STEPS = [
     dict(key='AEXT', kind='choice', title='哪个舵机管前后伸缩', setup='high',
@@ -76,6 +76,12 @@ STEPS = [
     dict(key='CLWC', kind='claw', title='夹爪夹紧', setup='high',
          text='拿一个物料放在两个爪子中间，调到刚好夹稳(用手拽不下来)。\n'
               '不要比需要的更紧：夹得太紧，夹爪舵机会一直使劲顶着，很快发烫。'),
+    dict(key='CLSPD', kind='speed', title='夹爪夹紧(夹取)的速度 CLSPD', setup='high',
+         text='夹爪合上时转得多快(脉宽每秒变多少微秒)：越小越慢，0 = 一下子合上。\n'
+              '直接输入数字(例如 800)，或者 +100 / -100，夹爪会张开再合上一次给你看。原来的做法是 0(一下子夹紧)。'),
+    dict(key='CLSPO', kind='speed', title='夹爪张开(放下)的速度 CLSPO', setup='high',
+         text='夹爪张开时转得多快：越小越慢，0 = 一下子张开。\n'
+              '直接输入数字(例如 800)，或者 +100 / -100，夹爪会合上再张开一次给你看。'),
     dict(key='ZHI', kind='lift', title='搬运高度 ZHI', setup='zhi',
          text='手臂转动、搬运时用的高度：在这个高度，手臂怎么转、伸都碰不到车上的东西。一般就用最高点。'),
     dict(key=('A1D', 'A2R'), kind='pose', title='转盘上方的姿态', setup='turntable',
@@ -193,6 +199,7 @@ class Wizard:
         self.inp = inp
         self.out = out
         self.P = {}                      # STM32 里现在的参数
+        self.spd = 0.0                   # 夹爪速度那两步正在试的值
         self.saved = {}                  # 这次保存过的
         self.claw = None                 # 夹爪现在的脉宽(只知道发过去的值)
         self.tt = None                   # 转盘现在的脉宽
@@ -342,6 +349,8 @@ class Wizard:
             return f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   (原来 {st["key"]}={P[st["key"]]:g})'
         if k == 'claw':
             return f'夹爪 {self.claw}us   (原来 {st["key"]}={P[st["key"]]:g})'
+        if k == 'speed':
+            return f'{st["key"]}={self.spd:g} 微秒/秒(0 = 一下子到)   (原来 {P.get(st["key"], 0):g})'
         if k == 'tt':
             return f'转盘 {self.tt}us   (原来 {st["key"]}={P[st["key"]]:g})'
         if k == 'lift':
@@ -359,6 +368,8 @@ class Wizard:
                 return f'{st["key"]}={self.z:g}'
             if k == 'claw' and self.claw is not None and abs(self.claw - P[st['key']]) > 0.5:
                 return f'{st["key"]}={self.claw:g}'
+            if k == 'speed' and abs(self.spd - P.get(st['key'], 0.0)) > 0.5:
+                return f'{st["key"]}={self.spd:g}'
             if k == 'tt' and self.tt is not None and abs(self.tt - P[st['key']]) > 0.5:
                 return f'{st["key"]}={self.tt:g}'
             if k == 'pose':
@@ -444,6 +455,11 @@ class Wizard:
             self._read_servos()
         if k == 'claw':
             self.claw_to(P[st['key']])
+        if k == 'speed':
+            if st['key'] not in P:
+                self.out(f'  STM32 里还没有 {st["key"]} 这个参数(是旧程序)：先烧录新的 arm.c，这一步跳过。')
+                return +1
+            self.spd = float(P[st['key']])
         if k == 'tt':
             self.tt_to(P[st['key']])
         if k == 'lift' and st['key'] in ('ZHI', 'ZOBRAW', 'ZOBRNG'):
@@ -516,6 +532,18 @@ class Wizard:
                 self.save({'AEXT': float(line)})
                 return +1
             raise CalError('这一步输入 1 或 2(哪个舵机管伸缩)，或者 w1 / w2 让它动一下看看')
+        if k == 'speed':
+            v = _num(line)
+            if v is None:
+                raise CalError('这一步输入速度数字(例如 800)，或者 +100 / -100')
+            want = self.spd + v if line[:1] in '+-' else v
+            want = max(0.0, min(20000.0, want))
+            self.do(f'SET {st["key"]} {want:g}', quiet=True)         # 先试，回车才存进配置
+            self.spd = want
+            a, b = (P['CLWO'], P['CLWC']) if st['key'] == 'CLSPD' else (P['CLWC'], P['CLWO'])
+            self.claw_to(a)
+            self.claw_to(b)                                           # 这一下就是按新速度转的
+            return None
         parts = line.split()
         axis, val = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0] if parts else '')
         if axis is None:
@@ -556,6 +584,9 @@ class Wizard:
         if k == 'claw':
             self.save({st['key']: float(self.claw)})
             self.claw_to(self.P['CLWO'])           # 张开，免得一直夹着
+        elif k == 'speed':
+            self.save({st['key']: float(self.spd)})
+            self.claw_to(self.P['CLWO'])
         elif k == 'tt':
             self.save({st['key']: float(self.tt)})
         elif k == 'lift':

@@ -104,7 +104,8 @@ static float g_amaxd  = 60.0f;     /* AMAXD  AD 指令一次最多转多少度(�
 static float g_para   = 1.0f;      /* PARA   1 = ID1、ID2 一起转(快)；0 = 一个一个转 */
 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
-static float g_clspd  = 0.0f;      /* CLSPD  夹爪转动速度(微秒/秒，脉宽每秒变多少)；0 = 一下子转过去(以前的做法)。张开到夹紧约差 500 微秒：1000 = 约 0.5 秒 */
+static float g_clspd  = 0.0f;      /* CLSPD  夹爪合上(夹取)的速度(微秒/秒，脉宽每秒变多少)；0 = 一下子转过去(以前的做法)。张开到夹紧约差 500 微秒：1000 = 约 0.5 秒 */
+static float g_clspo  = 800.0f;    /* CLSPO  夹爪张开(放下)的速度(微秒/秒)；0 = 一下子张开。10-10 用户定：张开 800，合上照旧一下子(CLSPD 0) */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
 static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
@@ -159,6 +160,7 @@ static const ArmTun tun[] =
     { "PARA",   &g_para,    0.0f,    1.0f },
     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
     { "CLSPD",  &g_clspd,   0.0f,    20000.0f },
+    { "CLSPO",  &g_clspo,   0.0f,    20000.0f },
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
@@ -824,14 +826,18 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 static uint8_t  tt_slot     = 1;
 static uint32_t tt_ready_at = 0;
 
-/* 夹爪慢慢转到 target 微秒：CLSPD > 0 时每 10 毫秒按速度挪一点(用户嫌夹爪一下子张开/合上太猛)；CLSPD = 0 一下子到 */
+/* 夹爪慢慢转到 target 微秒：往张开的方向用 CLSPO，往合上的方向用 CLSPD；速度 > 0 时每 10 毫秒挪一点
+ * (用户嫌夹爪一下子张开/合上太猛)；速度 = 0 一下子到 */
 static uint32_t claw_now = CLAW_BOOT_US;
 static void Claw_Move(uint32_t target)
 {
-    if (g_clspd > 0.5f)
+    uint8_t opening = ((g_clwo >= g_clwc) ? ((float)target > (float)claw_now) : ((float)target < (float)claw_now));
+    float spd = opening ? g_clspo : g_clspd;
+
+    if (spd > 0.5f)
     {
         float cur  = (float)claw_now;
-        float step = g_clspd * 0.01f;
+        float step = spd * 0.01f;
         float tgt  = (float)target;
         uint16_t guard = 0;
 
