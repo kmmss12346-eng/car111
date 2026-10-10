@@ -1052,11 +1052,18 @@ def _pcal(h, link, parts, state, log):
         log(f'== pcal {sub}：{"第一层平放" if key == "RING" else "第二层码垛"}的放置补偿；车停在 2 号环前，转盘 {slot} 号槽里放一个物料 ==')
         h.arm.obs('RING', open_claw=True)
         cfg = h.cfg
-        if key == 'RING':
-            res = h.servo.run('RING', h._ring_measure(), h.vision.scale('RING'), cfg['tol_mm']['RING'], allow_chassis=False,
-                              label='pcal', bounds=h.vision.bounds('RING'), confirm=True)
-        else:
-            res, _how = h._align_covered(1, 'STACK', 'pcal', confirm=True)
+        h._pcal_raw = True                                   # 按摄像头原样对准(不加 place_shift_mm 这类估计的挪动)
+        try:
+            kw = h._zone_servo_kw()
+            kw['max_iter'] = 10
+            kw['timeout_s'] = 40.0
+            if key == 'RING':
+                res = h.servo.run('RING', h._ring_measure(), h.vision.scale('RING'), cfg['tol_mm']['RING'], allow_chassis=True,
+                                  label='pcal', bounds=h.vision.bounds('RING'), confirm=True, **kw)
+            else:
+                res, _how = h._align_covered(1, 'STACK', 'pcal', confirm=True)
+        finally:
+            h._pcal_raw = False
         log(f'  摄像头对准：{res}')
         if res is None or not (res.ok or res.err_mm <= cfg['accept_mm']['RING']):
             h._recover('没对准圆环，pcal 不做')

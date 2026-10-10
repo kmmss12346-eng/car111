@@ -2349,7 +2349,7 @@ class MissionHooks:
     def _place_shift_px(self):
         """place_shift_mm 换成画面里的像素偏移(对准时要让"圆环 - 爪子点"等于它)。用底盘 J：车往前走 1mm 地上的东西在画面里动 J[:,1]；
         要放的点往前挪 d(车往前走 d 才对准)，对准时"圆环 - 爪子点"就该是 J[:,1]·d。没有底盘 J 或者挪 0 返回 None。"""
-        if self.place_adj('RING') is not None:                  # pcal 实测过补偿，就不用这个估计的整体挪动了
+        if getattr(self, '_pcal_raw', False) or self.place_adj('RING') is not None:   # pcal 量的时候要按摄像头原样对准；量过就不用这个估计值
             return None
         sh = self.cfg.get('place_shift_mm') or {}
         try:
