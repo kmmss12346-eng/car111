@@ -593,12 +593,13 @@ void Delay_Report(uint32_t ms)
  * 树莓派 -> STM32(每条一行文本)：
  *   PING | HOME | P2 | YAW? | GET | SET 名字 数值 | CAL [距离mm [速度]]
  *   F <mm> [速度] | S <mm> [速度] | R <度>        前进(负数后退) / 左移(负数右移) / 逆时针转(负数顺时针)
+ *                                                   R 可以带 1 位小数(例如 R -1.4)，R 0 = 把现在的车头记为要保持的方向
  *   A <id> <度> | U <id>                            舵机
  *   MOT? | MOT EN                                   读 1~5 号电机驱动器的电压/使能/堵转保护 | 解除堵转保护并使能
  *   !                                               (单独一个字符，不用换行)紧急停车
  * STM32 -> 树莓派：DONE [t=用时ms e=车头误差0.01度] | ERR <原因> | PONG | READY | YAW100 <角度x100> | P 名字=数值 | CAL … | MOT …
  *   转弯时轮子没转起来(陀螺仪几乎不变)回 ERR STALL t=… e=…
- * 同一时间只发一条，等到 DONE/ERR 再发下一条。 */
+ * 同一时间只发一条，等到 DONE/ERR 再发下一条(动作没做完时又来一行，会存下来、做完再执行，见 Link_RxCplt)。 */
 #define LINK_BUF 48
 
 static uint8_t           link_rx;
@@ -636,7 +637,9 @@ void Link_RxCplt(void)
     }
     else if (b == '\n')
     {
-        if (link_len > 0 && !link_ready)       /* 主循环还在忙时来的新指令直接丢掉 */
+        /* 动作执行时 link_ready 已经清掉了(Link_Poll 先取走指令再执行)，所以动作没做完时来的第一行会存下来，
+         * 等这个动作做完再执行；存下一行以后、Link_Poll 取走它之前再来的行才丢掉 */
+        if (link_len > 0 && !link_ready)
         {
             uint8_t i;
             for (i = 0; i < link_len; i++) link_cmd[i] = link_line[i];
@@ -703,6 +706,7 @@ void Link_Poll(void)
     char c;
     long v;
     long sp;
+    int pr;
     uint16_t speed;
     uint32_t t0;
 
@@ -840,29 +844,19 @@ void Link_Poll(void)
         return;
     }
 
-    /* F / S / R + 空格 + 整数 [+ 空格 + 速度] */
-    c = cmd[0];
-    if ((c == 'F' || c == 'S' || c == 'R') && cmd[1] == ' ')
+    /* F / S + 空格 + 整数 mm [+ 空格 + 速度]；R + 空格 + 角度(可以带 1 位小数) */
+    pr = Car_Parse_Move(cmd, &c, &v, &sp);           /* R 的 v 是角度×10 */
+    if (pr != 0)
     {
-        char *end;
-        sp = 0;
-        v = strtol(&cmd[2], &end, 10);
-        if (end == &cmd[2])                          { Link_Reply("ERR ARG\r\n"); return; }
-        if (*end == ' ')
-        {
-            char *e2;
-            sp = strtol(end + 1, &e2, 10);
-            if (e2 == end + 1 || *e2 != 0 || sp < 5 || sp > 300) { Link_Reply("ERR ARG\r\n"); return; }
-        }
-        else if (*end != 0)                          { Link_Reply("ERR ARG\r\n"); return; }
+        if (pr < 0)                                  { Link_Reply("ERR ARG\r\n"); return; }
         if (!HWT101_IsFresh(500))                    { Link_Reply("ERR GYRO\r\n"); return; }
 
         if (c == 'R')
         {
-            if (v > 180 || v < -180)                 { Link_Reply("ERR RANGE\r\n"); return; }
+            if (v > 1800 || v < -1800)               { Link_Reply("ERR RANGE\r\n"); return; }
             if (v != 0)
             {
-                Car_TurnBy_Center((float)v);         /* 绕车中心转，按累计的目标航向转 */
+                Car_TurnBy_Center((float)v / 10.0f); /* 绕车中心转，按累计的目标航向转 */
             }
             else
             {
