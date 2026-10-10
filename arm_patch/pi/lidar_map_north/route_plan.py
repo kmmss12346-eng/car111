@@ -265,7 +265,8 @@ def _margins(cfg):
     g = cfg.get
     ym = max(0.0, float(g('yellow_margin_mm', YELLOW_MARGIN_MM)))
     ymin = float(g('yellow_min_margin_mm', YELLOW_MIN_MARGIN_MM))
-    ymin = max(1.0, min(ymin, ym)) if ym > 0 else 0.0
+    ymin = max(1.0, min(ymin, ym))          # 最低档不会是 0(压到黄色区本轮就结束)
+    ym = max(ym, ymin)
     return dict(ym=ym, ymin=ymin,
                 zm=max(0.0, float(g('zone_margin_mm', ZONE_MARGIN_MM))),
                 rm=max(0.0, float(g('raw_margin_mm', RAW_MARGIN_MM))),
@@ -303,7 +304,7 @@ def _edge_items(em, cor, tm, soft=True):
 
 def fixed_items(cfg, margin_mm=None):
     """固定区域(黄色区、暂存/粗加工区、原料转盘、场地边、extra_blocked_rects)。
-    margin_mm 给定时：所有区域都按这一个余量(场地边也是，启停区旁边也不例外)。"""
+    margin_mm 给定时：所有区域都按这一个余量(场地边也是，启停区旁边也不例外；只有启停区本身那一段场地边还是 0)。"""
     m = _margins(cfg)
     if margin_mm is not None:
         v = max(0.0, float(margin_mm))
@@ -502,7 +503,8 @@ def _what(it, gap, turn):
 def pose_clear(cfg, obstacles, pose, margin_mm=None):
     """某个车位(车中心 x, y, 车头度数，任意角度)放得下吗？
     按真实车身(矩形+雷达圆盘)算到黄色区、暂存/粗加工区、原料转盘(整个可能范围)、场地边、障碍物的距离。
-    margin_mm=None：各区域按配置的硬余量(黄色区按 yellow_min_margin_mm)；给定时所有区域都按这一个余量。
+    margin_mm=None：各区域按配置的硬余量(黄色区按 yellow_min_margin_mm，启停区和它旁边那段场地边允许贴边)；
+    给定时所有区域都按这一个余量(只有启停区本身那一段场地边还是 0)。
     返回 (ok, 最近距离mm, 说明)：不 ok 时是最差的那个区域，ok 时是离得最近的那个区域。"""
     body = Body(cfg)
     items = fixed_items(cfg, margin_mm) + obstacle_items(cfg, obstacles or [], margin_mm)
@@ -645,7 +647,7 @@ def _fixed_maps(body, items, ox, oy):
     key = (body.key(), tuple(items), round(ox, 3), round(oy, 3))
     m = _FIXED_CACHE.get(key)
     if m is None:
-        if len(_FIXED_CACHE) >= 12:
+        if len(_FIXED_CACHE) >= 8:
             _FIXED_CACHE.pop(next(iter(_FIXED_CACHE)))
         m = _grid_maps(body, items, ox, oy)
         _FIXED_CACHE[key] = m
@@ -1010,10 +1012,10 @@ class Planner:
         park = False
         for k, it in enumerate(items):
             low = None
-            if sg[k] < it[7]:
+            if sg[k] < it[7] - EPS_MM:
                 low = sg[k]
                 notes.append(f'⚠ 起点离{it[0]}只有 {sg[k]:.0f}mm(要 {it[7]:.0f}mm)，离开时按 {max(sg[k], 0):.0f}mm 放宽')
-            if gg[k] < it[7]:
+            if gg[k] < it[7] - EPS_MM:
                 if it[1] == 'obs':
                     park = True
                     continue
@@ -1078,7 +1080,7 @@ class Planner:
         if park:
             pc = self.center_of(node_piv[0], node_piv[1], gyaw)
             goal_c = (pc[0], pc[1], gyaw)
-            ob = [it for k, it in enumerate(self.items) if it[1] == 'obs' and gg[k] < it[7]]
+            ob = [it for k, it in enumerate(self.items) if it[1] == 'obs' and gg[k] < it[7] - EPS_MM]
             notes.append(f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f})被{ob[0][0] if ob else "障碍物"}挡住，'
                          f'改停在 ({goal_c[0]:.0f},{goal_c[1]:.0f})，差 {math.hypot(goal_c[0]-gx, goal_c[1]-gy):.0f}mm')
         else:
