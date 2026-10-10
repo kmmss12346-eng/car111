@@ -304,6 +304,16 @@ class WizardTests(unittest.TestCase):
         self.assertTrue(any('ZGRAB' in l for l in self.lines))
         self.assertIn('ZGRAB', self.wiz.saved)
 
+    def test_zplc_high_needs_second_enter(self):
+        """升降还在高处(100mm)就按回车：ZPLC 先不存、提醒；再按一次回车才存(10-10 实车误存成 100)。"""
+        self.run_wiz(['', 'q'], start=STEP_KEYS.index('ZPLC'))
+        self.assertNotIn('ZPLC', self.wiz.saved)
+        self.assertTrue(any('掉下去' in l for l in self.lines))
+        self.run_wiz(['', '', 'q'], start=STEP_KEYS.index('ZPLC'))
+        self.assertIn('ZPLC', self.wiz.saved)
+        self.run_wiz(['z 2', '', 'q'], start=STEP_KEYS.index('ZPLC'))
+        self.assertEqual(self.wiz.saved.get('ZPLC'), 2)
+
     def test_aext_choice(self):
         self.run_wiz(['w1', 'x', '1', 'q'])
         self.assertEqual(self.wiz.saved['AEXT'], 1)

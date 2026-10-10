@@ -513,6 +513,13 @@ class Wizard:
         P = self.P
         k = st['kind']
         if line in ('', 'ok', 'y'):
+            lim = {'ZPLC': 40.0, 'ZSTK': 100.0}.get(st['key'])
+            if k == 'lift' and lim is not None and self.z > lim and getattr(self, '_hi_warned', None) != (st['key'], self.z):
+                self._hi_warned = (st['key'], self.z)     # 升降还在高处就按了回车(10-10 实车把 ZPLC、ZSTK 都存成了 100)：先提醒
+                self.out(f'  !! 现在升降在 {self.z:g}mm，{st["key"]} 存这么高，放物料时会从高处掉下去。'
+                         '先输入 c 夹住物料，用 -10 / -5 / -1 降到刚好碰到' + ('地面' if st['key'] == 'ZPLC' else '下面那个物料') +
+                         '再回车；确实要存这个值就再按一次回车')
+                return None
             return self._accept(st)
         if line == 'q':
             pend = self._pending(st)
