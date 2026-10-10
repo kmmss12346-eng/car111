@@ -308,6 +308,9 @@ class MissionHooks:
         要在 ZONE LOCK(屏回到比赛画面、清屏)之后调：这里写的 --- 才不会被清掉。"""
         if log is not None:
             self.log = log
+        if self._aborted:
+            self.log('  ★ 急停过：出发前准备不做(手臂不自动动)')
+            return False
         arm_ok = True
         try:
             if not self._prep.get('arm'):

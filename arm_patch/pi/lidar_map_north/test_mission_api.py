@@ -510,6 +510,9 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(h.prepare(w.link, lines.append))
         self.assertTrue(h._aborted)
         self.assertNotIn('QR CLR', w.requests)                       # 急停以后不再发别的指令
+        n = len(w.requests)
+        self.assertFalse(h.prepare(w.link, lines.append))           # 再调一次也不动手臂
+        self.assertEqual(w.requests[n:], [])
 
 
 class ArmLinkTests(unittest.TestCase):
