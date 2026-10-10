@@ -92,7 +92,9 @@ class ArmLink:
         return None
 
     def qr_clear(self):
-        self.request('QR CLR', 2.0)
+        """清掉 STM32 里存的任务码。返回是否成功(回了 DONE)。"""
+        ok, _reply, _info = self.request('QR CLR', 2.0)
+        return bool(ok)
 
     def screen(self, obj, text):
         """往串口屏的文本控件写字(只能 ASCII，且不超过 STM32 一行 47 字符的限制)。同样的内容不重复发。失败只记日志不抛错。"""

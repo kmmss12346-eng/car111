@@ -925,6 +925,14 @@ class ConfigScriptTests(unittest.TestCase):
             json.dump({'mission_cfg': {'ring_strafe_max_mm': 40}}, f)
         apply_mission_config.main([path])
         self.assertEqual(load(path)['mission_cfg']['ring_strafe_max_mm'], 20.0)   # 手写的整数 40 也算旧默认值
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'wheels_min_mm': 1.5}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['wheels_min_mm'], 4.0)        # 旧默认 1.5 -> 4
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'wheels_min_mm': 2.5}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['wheels_min_mm'], 2.5)        # 用户自己改过的不动
 
     def test_missing_file(self):
         self.assertEqual(apply_mission_config.main(['/nonexistent/x.json']), 1)

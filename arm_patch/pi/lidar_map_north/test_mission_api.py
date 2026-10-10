@@ -452,6 +452,66 @@ class QrSearchTests(unittest.TestCase):
         mission_cli._S['hooks'] = None
 
 
+class AuditTests(unittest.TestCase):
+    """审查时补的：急停以后 keepalive 不动手臂；没读到码先再问一次 QR? 再决定回家；QR CLR 偶尔失败再清；机械臂准备出错也清旧码。"""
+
+    def test_keepalive_never_moves_after_abort(self):
+        w = SimWorld(seed=1, code=CODE)
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        n = len(w.requests)
+        h._aborted = True
+        self.assertFalse(h.keepalive())
+        h._aborted = False
+        h.ctx = FakeCtx(abort=lambda: True)                          # 导航那边已经急停(钩子还不知道)
+        self.assertFalse(h.keepalive())
+        self.assertTrue(h._aborted)
+        self.assertEqual(w.requests[n:], [])                         # 一条手臂指令也没发
+
+    def test_go_home_asks_qr_again_before_giving_up(self):
+        """QR 点没读到码：导航问 go_home_now 时先再问一次 QR?，STM32 后来读到了就不回家，照常去原料区。"""
+        w = SimWorld(seed=3, code=CODE, qr_window=(1000.0, 1001.0))
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        h.start_clock()
+        w.arrive('QR')
+        h.task('QR', w.link, lines.append)
+        self.assertIsNone(h.plan)
+        w.qr_code = CODE                                             # 找码挪回停车点时/路上读到了
+        self.assertFalse(h.go_home_now('RAW', 10.0, 30.0))
+        self.assertEqual(h.plan.code, CODE)
+        self.assertEqual(w.screen['t0'], '156+123+')
+        w2 = SimWorld(seed=3, code=CODE, qr_window=(1000.0, 1001.0))
+        h2, lines2 = hooks(w2, dict(qr_retry_at_stops=False))
+        h2.prepare(w2.link, lines2.append)
+        w2.arrive('QR')
+        h2.task('QR', w2.link, lines2.append)
+        w2.qr_code = CODE
+        self.assertTrue(h2.go_home_now('RAW', 10.0, 30.0))         # 关掉"再问一次"：照以前直接回家
+
+    def test_qr_clear_glitch_is_retried(self):
+        w = SimWorld(seed=1, code=CODE, qr_stale='111+222+333+123', fail_cmd=('QR', 1))
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        self.assertIsNone(w.qr_code, '\n'.join(lines))
+        self.assertEqual(w.requests.count('QR CLR'), 2)
+        self.assertNotIn('清旧任务码出错', '\n'.join(lines))
+        w2 = SimWorld(seed=1, code=CODE, qr_stale='111+222+333+123')
+        h2, lines2 = hooks(w2)
+        h2._ensure = lambda link: (_ for _ in ()).throw(RuntimeError('摄像头模块出错'))
+        self.assertFalse(h2.prepare(w2.link, lines2.append))         # 机械臂没准备好：返回 False，不抛异常
+        self.assertIn('QR CLR', w2.requests)                         # 旧码照样清掉
+        self.assertIsNone(w2.qr_code)
+        self.assertEqual(w2.screen.get('t0'), '---')
+
+    def test_prepare_after_abort_does_nothing_else(self):
+        w = SimWorld(seed=2, code=CODE, qr_stale='111+222+333+123', abort_at=('STOW', 1))
+        h, lines = hooks(w)
+        self.assertFalse(h.prepare(w.link, lines.append))
+        self.assertTrue(h._aborted)
+        self.assertNotIn('QR CLR', w.requests)                       # 急停以后不再发别的指令
+
+
 class ArmLinkTests(unittest.TestCase):
     class Link:
         def __init__(self, replies):

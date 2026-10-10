@@ -308,18 +308,30 @@ class MissionHooks:
         要在 ZONE LOCK(屏回到比赛画面、清屏)之后调：这里写的 --- 才不会被清掉。"""
         if log is not None:
             self.log = log
+        arm_ok = True
         try:
             if not self._prep.get('arm'):
                 self._ensure(link)
                 self._prep['arm'] = True
         except Exception as ex:                     # 包括急停(Abort)：导航自己会看 ctx.aborted()
-            if isinstance(ex, Abort):
-                self._aborted = True
             self.log(f'  ★ 出发前准备机械臂出错：{ex!r}(到 QR 点再试)')
-            return False
+            if isinstance(ex, (Abort, ArmAbort)):
+                self._aborted = True
+                return False
+            arm_ok = False
+            if self.arm is None:
+                try:
+                    self._ensure_arm_only(link)     # 别的出错(摄像头模块之类)：旧任务码照样要清
+                except Exception:
+                    return False
         if not self._prep.get('qr'):
             try:
-                self.arm.qr_clear()
+                ok = self.arm.qr_clear()
+                if ok is False:
+                    self.sleep(0.1)
+                    ok = self.arm.qr_clear()        # 串口偶尔一次没回话：再清一次
+                if ok is False:
+                    raise ArmError('QR CLR 没有回 DONE')
                 self.arm.screen_reset()             # 屏可能刚清过(ZONE LOCK)：每个控件都重新写
                 self._ui('code', '---')
                 self._ui('code2', '---')
@@ -332,7 +344,7 @@ class MissionHooks:
             except Exception as ex:
                 if isinstance(ex, ArmAbort):
                     self._aborted = True
-                self.log(f'  ★ 清旧任务码出错：{ex!r}')
+                self.log(f'  ★ 清旧任务码出错：{ex!r}(STM32 里可能还存着上一轮/调试时的码；下次 prepare 再清)')
         if not self._prep.get('cam'):
             try:
                 self._ensure_vision()
@@ -341,7 +353,7 @@ class MissionHooks:
                 self._prep['cam'] = True
             except Exception as ex:
                 self.log(f'  ★ 打开摄像头出错：{ex!r}(到用摄像头时再试)')
-        return not self.disabled
+        return arm_ok and not self.disabled
 
     def start_clock(self):
         """比赛计时从现在开始(按下屏上 START / 终端确认出发的那一刻)。之前算的"时间不够"也清掉。"""
@@ -405,6 +417,14 @@ class MissionHooks:
         机械臂没就绪、本轮不夹放、爪子里夹着东西、离上次摆不到 keepalive_min_s 秒：什么也不做。不抛异常。返回这次摆了没有。"""
         if not self._inited or self.arm is None or self.disabled or self.holding is not None or self.maybe_holding:
             return False
+        if self._aborted:
+            return False                                  # 急停过：手臂一律不自动动(人手可能在附近)
+        try:
+            if self.ctx is not None and hasattr(self.ctx, 'aborted') and self.ctx.aborted():
+                self._aborted = True
+                return False
+        except Exception:
+            pass
         now = self.now()
         if now - self._t_alive < float(self.cfg.get('keepalive_min_s', 5.0)):
             return False
@@ -550,6 +570,15 @@ class MissionHooks:
             return None
         if self.disabled:
             return f'本轮不做夹放({self.disabled})'
+        if self.plan is None and self.arm is not None and self.cfg.get('qr_retry_at_stops', True):
+            # 回家之前再问一次 QR?(STM32 在路上/找码挪回来时可能读到了)：不然车直接回家，后面停车点的"再问一次"永远轮不到
+            try:
+                self._qr_again()
+            except ArmAbort as ex:
+                self._aborted = True
+                self.log(f'    (再问 QR? 时收到急停：{ex})')
+            except Exception as ex:
+                self.log(f'    (再问 QR? 出错：{ex!r})')
         if self.plan is None:
             return '没有读到任务码'
         return None
