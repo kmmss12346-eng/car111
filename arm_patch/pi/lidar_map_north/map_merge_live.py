@@ -18,7 +18,7 @@ from pose_fix import calibrate_mount,refine_second
 from route_plan import plan_mission,route_stats,Motion
 from stm32_link import Stm32Link,FakeLink
 from auto_run import (run_mission,Abort,apply_zone,zone_snapshot,zone_restore,mission_names,race_flow,run_bg,park_arm,quit_park,
-    home_route_legs,home_approach,Nav,firmware_caps,DEFAULT_SECOND_MOVES)
+    home_route_legs,home_approach,Nav,firmware_caps,zone_request,DEFAULT_SECOND_MOVES)
 import reloc
 ROOT=Path(__file__).resolve().parent
 
@@ -185,7 +185,7 @@ def main():
     state=dict(config=config,busy=False,worker=None,path=[],reason='NOT SCANNED',goal=POINTS['QR_SCAN'],yaw_scan1=None,
                legs=[],plan_start=None,calib=None,mode='scan',done_count=0,err_count=0,confirm=None,abort=False,auto=False,
                aborted=False,hooks=None,gui_done=0,preplan=None,ref=None,ref_key=None,ref1=None,home_routes={},home_gen=0,
-               route_ref=None,stm_target_yaw=None,legs_partial=False)
+               route_ref=None,stm_target_yaw=None,legs_partial=False,race=False)
     plan_lock=threading.Lock()
     rel=raw_cfg['second_relative_moves']          # 切换启停区时原地改，这里一直是同一个 dict
     sim_err=raw_cfg.get('sim_second_pose_error',[0,0,0])
@@ -392,6 +392,9 @@ def main():
             else:
                 d=math.hypot(p_new[0]-p_old[0],p_new[1]-p_old[1]);a=reloc.wrap180(p_new[2]-p_old[2])
                 print(f'  第二站雷达对齐：实际车位 ({p_new[0]:.0f},{p_new[1]:.0f}) 车头{p_new[2]:.1f}°，和记下的差 {d:.0f}mm、{a:+.1f}°',flush=True)
+                if d>float(raw_cfg.get('second_warn_mm',30)) or abs(a)>2.0:
+                    print(f'  ⚠ 第二站：按障碍物校正的车位和雷达整圈对齐的差得多({d:.0f}mm、{a:+.1f}°)。路线起点按雷达对齐的算；'
+                          '第二次扫描登记的障碍物位置可能偏了，看一眼地图(启停区 1 第一次用时尤其要看)',flush=True)
                 if not only_first:state['second_icp']=tuple(p_new)
         state[slot]=ref;state[slot+'_key']=key
         print(f'  (雷达定位参考点云：{len(ref.points)} 个点，建表 {time.monotonic()-t0:.2f} 秒)',flush=True)
@@ -478,7 +481,7 @@ def main():
             c=copy.deepcopy(state['config']);c.update(car_x_mm=est[0],car_y_mm=est[1],car_yaw_deg=est[2])
             print(f'站点扫描({stop_name})：车停稳，扫一圈(看有没有之前没看到的障碍物，同时雷达定位)……',flush=True)
             try:
-                m,seq=run_bg(lambda:acquire(c,args.port,args.model,stop,frames=int(raw_cfg.get('scan_frames',12)),true_pose=est,
+                m,seq=run_bg(lambda:acquire(c,args.port,args.model,stop,frames=int(raw_cfg.get('station_frames',raw_cfg.get('scan_frames',12))),true_pose=est,
                                             settle_s=float(raw_cfg.get('scan_settle_s',0.3)),quiet=True),self.tick,lambda:state['abort'])
             except Abort:raise
             except Exception as e:
@@ -629,11 +632,14 @@ def main():
         finally:state['auto']=False
     def race_thread():
         try:
-            st=race_flow(Ctx(),link,log,raw_cfg,lambda z,scanned:mission_body(True,scanned))
+            state['race']=True                              # 在等屏上选区/按 START(终端 zone 1|2 可以代替屏上选区)
+            def start_run(z,scanned):
+                state['race']=False;mission_body(True,scanned)
+            st=race_flow(Ctx(),link,log,raw_cfg,start_run)
             if st=='nozone':print('（race 没开始：用 zone 1 / zone 2 选区，go 开始）',flush=True)
         except Abort as e:print('★ 比赛流程已停止：',e,flush=True)
         except Exception as e:print('★ 比赛流程出错：',repr(e),flush=True)
-        finally:state['auto']=False
+        finally:state['auto']=False;state['race']=False
     def command(line):
         import unicodedata
         line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
@@ -799,6 +805,10 @@ def main():
             if state['busy']:raise ValueError('请等待扫描完成')
             state['goal']=POINTS[{'3':'QR_SCAN','4':'RAW_STOP','5':'TEMP_STOP','6':'ROUGH_STOP'}[k]];redraw();return
         if k in ('save','s'):save();return
+        if k=='zone' and state.get('race') and len(parts)==2 and parts[1] in ('1','2'):
+            # race 还在等屏上选区：从终端选(和在屏上按一样，桌上调试或屏的触摸不好用时)；START 还是要在屏上按
+            ok_,rep_,_=zone_request(link,'ZONE '+parts[1])
+            print(f'已让屏幕选启停区 {parts[1]}' if ok_ else f'STM32 不认 ZONE {parts[1]}：{rep_}',flush=True);return
         if state['busy']:raise ValueError('正在扫描，请等待完成')
         if k=='list':print_objects();return
         if state['auto'] and k!='pts':raise ValueError('一键流程正在运行(输入 abort 可以中止)，等结束再用 '+k)

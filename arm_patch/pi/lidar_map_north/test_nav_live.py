@@ -48,10 +48,16 @@ class World(SimCar):
             return SimCar._move(self, cmd, val)
 
     def request(self, text, timeout=None, collect=False):
+        if text in ('ZONE 1', 'ZONE 2'):                    # 终端 zone 1|2：和在屏上选一样
+            self.requests.append(text)
+            self.zone = int(text[-1])
+            self.zq = max(self.zq, 3)
+            out = (True, 'DONE', [])
+            return out if collect else out[:2]
         if text == 'ZONE?':
             self.requests.append(text)
             self.zq += 1
-            z = self.zone if self.zq > 3 else 0
+            z = (self.zone or 0) if self.zq > 3 else 0
             if self.ready_at is None and any(r.startswith('ZONE MSG READY') for r in self.requests):
                 self.ready_at = self.zq
             s = 1 if (self.ready_at is not None and self.zq >= self.ready_at + 3) else 0
@@ -291,7 +297,7 @@ class LiveTests(unittest.TestCase):
     def setUp(self):
         WORLD.clear()
 
-    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0):
+    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same'):
         with open(USER_CFG, encoding='utf-8') as f:
             raw = json.load(f)
         WORLD['mount'] = {k: raw[k] for k in ('lidar_forward_mm', 'lidar_left_mm', 'lidar_yaw_deg', 'sdk_y_sign')}
@@ -305,7 +311,7 @@ class LiveTests(unittest.TestCase):
             json.dump(raw, f)
         open(os.path.join(tmp, 'scan_bridge'), 'w').close()
         start = (2250.0, 150.0, 90.0) if zone == 2 else (2250.0, 2250.0, 180.0)
-        car = World(start, zone, rdec=True, **(car_kw or {}))
+        car = World(start, zone if screen_zone == 'same' else screen_zone, rdec=True, **(car_kw or {}))
         WORLD['car'] = car
         saved = {k: sys.modules.get(k) for k in STUBBED}
         stubs = make_stubs()
@@ -323,14 +329,25 @@ class LiveTests(unittest.TestCase):
                     for f, a2, k2 in t.cbs:
                         f(*a2, **k2)
                 txt = out.text()
-                if t_fin is None and ('路线全部走完' in txt or '★ 已停止' in txt or '★ 出错停止' in txt or '★ 比赛流程' in txt):
+                if t_fin is None and ('路线全部走完' in txt or '★ 已停止' in txt or '★ 出错停止' in txt or '★ 比赛流程' in txt
+                                      or (state.get('end_on') and state['end_on'] in txt)):
                     t_fin = time.monotonic()
                 if t_fin is not None and time.monotonic() - t_fin > 0.6:
                     state['done'] = True
                     return
                 time.sleep(0.02)
 
+        script = list(inputs or [])
+
         def no_input(*a):
+            # 终端输入的替身：按顺序，等条件满足了就"敲"一行；敲完了就当终端关了
+            while script:
+                cond, line = script[0]
+                t_end = time.monotonic() + timeout
+                while not cond() and time.monotonic() < t_end:
+                    time.sleep(0.05)
+                script.pop(0)
+                return line
             raise EOFError
         sys.modules.update(make_mpl(timers, show))
         old = (builtins.input, sys.stdout, sys.argv)
@@ -398,6 +415,36 @@ class LiveTests(unittest.TestCase):
         self.assertLess(math.hypot(x - 1650, y - 1250), 15, f'登记的圆柱位置 ({x},{y})')
         k0 = next(i for i, q in enumerate(car.trace) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
         self.assertGreaterEqual(edge_min(car.trace[k0:], self.cfg_after), 0.0, '横移多走 2.5% 也不能出场地')
+
+    def test_go_from_terminal(self):
+        # 不用屏幕：终端 go(调试用)。开跑后不问 y，一样一路定位、回家
+        car = self.run_live(2, dict(scale=0.01, drift_deg=0.05, resid_deg=0.2), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'go')], screen_zone=None)
+        self.assertIn('路线全部走完', self.log, self.log[-3000:])
+        self.assertNotIn('ZONE ASK', car.requests)
+        self.assertNotIn('输入 y', self.log)
+        self.assertGreaterEqual(self.log.count('雷达定位：车在'), 6)
+        self.assertEqual(car.requests[-1], 'PARK')
+
+    def test_abort_then_quit_does_not_park(self):
+        def moving():
+            c = WORLD.get('car')
+            return c is not None and len(c.sent) >= 6
+        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'go'), (moving, 'abort')], screen_zone=None)
+        self.assertIn('★ 已停止', self.log)
+        self.assertGreaterEqual(car.aborted, 1, '急停要发给 STM32')
+        self.assertNotIn('PARK', car.requests, '急停以后退出不能自动收臂')
+        self.assertIn('急停过', self.log)
+
+    def test_terminal_zone_during_race(self):
+        # 屏上没选(触摸不好用)：终端 zone 1 代替屏上选区，接着照常扫描、预先规划；START 还是在屏上按
+        def asked():
+            c = WORLD.get('car')
+            return c is not None and 'ZONE ASK' in c.requests
+        car = self.run_live(1, dict(scale=0.0), inputs=[(asked, 'zone 1')], screen_zone=None)
+        self.assertIn('ZONE 1', car.requests)
+        self.check_run(car, 1)
 
     def test_race_zone1(self):
         car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01))
