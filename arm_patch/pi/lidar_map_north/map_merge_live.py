@@ -305,7 +305,7 @@ def main():
             print('  有障碍物、整段封死不走的车道：'+'，'.join(f'x{r[0]}~{r[2]} y{r[1]}~{r[3]}' for r in state['sealed']),flush=True)
         if state.get('lane_fallback'):
             print('  ⚠ 把有障碍物的车道整段封死以后到不了，已改成只绕开障碍物本身：路线会从障碍物旁边过！',flush=True)
-        if abs(tb)>=0.5:print(f"  先原地{'逆时针' if tb>0 else '顺时针'}转{abs(tb):.0f}°，车头回到{ps[2]:.0f}°，车中心到 ({ps[0]:.0f},{ps[1]:.0f})",flush=True)
+        if abs(tb)>=0.5 and ps:print(f"  先原地{'逆时针' if tb>0 else '顺时针'}转{abs(tb):.0f}°，车头回到{ps[2]:.0f}°，车中心到 ({ps[0]:.0f},{ps[1]:.0f})",flush=True)
         for L in state['legs']:
             txt=[]
             for k,v in L['cmds']:
@@ -386,7 +386,13 @@ def main():
         if state.get(slot+'_key')==key and state.get(slot) is not None:return state[slot]
         t0=time.monotonic()
         ref=reloc.build_reference([(v['raw_frames'],view_pose(v)) for v in vs],
-                                  lambda fr,n,c=vs[0]['config']:reloc.body_points(fr,c,max_n=n))
+                                  lambda fr,n,c=vs[0]['config']:reloc.body_points(fr,c,max_n=n),cfg=raw_cfg)
+        for i,p_old,p_new,r in getattr(ref,'align_notes',[]):
+            if p_new is None:print(f'  (第二次扫描和第一次对不上({r["why"]})：参考点云按记下的第二站车位合并)',flush=True)
+            else:
+                d=math.hypot(p_new[0]-p_old[0],p_new[1]-p_old[1]);a=reloc.wrap180(p_new[2]-p_old[2])
+                print(f'  第二站雷达对齐：实际车位 ({p_new[0]:.0f},{p_new[1]:.0f}) 车头{p_new[2]:.1f}°，和记下的差 {d:.0f}mm、{a:+.1f}°',flush=True)
+                if not only_first:state['second_icp']=tuple(p_new)
         state[slot]=ref;state[slot+'_key']=key
         print(f'  (雷达定位参考点云：{len(ref.points)} 个点，建表 {time.monotonic()-t0:.2f} 秒)',flush=True)
         return ref
@@ -459,8 +465,9 @@ def main():
         def route_start(self):
             """路线起点：ref = 规划时按的第二站车位；est = 第二站实际车位 + STM32 现在要保持的车头(开跑时 HOME 的车头 - 第二站顺时针转的角度)。"""
             c=state['config'];ref=state.get('route_ref') or (c['car_x_mm'],c['car_y_mm'],c['car_yaw_deg'])
-            t0=state.get('stm_target_yaw')
-            return dict(est=(c['car_x_mm'],c['car_y_mm'],t0 if t0 is not None else c['car_yaw_deg']),ref=tuple(ref),yaw_real=c['car_yaw_deg'])
+            t0=state.get('stm_target_yaw');p2=state.get('second_icp')     # 第二站雷达对齐出来的实际车位(有就用它)
+            x,y=(p2[0],p2[1]) if (p2 and t0 is not None) else (c['car_x_mm'],c['car_y_mm'])
+            return dict(est=(x,y,t0 if t0 is not None else c['car_yaw_deg']),ref=tuple(ref),yaw_real=c['car_yaw_deg'])
         def home_route(self,name,goal):
             if goal is None:return None
             return state['home_routes'].get((name,round(goal[0]),round(goal[1])))
@@ -513,7 +520,9 @@ def main():
             commands.put('__second');self._wait('done_count',before)
         def plan(self):
             """1010：规划在后台线程里做(不卡界面)，等的时候手臂轻摆；race 时开跑前规划好的路线能用就直接用。"""
-            threading.Thread(target=reference,daemon=True).start()       # 雷达定位的参考点云先在后台建好
+            try:run_bg(reference,self.tick,lambda:state['abort'])          # 雷达定位的参考点云(顺便把第二站和第一次扫描对齐)
+            except Abort:raise
+            except Exception as e:print('  (建雷达定位参考点云出错：',repr(e),')',flush=True)
             cur_ok=state['legs'] and state['reason']=='ROUTE OK' and not state.get('legs_partial') and state.get('plan_obj_key')==obj_key()
             if not cur_ok and not try_reuse_preplan():
                 state['plan_start']=None;state['replan_from']=None
@@ -550,9 +559,10 @@ def main():
                                 turn_back=state.get('turn_back',0),plan_start=state['plan_start'],start_pivot=state.get('start_pivot'),
                                 pred=pred,path=list(state['path']),margin=state.get('plan_margin'),plan_obs=list(state.get('plan_obs') or []),
                                 obs=seen)
+                        if pp['status']=='ok':print_route()
                         state['plan_start']=None
                     state['preplan']=pp;commands.put('__redraw')
-                    if pp['status']=='ok':print_route();start_home_routes()
+                    if pp['status']=='ok':start_home_routes()
                 except Exception as e:
                     state['preplan']=dict(status=f'出错：{e!r}')
             threading.Thread(target=work,daemon=True).start()
@@ -592,7 +602,7 @@ def main():
             if first_scan:
                 # STM32 开跑时 HOME：要保持的车头 = 出发时的车头；第二站顺时针转 cw 度以后 = 出发车头 - cw
                 state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
-                state['legs']=[];state['plan_obj_key']=None                 # 不用上一次的路线
+                state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None   # 不用上一次的路线
             run_mission(Ctx(),link,log=log,first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,cfg=raw_cfg,scanned=scanned)
         except Abort as e:
             print('★ 已停止：',e,flush=True)

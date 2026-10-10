@@ -209,17 +209,20 @@ class Hooks:
         self.etas.append(s)
 
 
-def manhattan_leg(name, pose, goal):
-    """测试用的简单路线：沿现在的车头前进/横移到目标，再转到目标车头(转弯是 90° 的倍数)。"""
+def manhattan_leg(name, pose, goal, turn_first=False):
+    """测试用的简单路线：沿现在的车头前进/横移到目标，再转到目标车头(转弯是 90° 的倍数)。
+    turn_first=True：先在起点转到目标车头再走(停车点在场地边上时，在那里原地转会扫出场地)。"""
     x, y, h = pose
     gx, gy, gh = goal
+    d = wrap(gh - h)
+    turn = [('R', int(round(d)))] if abs(d) > 0.5 else []
+    if turn_first:
+        h = gh
     a = math.radians(h)
     f = (gx - x) * math.cos(a) + (gy - y) * math.sin(a)
     s = -(gx - x) * math.sin(a) + (gy - y) * math.cos(a)
     cmds = [(c, int(round(v))) for c, v in (('F', f), ('S', s)) if abs(v) >= 0.5]
-    d = wrap(gh - h)
-    if abs(d) > 0.5:
-        cmds.append(('R', int(round(d))))
+    cmds = turn + cmds if turn_first else cmds + turn
     return dict(stop=name, start=tuple(pose), goal=tuple(goal), cmds=cmds, poses=[tuple(goal)], note='')
 
 
@@ -290,11 +293,11 @@ class DriveTests(unittest.TestCase):
 
     def test_exact_arrival_without_lidar(self):
         # 没有雷达定位(ctx 没有 relocalize)：车按指令推算，到停车点前补上不到 20mm 的零头，车真的停在停车点上
-        car = SimCar((1000.0, 1000.0, 90.0))
+        car = SimCar((1200.0, 1100.0, 90.0))
         ctx = types.SimpleNamespace(aborted=lambda: False)
         h = Hooks(car)
-        stops = [('A', (1012.0, 1340.0, 90.0)), ('B', (1500.0, 1342.0, 0.0)), ('C', (1508.0, 1000.0, 0.0))]
-        self.drive(car, ctx, route((1000.0, 1000.0, 90.0), stops), hooks=h)
+        stops = [('A', (1212.0, 1300.0, 90.0)), ('B', (2100.0, 1302.0, 0.0)), ('C', (2108.0, 1700.0, 0.0))]
+        self.drive(car, ctx, route((1200.0, 1100.0, 90.0), stops), hooks=h)
         for (name, goal), (n2, p) in zip(stops, h.at):
             self.assertEqual(name, n2)
             # A 差 12mm、C 差 8mm(都 >= 5)：到停车点前补上，停得很准；B 只差 2mm：不单独发，带到下一段
@@ -353,6 +356,35 @@ class DriveTests(unittest.TestCase):
         self.assertLess(abs(car.x - 1200.0), 5)
 
 
+class GuardTests(unittest.TestCase):
+    def test_long_strafe_toward_wall_stops_short_then_lidar_fixes(self):
+        # 往东横移 1900mm 到 PREHOME(车身离东边线只有 20mm)，横移多走 1.5%：
+        # 先少走(2% + 10mm)，到停车点雷达定位后慢速补上，车身一直不出场地
+        for scale in (0.0, 0.015, 0.025):
+            car = SimCar((340.0, 400.0, 90.0), scale=scale)
+            ctx = SimCtx(car)
+            legs = [dict(stop='PREHOME', goal=(2250.0, 400.0, 90.0), cmds=[('S', -1910)])]
+            logs = []
+            auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                           motion=None, cfg=dict(CFG), start=dict(est=(340.0, 400.0, 90.0), ref=(340.0, 400.0, 90.0)),
+                           caps={'rdec': False})
+            self.assertGreaterEqual(edge_min(car.trace, CFG), 0.0, f'多走 {scale*100:.1f}% 出了场地')
+            s = [(v, sp) for c, v, sp in car.sent if c == 'S']
+            self.assertTrue(-1870 <= s[0][0] <= -1855, s)              # 横移按 3% + 10mm 留余量
+            self.assertTrue(all(sp == 60 for v, sp in s[1:]), s)
+            self.assertLess(abs(car.x - 2250.0), 7, scale)
+            self.assertTrue(any('先少走' in l for l in logs))
+
+    def test_moves_along_a_wall_are_not_shortened(self):
+        car = SimCar((2250.0, 400.0, 90.0))
+        ctx = SimCtx(car)
+        legs = [dict(stop='A', goal=(2250.0, 1600.0, 90.0), cmds=[('F', 1200)])]
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG), start=dict(est=(2250.0, 400.0, 90.0), ref=(2250.0, 400.0, 90.0)),
+                       caps={'rdec': False})
+        self.assertEqual(car.sent[0][:2], ('F', 1200))
+
+
 class HomeTests(unittest.TestCase):
     def run_home(self, car, ctx, legs, cfg=None, caps=None):
         logs = []
@@ -394,7 +426,8 @@ class HomeTests(unittest.TestCase):
         ctx = SimCtx(car, fail_from=1)            # 一次都测不到
         self.run_home(car, ctx, legs)
         f = [v for c, v, _ in car.sent if c == 'F']
-        self.assertEqual(sum(f), -1150 + 15, '最后朝边线那条少走 15mm(宁短不长)，定位一直失败就停在这里')
+        # 最后朝边线那条少走(至少 15mm，长的按 2% + 10mm)，宁短不长；定位一直失败就停在这里
+        self.assertTrue(-1135 <= sum(f) <= -1120, f)
         self.assertGreaterEqual(edge_min(car.trace, CFG), 10)
 
     def test_prehome_final_approach_is_precise_and_inside(self):
@@ -405,8 +438,9 @@ class HomeTests(unittest.TestCase):
         ctx = SimCtx(car)
         self.run_home(car, ctx, dict(reloc_stops=None) and legs, cfg=dict(reloc_stops=None), caps={'rdec': True})
         p = car.pose()
-        self.assertLess(math.hypot(p[0] - ZONE2[0], p[1] - ZONE2[1]), 8.0, p)
-        self.assertGreaterEqual(edge_min(car.trace, CFG), 0.0, '多走 2% 也不能出场地：最后一条先少走 15mm，再慢速修进去')
+        goal = auto_run.inset_goal(ZONE2, CFG)                     # (2250,155)：车身离南边线 10mm
+        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 8.0, p)
+        self.assertGreaterEqual(edge_min(car.trace, CFG), 3.0, '多走 2% 也不能出场地：最后一条先少走 15mm，再慢速修进去')
         self.assertTrue(auto_run.in_rect(p, auto_run.START_RECTS[2]))
         last_f = [v for c, v, sp in car.sent if c == 'F' and sp != 60]
         self.assertTrue(-245 <= last_f[-1] <= -205, car.sent)          # -250 加上 PREHOME 测到的前后偏差，再少走 15mm
@@ -416,10 +450,23 @@ class HomeTests(unittest.TestCase):
         car = SimCar((2250.0, 200.0, 90.0))
         nav = auto_run.Nav(dict(est=(2250.0, 200.0, 90.0), ref=(2250.0, 200.0, 90.0)))
         ctx = SimCtx(car, noise=(0, 0))
-        res = auto_run.home_approach(ctx, car, lambda m: None, nav, (2250.0, 140.0, 90.0), dict(CFG, home_edge_mm=3), {'rdec': False})
+        res = auto_run.home_approach(ctx, car, lambda m: None, nav, (2250.0, 140.0, 90.0),
+                                     dict(CFG, home_edge_mm=3, home_goal_edge_mm=0), {'rdec': False})
         self.assertGreaterEqual(edge_min(car.trace, CFG), 3.0 - 0.01)
-        self.assertEqual(res['status'], 'near')
+        self.assertIn(res['status'], ('ok', 'near'))
         self.assertLess(car.y, 150.0)
+
+    def test_home_goal_moved_inside(self):
+        # 出发位置车身离南边线只有 5mm：回家目标往北挪到离边线 10mm(区 1 往西挪)
+        self.assertEqual(tuple(round(v, 3) for v in auto_run.inset_goal(ZONE2, CFG)), (2250.0, 155.0, 90.0))
+        self.assertEqual(tuple(round(v, 3) for v in auto_run.inset_goal((2250.0, 2250.0, 180.0), CFG)), (2245.0, 2250.0, 180.0))
+        self.assertEqual(auto_run.inset_goal((1200.0, 1200.0, 0.0), CFG), (1200.0, 1200.0, 0.0))
+        car = SimCar((2250.0, 200.0, 90.0))
+        nav = auto_run.Nav(dict(est=(2250.0, 200.0, 90.0), ref=(2250.0, 200.0, 90.0)))
+        res = auto_run.home_approach(SimCtx(car, noise=(0, 0)), car, lambda m: None, nav, ZONE2, CFG, {'rdec': False})
+        self.assertEqual(res['status'], 'ok')
+        self.assertLess(abs(car.y - 155.0), 6.0)
+        self.assertGreaterEqual(edge_min(car.trace, CFG), 4.0)
 
     def test_home_turn_clamped_in_corner(self):
         # 车在启停区角落(车身离南边线 7mm)，要转 3° 才对上出发时的车头：转 3° 车角会扫出场地 -> 只转能转的
@@ -427,10 +474,17 @@ class HomeTests(unittest.TestCase):
             car = SimCar((2250.0, 152.0, 90.0), rdec=rdec)
             nav = auto_run.Nav(dict(est=(2250.0, 152.0, 90.0), ref=(2250.0, 152.0, 90.0)))
             ctx = SimCtx(car, noise=(0, 0))
-            auto_run.home_approach(ctx, car, lambda m: None, nav, (2250.0, 152.0, 93.0), dict(CFG, home_edge_mm=3), {'rdec': rdec})
+            auto_run.home_approach(ctx, car, lambda m: None, nav, (2250.0, 152.0, 93.0),
+                                   dict(CFG, home_edge_mm=3, home_goal_edge_mm=0), {'rdec': rdec})
             self.assertGreaterEqual(edge_min(car.trace, CFG), 3.0 - 0.01)
             self.assertGreater(car.yaw, 90.5, '能转的那一点还是要转')
             self.assertLess(car.yaw, 92.0)
+        # 目标往场内挪(默认)：先往北挪，下一轮就能转到位，车角一直不出场地
+        car = SimCar((2250.0, 152.0, 90.0), rdec=True)
+        nav = auto_run.Nav(dict(est=(2250.0, 152.0, 90.0), ref=(2250.0, 152.0, 90.0)))
+        auto_run.home_approach(SimCtx(car, noise=(0, 0)), car, lambda m: None, nav, (2250.0, 152.0, 93.0), dict(CFG), {'rdec': True})
+        self.assertGreaterEqual(edge_min(car.trace, CFG), 3.0 - 0.01)
+        self.assertAlmostEqual(car.yaw, 93.0, delta=1.0)
 
     def test_fail_moved_without_good_measure_stops_in_place(self):
         car = SimCar((2250.0, 500.0, 90.0))

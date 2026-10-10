@@ -691,6 +691,18 @@ def in_rect(p, r):
     return r[0] <= p[0] <= r[2] and r[1] <= p[1] <= r[3]
 
 
+def inset_goal(goal, cfg, edge_mm=None):
+    """回家的目标点：出发位置车身离场地边线只有几毫米(启停区在角上，车长 290 放进 300)。雷达定位差几毫米就出场地，
+    所以目标点往场内挪到车身(含雷达)离每条边线至少 home_goal_edge_mm(默认 10)。挪的方向是场地内侧，宁可在启停区开着的那边多出一点。"""
+    e = float((cfg or {}).get('home_goal_edge_mm', 10) if edge_mm is None else edge_mm)
+    poly, disk = body_poly(goal, body_model(cfg))
+    xs = [p[0] for p in poly] + ([disk[0] - disk[2], disk[0] + disk[2]] if disk else [])
+    ys = [p[1] for p in poly] + ([disk[1] - disk[2], disk[1] + disk[2]] if disk else [])
+    dx = max(0.0, e - min(xs)) - max(0.0, max(xs) - (FIELD_MM - e))
+    dy = max(0.0, e - min(ys)) - max(0.0, max(ys) - (FIELD_MM - e))
+    return (float(goal[0]) + dx, float(goal[1]) + dy, float(goal[2]))
+
+
 def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=None, order=None, label='回启停区对准',
                   aborted=None):
     """回到启停区：雷达定位 -> 按实际位置小步(home_fix_rpm，默认 60 转/分，STM32 精确模式)修到出发时手放的位置，最多 2 轮。
@@ -716,7 +728,11 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
     need = float(g('home_check_margin_mm', 0))
     limit = float(max_move if max_move is not None else g('home_max_move_mm', 150))
     zone = start_rect(goal, cfg)
-    goal = tuple(float(v) for v in goal[:3])
+    goal0 = tuple(float(v) for v in goal[:3])
+    goal = inset_goal(goal0, cfg)
+    if math.hypot(goal[0] - goal0[0], goal[1] - goal0[1]) > 0.5:
+        log(f'    (回家目标往场内挪 {goal[0]-goal0[0]:+.0f},{goal[1]-goal0[1]:+.0f}mm：车身离场地边线至少 '
+            f'{float(g("home_goal_edge_mm", 10)):.0f}mm，雷达定位差几毫米也不出场地)')
     obstacles = list(obstacles or [])
     moved = False
     last_good = None
@@ -917,6 +933,7 @@ class _Drive:
 
     def _send(self, cmd, v, speed, label=''):
         self.i += 1
+        self.total = max(self.total, self.i)
         est = f'，预计{self.motion.time_of(cmd, v):.1f}秒' if self.motion is not None else ''
         t0 = time.monotonic()
         ok, reply = self.link.move(cmd, v, speed)
@@ -938,6 +955,7 @@ class _Drive:
             self.nav.turned(target_yaw, 0.0)
             return
         self.i += 1
+        self.total = max(self.total, self.i)
         dt = time.monotonic() - t0
         self.t_move += dt
         info = parse_done(reply)
@@ -974,15 +992,10 @@ class _Drive:
             return
         ref_next, want = self.nav.lin_cmd(cmd, val)
         label = ''
-        if self.final_leg and self.nav.world and abs(want) >= 1:
-            # 启停区在场地角上，车身离边线只有几毫米：按推算走满，距离差 1~2% 就出场地。先少走一点，到了用雷达定位再慢速修进去
-            model = body_model(self.cfg)
-            p = self.nav.real()
-            end = apply_move(p, cmd, want)
-            e_end = edge_clearance(end, model)
-            if e_end < edge_clearance(p, model) and e_end < self.home_short + 10:
-                want = math.copysign(max(0.0, abs(want) - self.home_short), want)
-                label = f'(进启停区先少走 {self.home_short:.0f}mm，到了再慢速修进去)'
+        if self.nav.world and abs(want) >= 1:
+            cut, label = self._approach_cut(cmd, want)
+            if cut > 0:
+                want = math.copysign(max(0.0, abs(want) - cut), want)
         v = int(round(want))
         if abs(v) < STOP_MIN_MM:
             self.nav.ref = ref_next                       # 差得太少：这一条不发，带到后面
@@ -995,6 +1008,32 @@ class _Drive:
         self._send(cmd, v, speed, label)
         self.nav.moved(cmd, v)
         self.nav.ref = ref_next
+
+    def _approach_cut(self, cmd, want):
+        """朝场地边线/黄区/工位区/转盘/障碍物走的一条，按推算走满时离它很近：距离差 1~2%(长横移更多)就会压上。
+        先少走一点(终点至少留 approach_guard_frac(横移 approach_guard_frac_s) × 距离 + approach_guard_mm)，
+        到停车点用雷达定位后再慢速修过去。
+        走进启停区的最后一条(场地角上，车身离边线只有几毫米)另外先少走 home_short_mm。返回 (少走多少 mm, 日志)。"""
+        g = self.cfg.get
+        model = body_model(self.cfg)
+        obs = self._obstacles()
+        regs = regions(self.cfg, obs)
+        p = self.nav.real()
+        end = apply_move(p, cmd, want)
+        c0, _ = pose_clearance(self.cfg, obs, p, model, regs)
+        c1, what = pose_clearance(self.cfg, obs, end, model, regs)
+        frac = float(g('approach_guard_frac_s', 0.03)) if cmd == 'S' else float(g('approach_guard_frac', 0.02))   # 麦轮横移误差大一些
+        guard = frac * abs(want) + float(g('approach_guard_mm', 10))
+        cut, label = 0.0, ''
+        if c1 < c0 and c1 < guard:
+            cut = guard - max(c1, 0.0) if c1 >= 0 else guard
+            label = f'(终点离{what}只有 {c1:.0f}mm：先少走 {cut:.0f}mm，到停车点再慢速修)'
+        if self.final_leg:
+            e0, e1 = edge_clearance(p, model), edge_clearance(end, model)
+            if e1 < e0 and e1 < self.home_short + 10 and self.home_short > cut:
+                cut = self.home_short
+                label = f'(进启停区先少走 {self.home_short:.0f}mm，到了再慢速修进去)'
+        return min(cut, abs(want)), label
 
     # ------------------------------------------------------------ 停车点
     def _stop(self, stop, info):

@@ -333,12 +333,33 @@ class Reference:
         return measure(cur, self.grid, self.origin, plan_pose, cfg, use_init, max_shift, max_deg)
 
 
-def build_reference(views, body_points_fn, max_n_view=2000):
-    """views：[(扫描的原始帧, 当时的车位(世界))…]，第一项是出发时那次。返回 Reference。"""
-    origin = views[0][1]
+def build_reference(views, body_points_fn, max_n_view=2000, align=True, cfg=None):
+    """views：[(扫描的原始帧, 当时的车位(世界))…]，第一项是出发时那次。返回 Reference。
+    align=True：第二次(及以后)的扫描先和第一次对齐(ICP，从记下的车位开始)，对上了就按对齐后的车位放进参考点云，
+    参考点云自己不会"重影"；对齐后的车位记在 ref.view_poses 里(第二站的实际车位)。"""
+    origin = tuple(float(v) for v in views[0][1][:3])
     clouds = []
-    for frames, pose in views:
+    poses = []
+    notes = []
+    base = None
+    for i, (frames, pose) in enumerate(views):
+        pose = tuple(float(v) for v in pose[:3])
         B = body_points_fn(frames, max_n_view)
-        if len(B):
-            clouds.append(body_to_frame(B, pose, origin))
-    return Reference(origin, clouds)
+        if not len(B):
+            poses.append(pose)
+            continue
+        if i > 0 and align and base is not None:
+            r = base.measure(thin(B, 20.0, 1000), pose, cfg, max_shift=100.0, max_deg=5.0)
+            if r['ok']:
+                notes.append((i, pose, r['pose'], r))
+                pose = r['pose']
+            else:
+                notes.append((i, pose, None, r))
+        clouds.append(body_to_frame(B, pose, origin))
+        poses.append(pose)
+        if i == 0 and align and len(views) > 1:
+            base = Reference(origin, [clouds[0]], max_n=2000)
+    ref = Reference(origin, clouds)
+    ref.view_poses = poses
+    ref.align_notes = notes
+    return ref
