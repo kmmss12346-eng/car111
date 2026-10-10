@@ -96,7 +96,7 @@ DEFAULTS = dict(
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
     raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
-    raw_any_order=True,                 # True(10-10 用户要的：爪子下面停的是哪个就夹哪个) = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
+    raw_any_order=True,                 # 不再起作用(10-10 写死：原料区来一个夹一个)。以前：True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
@@ -1087,7 +1087,9 @@ class MissionHooks:
             raise
         except ArmError:
             pass
-        if (self.cfg.get('raw_any_order') or getattr(self, 'raw_any_once', False)) and hasattr(self.vision, 'material_stream'):
+        # 10-10 用户定的(写死，配置改不了)：原料区来一个夹一个——爪子下面停的是要抓的哪个颜色就夹哪个，放进它自己的槽
+        # (_raw_in_order 只给以前按顺序写的模拟测试用)
+        if (not getattr(self, '_raw_in_order', False) or getattr(self, 'raw_any_once', False)) and hasattr(self.vision, 'material_stream'):
             self._raw_any(self.plan.items(batch))
             return
         for item in self.plan.items(batch):

@@ -804,7 +804,9 @@ def make(world, cfg_extra=None, log=lambda m: None, raw=None):
     cfg.update(cfg_extra or {})
     rc = dict(raw or {})
     rc['mission_cfg'] = cfg
-    return MissionHooks(rc, log=log, vision=world.vision, now=world.now, sleep=world.advance)
+    h = MissionHooks(rc, log=log, vision=world.vision, now=world.now, sleep=world.advance)
+    h._raw_in_order = not cfg.get('raw_any_order', True)       # 以前按任务码顺序写的测试照旧按顺序抓
+    return h
 
 
 def rings_summary(world, zone):
