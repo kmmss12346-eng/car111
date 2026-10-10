@@ -791,10 +791,16 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
             'START1': [2250, 2250, 180], 'START2': [2250, 150, 90]}     # 用户配置里的停车点(10-06)
 
 
+LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False)
+LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=True, wheels_first=True)
+
+
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
     """raw：配置文件里 mission_cfg 以外的东西(stops、car_length_mm…)，QR 前后挪着找码要用 stops。"""
     cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='',      # 测试里不限时、不读写文件
                ring_order={z: world.ring_order(z) for z in ('ROUGH', 'TEMP')})  # 假摄像头装的方向是随机的
+    # 以前的测试是按"按任务码顺序抓、先动手臂"写的：这里固定成那样；测比赛默认(不按顺序、先动车轮)的用 LIVE_DEFAULTS
+    cfg.update(LEGACY)
     cfg.update(cfg_extra or {})
     rc = dict(raw or {})
     rc['mission_cfg'] = cfg
@@ -924,6 +930,17 @@ class MissionSimTests(unittest.TestCase):
         self.assertIn('规则只许码垛，不放、不算放置', '\n'.join(lines))
         self.assertEqual(w.screen['t3'], 'PLACE 9')
         self.assertEqual([c for c in w.tray.values() if c], [5])        # 黑色留在车上
+
+    def test_live_defaults_whatever_stops_under_the_claw_and_wheels_first(self):
+        """比赛默认(10-10 用户要的)：原料区爪子下面停的是哪个就夹哪个、对准先慢慢动车轮：全抓到、全放对、不空夹。"""
+        for seed in range(3):
+            w = SimWorld(seed=300 + seed, code=self.CODE)
+            h = make(w, dict(LIVE_DEFAULTS))
+            run_mission(w, h)
+            self.assertEqual(h.stats.grab_ok, 6)
+            self.assertEqual(h.stats.place_ok, 12)
+            self.assertEqual(w.air, 0)
+            self.assertLess(max(e for (_, _, _, e, st) in w.placed if not st), 2.5)
 
     def test_stm32_error_on_one_grab_is_recovered(self):
         w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2))

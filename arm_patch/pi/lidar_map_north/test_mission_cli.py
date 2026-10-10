@@ -915,7 +915,9 @@ class ConfigScriptTests(unittest.TestCase):
                   'qr_scanner_from_right_mm', 'tilt_precorrect', 'tilt_warn_deg', 'keepalive_deg', 'code_plus', 'home_when_idle'):
             self.assertIn(k, mc)
         self.assertEqual(mc['wheels_min_mm'], 4.0)
-        self.assertIs(mc['wheels_first'], False)
+        self.assertIs(mc['wheels_first'], True)          # 10-10：先慢慢动车轮
+        self.assertIs(mc['raw_any_order'], True)         # 10-10：爪子下面停的是哪个就夹哪个
+        self.assertIs(mc['raw_wheels_first'], True)
         self.assertIs(mc['zone_filter'], True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'ring_strafe_max_mm': 30}}, f)

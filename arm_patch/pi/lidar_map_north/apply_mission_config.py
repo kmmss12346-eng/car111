@@ -29,7 +29,9 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 (None, 'raw_stop_s'): (5.0, 4.0),             # 10-10：实测原料盘每次停约 4.8 秒，没量到之前按 4 秒算(保守)
                 (None, 'raw_frames'): (2, 1),                 # 10-10：原料区对准每次只拍一帧(快)
                 (None, 'ring_strafe_max_mm'): ((40.0, 40), 20.0),   # 10-10：工位里横移最多 20mm(停车点离白区只有 60mm，40 太近)
-                (None, 'wheels_min_mm'): (1.5, 4.0)}          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
+                (None, 'wheels_min_mm'): (1.5, 4.0),
+                (None, 'raw_any_order'): (False, True),       # 10-10：原料区爪子下面停的是要抓的哪个颜色就夹哪个
+                (None, 'wheels_first'): (False, True)}        # 10-10：工位对准尽量先慢慢动车轮，最后才动爪子          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
 
 
 def main(argv):

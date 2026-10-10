@@ -81,6 +81,9 @@ DEFAULTS = dict(
     raw_chassis='off',                  # 原料区对准时车轮能不能动：'off' = 只动手臂，车轮不动(不会压进原料区)；
                                         #   'F' = 只许沿车头方向前后挪，最多 raw_fix_max_mm；'SF' = 前后、横着都能挪(以前的做法，可能压进原料区)
     raw_fix_max_mm=40.0,                # raw_chassis='F' 时一次对准车轮最多前后挪多少毫米
+    raw_wheels_first=True,              # 原料区对准先动车轮(沿车头方向前后小步慢慢挪，每次最多 wheels_step_mm、wheels_rpm 转/分)，
+                                        #   差不到 wheels_min_mm 再动手臂；车轮不横移(不会压进原料区)。要先做过 vcal RAW 颜色号(不加 arm)，
+                                        #   存了车轮和画面的对应关系才有用，没有就只动手臂。False = 只动手臂(以前的做法)
     raw_track_s=30.0,                   # 等要抓的物料转过来、停在爪子下面最多等多久(秒)。原料盘转 3 秒停 6 秒、三个物料轮流停过来，一圈约 27 秒
     raw_stop_s=4.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
@@ -93,7 +96,7 @@ DEFAULTS = dict(
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
     raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
-    raw_any_order=False,                # True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
+    raw_any_order=True,                 # True(10-10 用户要的：爪子下面停的是哪个就夹哪个) = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
@@ -117,7 +120,7 @@ DEFAULTS = dict(
     zone_frames=2,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
     zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
     zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
-    wheels_first=False,                 # True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
+    wheels_first=True,                  # (10-10 用户要的：尽量先慢慢动车)True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
                                         #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)。
                                         #   模拟里比默认慢、失败多(车轮只能走整毫米，小步不准)，所以默认关；上车对比：mtest TEMP 1 force wheels
     wheels_step_mm=15.0,                # wheels_first：车轮每次最多挪多少毫米
@@ -1386,7 +1389,7 @@ class MissionHooks:
                         q = errs.get(c[0])
                         if q is not None:
                             d = math.hypot(q[0], q[1]) / v.scale('RAW')
-                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF' and not self._raw_wheels()) else ''
                             seen.append((d, far_c, c, np.array(q, float)))
                     near = [x for x in seen if not x[1]]
                     if not near:
@@ -1400,7 +1403,7 @@ class MissionHooks:
                     if cand[2] is not None:
                         lab = f'抓{cand[2].color_short}'
                         self.log(f'  {tag} 这次停在爪子附近的是{cand[2].color_name}：先夹它(放 {cand[1]} 号槽)')
-                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF' and not self._raw_wheels()) else ''
                 if far:
                     if ('far', stop_id) not in said:
                         said.add(('far', stop_id))
@@ -1448,6 +1451,18 @@ class MissionHooks:
                 out.append(f'{"ID2" if i == 0 else "ID1"} 要转 {d[i]:+.0f}°，最多 ±{lm:.0f}°')
         return '，'.join(out)
 
+    def _raw_wheels(self):
+        """原料区这次对准先不先动车轮：配置(或 mtest RAW … wheels)要求，而且存了车轮和画面的对应关系(vcal RAW 颜色号)。"""
+        want = bool(self.cfg.get('raw_wheels_first', True)) or bool(getattr(self, 'raw_wheels_once', False))
+        if not want:
+            return False
+        if self.store is None or self.store.get('RAW', 'ch') is None:
+            if not getattr(self, '_raw_wheels_said', False):
+                self._raw_wheels_said = True
+                self.log('    (原料区先动车轮：还没有车轮和画面的对应关系，这次只动手臂。原料盘停转时做一次 vcal RAW 颜色号(不加 arm)就有了)')
+            return False
+        return True
+
     def _raw_align_go(self, color, slot, mode, e0, deadline, label, probe=False):
         """物料停着：只动手臂快速对准(用存好的 J，不探测、不改 J，一下修到位，最多 raw_max_iter 次)；
         到 deadline(这一次停下必须下爪的时刻)就不再修，按当时的偏差下爪——只要不超过 raw_grab_max_mm。
@@ -1462,9 +1477,13 @@ class MissionHooks:
         if probe:
             kw = dict(fixed_j=False, timeout_s=max(0.3, budget))
         cmode = str(cfg.get('raw_chassis') or 'off').upper()
-        allow = cmode in ('F', 'SF')                         # 默认 'off'：只动手臂，车轮不动
+        allow = cmode in ('F', 'SF')                         # 'off'：只动手臂，车轮不动
         if cmode == 'F':
             kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0))
+        if not probe and self._raw_wheels():
+            # 先动车轮：沿车头方向前后小步慢慢挪找物料(不横移，不会压进原料区)，差不多了再用手臂补
+            allow = True
+            kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0), wheels_first=True)
         res = self.servo.run('RAW', _first(tuple(e0), lambda: v.material_error(color, n=n)), v.scale('RAW'), tol,
                              allow_chassis=allow, label=label, bounds=v.bounds('RAW'), confirm=False, **kw)
         self.log(f'    对准结果：{res}')

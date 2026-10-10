@@ -407,7 +407,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'mtest':
         if len(parts) < 2:
-            raise ValueError('格式：mtest QR / mtest RAW 1 [force] [any] / mtest ROUGH 1 [force] [nogo] [rev] [wheels] [nofilt] / '
+            raise ValueError('格式：mtest QR / mtest RAW 1 [force] [any] [wheels] / mtest ROUGH 1 [force] [nogo] [rev] [wheels] [nofilt] / '
                              'mtest TEMP 1 [force] [nogo] [rev] [wheels] [nofilt] / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
@@ -478,10 +478,11 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                         h.on_ring[('TEMP', it.ring)] = [it]
                     log('  (force：假定暂存区已经平放了第一批：' + '  '.join(f'环{it.ring}={it.color_name}' for it in h.plan.items(1)) + ')')
             h.raw_any_once = anyo and what == 'RAW'
+            h.raw_wheels_once = wheels and what == 'RAW'
             saved = {k_: h.cfg.get(k_) for k_ in ('wheels_first', 'zone_filter')}
             if wheels or nofilt:
-                if what not in ('ROUGH', 'TEMP'):
-                    log('  (wheels / nofilt 只管粗加工区、暂存区的对准)')
+                if what not in ('ROUGH', 'TEMP', 'RAW'):
+                    log('  (wheels / nofilt 只管原料区、粗加工区、暂存区的对准)')
                 if wheels:
                     h.cfg['wheels_first'] = True
                     log(f'  wheels：这次对准先动车轮(沿圆环那一排每次最多 {float(h.cfg.get("wheels_step_mm") or 15):g}mm、'
@@ -493,7 +494,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             try:
                 h.run_role(what, batch)
             finally:
-                h.nogo, h.ring_rev, h.raw_any_once = False, False, False
+                h.nogo, h.ring_rev, h.raw_any_once, h.raw_wheels_once = False, False, False, False
                 h.cfg.update(saved)
             if wheels or nofilt or what in ('ROUGH', 'TEMP'):
                 how = '、'.join(n for n, on in (('先动车轮', wheels), ('不滤波', nofilt)) if on) or '默认(先动手臂、滤波)'
