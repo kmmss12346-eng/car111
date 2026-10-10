@@ -85,13 +85,13 @@ DEFAULTS = dict(
                                         #   差不到 wheels_min_mm 再动手臂；车轮不横移(不会压进原料区)。要先做过 vcal RAW 颜色号(不加 arm)，
                                         #   存了车轮和画面的对应关系才有用，没有就只动手臂。False = 只动手臂(以前的做法)
     raw_track_s=30.0,                   # 等要抓的物料转过来、停在爪子下面最多等多久(秒)。原料盘转 3 秒停 6 秒、三个物料轮流停过来，一圈约 27 秒
-    raw_stop_s=4.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
+    raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
     raw_motion_frac=0.004,              # 前后两帧画面(爪子以外)变了的地方超过这个比例 = 原料盘在转
     raw_static_s=9.0,                   # 还没做 vcal RAW(没有手臂和画面的对应关系)时：看到原料盘连续这么多秒都不转(关了)，才现场小幅动几下测
     raw_keepalive_s=12.0,               # 等物料转过来时手臂这么多秒没动过，就轻轻摆一下 ID1(规则：机器人停止运行 15 秒、等转盘时 23 秒本轮结束)；0 = 不摆
     raw_keepalive_deg=1.0,              # 摆多少度(ID1，摆过去马上回来)
-    raw_frames=1,                       # 原料区对准时每次测量用几帧(一帧最快，停下来的时间有限)
+    raw_frames=2,                       # 原料区对准时每次测量用几帧(一帧最快，停下来的时间有限)
     raw_max_iter=3,                     # 原料区对准最多修正几次(果断：差不多就下爪)
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
     raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
@@ -1096,7 +1096,8 @@ class MissionHooks:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
-            if self._no_time('grab', '抓取'):
+            if self.time_left() < 0:
+                self.log('    ★ 时间到，不再抓取')
                 break
             left = self.in_tray.get(item.slot)
             if left is not None and not same_item(left, item):    # 前面没放出去的物料还在这个槽里：再放进去会砸在它上面
@@ -1105,14 +1106,12 @@ class MissionHooks:
                 self._show_stats()
                 continue
             ok = False
-            t_it = self.now()
             try:
                 ok = self._grab_item(item)
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
                 self._recover(f'抓 {item.color_name} 出错：{ex}')
-            self._note_item('grab', t_it)
             self.stats.grab(ok)
             if ok:
                 self.in_tray[item.slot] = item
@@ -1140,21 +1139,20 @@ class MissionHooks:
             self._check_abort()
             if self.disabled:
                 break
-            if self._no_time('grab', '抓取'):
+            if self.time_left() < 0:
+                self.log('    ★ 时间到，不再抓取')
                 break
             self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
             self._recenter(min_mm=20.0)
             got = None
-            t_it = self.now()
             try:
                 self.arm.obs('RAW', open_claw=True)
-                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self._work_deadline())
+                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + float(cfg['time_limit_s']))
                 got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
                 self._recover(f'抓取出错：{ex}')
-            self._note_item('grab', t_it)
             if got is None:
                 break
             it = got[2]
@@ -1180,7 +1178,7 @@ class MissionHooks:
             self.log(f'    ★ 没标定爪子区域(claw_mask.png)：{item.color_name}物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
         if hasattr(self.vision, 'material_stream'):
             t_end = min(self.now() + max(float(cfg['raw_wait_s']), float(cfg.get('raw_track_s', 30.0))),
-                        self._work_deadline())
+                        self.t0 + float(cfg['time_limit_s']))
             return self._raw_stop_grab(item.color, item.slot, 'grab', t_end, f'抓{item.color_short}')
         # 旧的视觉模块(没有一帧一帧认的功能)：等停稳，再闭环对准
         still, last = self.vision.wait_still(item.color, timeout_s=cfg['raw_wait_s'])
@@ -1263,8 +1261,6 @@ class MissionHooks:
         cfg, v = self.cfg, self.vision
         single = len(cands) == 1
         color = cands[0][0] if single else None
-        if single and cands[0][2] is not None and label == '抓':
-            label = f'抓{cands[0][2].color_short}'           # 不按顺序抓、只剩最后一个：日志里也写上颜色
         tag = f'[{label}]'
         J = self.store.get('RAW', 'arm') if self.store is not None else None
         static_s = float(cfg.get('raw_static_s', 9.0))
@@ -1391,7 +1387,7 @@ class MissionHooks:
                         q = errs.get(c[0])
                         if q is not None:
                             d = math.hypot(q[0], q[1]) / v.scale('RAW')
-                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF' and not self._raw_wheels()) else ''
+                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
                             seen.append((d, far_c, c, np.array(q, float)))
                     near = [x for x in seen if not x[1]]
                     if not near:
@@ -1405,7 +1401,7 @@ class MissionHooks:
                     if cand[2] is not None:
                         lab = f'抓{cand[2].color_short}'
                         self.log(f'  {tag} 这次停在爪子附近的是{cand[2].color_name}：先夹它(放 {cand[1]} 号槽)')
-                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF' and not self._raw_wheels()) else ''
+                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
                 if far:
                     if ('far', stop_id) not in said:
                         said.add(('far', stop_id))
@@ -1479,13 +1475,9 @@ class MissionHooks:
         if probe:
             kw = dict(fixed_j=False, timeout_s=max(0.3, budget))
         cmode = str(cfg.get('raw_chassis') or 'off').upper()
-        allow = cmode in ('F', 'SF')                         # 'off'：只动手臂，车轮不动
+        allow = cmode in ('F', 'SF')                         # 默认 'off'：只动手臂，车轮不动
         if cmode == 'F':
             kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0))
-        if not probe and self._raw_wheels():
-            # 先动车轮：沿车头方向前后小步慢慢挪找物料(不横移，不会压进原料区)，差不多了再用手臂补
-            allow = True
-            kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0), wheels_first=True)
         res = self.servo.run('RAW', _first(tuple(e0), lambda: v.material_error(color, n=n)), v.scale('RAW'), tol,
                              allow_chassis=allow, label=label, bounds=v.bounds('RAW'), confirm=False, **kw)
         self.log(f'    对准结果：{res}')

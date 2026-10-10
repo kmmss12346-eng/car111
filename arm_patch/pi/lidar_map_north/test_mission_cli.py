@@ -903,10 +903,10 @@ class ConfigScriptTests(unittest.TestCase):
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'px_per_mm': {'RAW': 4.36, 'RING': 2.96}, 'tol_mm': {'RAW': 3.0},
                                        'accept_mm': {'RAW': 5.0}, 'learn_pick': True, 'chassis_fine_rpm': 80,
-                                       'raw_stop_s': 5.0, 'raw_frames': 2}}, f)
+                                       'raw_stop_s': 4.0, 'raw_frames': 1}}, f)
         apply_mission_config.main([path])
         mc = load(path)['mission_cfg']
-        self.assertEqual((mc['raw_stop_s'], mc['raw_frames']), (4.0, 1))       # 10-10 写进配置的旧默认值也升级
+        self.assertEqual((mc['raw_stop_s'], mc['raw_frames']), (5.0, 2))       # 10-10 晚：原料区换回 1010i 的做法(5 秒、2 帧)
         self.assertEqual(mc['px_per_mm']['RAW'], 1.97)              # 没改过的旧默认值 -> 新默认值
         self.assertEqual(mc['tol_mm']['RAW'], 2.0)
         self.assertEqual(mc['accept_mm']['RAW'], 5.0)               # 用户自己改过的不动
@@ -924,7 +924,7 @@ class ConfigScriptTests(unittest.TestCase):
         apply_mission_config.main([path])
         mc = load(path)['mission_cfg']
         self.assertEqual(mc['ring_strafe_max_mm'], 20.0)
-        self.assertEqual(mc['raw_stop_s'], 4.0)                     # 以前那次升级也还在
+        self.assertEqual(mc['raw_stop_s'], 5.0)                     # 原料区按 1010i：5 秒
         self.assertEqual(mc['qr_dwell_s'], 1.5)                     # 用户的值不动
         for k in ('round_s', 'home_margin_s', 'work_item_s', 'qr_search', 'qr_targets_mm', 'qr_scanner_from_rear_mm',
                   'qr_scanner_from_right_mm', 'tilt_precorrect', 'tilt_warn_deg', 'keepalive_deg', 'code_plus', 'home_when_idle'):
