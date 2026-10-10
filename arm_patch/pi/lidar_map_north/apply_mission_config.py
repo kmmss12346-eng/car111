@@ -15,7 +15,8 @@ from mission_hooks import DEFAULTS, deep_merge
 
 NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调它就能微调放置位置，1 像素≈0.34mm)；px_per_mm=每毫米多少像素；'
         'tol_mm=对准到多小算好；ring_offset_mm=圆环相对停车点沿车头方向的位置(要去现场核对圆环编号方向)；'
-        'time_limit_s=超过这个时间不再做夹放，留时间回家。详见 README_mission.md')
+        'time_limit_s=超过这个时间不再做夹放，留时间回家；round_s/home_margin_s/work_item_s=按时间判断还做不做下一个物料、要不要直接回家；'
+        'qr_*=读不到码时沿车道前后挪着找；ring_strafe_max_mm=工位里车轮横移最多多少。详见 README_mission.md')
 
 
 # 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的。(None, 键) = mission_cfg 下面直接的键
@@ -26,7 +27,8 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 ('tol_mm', 'STACK'): (2.0, 2.5),             # 码垛不掉下来就得分
                 ('accept_mm', 'RING'): ((2.5, 3.0), 3.5),       # 4mm 以内还是 2 环(10 分)：放下比不放强
                 (None, 'raw_stop_s'): (5.0, 4.0),             # 10-10：实测原料盘每次停约 4.8 秒，没量到之前按 4 秒算(保守)
-                (None, 'raw_frames'): (2, 1)}                 # 10-10：原料区对准每次只拍一帧(快)
+                (None, 'raw_frames'): (2, 1),                 # 10-10：原料区对准每次只拍一帧(快)
+                (None, 'ring_strafe_max_mm'): ((40.0, 40), 20.0)}   # 10-10：工位里横移最多 20mm(停车点离白区只有 60mm，40 太近)
 
 
 def main(argv):
@@ -65,7 +67,8 @@ def main(argv):
     stops = cfg.get('mission')
     print(f'  路线(mission)：{stops}')
     if stops and sum(1 for s in stops if str(s).upper().startswith('RAW')) > 1:
-        print('  提示：路线里有两批。时间紧的话，先只做第一批：把 "mission" 改成 ["QR","RAW","ROUGH","TEMP","START"]，稳了再加第二批。')
+        print('  提示：路线里有两批。3 分钟一般做不完两批：时间不够时不再开始新的物料，新的导航会从当前停车点直接回家；'
+              '想稳一点先只做第一批：把 "mission" 改成 ["QR","RAW","ROUGH","TEMP","START"]。')
     print('下一步：看 README_mission.md 的上车测试步骤(物料颜色用 wuliao.py 里的范围，没有就用 matdet.py 里一样的默认值)。')
     return 0
 

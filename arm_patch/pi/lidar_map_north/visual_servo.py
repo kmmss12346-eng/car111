@@ -427,9 +427,12 @@ class VisualServo:
         'Fs' 时手臂伸缩到头还够不着，才让车轮横着挪(只挪够不着的那一段)。"""
         c = self.cfg
         self._need_s = False
-        if not allow_chassis or (e < c['chassis_min_mm'] and not self._wheels):
+        if not allow_chassis:
             return 'arm'
+        small = e < c['chassis_min_mm'] and not self._wheels       # 偏差小：一般只动手臂(底盘只能到几毫米精度)
         mode = self._mode()
+        if small and mode != 'Fs':
+            return 'arm'
         if mode != 'SF' and J['ch'] is not None:
             jf = np.asarray(J['ch'], float)[:, 1]
             along = e * abs(float(jf @ p)) / max(_norm(jf) * _norm(p), 1e-9)   # 偏差里沿着"底盘前后"方向的那一段(毫米)
@@ -452,7 +455,9 @@ class VisualServo:
                         short_r = True
             if short_r:
                 self._need_s = True                              # 车轮横着挪(靠近/远离)，只挪手臂够不着的那一段
-                return 'ch'
+                return 'ch'                                      # (偏差小也挪：手臂伸缩已经到头，不挪就一直卡在这里)
+            if small:
+                return 'arm'
             if self._wheels:
                 # 先动车轮：沿圆环那一排还差 wheels_min_mm 以上就让车轮前后小步挪；剩下的(和离圆环的远近)交给手臂
                 return 'ch' if along >= float(c.get('wheels_min_mm') or 1.5) else 'arm'
@@ -460,6 +465,8 @@ class VisualServo:
                 return 'arm'                             # 主要是横向的偏差：手臂伸缩够得着
             if along > c['arm_cover_mm'] or sat_a:
                 return 'ch'                              # 沿着圆环那一排差得多(或者沿这一排的舵机够不着)：底盘前后挪
+            return 'arm'
+        if small:
             return 'arm'
         if e > c['arm_cover_mm']:
             return 'ch'

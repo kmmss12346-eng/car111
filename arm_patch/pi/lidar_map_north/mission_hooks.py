@@ -56,9 +56,12 @@ DEFAULTS = dict(
     round_s=180.0,                      # 一轮多长(赛规 3 分钟)：导航告诉了回家要多久(set_home_eta)时，按它算还来不来得及
     home_margin_s=12.0,                 # 算"来不来得及回家"时再多留这么多秒(路线时间估得不准、回家前雷达定位、回家对准)
     stop_finish_s=3.0,                  # 停车点做完物料以后收臂、底盘挪回停车点大约要多久
+    home_when_idle=True,                # 后面再也没有夹放可做(没读到任务码、机械臂不能用)：go_home_now 回 True，导航直接回家(少走路、少压线)；
+                                        #   false = 照样把路线走完(只测路线时用 enabled=false 更直接)
     work_item_s=dict(grab=12.0, place=10.0, pick=8.0, stack=10.0),   # 每个物料大约要多久(抓/放/取回/码垛；按模拟的提速参数估的)。
                                         #   跑过一次就按实测的(每次都更新)，这里只是还没实测时用
     work_base_s=dict(QR=3.0, RAW=2.0, ROUGH=6.0, TEMP=5.0, START=3.0),   # 每个停车点物料以外的用时(看圆环、收臂、挪回停车点)
+    next_leg_s=12.0,                    # 粗加工区开到暂存区大约要多久(粗加工区放完以后判断"取回了还来不来得及去暂存区"用)
     qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码(qr_search=false 时；前后挪着找时每个位置等 qr_dwell_s)
     qr_search=True,                     # 到 QR 点读不到码：车沿车道前后挪，让扫码器依次对着码板可能的位置再读
     qr_first_wait_s=0.6,                # 到 QR 点先原地查这么久(路上可能已经读到了)
@@ -227,7 +230,8 @@ class MissionHooks:
         self.maybe_holding = None           # 不为 None = 爪子里可能还夹着东西(原因)：不降升降、不张爪子
         self._aborted = False               # 急停过：park() 不自动做(人手可能在附近)
         self._tilt = None                   # 看三个圆环时量的车身斜度和远近(提前补手臂伸缩用)，见 _survey
-        self._a2_hint = None                # 刚 OBS RING 过：ID2 在 A2P(OBS 不回报角度)
+        self._a2_hint = None                # 刚 OBS RING 过：ID2 在 A2P、ID1 在 A1P(OBS 不回报角度)
+        self._a1_hint = None
         self.arm = None
         self.act = None
         self.servo = None
@@ -363,6 +367,10 @@ class MissionHooks:
             return False
         if self.out_of_time:
             self.log(f'  ★ 时间不够了(前面已经停止开始新的物料)：不去 {next_role}，直接回家')
+            return True
+        idle = self._idle_for_good() if self.cfg.get('home_when_idle', True) else None
+        if idle:
+            self.log(f'  ★ {idle}：后面的停车点都没活可干，不去 {next_role}，直接回家(少走路、少压线的风险)')
             return True
         try:
             leg = max(0.0, float(est_leg_s or 0.0))
@@ -509,6 +517,34 @@ class MissionHooks:
             self.log(f'    ★ 时间不够：{why}。不再{what}，让车回家')
             self._ui('msg', 'TIME UP')
         return why
+
+    def _pickback_budget(self, n):
+        """粗加工区放完 n 个：取回几个以后还来得及开到暂存区把它们放下再回家(取回 k 个 + 暂存区放 k 个 + 路上 + 回家 + 余量)。
+        来不及的就不取回：取回要时间，物料放在粗加工区已经算了分，留在那儿不吃亏，车早点回家。
+        不知道回家要多久(导航没给 set_home_eta)时不判断，返回 n。"""
+        if self.home_eta_s is None or n <= 0:
+            return n
+        cfg = self.cfg
+        # 偏保守：取回了却去不成暂存区，白花时间，物料还从算了分的地方拿走了
+        fixed = (2 * float(cfg.get('stop_finish_s', 3.0)) + float(cfg.get('next_leg_s', 12.0)) + self._base_s('TEMP')
+                 + float(self.home_eta_s) + float(cfg.get('home_margin_s', 12.0)) + 8.0)
+        per = 1.25 * (self._item_s('pick') + self._item_s('place'))
+        left = float(cfg.get('round_s', 180.0)) - self.elapsed()
+        k = int(max(0.0, min(float(n), (left - fixed) / max(per, 1.0))))
+        if k < n:
+            self.log(f'    ★ 还剩 {left:.0f} 秒：取回、再去暂存区放，每个约 {per:.0f} 秒，加上路上和回家约 {fixed:.0f} 秒，'
+                     + (f'只来得及 {k} 个：其余的留在粗加工区(放下时已经算分)' if k else '一个也来不及：不取回了，物料留在粗加工区(放下时已经算分)，车直接回家'))
+            if k == 0:
+                self.out_of_time = True
+        return k
+
+    def _idle_for_good(self):
+        """这一轮后面再也没有夹放可做了(返回原因)：机械臂不能用；或者到过 QR 点(后面的停车点也问过)还是没有任务码。否则 None。"""
+        if self.disabled:
+            return f'本轮不做夹放({self.disabled})'
+        if self.plan is None and self.visits.get('QR'):
+            return '没有读到任务码'
+        return None
 
     def _work_s(self, role, first_only=False):
         """到停车点 role 要干多久的活(秒)；那里没活可干返回 0。first_only = 只算第一个物料(最少有用的活)。"""
@@ -1421,7 +1457,11 @@ class MissionHooks:
             self._note_item('place', t_it)
             if ok:
                 placed.append(item)
-        for item in self._pickback_sequence('ROUGH', placed):
+        seq = self._pickback_sequence('ROUGH', placed)
+        k = self._pickback_budget(len(seq))
+        if k < len(seq):
+            seq = seq[:k]                                        # 取回了也来不及去暂存区放的：留在粗加工区(放下时已经算分)
+        for item in seq:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
@@ -1738,6 +1778,7 @@ class MissionHooks:
         v, cfg = self.vision, self.cfg
         self.arm.obs('RING', open_claw=True)
         self._a2_hint = (self.arm.params() or {}).get('A2P')
+        self._a1_hint = (self.arm.params() or {}).get('A1P')
         self._ring_ready = self._at_obs = True
         rings = v.ring_list(n=cfg.get('survey_frames') or None)
         if not rings:
@@ -1953,22 +1994,29 @@ class MissionHooks:
     def _relook(self):
         """刚看完三个环、手臂没动过，底盘开到了第一个要放的环(离看圆环的地方 100mm 以上)：再看一眼画面。
         圆环在画面里整体移动的方向就是"底盘前进"在画面里的方向；挪了一两百毫米量的比第一次挪 40mm 测的准得多：
-        用它把车身和圆环那一排的夹角量准(存进 servo_cal.json，以后到工位直接用)，这个环和后面的环按它提前补手臂伸缩。"""
+        用它把车身和圆环那一排的夹角量准(存进 servo_cal.json，以后到工位直接用)，这个环和后面的环按它提前补手臂伸缩。
+        顺便返回这个环现在离爪子点多少像素(爪子附近的那个环；没看到返回 None)：手臂直接转过去，省掉对准的第一步。"""
         import numpy as np
         t = self._tilt
-        if not t or t.get('relooked') or t.get('angle') is None or not self.cfg.get('tilt_precorrect', True):
-            return
+        if not t or t.get('relooked') or not self.cfg.get('tilt_precorrect', True):
+            return None
         dF = float(self.act.disp['F']) - t['F0']
         if abs(dF) < 100.0:
-            return
+            return None
         t['relooked'] = True
         try:
             rings = self.vision.ring_list(n=self.cfg.get('survey_frames') or None)
         except VisionError:
-            return
+            return None
         if not rings:
-            return
+            return None
         pts1 = np.array([[r[0], r[1]] for r in rings], float)
+        claw = np.array(self.vision.claw('RING'), float)
+        dc = np.hypot(pts1[:, 0] - claw[0], pts1[:, 1] - claw[1])
+        gate = self.ring_gate_px or 0.45 * t['sp_px']
+        p_now = (pts1[int(np.argmin(dc))] - claw) if float(np.min(dc)) <= gate else None
+        if t.get('angle') is None:
+            return p_now
         shifts = []
         for q in t['rings']:
             e = q + t['jf'] * dF                                 # 按原来的 jf 估计它现在在哪
@@ -1977,10 +2025,10 @@ class MissionHooks:
             if float(dist[j]) < 0.3 * t['sp_px']:
                 shifts.append(pts1[j] - q)
         if not shifts:
-            return
+            return p_now
         jd = np.mean(shifts, axis=0) / dF
         if float(np.hypot(*jd)) < 0.2:
-            return
+            return p_now
         jf = jd / float(np.hypot(*jd)) * float(np.hypot(*t['jf']))   # 只要方向(走的距离不一定准)，大小按原来的
         axis, nrm = t['axis'], t['nrm']
         jdd = jf if float(jf @ axis) > 0 else -jf
@@ -2004,13 +2052,35 @@ class MissionHooks:
             st.put('RING', 'ch', J)
             st.set_extra('RING', 'ch_f_ref', [round(float(jf[0]), 5), round(float(jf[1]), 5)])
             st.save()
+        return p_now
+
+    def _arm_to(self, p):
+        """圆环在画面里离爪子点 p 像素(手臂在观察姿态)：手臂 ID2、ID1 各要转多少度才对上(用存着的手臂 J)。没有 J 返回 None。"""
+        import numpy as np
+        Ja = self.store.get('RING', 'arm') if self.store is not None else None
+        if Ja is None:
+            return None
+        try:
+            du = -np.linalg.solve(np.asarray(Ja, float), np.asarray(p, float))
+        except np.linalg.LinAlgError:
+            return None
+        lim1 = 0.9 * float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id1', 12.0))
+        return float(du[0]), max(-lim1, min(lim1, float(du[1])))
 
     def _survey_line(self):
         """看三个环时量的(能提前补手臂伸缩才有)：self._tilt；不能补返回 None。"""
+        import numpy as np
         t = self._tilt
-        if not t or t.get('g') is None or not self.cfg.get('tilt_precorrect', True):
+        if not t or not self.cfg.get('tilt_precorrect', True):
             return None
-        return t
+        if t.get('g') is None and self.store is not None:
+            Ja = self.store.get('RING', 'arm')               # 看圆环时还没有手臂的 J(第一次在这里)，对准过一次就有了
+            if Ja is not None:
+                try:
+                    t['g'] = -np.linalg.solve(np.asarray(Ja, float), t['nrm'])
+                except np.linalg.LinAlgError:
+                    t['g'] = None
+        return t if t.get('g') is not None else None
 
     def _predict_d1(self, d2):
         """ID2 提前伸缩 d2 度时，ID1 跟着补多少度：车身斜了，伸缩的方向不正好垂直于圆环那一排，ID1 补上沿这一排的那一点。
@@ -2053,13 +2123,16 @@ class MissionHooks:
         if cfg.get('zone_gain'):
             kw['gain_arm'] = float(cfg['zone_gain'])
         kw['filt'] = bool(cfg.get('zone_filter', True))
-        env = self._a2_env()
-        a2 = (getattr(self.arm, 'angle', None) or {}).get(2) if self.arm is not None else None
-        if a2 is None:
-            a2 = self._a2_hint
-        if env is not None and a2 is not None:
-            # 手臂伸缩可能已经提前伸过(ring_precorrect)：按机构的行程算这次还能往哪边伸缩多少，够不着的才让车轮横移
-            kw['arm_range'] = {'id2': (env[0] - float(a2), env[1] - float(a2))}
+        # 手臂可能已经提前转过(ring_precorrect/tilt_precorrect)：按机构的行程(观察姿态 ± arm_limit_deg)算这次还能往哪边转多少，
+        # 伸缩够不着的才让车轮横移
+        ang = (getattr(self.arm, 'angle', None) or {}) if self.arm is not None else {}
+        rng = {}
+        for key, env, cur in (('id2', self._a2_env(), ang.get(2) if ang.get(2) is not None else self._a2_hint),
+                              ('id1', self._a1_env(), ang.get(1) if ang.get(1) is not None else self._a1_hint)):
+            if env is not None and cur is not None:
+                rng[key] = (env[0] - float(cur), env[1] - float(cur))
+        if rng:
+            kw['arm_range'] = rng
         kw['wheels_first'] = bool(cfg.get('wheels_first', False))
         if self.servo is not None and kw['wheels_first']:
             for k in ('wheels_step_mm', 'wheels_min_mm', 'wheels_rpm'):
@@ -2076,6 +2149,14 @@ class MissionHooks:
         lim = float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id2', 250.0))
         a2p = float(P['A2P'])
         return max(A2_MIN, a2p - lim), min(A2_MAX, a2p + lim)
+
+    def _a1_env(self):
+        """ID1 在工位里能到的范围(绝对角度)：观察角度 A1P ± arm_limit_deg.id1。不知道 A1P 返回 None。"""
+        P = (self.arm.params() or {}) if self.arm is not None else {}
+        if 'A1P' not in P:
+            return None
+        lim = float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id1', 12.0))
+        return float(P['A1P']) - lim, float(P['A1P']) + lim
 
     def _drop(self, stack):
         """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。"""
@@ -2310,28 +2391,36 @@ class MissionHooks:
         P = self.arm.params() or {}
         pre = self.cfg.get('ring_precorrect', True)
         at_obs, self._at_obs = self._at_obs, False
+        p_now = None
         if at_obs and pre and self._ring_ready:
-            self._relook()                                       # 底盘挪了 100mm 以上：再看一眼，把车身斜度量准
+            p_now = self._relook()                               # 底盘挪了 100mm 以上：再看一眼，把车身斜度量准(顺便看到这个环在哪)
         d2 = self._predict_d2() if pre else None
+        d1 = None
+        full = self._arm_to(p_now) if (p_now is not None and 'A1P' in P and 'A2P' in P) else None
+        if full is not None:
+            d2, d1 = full                                        # 刚看到这个环在哪：ID2、ID1 一起转过去(相当于对准的第一步)
         if d2 is None and self._ring_ready and at_obs:
             return                                               # 刚看完三个环：手臂还在观察姿态(底盘挪过不影响)，不用再 OBS 一遍
         if d2 is None or not self._ring_ready or not all(k in P for k in ('A1P', 'A2P', 'ZHI', 'ZOBRNG')):
             self.arm.obs('RING', open_claw=True)
             self._a2_hint = P.get('A2P')
+            self._a1_hint = P.get('A1P')
             self._ring_ready = True
             return
-        d1 = self._predict_d1(d2)
+        if d1 is None:
+            d1 = self._predict_d1(d2)
         env = self._a2_env() or (A2_MIN, A2_MAX)
         a2 = min(env[1], max(env[0], float(P['A2P']) + d2))    # 伸缩的行程(A2P ± arm_limit_deg.id2，STM32 里 A2 的范围)
         d2 = a2 - float(P['A2P'])
         a1 = float(P['A1P']) + d1
         if at_obs:
             # 手臂还在观察姿态和高度(刚看完三个环)：直接转过去，不用升降
-            if abs(d2) < 2.0 and d1 == 0.0:
+            if abs(d2) < 2.0 and abs(d1) < 0.35:
                 return
             t = self._tilt or {}
-            self.log(f'    按看圆环时量的远近' + (f'(车身斜 {t["angle"]:+.1f}°)' if t.get('angle') is not None else '') +
-                     f'，手臂先伸缩到 ID2 {d2:+.0f}°' + (f'、ID1 {d1:+.1f}°' if d1 else '') + '再测')
+            why = '按刚看到的位置' if full is not None else '按看圆环时量的远近'
+            self.log(f'    {why}' + (f'(车身斜 {t["angle"]:+.1f}°)' if t.get('angle') is not None else '') +
+                     f'，手臂先转过去：ID2 {d2:+.0f}°' + (f'、ID1 {d1:+.1f}°' if abs(d1) >= 0.05 else '') + '，再测')
             self.arm.ap(a1, a2)
             return
         if abs(d2) >= 3.0:

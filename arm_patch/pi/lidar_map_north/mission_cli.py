@@ -17,14 +17,18 @@ vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小�
 vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
                              只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
 vdbg [RING | RAW <颜色号>]  存一张带标注的画面到 vdebug.png：爪子位置(绿十字)、识别到的圆环/物料
-mtest QR                   单独测读码并显示
+mtest QR                   单独测读码并显示：先清掉 STM32 里存的旧码，车放在 QR 停车点(车头方向以现在的为准)，
+                             读不到就沿车道前后挪着找(和比赛一样)，最后挪回原处
 mtest RAW <批次>           单独测原料盘抓取(批次 1 或 2；需要先 qr 或 mcode)
 mtest ROUGH <批次>         单独测粗加工区放置+取回(转盘里要有这批物料，没有就加 force 假定有：mtest ROUGH 1 force)
 mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这批物料；没跑过 mtest RAW 就加 force：mtest TEMP 1 force)
                              ROUGH/TEMP 后面还可以加：nogo = 只认圆环、对准，不取不放(先看对得准不准)；
                              rev = 这次圆环前后方向反过来(1 号、3 号环跑反了时用)。车是手放到工位上的，位移从 0 算
-mtest START                单独测回家后的显示
+                             wheels = 这次对准先动车轮(沿圆环那一排小步慢慢挪，差不多了再动手臂；默认是先动手臂)
+                             nofilt = 这次对准不用测量滤波(默认用)。两个都只管这一次，用来上车对比哪种快、准
+mtest START                单独测回家后的显示(会收臂、升降停 60)
 mtest reset                清空任务码和记录，重新开始
+park                       收臂、升降停到 60mm(下次开机编码器才认得准)；急停以后要自己输入这个
 vwatch RING | RAW <颜色号>  一直识别(圆环/物料)，画面给 python3 vview.py 实时看；这时照常用 arm LIFT / arm AD 调手臂，
                              边调边看(调 ZOBRNG、ZOBRAW、A1P 这些用)。vwatch off 停。rtest/gtest 这些命令运行时会自动让开
 rtest [arm]                圆环识别+对准测试(暂存区/粗加工区)：OBS RING 摆到圆环上方 → 摄像头找圆环 → 手臂(够不着时底盘)对准，
@@ -144,6 +148,7 @@ def release():
 # ---------------------------------------------------------------- vwatch：一边手动调手臂，一边实时看识别
 _W = {'thread': None, 'stop': None, 'what': None, 'resume': None}
 VISION_CMDS = ('vclaw', 'vcal', 'vdbg', 'gtest', 'rtest', 'mtest', 'vmask')    # 这些命令自己要用摄像头识别
+MTEST_OPTS = ('force', 'nogo', 'rev', 'any', 'wheels', 'nofilt')                 # mtest 后面能加的选项
 
 
 def _watch_stop(join=True):
@@ -305,6 +310,16 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             for line in info:
                 log('  ' + line)
             log(f'{text} -> {reply}')
+            if ok and text.startswith('CLAW O'):
+                h.maybe_holding = None                  # 用户自己张开过爪子：不再当成夹着东西
+                h.holding = None
+        return _run_async(state, log, go)
+
+    if k == 'park':
+        def go():
+            h.log = log
+            if h.park(link=link, force=True):
+                log('park 完成：可以关电了(升降在 60mm，下次开机编码器能认准高度)')
         return _run_async(state, log, go)
 
     if k == 'qr':
@@ -392,7 +407,8 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'mtest':
         if len(parts) < 2:
-            raise ValueError('格式：mtest QR / mtest RAW 1 [force] [any] / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
+            raise ValueError('格式：mtest QR / mtest RAW 1 [force] [any] / mtest ROUGH 1 [force] [nogo] [rev] [wheels] [nofilt] / '
+                             'mtest TEMP 1 [force] [nogo] [rev] [wheels] [nofilt] / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
             release()                                   # 关掉摄像头(后台线程)再丢掉记录，不然摄像头一直被占着
@@ -403,15 +419,33 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         batch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         opts = {p.lower() for p in parts[2:]}
         force, nogo, rev, anyo = 'force' in opts, 'nogo' in opts, 'rev' in opts, 'any' in opts
-        bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in ('force', 'nogo', 'rev', 'any')]
+        wheels, nofilt = 'wheels' in opts, 'nofilt' in opts
+        bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in MTEST_OPTS]
         if bad:
-            raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev、any(原料区不按顺序抓)')
+            raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev、any(原料区不按顺序抓)、'
+                             'wheels(这次先动车轮)、nofilt(这次不用测量滤波)')
 
         def go():
             h._ensure(link)
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
-            h.t0 = h.now()                              # 每次 mtest 重新计时(不然前面摆物料、搬车花的时间算进 time_limit_s，一开始就"时间到")
+            h._aborted = False
+            if what in ('RAW', 'ROUGH', 'TEMP'):
+                h.maybe_holding = h.holding = None       # 一开始就会张开爪子(OBS … O)：不再当成夹着东西
+            if hasattr(h, 'start_clock'):
+                h.start_clock()                         # 每次 mtest 重新计时(不然前面摆物料、搬车花的时间算进 time_limit_s，一开始就"时间到")
+            else:
+                h.t0 = h.now()
+            if what == 'QR':
+                if h.act is not None:
+                    h.act.reset_disp()                  # 车是手放到 QR 停车点的：底盘位移从 0 算(找码挪完按它挪回来)
+                if h.cfg.get('mtest_hold_heading', True) and hasattr(h, 'hold_heading'):
+                    h.hold_heading()                    # 找码时前后挪：保持现在的车头方向
+                try:
+                    h.arm.qr_clear()
+                    log('  先清掉 STM32 里存的旧任务码(QR CLR)，这次读到的一定是现在扫到的')
+                except Exception as ex:
+                    log(f'  (清旧码出错：{ex!r})')
             if what == 'RAW':
                 if h.plan is None:
                     raise ValueError('还没有任务码：先 qr 或者 mcode 143+213+413+321')
@@ -444,10 +478,26 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                         h.on_ring[('TEMP', it.ring)] = [it]
                     log('  (force：假定暂存区已经平放了第一批：' + '  '.join(f'环{it.ring}={it.color_name}' for it in h.plan.items(1)) + ')')
             h.raw_any_once = anyo and what == 'RAW'
+            saved = {k_: h.cfg.get(k_) for k_ in ('wheels_first', 'zone_filter')}
+            if wheels or nofilt:
+                if what not in ('ROUGH', 'TEMP'):
+                    log('  (wheels / nofilt 只管粗加工区、暂存区的对准)')
+                if wheels:
+                    h.cfg['wheels_first'] = True
+                    log(f'  wheels：这次对准先动车轮(沿圆环那一排每次最多 {float(h.cfg.get("wheels_step_mm") or 15):g}mm、'
+                        f'{h.cfg.get("wheels_rpm")} 转/分，差不到 {float(h.cfg.get("wheels_min_mm") or 4):g}mm 再动手臂)')
+                if nofilt:
+                    h.cfg['zone_filter'] = False
+                    log('  nofilt：这次对准不用测量滤波(每次都按这一次测的修)')
+            t_go = h.now()
             try:
                 h.run_role(what, batch)
             finally:
                 h.nogo, h.ring_rev, h.raw_any_once = False, False, False
+                h.cfg.update(saved)
+            if wheels or nofilt or what in ('ROUGH', 'TEMP'):
+                how = '、'.join(n for n, on in (('先动车轮', wheels), ('不滤波', nofilt)) if on) or '默认(先动手臂、滤波)'
+                log(f'  这次用时 {h.now() - t_go:.1f} 秒({how})')
             log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
             if what in ('ROUGH', 'TEMP'):
                 tray = '  '.join(f'{s}号槽={it.color_name}' for s, it in sorted(h.in_tray.items())) or '空'
@@ -465,7 +515,7 @@ def _rings_text(plan, it):
     if it.batch == 1:
         return f'粗加工区、暂存区都去环{it.ring}'
     sr = plan.stack_ring(it)
-    return f'粗加工区去环{it.ring}，暂存区' + (f'码垛到环{sr}' if sr is not None else '没有同色的第一批物料可叠，平放在空着的环')
+    return f'粗加工区去环{it.ring}，暂存区' + (f'码垛到环{sr}' if sr is not None else '没有同色的第一批物料可叠：不放(规则只许码垛在同色上)')
 
 
 def _clear_zone_records(h, zone, batch, log):
@@ -491,7 +541,7 @@ def _tools(h, link):
         if getattr(h, 'store', None) is None:
             h.store = JacStore(h.cfg.get('servo_cal_file'))
         h.act = ArmActuators(h.arm, link, h.cfg['chassis_fine_rpm'], log=h.log)
-        h.servo = VisualServo(h.act, h.store, cfg=h.cfg['servo'], log=h.log, sleep=h.sleep)
+        h.servo = VisualServo(h.act, h.store, cfg=h.cfg['servo'], log=h.log, sleep=h.sleep, clock=h.now)
         if hasattr(h, 'sync_params'):
             h.sync_params()
 
@@ -523,6 +573,7 @@ def _gtest(h, link, color, nogo, log):
             log('nogo：只对准，没夹。看看爪子是不是在物料正上方。')
         else:
             log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+            h.maybe_holding = 'gtest 夹起来的物料可能还在爪子里'   # park 不降(会压到车上转盘里)，arm CLAW O 以后清掉
         return
     log(f'② 摄像头找{name}色物料……')
     still, last = h.vision.wait_still(color, timeout_s=h.cfg['raw_wait_s'])
@@ -554,6 +605,7 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
     log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+    h.maybe_holding = 'gtest 夹起来的物料可能还在爪子里'
 
 
 def _raw_preflight(h, batch, force, log):
@@ -598,7 +650,7 @@ def _zone_preflight(h, zone, batch, force, log):
     for it in items:
         ring = h.plan.stack_ring(it) if stack else it.ring
         if stack and ring is None:
-            log(f'   {it.slot}号槽 {it.color_name} -> 第一批里没有{it.color_name}可叠：平放在空着的环')
+            log(f'   {it.slot}号槽 {it.color_name} -> 第一批里没有{it.color_name}可叠：不放(规则只许码垛在同色上，平放 0 分)')
             continue
         what = (f'码垛到环{ring}(叠在第一批的{h.plan.lower_item(it).color_name}上)' if stack else f'环{ring}')
         if survey:
@@ -883,6 +935,8 @@ def _vcal(h, kind, color, chassis, log):
             Jc = h.servo._probe(measure, 'ch')
             h.store.put(kind, 'ch', Jc)
             h.store.set_synth(kind, False)              # 横移、前进都实测过了
+            if kind == 'RING' and hasattr(h.store, 'set_extra'):
+                h.store.set_extra('RING', 'ch_f_ref', None)   # 换环时量准的前进方向作废(摄像头可能动过)，以后再量
             ps = np.linalg.norm(Jc, axis=0)
             log(f'  底盘：横移 1mm 画面移动 {ps[0]:.3f} 像素；前进 1mm 画面移动 {ps[1]:.3f} 像素')
             meas = float(ps.mean())
