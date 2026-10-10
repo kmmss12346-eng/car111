@@ -1,7 +1,17 @@
-/* chassis.c  v12a (2026-10-05)
+/* chassis.c  v13 (2026-10-10)
+ *  - v13 让底盘更平稳、最后停得更准(树莓派那边 F/S/R 的格式和 DONE/ERR 回复都没变)：
+ *    1. 转弯(包括 F/S 走完后自动补的小转弯)：快到目标时按"还差多少度"连续地减速，不再在 0 和 ±4 转/分之间来回切；
+ *       刹车不超过驱动器自己的加减速斜坡；"还没转出来的角度"按驱动器斜坡估计；要反向时先停稳一下再往回。
+ *       新参数 TCSTOP / TCTOL / TCMIN(见 tun 表)。
+ *    2. 横移：前馈从"加速/匀速"切到"减速"时不再一下跳几转/分(前馈限制变化速度，参数 SSFFR)；
+ *       航向环照直行 v12a 的做法改：低通滤波、连续死区、纠偏量限制变化速度、轮速没变不重发(参数 SSLPF / SSRL)。
+ *    3. 精确模式：F/S 的速度 ≤ PSPD(默认 60 转/分，树莓派对准/回家的小步修正就用 60)时，加减速更柔(PACC)、
+ *       最后低速爬到位(PMIN)、停稳多等一会(PSET)、车头偏差超过 PALTOL(0.5°)就转回去(平时是 ALTOL 1.5°)。PSPD=0 关掉。
+ *    4. R 支持 1 位小数(Car_Parse_Move，main.c 里用)。
  *  - v12a 只改了闭环直行的纠偏：车头误差先低通滤波、死区改成连续的、纠偏量限制变化速度、轮速没变就不重复发指令。
- *    目的是让匀速直行时轮速不再跟着陀螺仪噪声一直小幅跳动，减轻车身抖动。横移、转弯、其它参数全部没动。
- *    新参数 SCLPF(滤波时间，秒，0=不滤波) 和 SCRL(纠偏量每秒最多变多少 转/分，0=不限制)，都设成 0，纠偏算法就和 v12 一样。
+ *    目的是让匀速直行时轮速不再跟着陀螺仪噪声一直小幅跳动，减轻车身抖动。
+ *    参数 SCLPF(滤波时间，秒，0=不滤波) 默认 0.08，SCRL(纠偏量每秒最多变多少 转/分，0=不限制) 默认 30，都是开着的；
+ *    两个都 SET 成 0，纠偏算法就和 v12 一样。
  *  - 直行、横移、转弯用同一套"加速→匀速→按剩余距离减速 + 陀螺仪闭环"的方法，路线里的 F / S / R 都走这里
  *  - 转弯绕车中心(转的同时叠加平移)，并且按"累计的目标航向"转，不会越转越歪
  *  - 横移的车头补偿(前馈)带自适应：加速度/速度改了之后，几次横移内自己把补偿量调准
@@ -121,17 +131,41 @@ static float g_ss_rt    = 1.0f;     /* 横移中实时修正前馈增益的速�
 static float g_ss_ca[2] = { -0.0134f, 0.0128f };      /* [左,右] */
 static float g_ss_cd[2] = { -0.0060f, 0.0041f };
 static float g_drift[2] = { -0.037f, -0.033f };       /* 横移时往前(+)/后(-)漂：每横移 1mm 漂多少 mm [左,右] */
+/* v13：横移航向环照直行 v12a 的做法。SSLPF 取 0.04 秒(直行的一半：横移时车自己转得多，滤波太慢车头会多偏，
+ * 模拟里 0.08 秒停下时车头多偏约 0.3°；0.04 秒多偏约 0.1°，陀螺仪噪声引起的轮速来回变化少 15% 左右)；
+ * SSRL 取 50 转/分/秒(每个控制周期最多变约 1.7 转/分，前馈没标好时 0.2 秒内也能加到 10 转/分的纠偏)。
+ * 两个都 SET 成 0，就和 v12a 的横移一样(硬死区、不滤波、不限速)。 */
+static float g_ss_lpf  = 0.04f;     /* 横移时车头误差的低通滤波时间常数(秒)，0=不滤波 */
+static float g_ss_rate = 50.0f;     /* 横移纠偏量(含前馈)每秒最多变化多少 转/分，0=不限制 */
+/* v13：前馈从 CA 切到 CD(开始减速)时，CA 比 CD 大 2~3 倍，前馈会一下少 4~6 转/分(一个周期左右轮差跳 4~6 转/分)，车头被拽一下。
+ * 现在前馈每秒最多变 SSFFR 转/分(40：一个周期最多变约 1.3 转/分，4~6 转/分的落差 0.1~0.15 秒变完)。
+ * 加速时前馈涨得慢(约 15 转/分/秒)，不受影响。代价：减速开始那 0.1 秒前馈慢一点，模拟里车头最多多偏不到 0.1°。0=不限制。 */
+static float g_ss_ffr  = 40.0f;
 
 static float g_tc_vmax = 80.0f;     /* 转弯最高速(转/分) */
 static float g_tc_acc  = 400.0f;    /* 转弯起步加速 */
 static float g_tc_dec  = 250.0f;    /* 转弯刹车减速 */
 static float g_tc_kp   = 3.0f;
 static float g_tc_lag  = 0.16f;     /* 车身对轮速指令的延迟(秒) */
+/* v13：转弯末段。预测误差(把已经发出去还没转出来的算进去)≤ TCSTOP 就给 0 转速停着等；停着以后误差 ≤ TCTOL 连续 3 次算到位，
+ * 超过 TCTOL 才再动(中间留一段，不会停了又动、动了又停)。离目标近时转速 = TCKP×还差的度数，越近越慢，最低 TCMIN。
+ * 以前是 0.6° / 0.8° / 4 转/分 固定的：最后半秒在 0 和 ±8 转/分(后轮)之间来回切好几次。 */
+static float g_tc_stop = 0.15f;     /* 预测误差小于它就不再给转速(度) */
+static float g_tc_tol  = 0.5f;      /* 停下以后误差在这以内算到位(度) */
+static float g_tc_min  = 1.0f;      /* 还没到 TCSTOP 时最低给多少转速(转/分，车身) */
 static float g_pv_back = 103.0f;    /* 转轴在车中心后多少 mm */
 static float g_pv_left = 0.0f;      /* 转轴在车中心左边多少 mm */
 static float g_settle  = 60.0f;     /* 闭环动作走完后等车停稳(毫秒) */
 static float g_altol   = 1.5f;      /* 闭环动作走完后车头偏差超过这么多度，就绕车中心转回去(转一次约 1.2 秒；小于它的偏差留给下一条指令的纠偏) */
 static float g_dbg     = 0.0f;      /* 1=横移时每 0.1 秒发一行 SC 数据 */
+/* v13：精确模式。F/S 带的速度 ≤ PSPD 时用(树莓派对准停车点、回家的小步修正都发 60 转/分)：
+ * 加减速 PACC(比平时柔)、最后低速 PMIN 爬到位、走完多等 PSET 毫秒再量车头、车头偏差超过 PALTOL 就转回去。PSPD=0 关掉。
+ * 树莓派看 GET 里有没有 PSPD，就知道 STM32 是不是这一版。 */
+static float g_p_spd   = 60.0f;     /* 速度 ≤ 它(转/分)的 F/S 用精确模式，0=不用 */
+static float g_p_acc   = 120.0f;    /* 精确模式的加减速(转/分/秒)；比平时的 SCACC/SSACC 大时按平时的 */
+static float g_p_min   = 3.0f;      /* 精确模式最后爬行的速度(转/分)，平时是 6 */
+static float g_p_set   = 120.0f;    /* 精确模式走完后等车停稳(毫秒)，平时是 SETTLE */
+static float g_p_altol = 0.5f;      /* 精确模式走完后车头偏差超过这么多度就转回去，平时是 ALTOL */
 
 typedef struct
 {
@@ -169,16 +203,27 @@ static const Tun tun[] =
     { "SSCDR",  &g_ss_cd[1],   -0.2f,   0.2f },
     { "DRL",    &g_drift[0],   -0.2f,   0.2f },
     { "DRR",    &g_drift[1],   -0.2f,   0.2f },
+    { "SSLPF",  &g_ss_lpf,      0.0f,   0.5f },
+    { "SSRL",   &g_ss_rate,     0.0f,   500.0f },
+    { "SSFFR",  &g_ss_ffr,      0.0f,   1000.0f },
     { "TCV",    &g_tc_vmax,     10.0f,  200.0f },
     { "TCA",    &g_tc_acc,      50.0f,  1500.0f },
     { "TCD",    &g_tc_dec,      50.0f,  1500.0f },
     { "TCKP",   &g_tc_kp,       0.5f,   10.0f },
     { "TCLAG",  &g_tc_lag,      0.0f,   0.5f },
+    { "TCSTOP", &g_tc_stop,     0.05f,  3.0f },
+    { "TCTOL",  &g_tc_tol,      0.1f,   5.0f },
+    { "TCMIN",  &g_tc_min,      0.0f,   20.0f },
     { "PVB",    &g_pv_back,    -300.0f, 300.0f },
     { "PVL",    &g_pv_left,    -300.0f, 300.0f },
     { "SETTLE", &g_settle,      0.0f,   1000.0f },
     { "ALTOL",  &g_altol,       0.3f,   10.0f },
     { "DBG",    &g_dbg,         0.0f,   1.0f },
+    { "PSPD",   &g_p_spd,       0.0f,   300.0f },
+    { "PACC",   &g_p_acc,       30.0f,  600.0f },
+    { "PMIN",   &g_p_min,       1.0f,   20.0f },
+    { "PSET",   &g_p_set,       0.0f,   1000.0f },
+    { "PALTOL", &g_p_altol,     0.2f,   10.0f },
 };
 #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
 
@@ -280,6 +325,7 @@ uint8_t move_acc = 200;           /* 旧的位置模式动作、转弯后备方�
 /* ===== 闭环直行 / 横移 ===== */
 #define SC_PERIOD_MS     20       /* 控制周期(毫秒) */
 #define SC_MIN_RPM       6.0f     /* 快到终点时的最低爬行速度 */
+#define P_CREEP_MM       1.0f     /* v13 精确模式：最后这么多 mm 用 PMIN 慢慢爬(刹车曲线提前这么多降到 PMIN) */
 #define SC_DEADBAND      0.2f     /* 偏差小于这么多度就不纠(陀螺仪噪声约 0.35°) */
 #define SC_DEADBAND_F    0.05f    /* v12a：滤波以后的死区(滤波后噪声只剩约 0.05°) */
 #define SC_CORR_MAX      0.25f    /* 直行纠偏量最多占当前速度的比例 */
@@ -295,16 +341,18 @@ uint8_t move_acc = 200;           /* 旧的位置模式动作、转弯后备方�
 
 /* ===== 闭环转弯 ===== */
 #define TURN_CLOSED      1
-#define TC_MIN_RPM       4.0f
-#define TC_TOL_DEG       0.8f
 #define TC_TIMEOUT_MS    5000
-#define TC_STOP_DEG      0.6f
-#define TC_HIST          16
+/* v13：驱动器自己的加减速斜坡：Emm 加速度档位 acc 时，每变 1 转/分要 (256-acc)×50 微秒，acc=200 时约 357 转/分/秒 */
+#define TC_DRV_RAMP      (1000000.0f / ((256.0f - (float)SC_EMM_ACC) * 50.0f))
+#define TC_BRAKE_USE     0.85f    /* 刹车最多用驱动器斜坡的这么多(留一点余量，模型不准也停得住) */
+#define TC_REV_HOLD_MS   100u     /* 要反向时先给 0 转速停这么久，再往回转 */
 #define TC_COMP_ON       1        /* 1=Car_TurnBy_Center 叠加平移让车中心不动 */
 #define TC_PPM_LAT       13.67f
 #define TURN_REF_TOL_DEG 6.0f     /* 车头和记录的目标航向差超过这个角度，就按现在实际的车头算 */
 #define TC_STALL_CMD_DEG  90.0f   /* 卡住检测：发出去的转速累计够车转这么多度…… */
 #define TC_STALL_MOVE_DEG 3.0f    /* ……陀螺仪却没转出这么多度，就判定轮子没转起来(没电/驱动器保护/卡住)，停车回 ERR STALL */
+#define TC_STALL_PRED_DEG 45.0f   /* v13：按模型车身早该转了这么多度…… */
+#define TC_STALL_RATIO    0.2f    /* ……实际连它的这么多都没转到，也算轮子没转起来(只转一点：打滑/没劲) */
 
 static void Wheels_Vel(const float s[4]);
 
@@ -550,52 +598,51 @@ static uint8_t turn_comp = 0;        /* 1=这次转弯要叠加平移 */
 
 #define TC_LAG_S        g_tc_lag
 
-/* 已经发出去、但因为延迟还没转出来的那部分角度(度)。
- * ht[i]、hw[i]：第 i 次发的转速指令(时间 ms、转/分)，i=n-1 是最新的；每条指令一直有效到下一条发出(最新的有效到 now)。 */
-static float Turn_Inflight(const uint32_t *ht, const float *hw, uint8_t n, uint32_t now, float k)
-{
-    float sum = 0.0f;
-    float win = (float)now - TC_LAG_S * 1000.0f;
-    int i;
-
-    for (i = (int)n - 1; i >= 0; i--)
-    {
-        float a = (float)ht[i];
-        float b = (i == (int)n - 1) ? (float)now : (float)ht[i + 1];
-
-        if (b <= win)
-        {
-            break;
-        }
-        if (a < win)
-        {
-            a = win;
-        }
-        sum += hw[i] * (b - a) / 1000.0f;
-    }
-    return sum * k;
-}
-
+/* v13 转弯：
+ *  - 远处：按刹车曲线 sqrt(2×刹车减速度×还差的角度) 减速；刹车减速度 = min(TCD, 驱动器斜坡×0.85)。
+ *    驱动器斜坡按最快的那个轮子算(叠加平移时后轮约是车身转速的 2 倍，所以车身转速每秒最多变约 180 转/分)，
+ *    以前 TCKP 那一项要的减速度到 500~1000 转/分/秒，驱动器跟不上，实际转得比预测的多，冲过头再往回。
+ *  - 近处：转速 = TCKP×还差的度数，连续地越来越慢；预测误差 ≤ TCSTOP 才给 0。
+ *  - "已经转出去、陀螺仪还没看到的角度"：轮子实际转速按驱动器斜坡估计(加减速时和指令差很多)，
+ *    车身转速按一阶延迟(时间常数 TCLAG)跟着轮子，还没转出来的 = TCLAG×车身转速。
+ *    以前按"纯延迟 TCLAG、用发出去的指令"算：猛刹车时车身比轮子慢得多，算少了，冲过头再往回。
+ *  - 预测冲过头了：先给 0，停够 TC_REV_HOLD_MS 再往回，不在两个方向之间来回抽。 */
 static void Car_Turn_Closed(float target)
 {
-    float v = 0.0f;
+    float v = 0.0f;                                     /* 现在给的车身转速大小(轮子 转/分) */
     float s[4];
     uint32_t last = HAL_GetTick();
     uint32_t t0 = last;
+    uint32_t t_move = last;                             /* 最后一次给非 0 转速的时间(反向前要停够一会) */
     uint8_t inside = 0;
+    uint8_t parked = 0;                                 /* 1 = 预测已经到位，给 0 转速停着等车身转完 */
     int last_dir = 0;                                   /* 上一次往哪边转：1 逆时针，-1 顺时针 */
     float k = PULSES_PER_REV / 60.0f / PULSE_PER_DEG;   /* 轮子 1 转/分 ≈ 车身转多少 度/秒 */
-    uint32_t ht[TC_HIST];
-    float hw[TC_HIST];
-    uint8_t hn = 0;
     float yaw_ref = HWT101_GetYaw();                    /* 卡住检测：上一次"车头真的转了"时的读数 */
     float cmd_deg = 0.0f;                               /* 卡住检测：从那以后发出去的转速累计应该转多少度 */
+    float pred_deg = 0.0f;                              /* 卡住检测：从那以后按模型车身应该转了多少度 */
     float w_last = 0.0f;                                /* 上个周期发出去的车身转速(轮子 转/分) */
+    float w_mot = 0.0f;                                 /* 按驱动器斜坡估计的轮子实际转速(车身转速，转/分，带符号) */
+    float w_body = 0.0f;                                /* 按一阶延迟估计的车身实际转速(转/分，带符号) */
+    float fac = 1.0f;                                   /* 最快的那个轮子是车身转速的几倍 */
+    float ramp, acc, dec, tol;
+
+    if (turn_comp)
+    {
+        float cu = k * 0.0174533f * g_pv_back * TC_PPM_LAT * 60.0f / PULSES_PER_REV;
+        float cf = k * 0.0174533f * g_pv_left * PULSE_PER_MM_FORWARD * 60.0f / PULSES_PER_REV;
+
+        fac = 1.0f + Absf(cu) + Absf(cf);
+    }
+    ramp = TC_DRV_RAMP / fac;                           /* 车身转速每秒最多能变多少(转/分) */
+    acc  = g_tc_acc;                                    /* 起步照旧(驱动器自己按斜坡跟上，上面的模型也按斜坡算) */
+    dec  = (g_tc_dec < TC_BRAKE_USE * ramp) ? g_tc_dec : TC_BRAKE_USE * ramp;
+    tol  = (g_tc_tol > g_tc_stop) ? g_tc_tol : g_tc_stop;
 
     while (1)
     {
         uint32_t now;
-        float dt, err, errp, a, want, w, yaw_now;
+        float dt, err, errp, errs, a, want, w, yaw_now;
         int dir;
 
         HAL_Delay(SC_PERIOD_MS);
@@ -608,28 +655,63 @@ static void Car_Turn_Closed(float target)
             break;
         }
 
-        yaw_now = HWT101_GetYaw();
-        cmd_deg += Absf(w_last) * k * dt;
-        if (Absf(HWT101_AngleDiff(yaw_now, yaw_ref)) >= TC_STALL_MOVE_DEG)
         {
-            yaw_ref = yaw_now;                          /* 转起来了：重新开始算 */
-            cmd_deg = 0.0f;
+            /* 刚过去这一段：轮子按驱动器斜坡从 w_mot 往上次的指令 w_last 变；车身转速按一阶延迟跟着轮子的平均转速 */
+            float wm0 = w_mot;
+            float st = ramp * dt;
+
+            if (w_last > w_mot + st)       w_mot += st;
+            else if (w_last < w_mot - st)  w_mot -= st;
+            else                           w_mot = w_last;
+            w_body += (0.5f * (wm0 + w_mot) - w_body) * ((TC_LAG_S > 0.001f) ? (1.0f - expf(-dt / TC_LAG_S)) : 1.0f);
         }
-        else if (cmd_deg >= TC_STALL_CMD_DEG)
+
+        yaw_now = HWT101_GetYaw();
+        cmd_deg  += Absf(w_last) * k * dt;
+        pred_deg += Absf(w_body) * k * dt;
         {
-            car_stalled = 1;                            /* 轮子没转起来：别再空转了 */
-            break;
+            float moved = Absf(HWT101_AngleDiff(yaw_now, yaw_ref));
+
+            if (moved >= TC_STALL_MOVE_DEG && moved >= TC_STALL_RATIO * pred_deg)
+            {
+                yaw_ref  = yaw_now;                     /* 转起来了：重新开始算 */
+                cmd_deg  = 0.0f;
+                pred_deg = 0.0f;
+            }
+            else if ((cmd_deg >= TC_STALL_CMD_DEG && moved < TC_STALL_MOVE_DEG) ||
+                     (pred_deg >= TC_STALL_PRED_DEG && moved < TC_STALL_RATIO * pred_deg))
+            {
+                car_stalled = 1;                        /* 轮子没转起来(或者只转一点)：别再空转了 */
+                break;
+            }
         }
 
         err  = HWT101_AngleDiff(target, yaw_now);
-        errp = err - Turn_Inflight(ht, hw, hn, now, k);   /* 把已经发出去的指令算进去，预测"现在刹车"最后会停在哪 */
-        a    = (errp < 0.0f) ? -errp : errp;
-        dir  = (errp > 0.0f) ? 1 : -1;
+        if (last_dir != 0 && err * (float)last_dir < -90.0f)
+        {
+            err += (float)last_dir * 360.0f;           /* 转 180° 时目标在 ±180 附近，读数一抖就变成"往回转 360°"：按原来的方向算 */
+        }
+        errp = err - TC_LAG_S * w_body * k;            /* 把已经转出去还没看到的算进去 */
+        errs = errp - w_mot * Absf(w_mot) / (2.0f * ramp) * k;   /* 现在给 0 转速：轮子按斜坡停下来以后，最后会停在哪 */
+        a    = (errs < 0.0f) ? -errs : errs;
+        dir  = (errs > 0.0f) ? 1 : -1;
 
-        if (a <= TC_STOP_DEG)
+        if (parked)
+        {
+            if (a > tol)
+            {
+                parked = 0;                             /* 停下以后差得还多：再动 */
+            }
+        }
+        else if (a <= g_tc_stop)
+        {
+            parked = 1;
+        }
+
+        if (parked)
         {
             v = 0.0f;                                   /* 预测已经到位：不再给转速，等车身转完 */
-            if (err <= TC_TOL_DEG && err >= -TC_TOL_DEG)
+            if (err <= tol && err >= -tol)
             {
                 inside++;
                 if (inside >= 3)
@@ -644,26 +726,43 @@ static void Car_Turn_Closed(float target)
         }
         else
         {
+            uint8_t hold = 0;
+
             inside = 0;
             if (last_dir != 0 && dir != last_dir)
             {
-                v = 0.0f;                               /* 预测冲过头了：先停住，再慢慢往回 */
+                v = 0.0f;                               /* 预测冲过头了：先停住…… */
+                if ((now - t_move) < TC_REV_HOLD_MS)
+                {
+                    hold = 1;                           /* ……停够一会再往回 */
+                }
             }
-            /* 远处：按 TCD 均匀刹车；最后几度：差多少度转多快，越近越慢 */
-            want = sqrtf(2.0f * g_tc_dec * a / k);
-            if (want > g_tc_kp * a)  want = g_tc_kp * a;
-            if (want > g_tc_vmax)    want = g_tc_vmax;
-            if (want < TC_MIN_RPM)   want = TC_MIN_RPM;
-            if (v < want)
+            if (!hold)
             {
-                v += g_tc_acc * dt;
-                if (v > want) v = want;
+                /* 刹车曲线：按 dec 刹，刚好停在目标。新的转速要到下一个周期才起作用，所以先减掉这一个周期还要转的 */
+                float ac = Absf(errp) - k * v * dt;
+                float vb;
+
+                if (ac < 0.0f) ac = 0.0f;
+                vb = sqrtf(2.0f * dec * ac / k);
+
+                want = vb;
+                if (want > g_tc_kp * ac) want = g_tc_kp * ac;  /* 最后几度：差多少度转多快，越近越慢 */
+                if (want > g_tc_vmax)    want = g_tc_vmax;
+                if (want < g_tc_min)     want = g_tc_min;
+                if (v < want)
+                {
+                    v += acc * dt;
+                    if (v > want) v = want;
+                }
+                else
+                {
+                    /* 减速不超过 dec(驱动器跟得上)；已经超出刹车曲线了才用满驱动器斜坡 */
+                    v -= ((v > vb) ? ramp : dec) * dt;
+                    if (v < want) v = want;
+                }
+                last_dir = dir;
             }
-            else
-            {
-                v = want;
-            }
-            last_dir = dir;
         }
         if ((now - t0) > TC_TIMEOUT_MS)
         {
@@ -675,19 +774,10 @@ static void Car_Turn_Closed(float target)
         {
             w = 0.0f;
         }
-        if (hn >= TC_HIST)                              /* 记下这次发出去的转速，留给后面算"还没转出来的角度" */
+        else
         {
-            uint8_t q;
-            for (q = 1; q < TC_HIST; q++)
-            {
-                ht[q - 1] = ht[q];
-                hw[q - 1] = hw[q];
-            }
-            hn = TC_HIST - 1;
+            t_move = now;
         }
-        ht[hn] = now;
-        hw[hn] = w;
-        hn++;
         w_last = w;
         {
             float u = 0.0f;                                   /* 要叠加的横移(向左为正)，转/分 */
@@ -913,13 +1003,13 @@ static void Wheels_Vel(const float s[4])
     Emm_V5_Synchronous_motion(0x00);
 }
 
-/* 走完后检查车头：偏了超过 ALIGN_TOL_DEG 就绕车中心转回 yaw_target */
-static void Heading_Fix(float yaw_meas)
+/* 走完后检查车头：偏了超过 tol 度(平时 ALTOL，精确模式 PALTOL)就绕车中心转回 yaw_target */
+static void Heading_Fix(float yaw_meas, float tol)
 {
     float err = HWT101_AngleDiff(yaw_target, yaw_meas);
 
     car_last_err = err;
-    if (!car_abort && (err > g_altol || err < -g_altol))
+    if (!car_abort && (err > tol || err < -tol))
     {
 #if TC_COMP_ON
         turn_comp = 1;
@@ -930,6 +1020,12 @@ static void Heading_Fix(float yaw_meas)
 }
 
 
+/* v13：这条 F/S 用不用精确模式(速度 ≤ PSPD，PSPD=0 不用) */
+static uint8_t Prec_On(uint16_t speed)
+{
+    return (g_p_spd > 0.5f && (float)speed <= g_p_spd + 0.001f) ? 1 : 0;
+}
+
 /* 闭环直行 distance_mm：正数前进，负数后退 */
 void Car_Straight_Closed(uint16_t speed, float distance_mm)
 {
@@ -937,7 +1033,11 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
     uint8_t di   = (distance_mm >= 0.0f) ? 0 : 1;
     float ppm    = (distance_mm >= 0.0f) ? PULSE_PER_MM_FORWARD : PULSE_PER_MM_BACKWARD;
     float target = ((distance_mm >= 0.0f) ? distance_mm : -distance_mm) * ppm;   /* 要走的脉冲数 */
-    float a_pps2 = g_sc_acc * PULSES_PER_REV / 60.0f;
+    uint8_t prec = Prec_On(speed);                                    /* v13：精确模式 */
+    float acc    = (prec && g_p_acc < g_sc_acc) ? g_p_acc : g_sc_acc;
+    float vmin   = prec ? g_p_min : SC_MIN_RPM;
+    float creep  = prec ? P_CREEP_MM * ppm : 0.0f;                    /* 最后慢慢爬的脉冲数 */
+    float a_pps2 = acc * PULSES_PER_REV / 60.0f;
     float vmax   = (float)speed;
     float done   = 0.0f;
     float v      = 0.0f;
@@ -985,20 +1085,20 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
             break;
         }
 
-        /* 速度规划：加速 -> 匀速 -> 按剩余距离减速 */
-        v += g_sc_acc * dt;
+        /* 速度规划：加速 -> 匀速 -> 按剩余距离减速(精确模式最后 creep 脉冲用最低速度爬) */
+        v += acc * dt;
         if (v > vmax)
         {
             v = vmax;
         }
-        vbrake = sqrtf(2.0f * a_pps2 * rem) * 60.0f / PULSES_PER_REV;
+        vbrake = sqrtf(2.0f * a_pps2 * ((rem > creep) ? (rem - creep) : 0.0f)) * 60.0f / PULSES_PER_REV;
         if (v > vbrake)
         {
             v = vbrake;
         }
-        if (v < SC_MIN_RPM)
+        if (v < vmin)
         {
-            v = SC_MIN_RPM;
+            v = vmin;
         }
 
         /* 方向纠偏：err>0 要往逆时针转 -> 右侧轮子快、左侧轮子慢 */
@@ -1074,7 +1174,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
     s[0] = s[1] = s[2] = s[3] = 0.0f;
     Wheels_Vel(s);
     Stop_Quick();
-    HAL_Delay((uint32_t)g_settle);
+    HAL_Delay((uint32_t)(prec ? g_p_set : g_settle));
 
     {
         float ym = Yaw_Median5();
@@ -1088,7 +1188,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
             if (b < -SC_BIAS_MAX) b = -SC_BIAS_MAX;
             g_sc_bias[di] = b;
         }
-        Heading_Fix(ym);
+        Heading_Fix(ym, prec ? g_p_altol : g_altol);
     }
 }
 
@@ -1102,11 +1202,11 @@ static float Vpow(float v)
     return v * sqrtf(v);
 }
 
-/* 往前看 lead 秒：按和正式运行一样的速度规则，预测那时的速度和加速度 */
-static void Strafe_Lookahead(float v, float rem, float vmax, float lead, float *vl, float *al)
+/* 往前看 lead 秒：按和正式运行一样的速度规则(加减速 acc、最低速度 vmin)，预测那时的速度和加速度 */
+static void Strafe_Lookahead(float v, float rem, float vmax, float lead, float acc, float vmin, float *vl, float *al)
 {
     float h = 0.025f;
-    float a_pps2 = g_ss_acc * PULSES_PER_REV / 60.0f;
+    float a_pps2 = acc * PULSES_PER_REV / 60.0f;
     float vv = v;
     float vlast = v;
     float rr = rem;
@@ -1118,7 +1218,7 @@ static void Strafe_Lookahead(float v, float rem, float vmax, float lead, float *
         float vb;
 
         vlast = vv;
-        vv += g_ss_acc * h;
+        vv += acc * h;
         if (vv > vmax)
         {
             vv = vmax;
@@ -1128,9 +1228,9 @@ static void Strafe_Lookahead(float v, float rem, float vmax, float lead, float *
         {
             vv = vb;
         }
-        if (vv < SC_MIN_RPM)
+        if (vv < vmin)
         {
-            vv = SC_MIN_RPM;
+            vv = vmin;
         }
         rr -= vv * PULSES_PER_REV / 60.0f * h;
     }
@@ -1146,7 +1246,11 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
     float ppm    = (distance_mm >= 0.0f) ? g_lppm : g_rppm;
     float drift  = g_drift[di];
     float target = ((distance_mm >= 0.0f) ? distance_mm : -distance_mm) * ppm;
-    float a_pps2 = g_ss_acc * PULSES_PER_REV / 60.0f;
+    uint8_t prec = (!calib && Prec_On(speed)) ? 1 : 0;              /* v13：精确模式(校准时不用) */
+    float acc    = (prec && g_p_acc < g_ss_acc) ? g_p_acc : g_ss_acc;
+    float vmin   = prec ? g_p_min : SC_MIN_RPM;
+    float creep  = prec ? P_CREEP_MM * ppm : 0.0f;                    /* 最后慢慢爬的脉冲数 */
+    float a_pps2 = acc * PULSES_PER_REV / 60.0f;
     float k_turn = PULSES_PER_REV / 60.0f / PULSE_PER_DEG;            /* 左右轮差 1 转/分 → 车身转多少 度/秒 */
     float vmax   = (float)speed;
     float done   = 0.0f;
@@ -1160,6 +1264,11 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
     uint16_t cnt = 0;
     float s[4];
     float err = 0.0f;
+    float err_f;                                                      /* v13：滤波后的车头误差 */
+    float corr_prev = 0.0f;                                           /* v13：上一次的纠偏量(限制变化速度用) */
+    float ffu_prev = 0.0f;                                            /* v13：上一次的前馈(限制变化速度用) */
+    int16_t sent[4] = { 32767, 32767, 32767, 32767 };                 /* v13：上一次发给 4 个电机的速度(取整后) */
+    uint8_t keep = 0;                                                 /* v13：连续几次没重发了 */
     float yg_last;
     uint8_t yg_bad = 0;
     uint32_t last;
@@ -1173,11 +1282,12 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
     last = HAL_GetTick();
     yaw0 = Yaw_Median5();
     yg_last = yaw0;
+    err_f = HWT101_AngleDiff(yaw_target, yaw0);
 
     while (1)
     {
         uint32_t now;
-        float dt, rem, vbrake, corr, lim, fc, acc, yaw_now;
+        float dt, rem, vbrake, corr, lim, fc, vacc, yaw_now;
         float ffu = 0.0f;                                             /* 前馈(不带增益)，转/分 */
         float pi_out = 0.0f;
 
@@ -1198,21 +1308,21 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
             break;
         }
 
-        v += g_ss_acc * dt;
+        v += acc * dt;
         if (v > vmax)
         {
             v = vmax;
         }
-        vbrake = sqrtf(2.0f * a_pps2 * rem) * 60.0f / PULSES_PER_REV;
+        vbrake = sqrtf(2.0f * a_pps2 * ((rem > creep) ? (rem - creep) : 0.0f)) * 60.0f / PULSES_PER_REV;
         if (v > vbrake)
         {
             v = vbrake;
         }
-        if (v < SC_MIN_RPM)
+        if (v < vmin)
         {
-            v = SC_MIN_RPM;
+            v = vmin;
         }
-        acc    = (dt > 0.001f) ? (v - v_prev) / dt : 0.0f;            /* 速度曲线的加速度(转/分/秒)，减速时是负数 */
+        vacc   = (dt > 0.001f) ? (v - v_prev) / dt : 0.0f;            /* 速度曲线的加速度(转/分/秒)，减速时是负数 */
         v_prev = v;
 
         yaw_now = Yaw_Guard(&yg_last, &yg_bad);
@@ -1222,7 +1332,7 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
         {
             double y = (double)HWT101_AngleDiff(yaw_now, yaw0);   /* 车头已经转了多少度 */
 
-            if (acc >= 0.0f)
+            if (vacc >= 0.0f)
             {
                 Za += Vpow(v) * dt;
             }
@@ -1239,11 +1349,24 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
         {
             float e2 = err;
 
-            if (e2 > -SC_DEADBAND && e2 < SC_DEADBAND)
+            if (g_ss_lpf > 0.001f)
             {
-                e2 = 0.0f;
+                /* v13：和直行 v12a 一样：一阶低通滤波，死区连续，积分用滤波后的误差、不留死区 */
+                err_f += (err - err_f) * dt / (g_ss_lpf + dt);
+                e2 = err_f;
+                if (e2 > SC_DEADBAND_F)       e2 -= SC_DEADBAND_F;
+                else if (e2 < -SC_DEADBAND_F) e2 += SC_DEADBAND_F;
+                else                          e2 = 0.0f;
+                integ += g_ss_ki * err_f * dt;
             }
-            integ += g_ss_ki * e2 * dt;
+            else
+            {
+                if (e2 > -SC_DEADBAND && e2 < SC_DEADBAND)
+                {
+                    e2 = 0.0f;                                        /* SSLPF=0：和 v12a 一样 */
+                }
+                integ += g_ss_ki * e2 * dt;
+            }
             if (integ >  SCS_I_MAX) integ =  SCS_I_MAX;
             if (integ < -SCS_I_MAX) integ = -SCS_I_MAX;
 
@@ -1252,11 +1375,19 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
             {
                 float vl, al, ca;
 
-                Strafe_Lookahead(v, rem, vmax, g_ss_lead, &vl, &al);
+                Strafe_Lookahead(v, rem, vmax, g_ss_lead, acc, vmin, &vl, &al);
                 ca = (al >= 0.0f) ? g_ss_ca[di] : g_ss_cd[di];
                 ffu = -ca * Vpow(vl) / k_turn;                         /* 提前顶住车自己要转的那一份 */
                 if (ffu >  SCS_FF_MAX_RPM) ffu =  SCS_FF_MAX_RPM;
                 if (ffu < -SCS_FF_MAX_RPM) ffu = -SCS_FF_MAX_RPM;
+                if (g_ss_ffr > 0.001f)
+                {
+                    /* v13：CA 切到 CD 时前馈不再一下跳几转/分，每秒最多变 SSFFR */
+                    float dmax = g_ss_ffr * dt;
+                    if (ffu > ffu_prev + dmax) ffu = ffu_prev + dmax;
+                    if (ffu < ffu_prev - dmax) ffu = ffu_prev - dmax;
+                }
+                ffu_prev = ffu;
                 corr += g_ss_ffg[di] * ffu;
             }
             lnum += (double)pi_out * ffu * dt;
@@ -1271,9 +1402,17 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
                 g_ss_ffg[di] = g2;
             }
         }
+        if (!calib && g_ss_rate > 0.001f)
+        {
+            /* v13：纠偏量(PI + 前馈)每秒最多变 SSRL 转/分 */
+            float dmax = g_ss_rate * dt;
+            if (corr > corr_prev + dmax) corr = corr_prev + dmax;
+            if (corr < corr_prev - dmax) corr = corr_prev - dmax;
+        }
         lim = SCS_CORR_MAX * v;
         if (corr > lim)  corr = lim;
         if (corr < -lim) corr = -lim;
+        corr_prev = corr;
 
         /* 抵消横移时顺带往前/往后漂 */
         fc = -drift * v * (PULSE_PER_MM_FORWARD / ppm);
@@ -1283,7 +1422,22 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
         s[1] = -sl * v - corr + fc;   /* ID2 左前 */
         s[2] = -sl * v + corr + fc;   /* ID3 右后 */
         s[3] =  sl * v - corr + fc;   /* ID4 左后 */
-        Wheels_Vel(s);
+        {
+            /* v13：和直行一样，4 个轮子取整后的速度都没变就不重复发指令，但最多隔 10 个周期补发一次 */
+            int16_t q[4];
+            uint8_t i, same = 1;
+            for (i = 0; i < 4; i++)
+            {
+                q[i] = (int16_t)((s[i] >= 0.0f) ? (s[i] + 0.5f) : (s[i] - 0.5f));
+                if (q[i] != sent[i]) same = 0;
+            }
+            if (!same || ++keep >= 10)
+            {
+                Wheels_Vel(s);
+                for (i = 0; i < 4; i++) sent[i] = q[i];
+                keep = 0;
+            }
+        }
 
         if (g_dbg > 0.5f && (now - dbg_t) >= SCS_PERIOD_DBG_MS)
         {
@@ -1299,7 +1453,7 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
     s[0] = s[1] = s[2] = s[3] = 0.0f;
     Wheels_Vel(s);
     Stop_Quick();
-    HAL_Delay((uint32_t)g_settle);
+    HAL_Delay((uint32_t)(prec ? g_p_set : g_settle));
 
     if (calib)
     {
@@ -1346,7 +1500,7 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
         }
         if (!calib)
         {
-            Heading_Fix(ym);
+            Heading_Fix(ym, prec ? g_p_altol : g_altol);
         }
     }
 }
@@ -1371,7 +1525,7 @@ void Car_Strafe_Calib(uint16_t speed, float distance_mm)
     {
         float ym = Yaw_Median5();
 
-        Heading_Fix(ym);
+        Heading_Fix(ym, g_altol);
     }
 }
 
@@ -1396,6 +1550,138 @@ void Car_Move_Align(char kind, uint16_t speed, float distance_mm)
     {
         Car_Strafe_Closed(speed, -distance_mm);
     }
+}
+
+
+/* ================= 解析树莓派的 F / S / R 指令(main.c 的 Link_Poll 用) =================
+ * "F <mm> [速度]"、"S <mm> [速度]"：mm 和速度都是整数(和以前一样)，*val = mm
+ * "R <度> [速度]"：v13 起角度可以带小数，按 0.1° 四舍五入，*val = 角度×10(整数，例如 "R -1.4" → -14，"R 0.04" → 0 = HOME)；
+ *                  整数写法和以前完全一样。速度照样检查格式和范围，但转弯不用它。
+ * 返回 1 = 格式对(*kind、*val、*sp 填好，没带速度 *sp=0)；0 = 不是 F/S/R 指令；-1 = 格式不对(回 ERR ARG)。
+ * 数值范围(±2500mm、±180°)不在这里查，main.c 先查陀螺仪再查范围，顺序和以前一样。 */
+static int Parse_Long(const char *p, const char **end, long *out)
+{
+    long v = 0;
+    int neg = 0;
+    const char *q = p;
+
+    while (*q == ' ' || *q == '\t')                      /* 和 strtol 一样：前面的空格跳过 */
+    {
+        q++;
+    }
+    if (*q == '+' || *q == '-')
+    {
+        neg = (*q == '-');
+        q++;
+    }
+    if (*q < '0' || *q > '9')
+    {
+        return 0;
+    }
+    while (*q >= '0' && *q <= '9')
+    {
+        if (v < 100000000L)                               /* 太大的数不会溢出，照样回 ERR RANGE */
+        {
+            v = v * 10 + (*q - '0');
+        }
+        q++;
+    }
+    *out = neg ? -v : v;
+    *end = q;
+    return 1;
+}
+
+/* 带 1 位小数的角度：返回角度×10(第 2 位小数四舍五入)，格式不对返回 0 */
+static int Parse_Tenths(const char *p, const char **end, long *out)
+{
+    long v = 0;
+    int neg = 0;
+    int digits = 0;
+    const char *q = p;
+
+    while (*q == ' ' || *q == '\t')
+    {
+        q++;
+    }
+    if (*q == '+' || *q == '-')
+    {
+        neg = (*q == '-');
+        q++;
+    }
+    while (*q >= '0' && *q <= '9')
+    {
+        if (v < 10000000L)            /* 乘 10 以后也不会溢出 */
+        {
+            v = v * 10 + (*q - '0');
+        }
+        q++;
+        digits++;
+    }
+    v *= 10;
+    if (*q == '.')
+    {
+        q++;
+        if (*q >= '0' && *q <= '9')
+        {
+            v += (*q - '0');                              /* 第 1 位小数 */
+            q++;
+            digits++;
+            if (*q >= '5' && *q <= '9')
+            {
+                v++;                                      /* 第 2 位小数 ≥5：进一 */
+            }
+            while (*q >= '0' && *q <= '9')
+            {
+                q++;
+            }
+        }
+    }
+    if (digits == 0)
+    {
+        return 0;
+    }
+    *out = neg ? -v : v;
+    *end = q;
+    return 1;
+}
+
+int Car_Parse_Move(const char *cmd, char *kind, long *val, long *sp)
+{
+    const char *end;
+    const char *e2;
+    char c = cmd[0];
+    int ok;
+
+    if (!((c == 'F' || c == 'S' || c == 'R') && cmd[1] == ' '))
+    {
+        return 0;
+    }
+    *kind = c;
+    *sp = 0;
+    if (c == 'R')
+    {
+        ok = Parse_Tenths(&cmd[2], &end, val);
+    }
+    else
+    {
+        ok = Parse_Long(&cmd[2], &end, val);
+    }
+    if (!ok)
+    {
+        return -1;
+    }
+    if (*end == ' ')
+    {
+        if (!Parse_Long(end + 1, &e2, sp) || *e2 != 0 || *sp < 5 || *sp > 300)
+        {
+            return -1;
+        }
+    }
+    else if (*end != 0)
+    {
+        return -1;
+    }
+    return 1;
 }
 
 

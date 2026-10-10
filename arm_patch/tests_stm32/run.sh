@@ -1,7 +1,8 @@
 #!/bin/bash
 # 在电脑上编译并运行 STM32 代码的回归测试(不需要 Keil/开发板)。要有 gcc。
 #   test_arm.c     机械臂 arm.c
-#   test_chassis.c 底盘 chassis.c：转弯卡住检测(ERR STALL)、驱动器诊断(MOT? / MOT EN)
+#   test_chassis.c 底盘 chassis.c：转弯卡住检测(ERR STALL)、驱动器诊断(MOT? / MOT EN)、
+#                  v13 的转弯末段/横移前馈/精确模式/急停/R 带小数的解析/新参数(假车带陀螺仪噪声和 x/y 里程)
 #   test_servo.c   main.c 里的舵机：卡住时停在原地(不再顶着发热)、太慢时多等、SV? 状态
 set -e
 cd "$(dirname "$0")"
