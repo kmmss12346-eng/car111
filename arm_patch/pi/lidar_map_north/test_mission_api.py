@@ -145,6 +145,21 @@ class ClockTests(unittest.TestCase):
         self.assertEqual(h2.plan.code, CODE)
         self.assertTrue(h2.go_home_now('RAW', 10.0, 30.0))
 
+    def test_nothing_to_do_in_batch_two_goes_home(self):
+        """第二批的停车点没活可干(转盘里没有第二批的物料)：后面也不会有了，直接回家；第一批的停车点没活可干时照走(后面还有第二批)。"""
+        w = SimWorld(seed=1, code=CODE)
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        h.start_clock()
+        h._use_code(CODE)
+        h.visits = {'QR': 1, 'RAW': 2, 'ROUGH': 1, 'TEMP': 1}
+        h.in_tray = {}
+        self.assertTrue(h.go_home_now('ROUGH', 10.0, 22.0))
+        self.assertIn('第二批没活可干', '\n'.join(lines))
+        h.out_of_time = False
+        h.visits = {'QR': 1, 'RAW': 1, 'ROUGH': 1}
+        self.assertFalse(h.go_home_now('TEMP', 10.0, 25.0))          # 第一批的暂存区没东西放：照走(后面还有第二批)
+
     def test_home_eta_stops_items_in_time_without_raising(self):
         """按回家时间判断：每个物料开始前算"这个物料 + 收臂 + 回家 + 余量"，来不及就不开始，记下 out_of_time，不抛异常。"""
         w = SimWorld(seed=4, code=CODE)
@@ -360,9 +375,10 @@ class QrSearchTests(unittest.TestCase):
         w, h, text = self.run_qr((160.0, 210.0), raw=dict(RAW, stops=stops))
         self.assertEqual(f_moves(w), [], text)
         self.assertIn('黄色区', text)
-        stops = dict(QR_STOPS, QR=[2100, 2160, 90])                  # 往北挪会出场地
-        w, h, text = self.run_qr((160.0, 210.0), raw=dict(RAW, stops=stops))
-        self.assertTrue(all(v < 0 for v in f_moves(w)[:-1]) or not f_moves(w), (f_moves(w), text))
+        stops = dict(QR_STOPS, QR=[2100, 2150, 90])                  # 停车点靠近北边：往北挪会出场地，往南挪可以
+        w, h, text = self.run_qr((1000.0, 1001.0), cfg=dict(qr_targets_mm=[2160.0, 1950.0]), raw=dict(RAW, stops=stops))
+        self.assertIn('出场地', text)
+        self.assertEqual(f_moves(w), [-75, 75], text)                 # 只往南挪了一次，又挪回来
 
     def test_abort_during_search_does_not_move_back(self):
         """找码时急停：抛 Abort，不再挪回停车点(急停以后不动)。"""

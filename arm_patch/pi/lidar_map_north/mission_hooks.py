@@ -380,6 +380,11 @@ class MissionHooks:
         cfg = self.cfg
         el = self.elapsed()
         work = self._work_s(role, first_only=True)
+        if (work <= 0 and role in ('RAW', 'ROUGH', 'TEMP') and self.visits.get(role, 0) >= 1
+                and cfg.get('home_when_idle', True)):
+            # 第二批的停车点(路线最后几个)没活可干：后面也不会再有(第二批的物料只能从这里来)，直接回家
+            self.log(f'  ★ {next_role} 第二批没活可干(转盘里没有要放的/槽都占着)：后面也没有了，不去，直接回家')
+            return True
         finish = float(cfg.get('stop_finish_s', 3.0)) if work > 0 else 0.0
         end = el + leg + work + finish + home + float(cfg.get('home_margin_s', 12.0))
         late = end > float(cfg.get('round_s', 180.0))
