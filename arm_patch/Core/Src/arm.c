@@ -104,6 +104,7 @@ static float g_amaxd  = 60.0f;     /* AMAXD  AD 指令一次最多转多少度(�
 static float g_para   = 1.0f;      /* PARA   1 = ID1、ID2 一起转(快)；0 = 一个一个转 */
 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
+static float g_clspd  = 0.0f;      /* CLSPD  夹爪转动速度(微秒/秒，脉宽每秒变多少)；0 = 一下子转过去(以前的做法)。张开到夹紧约差 500 微秒：1000 = 约 0.5 秒 */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
 static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
@@ -157,6 +158,7 @@ static const ArmTun tun[] =
     { "AMAXD",  &g_amaxd,   1.0f,    300.0f },
     { "PARA",   &g_para,    0.0f,    1.0f },
     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
+    { "CLSPD",  &g_clspd,   0.0f,    20000.0f },
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
@@ -822,15 +824,40 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 static uint8_t  tt_slot     = 1;
 static uint32_t tt_ready_at = 0;
 
+/* 夹爪慢慢转到 target 微秒：CLSPD > 0 时每 10 毫秒按速度挪一点(用户嫌夹爪一下子张开/合上太猛)；CLSPD = 0 一下子到 */
+static uint32_t claw_now = CLAW_BOOT_US;
+static void Claw_Move(uint32_t target)
+{
+    if (g_clspd > 0.5f)
+    {
+        float cur  = (float)claw_now;
+        float step = g_clspd * 0.01f;
+        float tgt  = (float)target;
+        uint16_t guard = 0;
+
+        if (step < 1.0f) step = 1.0f;
+        while ((cur < tgt - 0.5f || cur > tgt + 0.5f) && guard < 2000)
+        {
+            if (cur < tgt) { cur += step; if (cur > tgt) cur = tgt; }
+            else           { cur -= step; if (cur < tgt) cur = tgt; }
+            Claw_Set((uint32_t)(cur + 0.5f));
+            HAL_Delay(10);
+            guard++;
+        }
+    }
+    Claw_Set(target);
+    claw_now = target;
+}
+
 /* 夹爪张开 / 夹紧(脉宽是参数 CLWO / CLWC) */
 static void Claw_O(void)
 {
-    Claw_Set((uint32_t)g_clwo);
+    Claw_Move((uint32_t)g_clwo);
 }
 
 static void Claw_C(void)
 {
-    Claw_Set((uint32_t)g_clwc);
+    Claw_Move((uint32_t)g_clwc);
 }
 
 static void TT_Go(uint8_t slot)
@@ -1696,7 +1723,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         {
             long us;
             if (!ParseL(t[1], &us) || us < 500 || us > 3000)  FAIL("ERR ARG");   /* 夹爪合上是 2910 */
-            Claw_Set((uint32_t)us);                /* main.c 里会再按夹爪限位夹住 */
+            Claw_Move((uint32_t)us);               /* main.c 里会再按夹爪限位夹住 */
         }
         Wait_Ms((uint32_t)g_clwait);
         return 1;

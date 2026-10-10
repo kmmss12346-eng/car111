@@ -309,6 +309,15 @@ int main(void) {
     CHECK(Arm_Param_Set("CLWO", 1999) == 1 && Arm_Param_Set("CLWC", 2777) == 1 && Arm_Param_Set("CLWC", 3000) == 2, "CLWO/CLWC 可以改，超出夹爪限位拒绝");
     clear(); run("CLAW O"); run("CLAW C");
     CHECK(has("claw1999;") && has("claw2777;"), "CLAW O / CLAW C 用 CLWO / CLWC");
+    {   /* CLSPD：夹爪慢慢转过去(1999 -> 2777 差 778 微秒，1000 微秒/秒 约 0.78 秒，中间经过好几个位置)；CLSPD 0 一下子到 */
+        uint32_t t0;
+        CHECK(Arm_Param_Set("CLSPD", 1000) == 1, "CLSPD 可以设");
+        run("CLAW O"); clear(); t0 = now; run("CLAW C");
+        CHECK(has("claw2009;") && has("claw2777;") && now - t0 >= 700u + (uint32_t)400, "CLSPD 1000：夹爪一点点转过去，约 0.8 秒(再加 CLWAIT)");
+        Arm_Param_Set("CLSPD", 0);
+        run("CLAW O"); clear(); t0 = now; run("CLAW C");
+        CHECK(!has("claw2009;") && has("claw2777;") && now - t0 < 500u, "CLSPD 0：和以前一样一下子到");
+    }
     CHECK(Arm_Param_Set("TT2", 1650) == 1 && Arm_Param_Set("TT3", 400) == 2, "TT1~3 可以改，超出转盘限位拒绝");
     clear(); run("TT 2"); run("TT 1");
     CHECK(has("ttus1650;") && has("tt1;"), "TT 2 用 TT2 的脉宽");
