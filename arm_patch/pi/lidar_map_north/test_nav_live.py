@@ -310,7 +310,7 @@ class LiveTests(unittest.TestCase):
         with open(cfg_path, 'w', encoding='utf-8') as f:
             json.dump(raw, f)
         open(os.path.join(tmp, 'scan_bridge'), 'w').close()
-        start = (2250.0, 150.0, 90.0) if zone == 2 else (2250.0, 2250.0, 180.0)
+        start = (2250.0, 150.0, 90.0) if zone == 2 else (2250.0, 2250.0, 90.0)
         car = World(start, zone if screen_zone == 'same' else screen_zone, rdec=True, **(car_kw or {}))
         WORLD['car'] = car
         saved = {k: sys.modules.get(k) for k in STUBBED}
@@ -385,7 +385,7 @@ class LiveTests(unittest.TestCase):
         self.assertNotIn('输入 y', log, '开跑后不能再要人输入 y')
         self.assertIn('直接用开跑前规划好的路线', log)
         self.assertGreaterEqual(log.count('雷达定位：车在'), 6, '每个停车点都要雷达定位')
-        goal = auto_run.inset_goal((2250.0, 150.0, 90.0) if zone == 2 else (2250.0, 2250.0, 180.0), self.cfg_after)
+        goal = auto_run.inset_goal((2250.0, 150.0, 90.0) if zone == 2 else (2250.0, 2250.0, 90.0), self.cfg_after)
         p = car.pose()
         self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'没回到出发位置：{p}')
         self.assertLess(abs(reloc.wrap180(p[2] - goal[2])), 1.5)
@@ -462,7 +462,7 @@ class LiveTests(unittest.TestCase):
     def test_race_zone1(self):
         car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01))
         self.check_run(car, 1)
-        self.assertIn('启停区 1：起点 (2250,2250) 车头 180°', self.log)
+        self.assertIn('启停区 1：起点 (2250,2250) 车头 90°', self.log)
 
 
 if __name__ == '__main__':

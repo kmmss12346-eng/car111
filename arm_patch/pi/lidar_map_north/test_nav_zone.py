@@ -27,10 +27,10 @@ def close(a, b, tol=1e-6):
 
 
 class ZonePoseTests(unittest.TestCase):
-    def test_rotation_about_field_centre(self):
-        self.assertTrue(close(auto_run.zone_pose((2250, 150, 90), 2, 1), (2250, 2250, 180)))
-        self.assertTrue(close(auto_run.zone_pose((2250, 400, 90), 2, 1), (2000, 2250, 180)))
-        self.assertTrue(close(auto_run.zone_pose((2208, 233, 33), 2, 1), (2167, 2208, 123)))
+    def test_mirror_north_south_heading_stays_north(self):
+        self.assertTrue(close(auto_run.zone_pose((2250, 150, 90), 2, 1), (2250, 2250, 90)))
+        self.assertTrue(close(auto_run.zone_pose((2250, 400, 90), 2, 1), (2250, 2000, 90)))
+        self.assertTrue(close(auto_run.zone_pose((2208, 233, 33), 2, 1), (2208, 2167, 147)))
         for p in [(2250, 150, 90), (2100, 1200, 90), (340, 1200, -90)]:
             q = auto_run.zone_pose(auto_run.zone_pose(p, 2, 1), 1, 2)
             self.assertTrue(close(q, p), (p, q))
@@ -50,28 +50,29 @@ class ZoneSettingsTests(unittest.TestCase):
         self.assertTrue(close(s['prehome'], (2250, 400, 90)))
         self.assertEqual(s['rel'], {'left_mm': 42, 'forward_mm': 83, 'cw_deg': 60})
 
-    def test_zone1_is_zone2_rotated(self):
+    def test_zone1_is_zone2_mirrored(self):
         s = auto_run.zone_settings(self.snap, 1)
-        self.assertTrue(close(s['car'], (2250, 2250, 180)), '区 1 车头朝西')
+        self.assertTrue(close(s['car'], (2250, 2250, 90)), '区 1 车头也朝北(和配置里的 START1 一样)')
         self.assertEqual(s['start_name'], 'START1')
-        self.assertTrue(close(s['start_stop'], (2250, 2250, 180)), 'START1 的车头要和起点一样(180)，不是配置里的 90')
-        self.assertTrue(close(s['prehome'], (2000, 2250, 180)))
-        self.assertEqual(s['rel'], {'left_mm': 42, 'forward_mm': 83, 'cw_deg': 60}, '第二站动作原样用')
+        self.assertTrue(close(s['start_stop'], (2250, 2250, 90)))
+        self.assertTrue(close(s['prehome'], (2250, 2000, 90)), '回家前先停在区 1 南边(场地里)')
+        self.assertEqual(s['rel'], {'left_mm': 42, 'forward_mm': -83.0, 'cw_deg': -60.0}, '第二站动作：后退、逆时针转')
         self.assertFalse(s['use_p2'])
         self.assertIsNone(s['second_pose'])
 
     def test_second_pose_is_rotated(self):
         snap = dict(self.snap, second_pose_mm=[2208, 233, 33.0])
         s = auto_run.zone_settings(snap, 1)
-        self.assertTrue(close(s['second_pose'], (2167, 2208, 123)))
+        self.assertTrue(close(s['second_pose'], (2208, 2167, 147)))
 
     def test_explicit_overrides(self):
         ov = {'1': {'car_x_mm': 2260, 'second_relative_moves': {'left_mm': 40, 'forward_mm': 80, 'cw_deg': 60},
                     'stops': {'PREHOME': [2000, 2240, 180]}, 'second_use_p2': False}}
         s = auto_run.zone_settings(self.snap, 1, ov)
-        self.assertTrue(close(s['car'], (2260, 2250, 180)))
-        self.assertTrue(close(s['start_stop'], (2260, 2250, 180)), '起点改了，START 跟着改')
+        self.assertTrue(close(s['car'], (2260, 2250, 90)))
+        self.assertTrue(close(s['start_stop'], (2260, 2250, 90)), '起点改了，START 跟着改')
         self.assertTrue(close(s['prehome'], (2000, 2240, 180)))
+        self.assertEqual(s['rel']['forward_mm'], 80, '逐项指定的第二站动作原样用')
         self.assertEqual(s['rel']['left_mm'], 40)
         s2 = auto_run.zone_settings(self.snap, 2, ov)
         self.assertTrue(close(s2['car'], (2250, 150, 90)), '区 2 不受区 1 的设置影响')
@@ -103,10 +104,11 @@ class ApplyZoneTests(unittest.TestCase):
         snap = auto_run.zone_snapshot(raw)
         auto_run.apply_zone(raw, 1, snap)
         self.assertEqual(raw['start_zone'], 1)
-        self.assertEqual((raw['car_x_mm'], raw['car_y_mm'], raw['car_yaw_deg']), (2250.0, 2250.0, 180.0))
+        self.assertEqual((raw['car_x_mm'], raw['car_y_mm'], raw['car_yaw_deg']), (2250.0, 2250.0, 90.0))
         self.assertIs(raw['second_relative_moves'], rel, '第二站动作的 dict 要原地改(map_merge_live 里一直引用同一个)')
-        self.assertEqual(raw['stops']['START1'], [2250.0, 2250.0, 180.0])
-        self.assertEqual(raw['stops']['PREHOME'], [2000.0, 2250.0, 180.0])
+        self.assertEqual(raw['stops']['START1'], [2250.0, 2250.0, 90.0])
+        self.assertEqual(raw['stops']['PREHOME'], [2250.0, 2000.0, 90.0])
+        self.assertEqual(rel, {'left_mm': 42, 'forward_mm': -83.0, 'cw_deg': -60.0})
         self.assertFalse(raw['second_use_p2'])
         self.assertEqual(raw['stops']['QR'], orig['stops']['QR'], '工位停车点不变')
         self.assertEqual(auto_run.mission_names(raw)[-2:], ['PREHOME', 'START1'])

@@ -1513,15 +1513,26 @@ ZONE_STOPS = ('START1', 'START2', 'PREHOME')
 
 
 def zone_pose(p, zfrom, zto):
-    """启停区 1 = 启停区 2 绕场地中心逆时针转 90°：(x, y, 车头) -> (2400 - y, x, 车头 + 90)。"""
+    """启停区 1 和启停区 2 上下对称(东边一上一下)，车在两个区里都是车头朝北摆(配置里 START1、START2 都是 90°)：
+    (x, y, 车头) -> (x, 2400 - y, 180 - 车头)。位置按场地中间那条东西向的线翻过来；车头朝北的还是朝北，
+    第二站动作里"前进"变"后退"、"顺时针"变"逆时针"(second_moves_for_zone)，转完的车头 30° 对应 150°。
+    (10-10 以前按"绕场地中心转 90°、区 1 车头朝西"算，和实际摆法不一样，区 1 扫描、规划全错)"""
     x, y = float(p[0]), float(p[1])
     h = float(p[2]) if len(p) > 2 else 0.0
     zfrom, zto = int(zfrom), int(zto)
     if zfrom == zto:
         return (x, y, wrap180(h))
-    if zfrom == 2 and zto == 1:
-        return (FIELD_MM - y, x, wrap180(h + 90))
-    return (y, FIELD_MM - x, wrap180(h - 90))
+    return (x, FIELD_MM - y, wrap180(180.0 - h))
+
+
+def second_moves_for_zone(rel, zfrom, zto):
+    """第二站动作换到另一个启停区：左移不变，前进/后退反过来，转弯方向反过来(和 zone_pose 的上下对称一致)。"""
+    out = dict(rel)
+    if int(zfrom) != int(zto):
+        for k in ('forward_mm', 'cw_deg'):
+            if k in out and out[k] is not None:
+                out[k] = -float(out[k])
+    return out
 
 
 def zone_snapshot(raw):
@@ -1555,7 +1566,7 @@ def _r(p):
 def zone_settings(snap, zone, overrides=None, prehome_mm=250.0):
     """按配置文件(snap，写的是 start_zone 那个区)推出 zone 区要用的值：
     起点车位、START 停车点(车头和起点一样)、PREHOME(启停区外 prehome_mm、同一条直线上)、第二站动作。
-    另一个区 = 绕场地中心转 90°(第二站动作原样用)；配置里 "zones": {"1": {...}, "2": {...}} 可以逐项指定。"""
+    另一个区 = 上下对称(车头都朝北；第二站动作前进/后退、转弯方向反过来)；配置里 "zones": {"1": {...}, "2": {...}} 可以逐项指定。"""
     bz = int(snap.get('start_zone', 2) or 2)
     z = int(zone)
     if z not in (1, 2):
@@ -1569,7 +1580,7 @@ def zone_settings(snap, zone, overrides=None, prehome_mm=250.0):
     pre = zone_pose(st['PREHOME'], bz, z) if 'PREHOME' in st else None
     sp = snap.get('second_pose_mm')
     out = dict(zone=z, car=car, start_name=sname, start_stop=start, prehome=pre,
-               rel=dict(snap.get('second_relative_moves') or DEFAULT_SECOND_MOVES),
+               rel=second_moves_for_zone(snap.get('second_relative_moves') or DEFAULT_SECOND_MOVES, bz, z),
                second_pose=zone_pose(sp, bz, z) if sp else None,
                use_p2=bool(snap.get('second_use_p2', False)) if (z == 2 and bz == 2) else False,
                prehome_mm=float(prehome_mm))
@@ -1598,6 +1609,8 @@ def zone_settings(snap, zone, overrides=None, prehome_mm=250.0):
     if out['prehome'] is None and out['prehome_mm'] > 0:
         x, y, h = out['start_stop']
         ux, uy = _axis(h, 'F')
+        if ux * (FIELD_MM / 2 - x) + uy * (FIELD_MM / 2 - y) < 0:
+            ux, uy = -ux, -uy                                # 车头朝外(区 1 车头朝北)：PREHOME 在车尾那边，场地里面
         out['prehome'] = (round(x + out['prehome_mm']*ux, 1), round(y + out['prehome_mm']*uy, 1), h)
     return out
 
