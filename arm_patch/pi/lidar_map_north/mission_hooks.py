@@ -52,6 +52,8 @@ DEFAULTS = dict(
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
     raw_motion_frac=0.004,              # 前后两帧画面(爪子以外)变了的地方超过这个比例 = 原料盘在转
     raw_static_s=9.0,                   # 还没做 vcal RAW(没有手臂和画面的对应关系)时：看到原料盘连续这么多秒都不转(关了)，才现场小幅动几下测
+    raw_keepalive_s=12.0,               # 等物料转过来时手臂这么多秒没动过，就轻轻摆一下 ID1(规则：机器人停止运行 15 秒、等转盘时 23 秒本轮结束)；0 = 不摆
+    raw_keepalive_deg=1.0,              # 摆多少度(ID1，摆过去马上回来)
     raw_frames=2,                       # 原料区对准时每次测量用几帧(少一点快，停下来的时间有限)
     raw_max_iter=3,                     # 原料区对准最多修正几次(果断：差不多就下爪)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
@@ -526,6 +528,8 @@ class MissionHooks:
         said = set()
         self.log(f'    盯着{label[1:] if label.startswith("抓") else ""}物料：原料盘一停、物料在爪子附近就马上对准下爪'
                  f'(下爪到夹住约 {T:.2f} 秒；每次停先按 {self._raw_stop_len():.1f} 秒算，看到实际的就按实际的)')
+        keep_s = float(cfg.get('raw_keepalive_s', 12.0) or 0.0)
+        t_arm = self.now()                                    # 手臂最后一次动的时刻
         stream = self._raw_stream(color)
         try:
             while True:
@@ -535,6 +539,17 @@ class MissionHooks:
                 if now > t_end:
                     self.log(f'  {tag} ★ 等了 {float(cfg.get("raw_track_s", 30.0)):.0f} 秒没等到它停在爪子附近，跳过')
                     return False
+                if (keep_s > 0 and now - t_arm > keep_s and home[0] is not None and home[1] is not None
+                        and not (state == 'stop' and p is not None)):
+                    self.log(f'  {tag} 手臂 {now - t_arm:.0f} 秒没动了：轻轻摆一下(规则：机器人停止运行 15 秒、等转盘时 23 秒，本轮结束)')
+                    d = float(cfg.get('raw_keepalive_deg', 1.0))
+                    self.arm.ap(home[0] + d, home[1])
+                    self.arm.ap(home[0], home[1])
+                    t_arm = self.now()
+                    stream.close()
+                    stream = self._raw_stream(color)          # 手臂动过：重新比画面
+                    hist, cnt = [], 0
+                    continue
                 if p is not None:
                     hist = (hist + [(t, p)])[-6:]
                 else:
@@ -617,6 +632,7 @@ class MissionHooks:
                 J = self.store.get('RAW', 'arm') if self.store is not None else None
                 if home[0] is not None and home[1] is not None:
                     self.arm.ap(home[0], home[1])             # 回到 OBS RAW 姿态等
+                t_arm = self.now()
                 stream.close()
                 stream = self._raw_stream(color)              # 手臂动过：重新比画面(不然会把手臂动当成转盘在转)
                 hist, cnt = [], 0

@@ -200,6 +200,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.w.air, 0, text)
         self.assertFalse([r for r in self.w.requests if r.startswith('GRAB')], text)
 
+    def test_long_wait_keeps_the_arm_alive(self):
+        """等物料转过来等得久：手臂隔一会儿轻轻摆一下(规则：机器人停止运行 15 秒/等转盘 23 秒本轮结束)，照样夹到。"""
+        self._plate_world()
+        self.h.cfg['raw_keepalive_s'] = 3.0
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('轻轻摆一下', text)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(self.w.air, 0, text)
+
     def test_gtest_nogo_on_stop_go_plate(self):
         self._plate_world()
         self.run_cli('gtest', 'gtest 1 nogo')
