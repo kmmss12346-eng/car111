@@ -22,8 +22,9 @@ NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调�
 OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0), ('accept_mm', 'RAW'): (6.0, 4.0),
                 (None, 'learn_pick'): (True, False),          # 10-10：放完不再回去拍物料(慢)，取回认圆环外圈
                 (None, 'chassis_fine_rpm'): (60, 100),        # 10-10：视觉微调时底盘快一点
-                ('tol_mm', 'RING'): (1.0, 2.0), ('tol_mm', 'STACK'): (2.0, 2.5),   # 10-10：差不多就行，不为零点几毫米反复微调
-                ('accept_mm', 'RING'): (2.5, 3.0)}
+                ('tol_mm', 'RING'): ((1.0, 2.0), 1.2),       # 10-10：赛规 1 环 = 偏心 <1.5mm(15 分)，2 环 <4mm(10 分)
+                ('tol_mm', 'STACK'): (2.0, 2.5),             # 码垛不掉下来就得分
+                ('accept_mm', 'RING'): ((2.5, 3.0), 3.5)}       # 4mm 以内还是 2 环(10 分)：放下比不放强
 
 
 def main(argv):
@@ -38,12 +39,13 @@ def main(argv):
     new = deep_merge(DEFAULTS, old)          # DEFAULTS 打底，已有的值覆盖它(不会改你已经设的)
     for (sec, k), (was, now) in OLD_DEFAULTS.items():     # 以前的默认值、没改过的：换成新的默认值
         cur = old.get(k, None) if sec is None else (old.get(sec) or {}).get(k)
-        if cur is not None and type(cur) is type(was) and cur == was:
+        olds = was if isinstance(was, tuple) else (was,)
+        if cur is not None and any(type(cur) is type(w) and cur == w for w in olds):
             if sec is None:
                 new[k] = now
             else:
                 new[sec][k] = now
-            print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {was} -> 新的默认值 {now}')
+            print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {cur} -> 新的默认值 {now}')
     if disable:
         new['enabled'] = False
     elif 'enabled' not in old:
