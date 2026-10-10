@@ -459,9 +459,14 @@ int main(void) {
         run("ZONE 1"); clear();
         scr_in(boot, 4); Arm_Poll();
         CHECK(scrs("sendxy=1|cls 0|") && scrs("\"ZONE 1\"") && scrs("\"START\"") && zone_is("ZONE 1 0"), "屏重新上电：再发 sendxy=1，整页重画(选的区不变)");
-        run("ZONE LOCK"); clear();
+        run("ZONE LOCK"); run("QR CLR"); clear();
         scr_in(boot, 4); Arm_Poll();
-        CHECK(scr[0] == 0, "比赛布局时屏重新上电：不画选区页");
+        CHECK(scr[0] == 0, "比赛布局时屏重新上电(还没读到码)：不画选区页，什么都不写");
+        qr_feed("321+654+987+123\r\n"); Arm_Poll(); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("\"321+654+\"") && scrs("\"987+123\"") && !scrs("START") && pi[0] == 0,
+              "比赛布局时屏重新上电：把任务码重新写上(赛规要一直显示)，不再发给树莓派");
+        run("QR CLR");
     }
     /* 旧的树莓派程序不发 ZONE LOCK：写 SCR 时自动回到比赛布局 */
     run("ZONE ASK"); clear();

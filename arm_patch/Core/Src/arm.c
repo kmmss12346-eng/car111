@@ -1467,6 +1467,19 @@ static void QR_Fetch(void)
     QR_Accept(c);
 }
 
+/* 屏上显示任务码。赛规要求字高不小于 12mm，3.5 寸屏一行放不下 15 个字符，所以分两行，组之间的 + 都留着：
+ * t0 = 前两组带后面的 +(如 452+321+)，t7 = 后两组(如 254+312)。控件名不一样就改这里 */
+static void QR_Draw(void)
+{
+    char h1[12];
+    char h2[8];
+
+    memcpy(h1, qr_code, 8);      h1[8] = 0;
+    memcpy(h2, qr_code + 8, 7);  h2[7] = 0;
+    Screen_Text("t0", h1);
+    Screen_Text("t7", h2);
+}
+
 void Arm_Poll(void)
 {
     char tmp[QR_BUF];
@@ -1474,11 +1487,19 @@ void Arm_Poll(void)
     int n;
     uint8_t b;
 
-    /* 屏刚重新上电(忘了 sendxy、画面也没了)：选区页还在用就整页重画 */
+    /* 屏刚重新上电(忘了 sendxy、画面也没了)：选区页还在用就整页重画；
+     * 比赛布局时把任务码重新写上(赛规要一直显示；树莓派写过的同样内容不会再发) */
     if (scr_boot)
     {
         scr_boot = 0;
-        Zone_Show(1);
+        if (zone_ui != ZUI_OFF)
+        {
+            Zone_Show(1);
+        }
+        else if (qr_valid)
+        {
+            QR_Draw();
+        }
     }
     /* 触摸：中断里已经认好了按钮 */
     if (scr_tap)
@@ -1508,19 +1529,12 @@ void Arm_Poll(void)
     if (qr_show)
     {
         char m[32];
-        char h1[12];
-        char h2[8];
 
         qr_show = 0;
-        /* 屏上显示任务码。赛规要求字高不小于 12mm，3.5 寸屏一行放不下 15 个字符，所以分两行，组之间的 + 都留着：
-         * t0 = 前两组带后面的 +(如 452+321+)，t7 = 后两组(如 254+312)。控件名不一样就改这里。
-         * 选区页还在显示时不写(会盖掉按钮)，码照样记着、照样告诉树莓派 */
+        /* 选区页还在显示时不写屏(会盖掉按钮)，码照样记着、照样告诉树莓派 */
         if (zone_ui == ZUI_OFF)
         {
-            memcpy(h1, qr_code, 8);      h1[8] = 0;
-            memcpy(h2, qr_code + 8, 7);  h2[7] = 0;
-            Screen_Text("t0", h1);
-            Screen_Text("t7", h2);
+            QR_Draw();
         }
         snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
         Say(m);
