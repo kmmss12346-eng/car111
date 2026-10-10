@@ -149,13 +149,99 @@ FULL = [
 
 
 class WizardTests(unittest.TestCase):
-    def run_wiz(self, items, stm=None, cfg=None, start=0):
+    def run_wiz(self, items, stm=None, cfg=None, start=0, **kw):
         self.stm = stm or FakeStm32()
         self.cfg = cfg if cfg is not None else make_cfg()
         self.lines = []
         self.inp = Script(self.stm, items)
-        self.wiz = Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append)
+        kw.setdefault('vision', False)                                    # 测试里不开真的摄像头
+        kw.setdefault('sleep', lambda s: None)
+        self.wiz = Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, **kw)
         return self.wiz.run(start)
+
+    # ---------------- 第一层 / 第二层放置位置(PL1、PL2)：补偿相对"摄像头对准圆环的姿态"
+    TRUE = (324.2, -880.0)                     # 摄像头里圆环正对爪子点时 ID1、ID2 的角度(车停得和 A1P 那一步不一样)
+
+    def _cam(self):
+        import numpy as np
+        from visual_servo import JacStore
+        stm = FakeStm32()
+        J = np.array([[0.0, -3.8], [0.26, 0.0]])                          # 列：ID2 每度、ID1 每度 画面动多少像素
+
+        class FakeVision:
+            def ring_error(self, n=None, max_px=None):
+                d = np.array([stm.ang[2] - WizardTests.TRUE[1], stm.ang[1] - WizardTests.TRUE[0]])
+                p = J @ d
+                return float(p[0]), float(p[1])
+
+            def scale(self, kind):
+                return 1.46
+
+            def bounds(self, kind, inset=8.0):
+                return ((-300.0, -220.0), (300.0, 220.0))
+
+            def close(self):
+                pass
+        store = JacStore(None)
+        store.put('RING', 'arm', J)
+        return stm, FakeVision(), store
+
+    def _err_mm_at(self, vis, a1, a2):
+        import math
+        self.stm.ang[1], self.stm.ang[2] = a1, a2
+        p = vis.ring_error()
+        return math.hypot(*p) / 1.46
+
+    def test_place_steps_measure_from_the_camera_alignment(self):
+        """PL1、PL2：空爪先用摄像头对准圆环(和比赛时一样)，补偿 = 夹着物料对正时比这个姿态多转多少；PL2 沿用 PL1 的对准，
+        PL1 放下的物料就是下面那层(不用再问)。车停得和 A1P 那一步不一样也不影响。"""
+        stm, vis, store = self._cam()
+        saved = self.run_wiz(['c', '1 +0.5', '2 -10', '',              # PL1
+                              'c', '1 -0.3', '',                       # PL2
+                              'q'], stm=stm, start=STEP_KEYS.index('PL1'), vision=vis, store=store)
+        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
+        self.assertEqual(adj, {'RING': [0.5, -10.0], 'STACK': [-0.3, 0.0]}, self.lines)
+        self.assertEqual(saved['PL1'], (0.5, -10.0))
+        ref = self.wiz._place_ref
+        self.assertIsNotNone(ref, self.lines)
+        self.assertLess(self._err_mm_at(vis, *ref), 1.0)                 # 对准的姿态就是圆环正对爪子点的地方
+        self.assertGreater(abs(ref[0] - 323.0), 0.5)                      # 不是 A1P(车停得不一样)
+        self.assertTrue(any('摄像头对准圆环了' in l for l in self.lines), self.lines)
+        self.assertTrue(any('沿用上一步(PL1)' in l for l in self.lines), self.lines)
+        self.assertFalse(any('当下面那层' in p for p in self.inp.prompts), self.inp.prompts)
+
+    def test_pl2_alone_aligns_first_then_asks_for_the_lower_material(self):
+        """单独做 PL2：圆环先空着让摄像头对准，再叫你把下面那层放进圆环正中。"""
+        stm, vis, store = self._cam()
+        self.run_wiz(['', 'c', '2 +5', '', 'q'], stm=stm, start=STEP_KEYS.index('PL2'), vision=vis, store=store)
+        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
+        self.assertEqual(adj, {'STACK': [0.0, 5.0]}, self.lines)
+        self.assertTrue(any('当下面那层' in p for p in self.inp.prompts), self.inp.prompts)
+        self.assertTrue(any('圆环里先空着' in l for l in self.lines), self.lines)
+
+    def test_place_step_without_camera_falls_back_to_a1p(self):
+        """用不了摄像头：按 A1P/A2P 算，并且说清楚这样要注意什么。"""
+        self.run_wiz(['c', '1 +0.5', '', 'q'], start=STEP_KEYS.index('PL1'))
+        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
+        self.assertEqual(adj, {'RING': [0.5, 0.0]})
+        self.assertTrue(any('这次没用摄像头对准' in l for l in self.lines), self.lines)
+
+    def test_camera_failure_falls_back(self):
+        """摄像头打不开、认不到圆环：不卡住，退回按 A1P/A2P 算。"""
+        class Broken:
+            def ring_error(self, n=None, max_px=None):
+                return None
+
+            def scale(self, kind):
+                return 1.46
+
+            def bounds(self, kind, inset=8.0):
+                return ((-300.0, -220.0), (300.0, 220.0))
+        self.run_wiz(['c', '2 -4', '', 'q'], start=STEP_KEYS.index('PL1'), vision=Broken())
+        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
+        self.assertEqual(adj, {'RING': [0.0, -4.0]})
+        self.assertTrue(any('没对准圆环' in l or '没做成' in l for l in self.lines), self.lines)
+        self.assertTrue(any('这次没用摄像头对准' in l for l in self.lines), self.lines)
 
     def test_full_run_saves_everything(self):
         saved = self.run_wiz(FULL)
