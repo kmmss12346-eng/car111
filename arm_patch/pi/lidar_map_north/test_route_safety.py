@@ -133,6 +133,15 @@ class MovesClearTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+    def test_explicit_margin_applies_to_turns_too(self):
+        # 回家对准在启停区角落转几度：auto_run 问 margin_mm=0，转弯也只看真的会不会出界(不再另加 turn_margin_mm)
+        cfg = dict(car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40)
+        ok, gap, _, _ = rp.moves_clear(cfg, [], (2250, 170, 90), [('R', 3)], margin_mm=0)
+        self.assertTrue(ok)
+        self.assertGreater(gap, 0)
+        ok, _, _, _ = rp.moves_clear(cfg, [], (2250, 170, 90), [('R', 3)])      # 默认余量(规划用)照旧要 turn_margin_mm
+        self.assertFalse(ok)
+
 class MissionTests(unittest.TestCase):
     def check_mission(self, zone, obs, prehome):
         z = ZONES[zone]

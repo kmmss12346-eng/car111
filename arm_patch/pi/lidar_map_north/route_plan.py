@@ -304,16 +304,18 @@ def _edge_items(em, cor, tm, soft=True):
 
 def fixed_items(cfg, margin_mm=None):
     """固定区域(黄色区、暂存/粗加工区、原料转盘、场地边、extra_blocked_rects)。
-    margin_mm 给定时：所有区域都按这一个余量(场地边也是，启停区旁边也不例外；只有启停区本身那一段场地边还是 0)。"""
+    margin_mm 给定时：所有区域都按这一个余量(场地边也是，启停区旁边也不例外；只有启停区本身那一段场地边还是 0)，
+    转弯也一样(不再加 turn_margin_mm：moves_clear 按角度一步步扫真实车身，不需要规划时那份圆的余量)。"""
     m = _margins(cfg)
     if margin_mm is not None:
         v = max(0.0, float(margin_mm))
         ymh = ymp = zm = rm = em = v
         soft = False
+        tm = v
     else:
         ymh, ymp, zm, rm, em = m['ymin'], m['ym'], m['zm'], m['rm'], m['em']
         soft = True
-    tm = m['tm']
+        tm = m['tm']
     out = []
     for r in YELLOW:
         out.append(_mk('黄色区', 'yellow', r, 0, ymh, ymp, tm))
@@ -329,7 +331,8 @@ def fixed_items(cfg, margin_mm=None):
 def obstacle_items(cfg, obstacles, margin_mm=None):
     m = _margins(cfg)
     om = m['om'] if margin_mm is None else max(0.0, float(margin_mm))
-    return [_mk(f'障碍物({float(x):.0f},{float(y):.0f})', 'obs', (x, y, x, y), r, om, om, m['tm'], add_turn=True)
+    tm = m['tm'] if margin_mm is None else 0.0          # 给定 margin_mm 时转弯不再另加(同 fixed_items)
+    return [_mk(f'障碍物({float(x):.0f},{float(y):.0f})', 'obs', (x, y, x, y), r, om, om, tm, add_turn=True)
             for x, y, r in obstacles]
 
 
