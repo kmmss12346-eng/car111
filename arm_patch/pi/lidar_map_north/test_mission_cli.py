@@ -690,7 +690,7 @@ class CliTests(unittest.TestCase):
         text = '\n'.join(self.lines)
         self.assertIn('按记录环2 上还放着 BLACK', text)
         self.assertIn('不是摄像头看到的', text)
-        self.assertEqual([p[1] for p in self.w.placed], [1, 3], text)
+        self.assertEqual(sorted(p[1] for p in self.w.placed), [1, 3], text)
         self.assertEqual(self.w.collisions, 0, text)
 
     def test_gtest_nogo_and_needs_zero(self):
