@@ -200,6 +200,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.w.air, 0, text)
         self.assertFalse([r for r in self.w.requests if r.startswith('GRAB')], text)
 
+    def test_time_up_grabs_with_current_error(self):
+        """没修到容差以内、但停的时间到了：只要偏差不超过 raw_grab_max_mm 就按现在的位置下爪，不放过这一次。"""
+        self._plate_world()
+        self.h.cfg['tol_mm'] = dict(self.h.cfg['tol_mm'], RAW=0.01)      # 永远修不到
+        self.h.cfg['raw_max_iter'] = 1
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('按现在的位置夹', text)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(self.w.air, 0, text)
+
+    def test_stop_phase_from_measured_cycle(self):
+        """量到过停多久、转多久：一开始就看到它停着时，按周期推算已经停了几秒(知道还剩多久)。"""
+        self._plate_world(stop_s=4.8, move_s=2.7, seed=11)
+        self.h.raw_stops, self.h.raw_moves = [4.8], [2.7]
+        t_stop = self.w.plate_t0
+        while self.w.plate_phase(t_stop + 0.01)[1]:              # 找一个"停下"的时刻当作量到过的
+            t_stop += 0.01
+        self.h.raw_cycle['t_stop'] = t_stop
+        got = self.h._raw_predict_stop_start(t_stop + 7.5 * 3 + 2.0)
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got, t_stop + 7.5 * 3, delta=0.05)
+        self.assertIsNone(self.h._raw_predict_stop_start(t_stop + 7.5 * 3 + 6.0))   # 这会儿应该在转
+
     def test_long_wait_keeps_the_arm_alive(self):
         """等物料转过来等得久：手臂隔一会儿轻轻摆一下(规则：机器人停止运行 15 秒/等转盘 23 秒本轮结束)，照样夹到。"""
         self._plate_world()

@@ -29,7 +29,7 @@ MEASURE_S = 0.35
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
 
-DEFAULT_PARAMS = dict(ARMOK=1.0, ZHI=0.0, ZGRAB=100.0, ZDROP=60.0, ZPLC=100.0, ZSTK=40.0, ZOBRAW=0.0, ZOBRNG=0.0,
+DEFAULT_PARAMS = dict(ARMOK=1.0, ZHI=0.0, ZGRAB=100.0, ZDROP=60.0, ZPLC=100.0, ZSTK=40.0, ZOBRAW=80.0, ZOBRNG=0.0,
                       A1G=500.0, A1D=430.0, A1H=410.0, A1P=470.0, A2E=-800.0, A2R=-1100.0, A2P=-780.0,
                       LFPPM=80.0, LFRPM=150.0, LFSPR=3200.0, LFMRG=200.0, ASPD=90.0, ASPDF=40.0, ATOLC=1.0, ATOL=0.3,
                       PARA=1.0, CLWAIT=400.0, TTWAIT=800.0, FPPM=12.9, LPPM=13.7)
@@ -281,10 +281,10 @@ class SimWorld:
             a = a if a[1] > 0 else -a
         return 'lr' if float(a @ d) > 0 else 'rl'
 
-    def pixel_error(self, target, kind):
+    def pixel_error(self, target, kind, dt=MEASURE_S):
         e = np.asarray(target, float) - self.claw()
         p = self.scale[kind] * (self.Rcam @ e) + self.rng.normal(0, self.noise_px, 2)
-        self.advance(MEASURE_S)
+        self.advance(dt)
         if abs(p[0]) > 280 or abs(p[1]) > 200:
             return None                                   # 出了画面
         return (float(p[0]), float(p[1]))
@@ -580,7 +580,8 @@ class SimVision:
             return None
         c = w.claw()
         it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
-        return self._off('RAW', w.pixel_error(w.raw_pos(it), 'RAW'))
+        dt = MEASURE_S if not n else 0.05 + 0.07 * int(n)          # 一帧大约 0.07 秒(n 帧取平均)
+        return self._off('RAW', w.pixel_error(w.raw_pos(it), 'RAW', dt))
 
     def material_stream(self, color_id):
         """和真的 Vision.material_stream 一样：每认完一帧 yield (这帧拍下的时间, 像素位置或 None, 画面变了的比例或 None)；认一帧要 FRAME_S。"""

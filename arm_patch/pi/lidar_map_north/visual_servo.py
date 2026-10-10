@@ -412,12 +412,19 @@ class VisualServo:
         return 'arm'
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
-            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False):
+            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False,
+            gain_arm=None, near_avg=None):
         """对准(见 _run)。chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
         chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。
         fixed_j = True：只用存好的 J——不探测、不丢、不改存着的 J；误差变大就直接停(原料盘停下的几秒钟里对准用：
-        万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。"""
+        万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。
+        gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。"""
         self._fixed = bool(fixed_j)
+        saved = {}
+        for k, val in (('gain_arm', gain_arm), ('near_avg', near_avg)):
+            if val is not None:
+                saved[k] = self.cfg.get(k)
+                self.cfg[k] = val
         self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
         self._s_range = tuple(chassis_s_range) if chassis_s_range is not None else None
         self._s_used = 0.0
@@ -431,6 +438,7 @@ class VisualServo:
             self._s_range = None
             self._need_s = False
             self._fixed = False
+            self.cfg.update(saved)
 
     def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
              bounds=None, confirm=None, chassis_fix_max_mm=None):

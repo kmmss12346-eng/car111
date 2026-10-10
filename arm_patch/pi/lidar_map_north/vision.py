@@ -505,7 +505,7 @@ class Vision:
                 self._publish(fr, 'RAW', p, color_id=color_id)
                 if p is not None:
                     pts.append(p)
-        if len(pts) < max(2, n // 2 + 1):
+        if len(pts) < (1 if n == 1 else max(2, n // 2 + 1)):        # n=1：一帧认到就算(原料盘停下的几秒钟里要快)
             return None
         return _robust_mean(pts, self.cfg['reject_px'])
 
