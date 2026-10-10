@@ -997,6 +997,8 @@ class MissionHooks:
 
     def _qr_obstacles(self):
         """现在地图上的障碍物 [(x, y, 半径)]：导航的 ctx 有 obstacles() 才有，没有返回 None。"""
+        if not (self.raw_cfg or {}).get('exec_obstacles', False):
+            return []                                     # (10-11 用户)障碍物只用来规划路线，跑的时候不管
         f = getattr(self.ctx, 'obstacles', None) if self.ctx is not None else None
         if f is None:
             return None

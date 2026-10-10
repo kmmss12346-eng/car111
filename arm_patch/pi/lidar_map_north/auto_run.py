@@ -930,6 +930,10 @@ class _Drive:
             raise Abort('收到 abort，已停止发送')
 
     def _obstacles(self):
+        # (10-11 用户：障碍物只用来规划路线；跑的时候不管它们——不因为它们少走、不限幅修正)
+        # 黄色区、工位、原料转盘、场地边线照样管。exec_obstacles=true 恢复以前(跑的时候也躲障碍物)
+        if not self.cfg.get('exec_obstacles', False):
+            return []
         try:
             return list(self.ctx.obstacles()) if hasattr(self.ctx, 'obstacles') else []
         except Exception:

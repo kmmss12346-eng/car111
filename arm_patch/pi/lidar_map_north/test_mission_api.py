@@ -357,9 +357,15 @@ class QrSearchTests(unittest.TestCase):
         self.assertIn('读到了(扫码器对着 1260 左右)', text)
         self.assertEqual(w.screen['t0'], '156+123+')
 
-    def test_search_skips_positions_near_obstacles(self):
-        """车道上前面有障碍物(车头离它不到 60mm)：那几个位置跳过，不往那边挪。"""
+    def test_search_ignores_obstacles_by_default(self):
+        """(10-11 用户)障碍物只用来规划路线：默认找码时不管它，照样挪过去。"""
         w, h, text = self.run_qr((-140.0, -100.0), obstacles=[(2110.0, 1560.0, 25.0)])
+        self.assertNotIn('离障碍物', text)
+        self.assertIn('扫码器对着 1260：底盘前进 60mm', text)          # 朝障碍物那边的位置照样挪过去
+
+    def test_search_skips_positions_near_obstacles(self):
+        """exec_obstacles=true：车道上前面有障碍物(车头离它不到 60mm)：那几个位置跳过，不往那边挪。"""
+        w, h, text = self.run_qr((-140.0, -100.0), obstacles=[(2110.0, 1560.0, 25.0)], raw=dict(RAW, exec_obstacles=True))
         self.assertIsNone(h.plan)
         self.assertIn('离障碍物(2110,1560)', text)
         pos, far = 0.0, 0.0
