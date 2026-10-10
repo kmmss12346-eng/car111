@@ -57,6 +57,11 @@ class ArmLink:
         self._screen_last = {}
         self._params = None
         self.lift_boot = None                    # 开机时升降高度是怎么认出来的(LIFT? 回复里的 BOOT=…；旧程序没有)
+        try:                                     # 扫码器插在树莓派 USB 口上时从这里读(见 qr_usb.py)；没有就只问 STM32
+            import qr_usb
+            self.usb_qr = qr_usb.reader(log)
+        except Exception:
+            self.usb_qr = None
 
     # ------------------------------------------------------------ 基础
     def request(self, text, timeout=None):
@@ -83,7 +88,11 @@ class ArmLink:
 
     # ------------------------------------------------------------ 二维码 / 串口屏
     def qr(self):
-        """STM32 读到的任务码，没有返回 None。"""
+        """读到的任务码，没有返回 None。先看插在树莓派 USB 口上的扫码器，再问 STM32。"""
+        if getattr(self, "usb_qr", None) is not None:
+            c = self.usb_qr.get()
+            if c:
+                return c
         ok, reply, info = self.request('QR?', 2.0)
         for line in info:
             m = _QR.match(line)
@@ -92,7 +101,9 @@ class ArmLink:
         return None
 
     def qr_clear(self):
-        """清掉 STM32 里存的任务码。返回是否成功(回了 DONE)。"""
+        """清掉存的任务码(树莓派 USB 扫码器的和 STM32 的)。返回 STM32 是否回了 DONE。"""
+        if getattr(self, "usb_qr", None) is not None:
+            self.usb_qr.clear()
         ok, _reply, _info = self.request('QR CLR', 2.0)
         return bool(ok)
 
