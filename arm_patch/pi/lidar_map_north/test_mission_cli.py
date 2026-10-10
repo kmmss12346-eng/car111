@@ -931,7 +931,7 @@ class ConfigScriptTests(unittest.TestCase):
             self.assertIn(k, mc)
         self.assertEqual(mc['wheels_min_mm'], 4.0)
         self.assertIs(mc['wheels_first'], False)         # 10-10 晚：工位换回 1010i 的做法(先动手臂)
-        self.assertIs(mc['raw_any_order'], False)        # 10-10 晚：原料区换回 1010i 的做法(按任务码顺序)
+        self.assertIs(mc['raw_any_order'], True)         # 10-11 用户：原料区来一个夹一个
         self.assertIs(mc['raw_wheels_first'], False)      # 10-10：原料区只动爪子
         self.assertIs(mc['zone_filter'], False)
         with open(path, 'w', encoding='utf-8') as f:

@@ -939,7 +939,7 @@ class MissionSimTests(unittest.TestCase):
         """10-10 晚用户定的默认(按 1010i 的做法)：原料区按任务码顺序抓、工位空爪先对准再取再放、不先动车轮、不滤波、5 帧。全抓到、全放对。"""
         import mission_hooks
         D = mission_hooks.DEFAULTS
-        self.assertEqual((D['raw_any_order'], D['take_first'], D['wheels_first'], D['zone_filter']), (False, False, False, False))
+        self.assertEqual((D['raw_any_order'], D['take_first'], D['wheels_first'], D['zone_filter']), (True, False, False, False))   # 10-11：原料区来一个夹一个
         for seed in range(3):
             w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0)
             keep = {k: D[k] for k in ('raw_any_order', 'raw_wheels_first', 'wheels_first', 'take_first', 'zone_filter',
