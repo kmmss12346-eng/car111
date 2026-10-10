@@ -42,6 +42,9 @@ DEFAULTS = dict(
     time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)
     qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码
     raw_wait_s=10.0,                    # 等原料盘停稳最多多久(规则：等转盘最多多停 8 秒)
+    raw_chassis='off',                  # 原料区对准时车轮能不能动：'off' = 只动手臂，车轮不动(不会压进原料区)；
+                                        #   'F' = 只许沿车头方向前后挪，最多 raw_fix_max_mm；'SF' = 前后、横着都能挪(以前的做法，可能压进原料区)
+    raw_fix_max_mm=40.0,                # raw_chassis='F' 时一次对准车轮最多前后挪多少毫米
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
@@ -429,11 +432,17 @@ class MissionHooks:
             self._ui('msg', f'NO {item.color_short}')
             return False
         if not still:
-            self.log('    原料盘还没停稳，按现在的位置先试(对准过程中会继续跟)')
+            self.log('    原料盘还没停稳，按现在的位置先试(对准过程中会继续跟；只动手臂，不用车轮去追)')
+        mode = str(cfg.get('raw_chassis') or 'off').upper()
+        allow = still and mode in ('F', 'SF')
+        kw = dict(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0)) if allow and mode == 'F' else {}
         res = self.servo.run('RAW', lambda: self.vision.material_error(item.color), self.vision.scale('RAW'),
-                             cfg['tol_mm']['RAW'], allow_chassis=True, label=f'抓{item.color_short}', bounds=self.vision.bounds('RAW'), confirm=False)
+                             cfg['tol_mm']['RAW'], allow_chassis=allow, label=f'抓{item.color_short}', bounds=self.vision.bounds('RAW'),
+                             confirm=False, **kw)
         self.log(f'    对准结果：{res}')
         if not res.ok and res.err_mm > cfg['accept_mm']['RAW']:
+            if not allow:
+                self.log('    (原料区对准只动手臂、车轮不动：物料停在手臂够不着的地方就跳过。车要停得让物料停下时在爪子附近)')
             self._recover(f'没对准({res.reason})，不夹，免得夹偏')
             return False
         self.arm.grab_here(item.slot)

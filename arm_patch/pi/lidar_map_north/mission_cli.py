@@ -379,6 +379,9 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 raise ValueError('vcal RAW 要给颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝，例如 vcal RAW 1')
             color = int(parts[2])
         chassis = 'arm' not in rest
+        if kind == 'RAW' and chassis and str(h.cfg.get('raw_chassis') or 'off').upper() == 'OFF':
+            chassis = False
+            log('(原料区对准不动车轮：只校准手臂，不探测底盘)')
 
         def go():
             h._ensure(link)
@@ -389,7 +392,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'mtest':
         if len(parts) < 2:
-            raise ValueError('格式：mtest QR / mtest RAW 1 / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
+            raise ValueError('格式：mtest QR / mtest RAW 1 [force] / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
             release()                                   # 关掉摄像头(后台线程)再丢掉记录，不然摄像头一直被占着
@@ -409,6 +412,14 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
             h.t0 = h.now()                              # 每次 mtest 重新计时(不然前面摆物料、搬车花的时间算进 time_limit_s，一开始就"时间到")
+            if what == 'RAW':
+                if h.plan is None:
+                    raise ValueError('还没有任务码：先 qr 或者 mcode 143+213+413+321')
+                _raw_preflight(h, batch, force, log)    # 转盘里记着有物料又没加 force：在这里停下，手臂不动
+                if h.act is not None:
+                    h.act.reset_disp()                  # 车是手放到原料区的：底盘位移从 0 算(不会按上一个工位剩下的位移开回去)
+                if h.cfg.get('mtest_hold_heading', True) and hasattr(h, 'hold_heading'):
+                    h.hold_heading()
             if what in ('ROUGH', 'TEMP'):
                 if h.plan is None:
                     raise ValueError('还没有任务码：先 qr 或者 mcode 156+123+516+231')
@@ -504,6 +515,29 @@ def _gtest(h, link, color, nogo, log):
     h.arm.do('CLAW C')
     h.arm.do(f'LIFT {P["ZHI"]:g}')
     log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+
+
+def _raw_preflight(h, batch, force, log):
+    """mtest RAW 开始前：抓的顺序、放进哪个槽；车上转盘里记着有物料(比如刚才粗加工区取回的)要先拿空。"""
+    items = h.plan.items(batch)
+    full = sorted({it.slot for it in items if h.in_tray.get(it.slot) is not None})
+    if full and not force:
+        names = '、'.join(f'{s}号槽({h.in_tray[s].color_name})' for s in full)
+        raise ValueError(f'程序里记着车上转盘 {names} 有物料(刚才粗加工区/暂存区测试留下的)，再夹进去会砸在上面。'
+                         f'先用手把车上转盘拿空，再输入 mtest RAW {batch} force(force = 转盘已经拿空了)')
+    for s in full:
+        h.in_tray.pop(s, None)
+    mode = str(h.cfg.get('raw_chassis') or 'off').upper()
+    log(f'== 原料区 第{batch}批：按这个顺序抓，放进车上转盘 ==')
+    for it in items:
+        log(f'   {it.color_name} -> {it.slot}号槽')
+    if full:
+        log('   (force：车上转盘当作已经拿空了)')
+    log(f'   原料盘会转：每个物料先等它停稳(最多 {float(h.cfg.get("raw_wait_s", 10.0)):g} 秒)再对准；一直没停稳就按当时的位置试')
+    log('   对准只动手臂，车轮不动(不会压进原料区)；物料停在手臂够不着的地方就跳过' if mode == 'OFF' else
+        (f'   对准时车轮只会前后挪，最多 {float(h.cfg.get("raw_fix_max_mm") or 40.0):g}mm，不横着挪' if mode == 'F' else
+         '   ★ raw_chassis=SF：对准时车轮前后、横着都会挪，小心压进原料区'))
+    log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
 
 
 def _zone_preflight(h, zone, batch, force, log):

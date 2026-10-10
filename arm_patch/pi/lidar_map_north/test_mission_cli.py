@@ -78,6 +78,69 @@ class CliTests(unittest.TestCase):
         self.run_cli('mtest', 'mtest TEMP 1')
         self.assertEqual(rings_summary(self.w, 'TEMP'), {1: [1], 2: [5], 3: [6]})
 
+    # ---------------- 原料区：车是手放的，对准时车轮不能动(不能压进原料区)
+    def _raw_setup(self):
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.w.arrive('RAW', 1)
+        moves = []
+        orig = self.w.link.move
+        self.w.link.move = lambda cmd, val, speed=None: (moves.append((cmd, val)), orig(cmd, val, speed))[1]
+        self.w.requests.clear()
+        self.lines.clear()
+        return moves
+
+    def test_mtest_raw_keeps_wheels_still(self):
+        """默认对准只动手臂；上一个工位剩下的底盘位移不会让车开回去；先记下现在的车头方向。"""
+        moves = self._raw_setup()
+        self.h._ensure(self.w.link)
+        self.h.act.disp = {'S': 120.0, 'F': -150.0}            # 上一个工位没挪回去
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertEqual(moves, [], text)
+        self.assertEqual(self.w.homed, 1, text)
+        self.assertIn('车轮不动', text)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(sorted(c for c in self.w.tray.values() if c), [1, 5, 6])
+
+    def test_mtest_raw_out_of_reach_is_skipped_not_chased(self):
+        """物料停在手臂够不着的地方：跳过，不开车去追。"""
+        moves = self._raw_setup()
+        self.w.raw_items[0]['pos'] = self.w.raw_items[0]['pos'] * 0 + (0.0, 60.0)
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertEqual(moves, [], text)
+        self.assertIn('手臂够不着的地方就跳过', text)
+        self.assertEqual(self.w.air + self.w.collisions, 0, text)
+
+    def test_raw_chassis_f_only_moves_forward_back(self):
+        moves = self._raw_setup()
+        self.h.cfg['raw_chassis'] = 'F'
+        self.w.raw_items[0]['pos'] = self.w.raw_items[0]['pos'] * 0 + (0.0, 45.0)
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertTrue(moves, text)
+        self.assertEqual({c for c, v in moves}, {'F'}, moves)
+        pos, far = 0.0, 0.0
+        for c, v in moves:                                     # 离停车点最远多少(探测 + 对准)
+            pos += v
+            far = max(far, abs(pos))
+        self.assertLessEqual(far, 60.0, moves)
+
+    def test_mtest_raw_needs_empty_tray(self):
+        """转盘里记着有物料(粗加工区测试取回的)：不加 force 不夹，加了 force 当作已经拿空。"""
+        self._raw_setup()
+        for it in self.h.plan.items(1):
+            self.h.in_tray[it.slot] = it
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('先用手把车上转盘拿空', text)
+        self.assertFalse([r for r in self.w.requests if r.startswith(('GRAB', 'OBS'))], self.w.requests)
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest RAW 1 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+
     def test_mtest_force_assumes_tray(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
         self.w.arrive('ROUGH', 1)

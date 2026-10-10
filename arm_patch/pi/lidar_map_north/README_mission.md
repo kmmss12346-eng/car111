@@ -41,7 +41,7 @@
 **QR**：反复发 `QR?`(最多 `qr_timeout_s` 秒)，读到后解析，屏上显示任务码。没读到/内容不对：本轮不夹放，路线照走。
 
 **RAW**（每个物料）：
-`OBS RAW O`(手臂摆到原料盘上方、张开夹爪) → 等原料盘停稳(`wait_still`，最多 `raw_wait_s` 秒) → 视觉闭环对准(物料顶面中心对爪子位置) → `GRAB n H`(下降夹紧、抬起、转到转盘上方放进 n 号槽)。底盘为了对准挪过的话，抓下一个前先挪回停车点。
+`OBS RAW O`(手臂摆到原料盘上方、张开夹爪) → 等原料盘停稳(`wait_still`，最多 `raw_wait_s` 秒) → 视觉闭环对准(物料顶面中心对爪子位置) → `GRAB n H`(下降夹紧、抬起、转到转盘上方放进 n 号槽)。对准默认**只动手臂、车轮不动**(`raw_chassis='off'`，不会压进原料区)；物料停在手臂够不着的地方就跳过。原料盘一直没停稳时也只动手臂跟。
 
 **ROUGH / TEMP 到工位先做的事**：
 - (只在 `mtest` 里)`HOME`：把现在的车头方向记为要保持的方向。车是手搬过来的，不记的话底盘一前后挪就把车头往开机时的方向转。
@@ -78,6 +78,7 @@
 | `enabled` | true | false = `go` 时不做夹放，只走路线 |
 | `time_limit_s` | 150 | 超过这个时间不再夹放。计时从 `go` 开始，要给回家留时间 |
 | `qr_timeout_s` / `raw_wait_s` | 6 / 10 | 等二维码 / 等原料盘停稳最多多久 |
+| `raw_chassis` / `raw_fix_max_mm` | 'off' / 40 | 原料区对准时车轮能不能动：'off' 只动手臂(不会压进原料区)；'F' 只许沿车头方向前后挪，最多 `raw_fix_max_mm`；'SF' 前后横着都能挪(以前的做法，可能压进原料区) |
 | `lift_init` | `"zero"` | 升降零点：`zero`(现在就是最低点，数字越大越高) / `home`(驱动器回零) / `skip` |
 | `camera` | /dev/video0 640x480 | `flip` 可设 -1/0/1(cv2.flip)，None 不翻 |
 | `claw_px` | RAW、RING 都是 [336.8, 282.9] | 爪子点(物料夹正时圆心在画面里的位置)。**用 `vclaw RAW <颜色>` / `vclaw RING` 实测**，存在 `vision_cal.json`，比这里的优先 |
@@ -126,7 +127,7 @@
 | `rtest [arm]` | 圆环识别+对准测试：OBS RING → 找圆环 → 手臂(够不着时底盘)对准，报告误差，不取不放。`arm` = 只动手臂。同时开 `python3 vview.py` 看画面 |
 | `vcal RING` / `vcal RAW <颜色号>` | 视觉校准。加 `arm` 只校准手臂不动底盘：`vcal RING arm` |
 | `vdbg [RING\|RAW <颜色号>]` | 存 `vdebug.png`：爪子位置(绿十字)、识别到的圆环(黄)/物料(红叉) |
-| `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force` |
+| `mtest QR` / `RAW n` / `ROUGH n` / `TEMP n` / `START` | 单独测一个工位(n=批次)。转盘里没东西时加 `force` 假定有：`mtest ROUGH 1 force`。`mtest RAW n`：车上转盘里记着有物料(前面测试留下的)时不夹，先手动拿空再 `mtest RAW n force`；开始时以现在的车头方向为准、底盘位移从 0 算 |
 | `mtest ROUGH n nogo` / `rev` | `nogo` = 只认圆环、对准，不取不放(先看对得准不准)；`rev` = 这次 1 号、3 号环反过来。mtest 每次重新计时，开始时 `HOME`(以现在的车头方向为准)，底盘位移从 0 算 |
 | `mtest reset` | 清空任务码和记录 |
 | `vclaw PICK` | 清掉物料顶面的爪子点(PICK)，下次放下物料时重新量。摄像头/爪子动过、改过 `ZOBRNG` 时用(改了 `ZOBRNG` 程序也会自己发现) |
