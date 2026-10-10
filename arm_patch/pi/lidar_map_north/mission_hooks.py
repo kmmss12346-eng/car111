@@ -2485,11 +2485,13 @@ class MissionHooks:
             self.log(f'    {why}' + (f'(车身斜 {t["angle"]:+.1f}°)' if t.get('angle') is not None else '') +
                      f'，手臂先转过去：ID2 {d2:+.0f}°' + (f'、ID1 {d1:+.1f}°' if abs(d1) >= 0.05 else '') + '，再测')
             self.arm.ap(a1, a2)
+            self._a1_hint, self._a2_hint = a1, a2                # AP 没回报角度时，对准的行程按转到的这个角度算(不是观察角度)
             return
         if abs(d2) >= 3.0:
             self.log(f'    手臂伸缩直接到前面对准时的远近(ID2 {d2:+.0f}°)' + (f'，ID1 {d1:+.1f}°' if d1 else ''))
         self.arm.lift(float(P['ZHI']))                       # 和 OBS 一样：先在搬运高度转过去(已经在这个高度就不动)
         self.arm.ap(a1, a2)
+        self._a1_hint, self._a2_hint = a1, a2
         self.arm.lift(float(P['ZOBRNG']))
 
     def _predict_d2(self):

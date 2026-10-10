@@ -476,6 +476,38 @@ class AuditTests(unittest.TestCase):
         h2._use_code(CODE)
         self.assertEqual(w.screen['t0'], '156+123')
 
+    def test_arm_range_follows_the_pre_turned_arm_without_ang_reply(self):
+        """工位里手臂提前转过(AP)、STM32 这次没回报角度：对准的手臂行程按转到的角度算，不按观察角度 A2P 算
+        (不然 ID2 可能被推到 A2P±limit 以外，或者还没到头就当成到头)。"""
+        w = SimWorld(seed=1, code=CODE)
+        h, lines = hooks(w)
+        real = w.handle
+
+        def handle(text):
+            ok, reply, info = real(text)
+            if text.startswith('AP '):
+                info = [ln for ln in info if not ln.startswith('ANG')]   # 这次 AP 没回读到角度
+            return ok, reply, info
+        w.handle = handle
+        got = []
+        h.prepare(w.link, lines.append)
+        run = h.servo.run
+
+        def spy(*a, **kw):
+            rng = kw.get('arm_range')
+            if rng and 'id2' in rng:
+                got.append((rng['id2'], w.a2))
+            return run(*a, **kw)
+        h.servo.run = spy
+        for role in ('QR', 'RAW', 'ROUGH'):
+            w.arrive(role)
+            h.task(role, w.link, lines.append)
+        self.assertTrue(got)
+        env = h._a2_env()
+        for (lo, hi), a2 in got:
+            self.assertAlmostEqual(a2 + hi, env[1], delta=1.0)        # 范围的上下限换回绝对角度 = 机构的行程
+            self.assertAlmostEqual(a2 + lo, env[0], delta=1.0)
+
     def test_keepalive_never_moves_after_abort(self):
         w = SimWorld(seed=1, code=CODE)
         h, lines = hooks(w)
