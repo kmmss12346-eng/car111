@@ -604,6 +604,9 @@ class MissionHooks:
             if res is None:
                 self._recover('下面那层物料和圆环都看不到，物料留在车上，不放')
             elif not res.ok and res.err_mm > cfg['accept_mm'][key]:
+                if not math.isfinite(res.err_mm) and (zone, int(ring)) in self.ring_f:
+                    self.log(f'    ★ 开到算出来的环{ring}位置，爪子附近没看到圆环：可能认错了是几号环(车要停在 2 号环正对爪子)，'
+                             '或者这个环被挡住了/反光')
                 self._recover(f'没对准({res.reason})，物料留在车上，不放')
             elif not stack and cfg.get('check_ring_empty', True) and self._ring_taken(zone, ring):
                 self._recover(f'环{ring} 的白心里已经有东西了(别的物料？)，不放，免得砸上去；物料留在车上')
@@ -803,13 +806,20 @@ class MissionHooks:
         if n == 3:
             first = 0                                            # pts[0] 是排在最前面(左/上)的那个
         elif n == 2:
+            near = int(np.argmin(dist))
             before, after = inside(pts[0] - step), inside(pts[1] + step)
-            if before and not after and not covered:
-                first = 0                                        # 前面那头看得到却没有环：pts[0] 就是这一排的第一个
-            elif after and not before and not covered:
-                first = 1                                        # 后面那头看得到却没有环：pts[1] 是最后一个，pts[0] 是中间那个
+            end_first = 0 if (before and not after) else (1 if (after and not before) else None)   # "那一头看得到却没有环"推出来的
+            if float(dist[near]) <= 0.35 * sp_px:
+                # 爪子下面(附近)就有一个环：车按要求停在 2 号环前面，它就是 2 号。
+                # 另一边那个环没认出来(被爪子挡住、反光……)时，"那一头没有环"会推错成停在 1 号/3 号，整排认错一位，所以不信它
+                first = 1 if near == 0 else 0
+                if end_first is not None and end_first != first:
+                    self.log('    ★ 画面里' + ('左(上)' if near == 0 else '右(下)') + '边那个圆环没认出来(被爪子挡住了？反光？)：'
+                             '按"车停在 2 号环"算，爪子下面这个是 2 号')
+            elif end_first is not None and not covered:
+                first = end_first                                # 车停在两个环中间：看哪一头是这一排的尽头
             else:
-                first = 1 if int(np.argmin(dist)) == 0 else 0    # 认不准：当作离爪子点近的那个是中间(2 号)
+                first = 1 if near == 0 else 0                    # 认不准：当作离爪子点近的那个是中间(2 号)
                 guess = True
         else:
             first = 1                                            # 只看到一个：当作中间那个(2 号)
@@ -856,6 +866,8 @@ class MissionHooks:
         side_px = max(side for _k, _f, side in parts)
         self.ring_gate_px = math.hypot(0.45 * sp_px, side_px + 10.0)
         seen = '、'.join(str(ids[i]) for i in range(3) if any(np.hypot(*(pos[i] - p)) < 0.3 * sp_px for p in pts))
+        self.log('    圆环在画面里：' + '  '.join(f'({r[0]:.0f},{r[1]:.0f}) 半径{r[2]:.0f}' for r in rings) +
+                 f'；爪子点 ({cu:.0f},{cv_:.0f})')
         self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素：' +
                  '  '.join(f'环{k} ' + ('不用挪' if abs(f) < 1 else ('前进' if f > 0 else '后退') + f' {abs(f):.0f}mm') +
                            f'(横向差 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))

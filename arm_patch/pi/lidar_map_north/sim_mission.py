@@ -966,16 +966,34 @@ class ZoneFlowTests(unittest.TestCase):
             self.assertLessEqual(len(fix), 4, (fix, text))
             self.assertTrue(all(p[3] < 2.5 for p in w.placed), w.placed)
 
-    def test_car_parked_at_ring1_or_ring3_still_finds_the_right_rings(self):
-        """车没停在 2 号环前面(停在 1 号或 3 号环前面、或者两个环中间偏 2 号)：圆环空着时看清以后照样认对、放对。
-        (圆环上放着物料时不靠"那一头没有环"认，按离爪子近的是 2 号算，所以这里只跑第一批)"""
-        for park, sure in (({'ROUGH': 150.0, 'TEMP': -150.0}, True), ({'ROUGH': -150.0, 'TEMP': 150.0}, True),
-                           ({'ROUGH': 55.0, 'TEMP': -55.0}, False)):
+    def test_side_ring_missed_when_parked_at_ring2(self):
+        """车停在 2 号环前面，画面里一边的圆环没认出来(被爪子挡住、反光)：不能当成"车停在 3 号(1 号)环"把整排认错一位
+        (10-10 实车：只看到两个环，认成了 2、3 号，结果开到环1 的位置没有环)。"""
+        for drop in ('right', 'left'):
+            for seed in range(3):
+                w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0)
+                h = make(w)
+                orig = w.vision.ring_list
+
+                def ring_list(n=None, orig=orig, drop=drop):
+                    r = orig(n)
+                    if len(r) == 3:
+                        return r[:2] if drop == 'right' else r[1:]
+                    return r
+                w.vision.ring_list = ring_list
+                lines = []
+                run_mission(w, h, log=lines.append)
+                text = '\n'.join(lines)
+                self._assert_all_good(w, h, text, seed)
+                self.assertIn('没认出来', text)
+
+    def test_car_parked_between_rings_still_finds_the_right_rings(self):
+        """车停得离 2 号环偏了 55mm(两个环中间偏 2 号)：照样认对、放对。
+        (停在 1 号/3 号环正前面、画面里只看到两个环时，按"车停在 2 号环"算，会认错一位：车要停在 2 号环前面)"""
+        for park in ({'ROUGH': 55.0, 'TEMP': -55.0}, {'ROUGH': -55.0, 'TEMP': 55.0}):
             for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park=park), stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
                 self._assert_all_good(w, h, text, seed, batches=1)
                 self.assertEqual(rings_summary(w, 'TEMP'), {1: [1], 2: [5], 3: [6]}, f'{park} seed {seed}')
-                if sure:
-                    self.assertNotIn('认不准', text)
 
     def test_covered_end_ring_missed_does_not_shift_numbering(self):
         """暂存区第二批：圆环上都放着第一批的物料，一头那个没认出来：不能当成"那一头没有环"把编号整体挪一位(会叠错颜色)。"""
