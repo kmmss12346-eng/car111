@@ -153,9 +153,16 @@ class ArmLink:
         self.do('STOW')
 
     # ------------------------------------------------------------ ID1 / ID2
-    def read_angles(self):
+    def read_angles(self, tries=4):
+        """读 ID1、ID2 现在的角度。总线舵机偶尔一次没回话(STM32 回 ERR READ)：歇一下再读，最多读 tries 次。"""
         for i in (1, 2):
-            self.do(f'A? {i}')
+            for k in range(tries):
+                ok, reply, _info = self.request(f'A? {i}')
+                if ok:
+                    break
+                if 'READ' not in (reply or '') or k == tries - 1:
+                    raise ArmError(f'A? {i} 失败：{reply}')
+                time.sleep(0.05 + 0.05 * k)
         return self.angle[1], self.angle[2]
 
     def ap(self, a1, a2):

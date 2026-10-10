@@ -1084,6 +1084,26 @@ class ZoneFlowTests(unittest.TestCase):
         w.stop_err[:] = (0.0, 75.0)                              # 正好在 1、2 号环中间：两个都太远，当没看到
         self.assertIsNone(h._ring_measure()())
 
+    def test_servo_read_glitch_is_retried(self):
+        """总线舵机偶尔读角度没回话(A? 回 ERR READ，10-10 实车上蓝色因为这个没放)：再读一次就好，不能整个物料跳过。"""
+        w = SimWorld(seed=6, code=self.CODE, cam_deg=90.0)
+        h = make(w)
+        orig = w._handle
+        st = {'n': 0}
+
+        def handle(text):
+            if text.startswith('A?'):
+                st['n'] += 1
+                if st['n'] % 7 in (3, 4):                      # 每 7 次里连着两次读不到
+                    return False, 'ERR READ', []
+            return orig(text)
+        w._handle = handle
+        lines = []
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self._assert_all_good(w, h, text, 6)
+        self.assertNotIn('ERR READ', text)
+
     def test_occupied_tray_slot_is_not_grabbed_into(self):
         """第一批有物料没放出去还在转盘里：第二批同一个槽的物料不夹(放进去会砸在上面)，也不会把它当成第二批的去放。"""
         w = SimWorld(seed=4, code=self.CODE)
