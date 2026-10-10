@@ -11,7 +11,8 @@
 第一次用(或发现对不上)时先做几个小动作测出来(探测)，存进文件，下次直接用；每次修正后还会用实际移动量在线微调(Broyden 更新)。
 
 保护：
-  - 误差变大(发散)就丢掉这组 J 重新探测，再不行就放弃，不盲动
+  - 误差变大(发散)就丢掉这组 J 重新探测，再不行就放弃，不盲动。一次测量跳一下(噪声)不算：先再测一次，还是变大才算发散；
+    丢掉的 J 只在这次运行里不用(内存里)，不从 servo_cal.json 里删(比赛中一次误判不会把 vcal 测好的 J 弄没)
   - 手臂相对观察姿态的总偏移有上限，超了就改用底盘
   - 每步动作量有上限；总时间有上限
 """
@@ -29,7 +30,7 @@ class ServoError(Exception):
 
 DEFAULTS = dict(
     max_iter=6,                 # 最多修正几次
-    timeout_s=10.0,             # 一次对准最多用多少秒
+    timeout_s=10.0,             # 一次对准最多用多少秒(不算探测 J 的时间：那是一次性的校准)
     gain_arm=0.85,              # 手臂每次修正掉多少比例的偏差(<1 留余量，防止过冲)
     gain_ch=0.8,                # 底盘
     settle_arm_s=0.20,          # 手臂动完等多久再拍(摄像头在手臂上，要等它不抖)
@@ -99,12 +100,14 @@ class Result:
 
 
 class JacStore:
-    """把测出来的 J 存成 json，下次启动直接用。键：(kind, group)，kind='RAW'/'RING'，group='arm'/'ch'。"""
+    """把测出来的 J 存成 json，下次启动直接用。键：(kind, group)，kind='RAW'/'RING'，group='arm'/'ch'。
+    suspend：这次运行里先不用这组 J(发散过)，但不从文件里删；下次 put 新的 J(对准成功、重新探测)就恢复正常。"""
 
     def __init__(self, path=None):
         self.path = path
         self.data = {}
         self.dirty = False
+        self.suspended = set()          # (kind, group)：这次运行里先不用(只在内存里，不存进文件)
         if path and os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -113,6 +116,8 @@ class JacStore:
                 self.data = {}
 
     def get(self, kind, group):
+        if (kind, group) in self.suspended:
+            return None
         v = (self.data.get(kind) or {}).get(group)
         if not v:
             return None
@@ -124,14 +129,31 @@ class JacStore:
 
     def put(self, kind, group, J):
         self.data.setdefault(kind, {})[group] = [[float(x) for x in row] for row in np.asarray(J)]
+        self.suspended.discard((kind, group))
         self.dirty = True
 
     def drop(self, kind, group):
+        """真的删掉(存文件时也没了)：只给用户的命令用(vcal、vclaw PICK)，对准过程中用 suspend。"""
+        self.suspended.discard((kind, group))
         if kind in self.data and group in self.data[kind]:
             del self.data[kind][group]
             self.dirty = True
         if group == 'ch':
             self.set_synth(kind, False)
+
+    def suspend(self, kind, group):
+        """这次运行里先不用这组 J(发散了、可能不对)：get 返回 None，下次对准重新探测；文件里的不动。"""
+        self.suspended.add((kind, group))
+
+    def extra(self, kind, key):
+        """这个 kind 下面存的别的值(比如 RING 的 ch_f_ref)；没有返回 None。"""
+        return (self.data.get(kind) or {}).get(key)
+
+    def set_extra(self, kind, key, value):
+        d = self.data.setdefault(kind, {})
+        if d.get(key) != value:
+            d[key] = value
+            self.dirty = True
 
     def synth(self, kind):
         """这个 kind 的底盘 J 只测过前后(F)，横移(S)那一列是补出来的：要横移时得重新测。"""
@@ -190,6 +212,7 @@ class VisualServo:
         self._wheels = False            # 这次对准先动车轮(run 里设)
         self._rpm = None                # 这次对准车轮小步挪的速度
         self._flt = False               # 这次对准用测量滤波
+        self._arm_range = {}            # 这次对准手臂能偏的范围(相对开始时，度)：{'id2': (下限, 上限)}；没给的轴按 ±arm_limit_deg
         self.meas_var = {}              # kind -> 一次测量的噪声方差(像素²，每个方向)：同一个位置连着测两次时更新
 
     # ------------------------------------------------------------------ 测量
@@ -202,6 +225,15 @@ class VisualServo:
         raise ServoError('看不到目标')
 
     # ------------------------------------------------------------------ 手臂 / 底盘动作
+    def _range(self, i):
+        """手臂第 i 个轴(0 = ID2，1 = ID1)这次对准能偏的范围 (下限, 上限)，相对开始对准时的角度(度)。"""
+        key = ('id2', 'id1')[i]
+        r = (getattr(self, '_arm_range', None) or {}).get(key)
+        if r is not None:
+            return float(r[0]), float(r[1])
+        lim = float(self.cfg['arm_limit_deg'][key])
+        return -lim, lim
+
     def _clip_arm(self, du):
         """按每步上限和总偏移上限裁剪。返回 (裁剪后的 du, 是否被明显裁剪)。"""
         c = self.cfg
@@ -210,9 +242,9 @@ class VisualServo:
         for i, key in enumerate(('id2', 'id1')):
             want = out[i]
             step = c['step_limit_deg'][key]
-            lim = c['arm_limit_deg'][key]
+            lo, hi = self._range(i)
             v = max(-step, min(step, want))
-            v = max(-lim - self.dev[i], min(lim - self.dev[i], v))
+            v = max(lo - self.dev[i], min(hi - self.dev[i], v))
             if abs(want) > 1e-9 and abs(want - v) > 0.3 * abs(want):
                 sat = True
             out[i] = v
@@ -320,7 +352,8 @@ class VisualServo:
             if group == 'arm':
                 key = 'id2' if axis == 0 else 'id1'
                 step = c['probe_start_deg'][key] * shrink
-                sign = -1.0 if self.dev[axis] > 0.5 * c['arm_limit_deg'][key] else 1.0
+                lo, hi = self._range(axis)
+                sign = -1.0 if self.dev[axis] - (lo + hi) / 2.0 > 0.25 * (hi - lo) else 1.0   # 已经偏到一边：往另一边探
             else:
                 step = c['probe_chassis_mm'] * shrink
                 sign = 1.0
@@ -384,8 +417,9 @@ class VisualServo:
     # ------------------------------------------------------------------ 主循环
     def _short(self, need, i):
         """手臂第 i 个轴(0 = ID2，1 = ID1)要再转 need 度：超出这次对准的总行程吗？超出返回超出了多少度，没超出返回 0。"""
-        lim = float(self.cfg['arm_limit_deg'][('id2', 'id1')[i]])
-        return max(0.0, abs(float(self.dev[i]) + float(need)) - lim)
+        lo, hi = self._range(i)
+        x = float(self.dev[i]) + float(need)
+        return max(0.0, x - hi, lo - x)
 
     def _decide(self, J, p, e, allow_chassis):
         """这一次用手臂还是底盘。偏差大、或者手臂这一步够不着(超出行程)就用底盘；其余用手臂(精度高)。
@@ -393,9 +427,12 @@ class VisualServo:
         'Fs' 时手臂伸缩到头还够不着，才让车轮横着挪(只挪够不着的那一段)。"""
         c = self.cfg
         self._need_s = False
-        if not allow_chassis or (e < c['chassis_min_mm'] and not self._wheels):
+        if not allow_chassis:
             return 'arm'
+        small = e < c['chassis_min_mm'] and not self._wheels       # 偏差小：一般只动手臂(底盘只能到几毫米精度)
         mode = self._mode()
+        if small and mode != 'Fs':
+            return 'arm'
         if mode != 'SF' and J['ch'] is not None:
             jf = np.asarray(J['ch'], float)[:, 1]
             along = e * abs(float(jf @ p)) / max(_norm(jf) * _norm(p), 1e-9)   # 偏差里沿着"底盘前后"方向的那一段(毫米)
@@ -418,7 +455,9 @@ class VisualServo:
                         short_r = True
             if short_r:
                 self._need_s = True                              # 车轮横着挪(靠近/远离)，只挪手臂够不着的那一段
-                return 'ch'
+                return 'ch'                                      # (偏差小也挪：手臂伸缩已经到头，不挪就一直卡在这里)
+            if small:
+                return 'arm'
             if self._wheels:
                 # 先动车轮：沿圆环那一排还差 wheels_min_mm 以上就让车轮前后小步挪；剩下的(和离圆环的远近)交给手臂
                 return 'ch' if along >= float(c.get('wheels_min_mm') or 1.5) else 'arm'
@@ -426,6 +465,8 @@ class VisualServo:
                 return 'arm'                             # 主要是横向的偏差：手臂伸缩够得着
             if along > c['arm_cover_mm'] or sat_a:
                 return 'ch'                              # 沿着圆环那一排差得多(或者沿这一排的舵机够不着)：底盘前后挪
+            return 'arm'
+        if small:
             return 'arm'
         if e > c['arm_cover_mm']:
             return 'ch'
@@ -437,13 +478,15 @@ class VisualServo:
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
             bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False,
-            gain_arm=None, near_avg=None, wheels_first=None, filt=None):
+            gain_arm=None, near_avg=None, wheels_first=None, filt=None, arm_range=None):
         """对准(见 _run)。chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
         chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。
         fixed_j = True：只用存好的 J——不探测、不丢、不改存着的 J；误差变大就直接停(原料盘停下的几秒钟里对准用：
         万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。
         gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。
-        wheels_first / filt：只这一次 先动车轮(只在 'F'/'Fs' 时有用) / 测量滤波；None = 用配置里的。"""
+        wheels_first / filt：只这一次 先动车轮(只在 'F'/'Fs' 时有用) / 测量滤波；None = 用配置里的。
+        arm_range = {'id2': (下限, 上限)}：这次手臂能偏的范围(相对开始对准时的角度)；开始前手臂已经提前伸缩过时，
+        按机构的行程算还能往哪边偏多少(不然会按 ±arm_limit_deg 以为还能伸，顶到头)。没给的轴按 ±arm_limit_deg。"""
         self._fixed = bool(fixed_j)
         self._wheels = bool(self.cfg.get('wheels_first') if wheels_first is None else wheels_first) and \
             str(chassis_axes or self.cfg.get('chassis_axes') or 'SF') != 'SF'
@@ -456,6 +499,7 @@ class VisualServo:
                 self.cfg[k] = val
         self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
         self._s_range = tuple(chassis_s_range) if chassis_s_range is not None else None
+        self._arm_range = dict(arm_range or {})
         self._s_used = 0.0
         self._s_clipped = False
         self._need_s = False
@@ -470,6 +514,7 @@ class VisualServo:
             self._wheels = False
             self._rpm = None
             self._flt = False
+            self._arm_range = {}
             self.cfg.update(saved)
 
     def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
@@ -496,6 +541,7 @@ class VisualServo:
         timeout = float(timeout_s or c['timeout_s'])
         do_confirm = c['confirm'] if confirm is None else bool(confirm)
         t0 = self.clock()
+        t_probe = [0.0]                 # 探测 J 用了多久(一次性的校准，不算进对准超时)
         self.dev = np.zeros(2)
         J = {g: self.store.get(kind, g) for g in ('arm', 'ch')}
         self._ch_synth = J['ch'] is not None and self.store.synth(kind)
@@ -517,6 +563,7 @@ class VisualServo:
         fresh = [False]                 # p 是不是最后一次动作以后测的(动了以后没测到 = 不知道现在偏多少)
         avg = [False]                   # 这个位置已经测过两次取了平均
         stalls = 0
+        rechecked = False               # 这一步之后偏差一下变大了，已经再测过一次
         flt = bool(self._flt)
         if flt and kind not in self.meas_var:
             self.meas_var[kind] = float(c.get('meas_sigma_px') or 0.8) ** 2
@@ -571,8 +618,9 @@ class VisualServo:
             return fix_max is not None and ch_moved[0] >= float(fix_max)
 
         def finish(ok, reason=''):
-            # 对准成功：把这次用实际移动修正过的 J 存下来(fixed_j 时也存：成功说明目标没在动，修正是对的)；探测过的也存(fixed_j 不探测)
-            if ok or (probed and not getattr(self, '_fixed', False)):
+            # 对准成功：把这次用实际移动修正过的 J 存下来(fixed_j 时也存：成功说明目标没在动，修正是对的)；探测过的也存(fixed_j 不探测)。
+            # 发散过(重新探测过)又没对准：目标多半自己在动，这次探测的 J 也不可信，不存(servo_cal.json 里原来的不动)
+            if ok or (probed and not getattr(self, '_fixed', False) and not reprobes):
                 for g in ('arm', 'ch'):
                     if J[g] is not None:
                         self.store.put(kind, g, J[g])
@@ -617,23 +665,28 @@ class VisualServo:
                 confirmed = False
                 if moves >= max_iter:
                     return finish(False, f'{max_iter}次修正后仍有 {e:.2f}mm')
-                if self.clock() - t0 > timeout:
+                if self.clock() - t0 - t_probe[0] > timeout:
                     return finish(False, f'超时({timeout:.0f}秒)，还差 {e:.2f}mm')
 
-                # 发散：这次比上次明显更差。第一次发散丢掉 J 重新探测，再发散就放弃
+                # 发散：这次比上次明显更差。一次测量跳一下(噪声)不算：先再测一次(滤波开着时用滤波后的值)，还是这么大才算。
+                # 第一次发散丢掉 J 重新探测，再发散就放弃。丢掉的 J 只在这次运行里不用(suspend)，不从 servo_cal.json 里删
                 if prev_e is not None and e > prev_e * c['diverge_ratio'] + 0.6:
+                    if not rechecked:
+                        rechecked = True
+                        self.log(f'  {tag} 偏差一下变大了({prev_e:.2f}→{e:.2f}mm)：再测一次，看是不是测量跳了一下')
+                        p = meas()
+                        continue
                     bad += 1
-                    self.log(f'  {tag} 误差变大了({prev_e:.2f}→{e:.2f}mm)，J 可能不对')
+                    self.log(f'  {tag} 误差变大了({prev_e:.2f}→{e:.2f}mm，复测也是)，J 可能不对')
                     if getattr(self, '_fixed', False):
                         return finish(False, '误差变大了(目标自己在动？)，停下')
                     if bad >= 2 or reprobes >= 1:
                         for g in ('arm', 'ch'):
-                            self.store.drop(kind, g)
-                        self.store.save()
+                            self.store.suspend(kind, g)
                         return finish(False, '发散：动作方向和画面对不上，需要重新校准(vcal)')
                     for g in ('arm', 'ch'):
                         J[g] = None
-                        self.store.drop(kind, g)
+                        self.store.suspend(kind, g)
                     reprobes += 1
                 else:
                     bad = 0
@@ -645,7 +698,9 @@ class VisualServo:
                     if getattr(self, '_fixed', False):
                         return finish(False, '没有存好的对应关系(J)，这次不探测')
                     moved()
+                    tp = self.clock()
                     J[group] = self._probe(measure, group, bounds)
+                    t_probe[0] += self.clock() - tp
                     probed = True
                     p = meas()                               # 探测动过了，重新测，下一圈再决定
                     prev_e = None
@@ -665,9 +720,16 @@ class VisualServo:
                     sf = self._ch_cmd(J['ch'], p)
                     moved()
                     applied = self._apply_chassis(sf[0], sf[1])
-                    used_ch = True
-                    ch_moved[0] += abs(float(applied[1]))
-                    if self._need_s and abs(float(applied[0])) > 0:
+                    if _norm(applied) < 1e-9 and self._wheels and J['arm'] is not None:
+                        # 先动车轮：这一步四舍五入成 0mm(车轮只能按整毫米挪)：这一次改用手臂，不当成"到头了"
+                        group = 'arm'
+                        du = self._min_step(J['arm'], p, -c['gain_arm'] * np.linalg.solve(J['arm'], p))
+                        cmd, _s = self._clip_arm(du)
+                        applied, sat = self._apply_arm(du)
+                    else:
+                        used_ch = True
+                        ch_moved[0] += abs(float(applied[1]))
+                    if group == 'ch' and self._need_s and abs(float(applied[0])) > 0:
                         self.log(f'  {tag} 手臂伸缩够不着：车轮横着挪 {applied[0]:+.0f}mm(离圆环近一点/远一点)')
                 expect(group, applied)
                 if _norm(applied) < 1e-9:
@@ -685,7 +747,9 @@ class VisualServo:
                         # 手臂一点都动不了(到头了)：这一圈改用底盘
                         if J['ch'] is None:
                             moved()
+                            tp = self.clock()
                             J['ch'] = self._probe(measure, 'ch', bounds)
+                            t_probe[0] += self.clock() - tp
                             probed = True
                             p = meas()
                             prev_e = None
@@ -706,6 +770,7 @@ class VisualServo:
                         return finish(False, f'手臂已到行程极限、底盘也不用动，还差 {e:.2f}mm')
                 prev_e = e
                 moves += 1
+                rechecked = False
 
                 p_before = p
                 pred = J[group] @ applied

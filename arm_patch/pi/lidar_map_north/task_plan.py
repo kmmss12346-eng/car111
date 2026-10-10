@@ -82,6 +82,12 @@ class Plan:
             out.append(f'第{b}批: ' + ' '.join(f'{it.color_name}->环{it.ring}' for it in self.batches[b]))
         return '；'.join(out)
 
+    def screen_code(self, plus=True):
+        """任务码分两行显示(字高 ≥12mm，一行放不下 15 个字符)。plus=True：第一行带上两组之间的 +，
+        '156+123+516+231' -> ('156+123+', '516+231')，屏上看到的就是完整的任务码；False：('156+123', '516+231')(以前的显示)。"""
+        c = self.code
+        return (c[:8], c[8:]) if plus else (c[:7], c[8:])
+
     def screen_lines(self):
         """给串口屏用的纯 ASCII 短文本。"""
         l1 = 'B1 ' + ' '.join(f'{it.color_short}{it.ring}' for it in self.batches[1])
@@ -146,6 +152,7 @@ class Stats:
     grab_ok / grab_total      从原料盘抓进车里的物料数(最多 6)
     place_ok / place_total    放到圆环上的次数(粗加工区 6 次 + 暂存区 6 次，最多 12)
     注意：这里的"成功"是指令执行成功且对准误差在容许范围内，不是传感器确认的结果。
+    跑的时候屏上显示 成功/做了几次(看进度)；回到启停区以后只显示成功的个数(final_*：赛规要的是"正确的数量"，写成分数裁判容易看错)。
     """
 
     def __init__(self):
@@ -167,3 +174,9 @@ class Stats:
 
     def place_text(self):
         return f'PLACE {self.place_ok}/{self.place_total}'
+
+    def final_grab_text(self):
+        return f'GRAB {self.grab_ok}'
+
+    def final_place_text(self):
+        return f'PLACE {self.place_ok}'

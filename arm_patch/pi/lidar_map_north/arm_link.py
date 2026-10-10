@@ -20,11 +20,12 @@ _TIMEOUTS = (
     ('GRAB', 60.0), ('PICK', 60.0), ('PLACE', 70.0), ('TAKE', 40.0), ('DROP', 30.0), ('OBS', 40.0), ('STOW', 40.0),
     ('LIFT', 25.0), ('AP', 15.0), ('AD', 10.0), ('AF', 10.0), ('A?', 4.0), ('CLAW', 5.0), ('TT', 5.0),
     ('SCR', 2.0), ('SCMD', 2.0), ('QR', 2.0), ('SET', 2.0), ('GET', 4.0),
+    ('PARK', 40.0), ('ZONE', 3.0), ('ZONE?', 2.0),
 )
 
 
 # 这些指令会动 ID1/ID2 但不回报角度，执行后缓存的角度就过期了
-_MOVING = ('OBS', 'GRAB', 'PICK', 'PLACE', 'TAKE', 'DROP', 'STOW')
+_MOVING = ('OBS', 'GRAB', 'PICK', 'PLACE', 'TAKE', 'DROP', 'STOW', 'PARK')
 
 
 def _timeout_for(text):
@@ -39,6 +40,13 @@ _ANG = re.compile(r'ANG (\d) (-?\d+(?:\.\d+)?)')
 _LIFT = re.compile(r'LIFT (\d) (-?\d+(?:\.\d+)?)')
 _QR = re.compile(r'QR (\d{3}\+\d{3}\+\d{3}\+\d{3})')
 _PARAM = re.compile(r'P (\w+)=(-?\d+(?:\.\d+)?)')
+_BOOT = re.compile(r'BOOT=(\w+)')
+_ZONE = re.compile(r'ZONE (\d) (\d)')
+
+
+def unknown_cmd(reply):
+    """STM32 不认识这条指令(旧程序回 ERR CMD)。"""
+    return 'ERR CMD' in (reply or '')
 
 
 class ArmLink:
@@ -48,6 +56,7 @@ class ArmLink:
         self.angle = {1: None, 2: None}          # 最近一次读到的 ID1、ID2 角度(度)
         self._screen_last = {}
         self._params = None
+        self.lift_boot = None                    # 开机时升降高度是怎么认出来的(LIFT? 回复里的 BOOT=…；旧程序没有)
 
     # ------------------------------------------------------------ 基础
     def request(self, text, timeout=None):
@@ -83,7 +92,9 @@ class ArmLink:
         return None
 
     def qr_clear(self):
-        self.request('QR CLR', 2.0)
+        """清掉 STM32 里存的任务码。返回是否成功(回了 DONE)。"""
+        ok, _reply, _info = self.request('QR CLR', 2.0)
+        return bool(ok)
 
     def screen(self, obj, text):
         """往串口屏的文本控件写字(只能 ASCII，且不超过 STM32 一行 47 字符的限制)。同样的内容不重复发。失败只记日志不抛错。"""
@@ -102,6 +113,10 @@ class ArmLink:
         except Exception as ex:
             self.log(f'    (串口屏 {obj} 写入出错：{ex!r})')
 
+    def screen_reset(self):
+        """屏被清过(ZONE LOCK、STM32 重启)：忘掉"已经写过什么"，下次每个控件都重新写。"""
+        self._screen_last = {}
+
     def screen_cmd(self, raw):
         try:
             self.request(f'SCMD {raw}'[:47], 2.0)
@@ -118,13 +133,48 @@ class ArmLink:
         self.do(f'LIFT {mm:.1f}')
 
     def lift_state(self):
-        """(是否已回零, 当前毫米)。"""
+        """(是否已回零, 当前毫米)。新程序的回复后面还带 BOOT=ENC|NOCAL|NOENC|POS(开机怎么认的高度)，记在 self.lift_boot。"""
         ok, reply, info = self.request('LIFT?', 3.0)
         for line in info:
             m = _LIFT.match(line)
             if m:
+                b = _BOOT.search(line)
+                self.lift_boot = b.group(1) if b else None
                 return bool(int(m.group(1))), float(m.group(2))
         return False, 0.0
+
+    def park(self):
+        """PARK：收臂(像 STOW)，再把升降停到开机高度 60mm(60 只在 STM32 里定义一处)。
+        返回 (True, 回复) 成功；(False, 回复) STM32 认识但没做成(比如 ERR NOZERO 升降位置不知道)；
+        (None, 回复) 旧程序不认识 PARK(调用的地方改用 STOW + LIFT 60)。"""
+        ok, reply, _ = self.request('PARK')
+        if not ok and unknown_cmd(reply):
+            return None, reply
+        return bool(ok), reply
+
+    def zone(self):
+        """ZONE?：屏上选的启停区。返回 (区 0/1/2(0 = 还没选), 按过 START 没有 0/1)；旧程序不认识返回 None。"""
+        ok, reply, info = self.request('ZONE?', 2.0)
+        if not ok:
+            return None
+        for line in info:
+            m = _ZONE.match(line.strip())
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        return None
+
+    def zone_cmd(self, arg):
+        """ZONE ASK / ZONE 1 / ZONE 2 / ZONE MSG 文字(≤20 个 ASCII) / ZONE LOCK。返回是否成功(旧程序不认识：False)。"""
+        arg = str(arg).strip()
+        if arg.upper().startswith('MSG'):
+            txt = arg[3:].strip().encode('ascii', 'replace').decode('ascii').replace('"', "'")[:20]
+            arg = 'MSG ' + txt
+        else:
+            arg = arg.upper()
+        ok, reply, _ = self.request(f'ZONE {arg}'[:47], 3.0)
+        if not ok and not unknown_cmd(reply):
+            self.log(f'    (ZONE {arg} 失败：{reply})')
+        return bool(ok)
 
     def claw(self, open_):
         self.do('CLAW O' if open_ else 'CLAW C')

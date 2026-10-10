@@ -19,8 +19,18 @@
 出错处理：
   - 机械臂还没标定(ARMOK=0)、升降没回零：整轮不做夹放，路线照走，并在串口屏提示
   - 单个物料对不准或出错：跳过这个物料，收臂，继续下一个
-  - 收到急停(abort)：立刻抛 Abort，路线停止
-  - 超过 time_limit_s：不再做夹放，让车尽快回家
+  - 停车点里出了意外的错(程序 bug 之类)：这个停车点不再做，收臂、挪回停车点，路线照走(不结束这一轮)
+  - 收到急停(abort)、收臂失败、底盘挪不回停车点(车在哪不知道了)：抛 Abort，路线停止
+  - 时间不够(按每个物料的用时 + 回家的时间算)：不再开始新的物料，记下 out_of_time，让导航直接回家(不抛异常)
+
+给导航(auto_run / map_merge_live)用的接口(导航都先 hasattr 再调)：
+  prepare(link, log)   一键出发后马上调：机械臂初始化 + 收臂、同步参数、清掉 STM32 里的旧任务码、屏上任务码写 ---、打开摄像头
+  start_clock()        比赛计时从现在开始(按下屏上 START 的那一刻)
+  time_left()          离 time_limit_s 还有多少秒
+  go_home_now(下一个停车点, 开过去要几秒, 从那里回家要几秒) -> True = 去了就来不及回家，从这里直接回家
+  set_home_eta(秒)     导航告诉钩子：从现在这个停车点回家要多久(停车点里每个物料开始前按它判断来不来得及)
+  keepalive()          车长时间不动时手臂轻轻摆一下(规则：停止运行 15 秒本轮结束)
+  park()               收臂、升降停到 60mm(跑完回到启停区、退出程序时；急停以后不自动做)
 """
 import math
 import time
@@ -41,8 +51,32 @@ except Exception:                       # 单独测试时没有 auto_run
 
 DEFAULTS = dict(
     enabled=True,
-    time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)
-    qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码
+    time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)。
+                                        #   每个物料开始前还要来得及在这之前做完(按实测的每个物料用时)
+    round_s=180.0,                      # 一轮多长(赛规 3 分钟)：导航告诉了回家要多久(set_home_eta)时，按它算还来不来得及
+    home_margin_s=12.0,                 # 算"来不来得及回家"时再多留这么多秒(路线时间估得不准、回家前雷达定位、回家对准)
+    stop_finish_s=3.0,                  # 停车点做完物料以后收臂、底盘挪回停车点大约要多久
+    home_when_idle=True,                # 后面再也没有夹放可做(没读到任务码、机械臂不能用)：go_home_now 回 True，导航直接回家(少走路、少压线)；
+                                        #   false = 照样把路线走完(只测路线时用 enabled=false 更直接)
+    work_item_s=dict(grab=12.0, place=10.0, pick=8.0, stack=10.0),   # 每个物料大约要多久(抓/放/取回/码垛；按模拟的提速参数估的)。
+                                        #   跑过一次就按实测的(每次都更新)，这里只是还没实测时用
+    work_base_s=dict(QR=3.0, RAW=2.0, ROUGH=6.0, TEMP=5.0, START=3.0),   # 每个停车点物料以外的用时(看圆环、收臂、挪回停车点)
+    next_leg_s=12.0,                    # 粗加工区开到暂存区大约要多久(粗加工区放完以后判断"取回了还来不来得及去暂存区"用)
+    qr_timeout_s=6.0,                   # 到 QR 点最多等多久读码(qr_search=false 时；前后挪着找时每个位置等 qr_dwell_s)
+    qr_search=True,                     # 到 QR 点读不到码：车沿车道前后挪，让扫码器依次对着码板可能的位置再读
+    qr_first_wait_s=0.6,                # 到 QR 点先原地查这么久(路上可能已经读到了)
+    qr_targets_mm=[1200.0, 1260.0, 1140.0, 1320.0, 1080.0],     # 扫码器依次对着码板的这些位置(沿码板方向的场地坐标；码板中心每场随机在 1100~1300)
+    qr_dwell_s=0.8,                     # 每个位置停多久查 QR?
+    qr_board_axis='y',                  # 码板沿哪个方向摆(在东墙上：y)
+    qr_scanner_from_rear_mm=20.0,       # 扫码器装在车的右后方：离车尾多少毫米
+    qr_scanner_from_right_mm=40.0,      #   离车右边多少毫米(车 290x260：在车中心后 125、右 90)
+    qr_max_move_mm=300.0,               # 找码时离停车点最多前后挪多少
+    qr_obstacle_margin_mm=60.0,         # 找码挪车时车身(含雷达)离障碍物至少多远，不够就跳过那个位置
+    qr_zone_margin_mm=30.0,             # 找码挪车时车身离黄色区、工位、原料转盘、场地边至少多远
+    qr_move_rpm=None,                   # 找码时底盘挪的速度(转/分)；None = 和视觉微调一样(60mm 以内 chassis_fine_rpm，再远用 STM32 默认)
+    qr_retry_at_stops=True,             # 到 QR 点也没读到：后面每个停车点再问一次 QR?(STM32 可能在路上读到了)
+    code_plus=True,                     # 屏上任务码带上两组之间的 +(t0 = '156+123+'，t7 = '516+231')。只在新 STM32 程序上带
+                                        #   (LIFT? 回 BOOT=…：t0 加宽到放得下 8 个大字)；旧程序 t0 只有 7 个字宽，自动不带(不然两头被裁掉)。false = 一律不带
     raw_wait_s=10.0,                    # 等原料盘停稳最多多久(规则：等转盘最多多停 8 秒)
     raw_chassis='off',                  # 原料区对准时车轮能不能动：'off' = 只动手臂，车轮不动(不会压进原料区)；
                                         #   'F' = 只许沿车头方向前后挪，最多 raw_fix_max_mm；'SF' = 前后、横着都能挪(以前的做法，可能压进原料区)
@@ -63,7 +97,10 @@ DEFAULTS = dict(
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
-    lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
+    lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停。
+                                        #   60 时用 STM32 的 PARK(收臂 + 停 60)，旧程序不认识就 STOW + LIFT 60
+    keepalive_deg=3.0,                  # keepalive()：ID1 摆多少度再摆回来(导航在扫描、规划、定位这些车不动的时候调)
+    keepalive_min_s=5.0,                #   两次之间至少隔多久
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
     frames=5,                                                    # 每次测量取几帧(多帧取中值；少一点快一点，噪声会大一点)
     detector='circle',                                           # 物料识别：'circle' = matdet.py 抗遮挡圆拟合；'wuliao' = 原来的 wuliao.py
@@ -81,11 +118,15 @@ DEFAULTS = dict(
     zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
     zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
     wheels_first=False,                 # True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
-                                        #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)
+                                        #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)。
+                                        #   模拟里比默认慢、失败多(车轮只能走整毫米，小步不准)，所以默认关；上车对比：mtest TEMP 1 force wheels
     wheels_step_mm=15.0,                # wheels_first：车轮每次最多挪多少毫米
-    wheels_min_mm=1.5,                  # wheels_first：沿那一排的偏差比这个小就交给手臂
+    wheels_min_mm=4.0,                  # wheels_first：沿那一排的偏差比这个小就交给手臂(1.5 时模拟里失败多，4 好一些)
     wheels_rpm=60,                      # wheels_first：车轮小步挪的速度(转/分，慢一点准一点)
     ring_precorrect=True,               # 同一个工位里对准过一个环以后，去下一个环时手臂伸缩直接伸到同样的远近(不先缩回观察姿态再伸出来，省一次大的修正)
+    tilt_precorrect=True,               # 车身和圆环那一排不平行(车停斜了)：看三个环时算出斜了几度，挪到每个环以后离圆环远/近多少，
+                                        #   第一次测量之前手臂伸缩(必要时 ID1)就先补上
+    tilt_warn_deg=3.0,                  # 斜到这么多度就在终端打 ★ 提醒"把车摆正"
     survey_frames=3,                    # 到工位看三个圆环时拍几帧
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
@@ -97,7 +138,8 @@ DEFAULTS = dict(
     ring_spacing_mm=150.0,              # 相邻两个圆环中心的距离(毫米)：用来从画面里算每毫米多少像素
     chassis_strafe=False,               # True = 工位里对准时底盘随便横移(不推荐，会压进工位)。False = 沿圆环那一排前后挪；离圆环远近先靠手臂伸缩补，
                                         #   手臂伸缩到头还够不着，车轮才横着挪(靠近/远离圆环)，只挪够不着的那一段、累计不超过 ring_strafe_max_mm
-    ring_strafe_max_mm=40.0,            # 工位里车轮横着挪(靠近/远离圆环)累计最多多少毫米(相对停车点)。0 = 绝不横移，全靠手臂伸缩
+    ring_strafe_max_mm=20.0,            # 工位里车轮横着挪(靠近/远离圆环)累计最多多少毫米(相对停车点)。0 = 绝不横移，全靠手臂伸缩。
+                                        #   10-10 从 40 改成 20：停车点离工位白区只有 60mm，挪满 40 再加上定位误差就只剩几毫米
     ring_fix_max_mm=60.0,               # 对准一个圆环时，底盘最多再为对准前后挪这么多毫米(超过就停下：多半认错了环)
     ring_move_min_mm=15.0,              # 到下一个圆环要挪的距离小于这个就不动底盘(手臂够得着)
     drop_retract=False,                 # 放下物料后要不要缩回伸缩舵机。False = 只抬起来，接着去下一个环，这个工位做完再收臂(省时间)
@@ -117,6 +159,10 @@ DEFAULTS = dict(
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
 
+
+A2_MIN, A2_MAX = -1220.0, -503.5       # STM32 里 A2(伸缩)参数的范围
+
+BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60mm', 'NOENC': '读不到编码器，当成 60mm', 'POS': '按上次停的位置认的高度'}
 
 PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
 
@@ -170,7 +216,25 @@ class MissionHooks:
         self.ctx = ctx                      # auto_run.drive 会把 ctx 填进来，用来检查 abort
         self.vision = vision
         self.store = store
-        self.t0 = now()                     # 计时从创建开始(go 一开始就创建)
+        self.t0 = now()                     # 比赛计时的起点：start_clock() 时改成那一刻(按下 START)；导航不调 start_clock 时就从创建算(偏保守)
+        self.clock_started = False          # start_clock() 调过了
+        self.out_of_time = False            # 时间不够了：不再开始新的物料，go_home_now 一律回 True
+        self.home_eta_s = None              # 导航说的"从现在这个停车点回家要多久"(秒)；None = 不知道(只按 time_limit_s)
+        self.work_t = {}                    # 实测的每个物料用时(秒)：'grab' / 'place' / 'pick' / 'stack'
+        self.base_t = {}                    # 实测的每个停车点物料以外的用时(秒)：角色 -> 秒
+        self.stop_times = []                # 每个停车点用了多久：(停车点, 角色, 第几次, 秒)
+        self._items_t = 0.0                 # 这个停车点里做物料一共用了多久
+        self._stop_name = None              # 现在在哪个停车点(配置 stops 里的名字)
+        self._prep = {}                     # prepare() 做成了哪几步：'arm' / 'qr' / 'cam'
+        self._t_alive = -1e9                # 上一次 keepalive 摆手臂的时刻
+        self.holding = None                 # 爪子里现在夹着的物料(从转盘取出来、还没放下)
+        self.maybe_holding = None           # 不为 None = 爪子里可能还夹着东西(原因)：不降升降、不张爪子
+        self._aborted = False               # 急停过：park() 不自动做(人手可能在附近)
+        self._boot_asked = False            # 为了看 STM32 是不是新程序(屏上任务码带不带 +)问过 LIFT? 了
+        self._plus_warned = False
+        self._tilt = None                   # 看三个圆环时量的车身斜度和远近(提前补手臂伸缩用)，见 _survey
+        self._a2_hint = None                # 刚 OBS RING 过：ID2 在 A2P、ID1 在 A1P(OBS 不回报角度)
+        self._a1_hint = None
         self.arm = None
         self.act = None
         self.servo = None
@@ -209,11 +273,365 @@ class MissionHooks:
         if role is None:
             self.log(f'    (停车点 {stop} 没有对应任务，跳过)')
             return
+        self._stop_name = stop
         self._ensure(link)
         self.act.reset_disp()                       # 路线把车开到了新的停车点，位移从 0 重新算
         self.learn = {'S': 0.0, 'F': 0.0}
         self.visits[role] = self.visits.get(role, 0) + 1
-        self.run_role(role, self.visits[role])
+        t_start = self.now()
+        self._items_t = 0.0
+        try:
+            if (role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and not self.disabled
+                    and self.cfg.get('qr_retry_at_stops', True)):
+                self._qr_again()                    # QR 点没读到码：STM32 可能在路上读到了，再问一次
+            self.run_role(role, self.visits[role])
+        except Abort:
+            self._aborted = True
+            raise
+        except ArmAbort as ex:
+            self._aborted = True
+            raise Abort(str(ex))
+        except Exception as ex:                     # 程序里意外的错：不结束这一轮，这个停车点不做了，收臂、挪回停车点
+            self.log(f'  ★ {stop} 出了意外的错({ex!r})：这个停车点不再做，收臂、挪回停车点，路线照走')
+            self._bail_out(role)
+        dt = self.now() - t_start
+        self.stop_times.append((stop, role, self.visits[role], dt))
+        if role in ('RAW', 'ROUGH', 'TEMP') and self._items_t > 0.5:
+            self._learn_t(self.base_t, role, max(0.0, dt - self._items_t))
+        if role != 'START':
+            self.log(f'    ({stop} 用了 {dt:.0f} 秒；从出发算已用 {self.elapsed():.0f} 秒)')
+
+    # ------------------------------------------------------------------ 给导航的接口：准备、计时、时间判断、保活、收臂停 60
+    def prepare(self, link, log=None):
+        """一键出发以后马上调(第二站动作之前)：把开跑前能做的先做掉，到了 QR 点就不用再等。
+          机械臂初始化 + 收臂(STOW)、同步参数(和第一次 task 一样)；
+          QR CLR：清掉 STM32 里存的旧任务码(上一轮/调试时扫过的)，屏上任务码写 ---(STM32 的 QR CLR 不清屏)；
+          打开摄像头。
+        调多次没关系(做成过的不再做)；出错只记日志、不抛异常(导航照常走；到 QR 点 task 会再初始化)。返回机械臂是否就绪。
+        要在 ZONE LOCK(屏回到比赛画面、清屏)之后调：这里写的 --- 才不会被清掉。"""
+        if log is not None:
+            self.log = log
+        if self._aborted:
+            self.log('  ★ 急停过：出发前准备不做(手臂不自动动)')
+            return False
+        arm_ok = True
+        try:
+            if not self._prep.get('arm'):
+                self._ensure(link)
+                self._prep['arm'] = True
+        except Exception as ex:                     # 包括急停(Abort)：导航自己会看 ctx.aborted()
+            self.log(f'  ★ 出发前准备机械臂出错：{ex!r}(到 QR 点再试)')
+            if isinstance(ex, (Abort, ArmAbort)):
+                self._aborted = True
+                return False
+            arm_ok = False
+            if self.arm is None:
+                try:
+                    self._ensure_arm_only(link)     # 别的出错(摄像头模块之类)：旧任务码照样要清
+                except Exception:
+                    return False
+        if not self._prep.get('qr'):
+            try:
+                ok = self.arm.qr_clear()
+                if ok is False:
+                    self.sleep(0.1)
+                    ok = self.arm.qr_clear()        # 串口偶尔一次没回话：再清一次
+                if ok is False:
+                    raise ArmError('QR CLR 没有回 DONE')
+                self.arm.screen_reset()             # 屏可能刚清过(ZONE LOCK)：每个控件都重新写
+                self._ui('code', '---')
+                self._ui('code2', '---')
+                self._ui('b1', 'B1 ---')
+                self._ui('b2', 'B2 ---')
+                self._ui('stage', 'RUN')
+                self._show_stats()
+                self._prep['qr'] = True
+                self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上任务码先显示 ---')
+            except Exception as ex:
+                if isinstance(ex, ArmAbort):
+                    self._aborted = True
+                self.log(f'  ★ 清旧任务码出错：{ex!r}(STM32 里可能还存着上一轮/调试时的码；下次 prepare 再清)')
+        if not self._prep.get('cam'):
+            try:
+                self._ensure_vision()
+                if hasattr(self.vision, 'open'):
+                    self.vision.open()
+                self._prep['cam'] = True
+            except Exception as ex:
+                self.log(f'  ★ 打开摄像头出错：{ex!r}(到用摄像头时再试)')
+        return arm_ok and not self.disabled
+
+    def start_clock(self):
+        """比赛计时从现在开始(按下屏上 START / 终端确认出发的那一刻)。之前算的"时间不够"也清掉。"""
+        self.t0 = self.now()
+        self.clock_started = True
+        self.out_of_time = False
+
+    def set_home_eta(self, seconds):
+        """导航告诉钩子：从现在这个停车点开回启停区要多久(秒，路线估算)。None = 不知道。
+        停车点里每个物料开始前按"这个物料的用时 + 收臂挪回 + 回家 + 余量"算来不来得及(见 _no_time)。"""
+        try:
+            self.home_eta_s = None if seconds is None else max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            self.home_eta_s = None
+
+    def go_home_now(self, next_role, est_leg_s, est_home_from_next_s):
+        """导航开往下一个停车点之前问：去 next_role(停车点名或角色)做事，还来得及回家吗？来不及返回 True(导航从这里直接回家)。
+        est_leg_s = 开过去要几秒，est_home_from_next_s = 从那里回家要几秒(导航按路线估的)。
+        "做事"按最少有用的算：那里至少能做完一个物料(放一个就有分；到了以后每个物料开始前还会再按时间判断)；
+        那里没活可干(没有任务码、转盘里没东西)就只看开过去再回家来不来得及。用时按实测的每个物料用时(没实测过按 work_item_s)。"""
+        role = role_of(next_role, self.cfg.get('stop_aliases')) if next_role else None
+        if role == 'START':
+            return False
+        if self.out_of_time:
+            self.log(f'  ★ 时间不够了(前面已经停止开始新的物料)：不去 {next_role}，直接回家')
+            return True
+        idle = self._idle_for_good() if self.cfg.get('home_when_idle', True) else None
+        if idle:
+            self.log(f'  ★ {idle}：后面的停车点都没活可干，不去 {next_role}，直接回家(少走路、少压线的风险)')
+            return True
+        try:
+            leg = max(0.0, float(est_leg_s or 0.0))
+            home = max(0.0, float(est_home_from_next_s or 0.0))
+        except (TypeError, ValueError):
+            return False
+        cfg = self.cfg
+        el = self.elapsed()
+        work = self._work_s(role, first_only=True)
+        if (work <= 0 and role in ('RAW', 'ROUGH', 'TEMP') and self.visits.get(role, 0) >= 1
+                and cfg.get('home_when_idle', True)):
+            # 第二批的停车点(路线最后几个)没活可干：后面也不会再有(第二批的物料只能从这里来)，直接回家
+            self.log(f'  ★ {next_role} 第二批没活可干(转盘里没有要放的/槽都占着)：后面也没有了，不去，直接回家')
+            return True
+        finish = float(cfg.get('stop_finish_s', 3.0)) if work > 0 else 0.0
+        end = el + leg + work + finish + home + float(cfg.get('home_margin_s', 12.0))
+        late = end > float(cfg.get('round_s', 180.0))
+        if work > 0 and el + leg + work > float(cfg['time_limit_s']):
+            late = True                                       # 到那里时已经过了 time_limit_s，一个物料也做不了
+        what = f'做一个物料约 {work:.0f} 秒 + ' if work > 0 else '(那里没活可干) '
+        if late:
+            self.out_of_time = True
+            self.log(f'  ★ 时间不够去 {next_role}：已用 {el:.0f} 秒，开过去约 {leg:.0f} 秒 + {what}回家约 {home:.0f} 秒'
+                     f' + 余量 {float(cfg.get("home_margin_s", 12.0)):.0f} 秒 > {float(cfg.get("round_s", 180.0)):.0f} 秒：从这里直接回家')
+        else:
+            self.log(f'    时间：已用 {el:.0f} 秒，去 {next_role} {what}再回家，预计 {end:.0f} 秒(含余量)，来得及')
+        return late
+
+    def keepalive(self):
+        """车长时间不动(扫描、规划、雷达定位)时手臂轻轻摆一下：ID1 转 keepalive_deg 度马上转回来(不到 1 秒)，
+        让裁判看得出车还在运行(规则：停止运行 15 秒本轮结束)。只在任务线程里调(和 task 同一个线程，不会和别的机械臂指令撞上)。
+        机械臂没就绪、本轮不夹放、爪子里夹着东西、离上次摆不到 keepalive_min_s 秒：什么也不做。不抛异常。返回这次摆了没有。"""
+        if not self._inited or self.arm is None or self.disabled or self.holding is not None or self.maybe_holding:
+            return False
+        if self._aborted:
+            return False                                  # 急停过：手臂一律不自动动(人手可能在附近)
+        try:
+            if self.ctx is not None and hasattr(self.ctx, 'aborted') and self.ctx.aborted():
+                self._aborted = True
+                return False
+        except Exception:
+            pass
+        now = self.now()
+        if now - self._t_alive < float(self.cfg.get('keepalive_min_s', 5.0)):
+            return False
+        self._t_alive = now
+        d = float(self.cfg.get('keepalive_deg', 3.0) or 0.0)
+        if d <= 0:
+            return False
+        try:
+            self.arm.do(f'AD 1 {d:g}')
+            self.arm.do(f'AD 1 {-d:g}')
+        except ArmAbort as ex:
+            self._aborted = True
+            self.log(f'    (keepalive：{ex})')
+            return False
+        except Exception as ex:
+            self.log(f'    (keepalive 摆手臂出错：{ex!r})')
+            return False
+        return True
+
+    def park(self, link=None, force=False):
+        """收臂，升降停到开机高度(lift_park_mm，60mm：下次开机编码器才认得准)。STM32 认识 PARK 就用 PARK(收臂 + 停 60，
+        没标定时只降升降)，旧程序不认识就 STOW + LIFT 60(STOW 失败就不降)。跑完回到启停区、退出程序时用。
+        不做的情况：爪子里可能夹着物料(60 正好是放进车上转盘的高度，会压上去)；急停过(人手可能在附近)，除非 force=True(终端 park 命令)。
+        link：机械臂还没连上时用它连(导航退出时可以新建一个钩子来调)。不抛异常，返回是否停好了。"""
+        if self.arm is None:
+            if link is None:
+                self.log('  (机械臂还没连上：不收臂、不停 60)')
+                return False
+            self._ensure_arm_only(link)
+        if self._aborted and not force:
+            self.log('  ★ 急停过：不自动收臂、不降升降(人手可能在附近)。确认安全后输入 park')
+            return False
+        why = self._may_hold()
+        if why:
+            self.log(f'  ★ 不收臂停 60：{why}。先把物料拿出来(arm CLAW O)再输入 park')
+            return False
+        mm = self.cfg.get('lift_park_mm')
+        try:
+            if mm is None:
+                self.arm.stow()
+                self.log('  已收臂(lift_park_mm=null：升降不动)')
+                return True
+            mm = float(mm)
+            if abs(mm - 60.0) < 0.5:
+                ok, reply = self.arm.park()
+                if ok:
+                    self.log('  已收臂，升降停在 60mm(PARK)')
+                    return True
+                if ok is False:
+                    self.log(f'  ★ PARK 没做成：{reply}' + ('(升降位置不知道了：把升降放到最低点，arm LIFT ZERO)' if 'NOZERO' in reply else ''))
+                    return False
+            P = self.arm.params() or {}                       # 旧程序：STOW + LIFT 60(没标定时只降升降，和 PARK 一样)
+            if float(P.get('ARMOK', 1.0)) >= 0.5:
+                self.arm.stow()
+            self.arm.lift(mm)
+            self.log(f'  已收臂，升降停在 {mm:g}mm')
+            return True
+        except ArmAbort as ex:
+            self._aborted = True
+            self.log(f'  ★ 收臂停 60 被急停打断：{ex}')
+        except Exception as ex:
+            self.log(f'  ★ 收臂/停 60 失败：{ex}')
+        return False
+
+    def _may_hold(self):
+        if self.holding is not None:
+            return f'爪子里夹着{self.holding.color_name}'
+        return self.maybe_holding
+
+    # ------------------------------------------------------------------ 时间：每个物料来不来得及、下一个停车点值不值得去
+    def _learn_t(self, d, key, dt):
+        """实测的用时：和以前的平均(新的占一半)，太离谱的不要。"""
+        if not 0.3 < dt < 150.0:
+            return
+        old = d.get(key)
+        d[key] = dt if old is None else 0.5 * old + 0.5 * dt
+
+    def _note_item(self, kind, t0):
+        dt = self.now() - t0
+        self._items_t += dt
+        self._learn_t(self.work_t, kind, dt)
+
+    def _item_s(self, kind):
+        """一个物料大约要多久(秒)：实测过按实测的，没有按 work_item_s。"""
+        if kind in self.work_t:
+            return float(self.work_t[kind])
+        return float((self.cfg.get('work_item_s') or {}).get(kind, 10.0))
+
+    def _base_s(self, role):
+        if role in self.base_t:
+            return float(self.base_t[role])
+        return float((self.cfg.get('work_base_s') or {}).get(role, 3.0))
+
+    def _work_deadline(self):
+        """物料最晚什么时候必须做完(绝对时刻)：time_limit_s；知道回家要多久时还要 留出收臂 + 回家 + 余量。"""
+        cfg = self.cfg
+        t = self.t0 + float(cfg['time_limit_s'])
+        if self.home_eta_s is not None:
+            t = min(t, self.t0 + float(cfg.get('round_s', 180.0)) - float(cfg.get('home_margin_s', 12.0))
+                    - float(cfg.get('stop_finish_s', 3.0)) - float(self.home_eta_s))
+        return t
+
+    def _no_time(self, kind, what, quiet=False):
+        """再开始一个 kind 的物料(grab/place/pick/stack)来不来得及：来不及返回原因(并记下 out_of_time，让车回家)，来得及返回 None。"""
+        need = self._item_s(kind)
+        left = self._work_deadline() - self.now()
+        if left >= need:
+            return None
+        if self.home_eta_s is not None:
+            why = f'已用 {self.elapsed():.0f} 秒，{what}一个约 {need:.0f} 秒，再收臂、回家(约 {self.home_eta_s:.0f} 秒)就超时'
+        else:
+            why = f'已用 {self.elapsed():.0f} 秒，{what}一个约 {need:.0f} 秒，做完会超过 time_limit_s={float(self.cfg["time_limit_s"]):g} 秒'
+        if not quiet:
+            self.out_of_time = True
+            self.log(f'    ★ 时间不够：{why}。不再{what}，让车回家')
+            self._ui('msg', 'TIME UP')
+        return why
+
+    def _pickback_budget(self, n):
+        """粗加工区放完 n 个：取回几个以后还来得及开到暂存区把它们放下再回家(取回 k 个 + 暂存区放 k 个 + 路上 + 回家 + 余量)。
+        来不及的就不取回：取回要时间，物料放在粗加工区已经算了分，留在那儿不吃亏，车早点回家。
+        不知道回家要多久(导航没给 set_home_eta)时不判断，返回 n。"""
+        if self.home_eta_s is None or n <= 0:
+            return n
+        cfg = self.cfg
+        # 偏保守：取回了却去不成暂存区，白花时间，物料还从算了分的地方拿走了
+        fixed = (2 * float(cfg.get('stop_finish_s', 3.0)) + float(cfg.get('next_leg_s', 12.0)) + self._base_s('TEMP')
+                 + float(self.home_eta_s) + float(cfg.get('home_margin_s', 12.0)) + 4.0)
+        per = 1.15 * (self._item_s('pick') + self._item_s('place'))
+        left = float(cfg.get('round_s', 180.0)) - self.elapsed()
+        k = int(max(0.0, min(float(n), (left - fixed) / max(per, 1.0))))
+        if k < n:
+            self.log(f'    ★ 还剩 {left:.0f} 秒：取回、再去暂存区放，每个约 {per:.0f} 秒，加上路上和回家约 {fixed:.0f} 秒，'
+                     + (f'只来得及 {k} 个：其余的留在粗加工区(放下时已经算分)' if k else '一个也来不及：不取回了，物料留在粗加工区(放下时已经算分)，车直接回家'))
+            if k == 0:
+                self.out_of_time = True
+        return k
+
+    def _idle_for_good(self):
+        """这一轮后面再也没有夹放可做了(返回原因)：到过 QR 点以后，机械臂不能用、或者还是没有任务码。否则 None。
+        QR 点还没去过不算(读到任务码本身就有分，机械臂不能用也照样去读)。"""
+        if not self.visits.get('QR'):
+            return None
+        if self.disabled:
+            return f'本轮不做夹放({self.disabled})'
+        if self.plan is None and self.arm is not None and self.cfg.get('qr_retry_at_stops', True):
+            # 回家之前再问一次 QR?(STM32 在路上/找码挪回来时可能读到了)：不然车直接回家，后面停车点的"再问一次"永远轮不到
+            try:
+                self._qr_again()
+            except ArmAbort as ex:
+                self._aborted = True
+                self.log(f'    (再问 QR? 时收到急停：{ex})')
+            except Exception as ex:
+                self.log(f'    (再问 QR? 出错：{ex!r})')
+        if self.plan is None:
+            return '没有读到任务码'
+        return None
+
+    def _work_s(self, role, first_only=False):
+        """到停车点 role 要干多久的活(秒)；那里没活可干返回 0。first_only = 只算第一个物料(最少有用的活)。"""
+        if role in (None, 'START'):
+            return 0.0
+        if role == 'QR':
+            if self.plan is not None or self.disabled:
+                return 0.0
+            return self._base_s('QR') + float(self.cfg.get('qr_dwell_s', 0.8)) * 6
+        if self.disabled or self.plan is None:
+            return 0.0
+        batch = 1 if self.visits.get(role, 0) + 1 <= 1 else 2
+        items = self.plan.items(batch)
+        if role == 'RAW':
+            kinds = ['grab' for it in items if self.in_tray.get(it.slot) is None or same_item(self.in_tray.get(it.slot), it)]
+        else:
+            have = [it for it in items if same_item(self.in_tray.get(it.slot), it)]
+            if role == 'ROUGH':
+                kinds = ['place'] * len(have) + ['pick'] * len(have)
+            elif batch == 1:
+                kinds = ['place'] * len(have)
+            else:
+                kinds = ['stack' for it in have if self._stack_target(it) is not None]
+        if not kinds:
+            return 0.0
+        if first_only:
+            kinds = kinds[:1]
+        return self._base_s(role) + sum(self._item_s(k) for k in kinds)
+
+    # ------------------------------------------------------------------ 出错以后
+    def _bail_out(self, role):
+        """停车点里出了意外的错：把手臂收好(夹着物料就先放回转盘)、底盘挪回停车点，路线照走。收不好/挪不回去就停下(Abort)。"""
+        try:
+            if self.holding is not None:
+                self._put_back(self.holding, '出错时爪子里夹着物料')
+            elif self.arm is not None and not self.maybe_holding:
+                self._stow_quiet()
+            if self.act is not None:
+                self._return_to_stop(role)
+        except Abort:
+            self._aborted = True
+            raise
+        except Exception as ex:
+            raise Abort(f'出错以后收臂/挪回停车点也失败了({ex!r})，停止路线')
 
     # ------------------------------------------------------------------ 初始化
     def _ensure_arm_only(self, link):
@@ -238,7 +656,7 @@ class MissionHooks:
         if self.store is None:
             self.store = JacStore(cfg.get('servo_cal_file'))
         self.act = ArmActuators(self.arm, link, cfg['chassis_fine_rpm'], log=self.log)
-        self.servo = VisualServo(self.act, self.store, cfg=cfg['servo'], log=self.log, sleep=self.sleep)
+        self.servo = VisualServo(self.act, self.store, cfg=cfg['servo'], log=self.log, sleep=self.sleep, clock=self.now)
         self._inited = True
         self._init_arm()
         self.sync_params()
@@ -279,15 +697,18 @@ class MissionHooks:
                 self.disabled = '机械臂参数还没标定(ARMOK=0)：标定好各姿态后 set ARMOK 1'
             else:
                 known, mm = self.arm.lift_state()
+                boot = getattr(self.arm, 'lift_boot', None)
                 if known:
-                    self.log(f'  升降已回零，现在 {mm:.1f}mm')
+                    self.log(f'  升降已回零，现在 {mm:.1f}mm' + (f'(开机时{BOOT_TEXT.get(boot, boot)})' if boot else ''))
+                    if boot in ('NOCAL', 'NOENC'):
+                        self.log('  ★ 开机时没用编码器认高度，当成了 60mm：升降一定要停在 60mm 再关电(跑完/退出时会自动停 60；没停就输入 park)')
                 elif self.cfg['lift_init'] == 'home':
                     self.arm.do('LIFT HOME')
                     self.log('  升降：驱动器回零完成')
                 else:
                     self.disabled = '升降位置不知道了(急停打断过升降？)：把升降放到最低点，输入 arm LIFT ZERO'
                 if not self.disabled and self.cfg.get('stow_at_start', True):
-                    self.arm.stow()                 # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
+                    self._stow_retry()              # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
                     self.log('  手臂已收到待机姿态')
         except ArmAbort as ex:
             raise Abort(str(ex))
@@ -318,6 +739,7 @@ class MissionHooks:
 
     def _check_abort(self):
         if self.ctx is not None and hasattr(self.ctx, 'aborted') and self.ctx.aborted():
+            self._aborted = True
             raise Abort('收到 abort，已停止')
 
     def elapsed(self):
@@ -343,11 +765,22 @@ class MissionHooks:
         self.log(f'    ★ {why}；收臂')
         self._ring_ready = self._at_obs = False
         try:
-            self.arm.stow()
+            self._stow_retry()
         except ArmAbort as ex:
             raise Abort(str(ex))
         except ArmError as ex:
             raise Abort(f'收臂也失败了({ex})，停止路线')
+
+    def _stow_retry(self):
+        """收臂；STM32 偶尔一次出错(总线舵机没回话之类)就歇一下再收一次，还不行抛 ArmError。"""
+        try:
+            self.arm.stow()
+        except ArmAbort:
+            raise
+        except ArmError as ex:
+            self.log(f'    收臂出错({ex})，再收一次')
+            self.sleep(0.3)
+            self.arm.stow()
 
     def _put_back(self, item, why):
         """从转盘取出物料以后出错(回不到对准姿态、DROP 失败…)：把物料放回它的转盘槽，再收臂。
@@ -367,10 +800,13 @@ class MissionHooks:
             raise Abort(str(ex))
         except (ArmError, KeyError, TypeError, ValueError) as ex:
             self.disabled = f'{item.color_name}可能还夹在爪子里(放回转盘失败：{ex})，本轮不再夹放，免得张开爪子把它掉在半路'
+            self.maybe_holding = f'{item.color_name}可能还夹在爪子里'
+            self.holding = None
             self.log(f'    ★ {self.disabled}')
             self._ui('msg', 'ARM OFF')
             self._recover('放回转盘失败')
             return
+        self.holding = None
         self.in_tray[item.slot] = item
         self._recover(f'{item.color_name}已放回转盘 {item.slot} 号槽')
 
@@ -381,44 +817,261 @@ class MissionHooks:
         try:
             h(visit)
         except ArmAbort as ex:
+            self._aborted = True
             raise Abort(str(ex))
 
     # ------------------------------------------------------------------ QR
     def _qr(self, visit):
+        """读任务码：先原地查 qr_first_wait_s 秒(路上可能已经读到了)；没读到就沿车道前后挪着找(_qr_search)，最后回到停车点。
+        qr_search=false：原地最多等 qr_timeout_s 秒(以前的做法)。"""
+        cfg = self.cfg
         self._ui('stage', 'QR SCAN')
-        code = None
-        t_end = self.now() + self.cfg['qr_timeout_s']
+        search = bool(cfg.get('qr_search', True))
+        code = self._qr_poll(float(cfg.get('qr_first_wait_s', 0.6)) if search else float(cfg['qr_timeout_s']))
+        if not code and search:
+            code = self._qr_search()
+        if not code:
+            self.log('★ 没有读到二维码：先不做夹取/放置(路线照走，后面每个停车点再问一次 QR?)')
+            self._ui('msg', 'QR FAIL')
+            return
+        self._use_code(code)
+
+    def _qr_poll(self, dwell_s):
+        """每 0.2 秒问一次 QR?，最多 dwell_s 秒(至少问一次)。读到返回任务码，没读到返回 None。偶尔一次出错不放弃。"""
+        t_end = self.now() + max(0.0, float(dwell_s))
         while True:
             try:
                 code = self.arm.qr()
+            except ArmAbort:
+                raise
             except ArmError as ex:
                 self.log(f'    读二维码出错：{ex}')
-                break
+                code = None
             if code or self.now() >= t_end:
-                break
+                return code
             self._check_abort()
             self.sleep(0.2)
-        if not code:
-            self.log('★ 没有读到二维码，本轮不做夹取/放置(路线照走)')
-            self._ui('msg', 'QR FAIL')
+
+    def _qr_again(self):
+        """QR 点没读到码：到后面的停车点再问一次(STM32 在路上读到的码也会存着)。"""
+        try:
+            code = self.arm.qr()
+        except ArmAbort:
+            raise
+        except ArmError:
             return
+        if code:
+            self.log(f'  ★ 到 {self._stop_name} 时 STM32 里有任务码了(路上读到的)：{code}')
+            self._use_code(code)
+
+    def _use_code(self, code):
         try:
             self.plan = parse_code(code)
         except TaskError as ex:
             self.log(f'★ 二维码内容不对：{ex}')
             self._ui('msg', 'QR BAD')
-            return
+            return False
         self.log(f'    任务码 {self.plan.code}：{self.plan.describe()}')
         for w in self.plan.warnings:
             self.log(f'    注意：{w}')
-        self._ui('code', self.plan.code[:7])
-        self._ui('code2', self.plan.code[8:])
-        l1, l2 = self.plan.screen_lines()
-        self._ui('b1', l1)
-        self._ui('b2', l2)
+        self._show_code()
+        return True
+
+    def _code_plus(self):
+        """屏上任务码带不带两组之间的 +：配置要带、而且 STM32 是新程序(t0 放得下 8 个大字)。
+        新程序的 LIFT? 回复带 BOOT=…(和加宽 t0 是同一版)；还没问过就问一次。旧程序：不带(7 个字，和以前一样)。"""
+        if not self.cfg.get('code_plus', True) or self.arm is None:
+            return False
+        if getattr(self.arm, 'lift_boot', None) is None and not self._boot_asked:
+            self._boot_asked = True
+            try:
+                self.arm.lift_state()
+            except ArmAbort:
+                raise
+            except Exception:
+                pass
+        if getattr(self.arm, 'lift_boot', None) is not None:
+            return True
+        if not self._plus_warned:
+            self._plus_warned = True
+            self.log('    (STM32 是旧程序：屏上 t0 只放得下 7 个大字，任务码中间的 + 不显示；烧录新程序以后自动带上)')
+        return False
+
+    def _show_code(self):
+        l0, l1 = self.plan.screen_code(self._code_plus())
+        self._ui('code', l0)
+        self._ui('code2', l1)
+        b1, b2 = self.plan.screen_lines()
+        self._ui('b1', b1)
+        self._ui('b2', b2)
         self._ui('stage', 'QR OK')
         self._ui('msg', 'QR OK')
         self._show_stats()
+
+    # ---- 读不到码：沿车道前后挪着找
+    def _qr_pose(self):
+        """QR 停车点的位姿 (x, y, 车头°)(配置 stops 里)；没有返回 None。"""
+        stops = self.raw_cfg.get('stops') or {}
+        pose = stops.get(self._stop_name) if self._stop_name else None
+        if pose is None:
+            pose = next((v for k, v in stops.items() if role_of(k, self.cfg.get('stop_aliases')) == 'QR'), None)
+        try:
+            return float(pose[0]), float(pose[1]), float(pose[2])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _qr_offsets(self, pose):
+        """读不到码时底盘依次前后挪到哪儿：[(扫码器对着的码板位置, 底盘前进多少 mm)]。
+        扫码器在车的右后方(离车尾 qr_scanner_from_rear_mm、离右边 qr_scanner_from_right_mm)，底盘沿车头方向挪 F，
+        扫码器沿码板方向移动 F × (车头方向在码板方向上的分量)。车头和码板垂直(挪了也对不上)返回 []。"""
+        cfg = self.cfg
+        x, y, h = pose
+        L = float(self.raw_cfg.get('car_length_mm', 290.0))
+        W = float(self.raw_cfg.get('car_width_mm', 260.0))
+        sf = -L / 2.0 + float(cfg.get('qr_scanner_from_rear_mm', 20.0))     # 车身坐标：前 / 左
+        sl = -W / 2.0 + float(cfg.get('qr_scanner_from_right_mm', 40.0))
+        a = math.radians(h)
+        fx, fy = math.cos(a), math.sin(a)
+        lx, ly = -fy, fx
+        scan = (x + sf * fx + sl * lx, y + sf * fy + sl * ly)
+        i = 0 if str(cfg.get('qr_board_axis', 'y')).lower() == 'x' else 1
+        along, k = scan[i], (fx, fy)[i]
+        if abs(k) < 0.5:
+            self.log(f'    (QR 停车点车头 {h:g}°，和码板方向差太多：前后挪也对不上码，不挪)')
+            return []
+        lim = float(cfg.get('qr_max_move_mm', 300.0))
+        out, done = [], [0.0]
+        for t in cfg.get('qr_targets_mm') or []:
+            f = (float(t) - along) / k
+            if abs(f) > lim or any(abs(f - d) < 25.0 for d in done):
+                continue                                    # 太远 / 和已经看过的位置差不多(扫码器在停车点时就对着它)
+            out.append((float(t), float(round(f))))
+            done.append(f)
+        return out
+
+    def _qr_obstacles(self):
+        """现在地图上的障碍物 [(x, y, 半径)]：导航的 ctx 有 obstacles() 才有，没有返回 None。"""
+        f = getattr(self.ctx, 'obstacles', None) if self.ctx is not None else None
+        if f is None:
+            return None
+        try:
+            return [(float(o[0]), float(o[1]), float(o[2])) for o in (f() or [])]
+        except Exception as ex:
+            self.log(f'    (读地图障碍物出错：{ex!r})')
+            return None
+
+    def _qr_move_ok(self, pose, f0, f1, obstacles):
+        """底盘从停车点前进 f0 挪到 f1(只沿车头方向)，车身(含雷达)扫过的长方形离障碍物、黄色区、工位、原料转盘、场地边够不够远。
+        返回 (能不能挪, 原因)。route_plan 有 moves_clear 时也让它查一遍(用它的车身和余量)。"""
+        cfg, rc = self.cfg, self.raw_cfg
+        x, y, h = pose
+        a = math.radians(h)
+        fx, fy = math.cos(a), math.sin(a)
+        lx, ly = -fy, fx
+        L = float(rc.get('car_length_mm', 290.0))
+        W = float(rc.get('car_width_mm', 260.0))
+        ov = float(rc.get('lidar_overhang_mm', 45.0))
+        u0, u1 = -L / 2.0 + min(f0, f1), L / 2.0 + max(f0, f1)          # 车身坐标：前后、左右(雷达在左边)
+        v0, v1 = -W / 2.0, W / 2.0 + ov
+
+        def dist_pt(px, py):                                # 点到扫过的长方形的距离(在里面 = 0)
+            dx, dy = px - x, py - y
+            u, v = dx * fx + dy * fy, dx * lx + dy * ly
+            return math.hypot(max(u0 - u, 0.0, u - u1), max(v0 - v, 0.0, v - v1))
+
+        corners = [(x + u * fx + v * lx, y + u * fy + v * ly) for u in (u0, u1) for v in (v0, v1)]
+        zm = float(cfg.get('qr_zone_margin_mm', 30.0))
+        om = float(cfg.get('qr_obstacle_margin_mm', 60.0))
+        try:
+            import route_plan as rp
+            field = float(getattr(rp, 'FIELD', 2400))
+            rects = list(getattr(rp, 'YELLOW', [])) + [getattr(rp, 'TEMP_ZONE', (0, 910, 150, 1490)),
+                                                        getattr(rp, 'ROUGH_ZONE', (910, 0, 1490, 150))]
+        except Exception:
+            rp, field = None, 2400.0
+            rects = [(550, 1400, 1000, 1850), (1400, 1400, 1850, 1850), (550, 550, 1000, 1000), (1400, 550, 1850, 1000),
+                     (0, 910, 150, 1490), (910, 0, 1490, 150)]
+        rects += [tuple(r) for r in (rc.get('extra_blocked_rects') or [])]
+        if any(cx < zm or cx > field - zm or cy < zm or cy > field - zm for cx, cy in corners):
+            return False, '车身会出场地(或离场地边太近)'
+        for r in rects:
+            x0, y0, x1, y1 = (float(v) for v in r[:4])
+            # 两个长方形(车身那个是斜的)离得够不够远：按分离轴，四个方向里有一个方向上投影隔开 zm 以上就够远
+            sep = False
+            for ax in ((1.0, 0.0), (0.0, 1.0), (fx, fy), (lx, ly)):
+                pa = [cx * ax[0] + cy * ax[1] for cx, cy in corners]
+                pb = [px * ax[0] + py * ax[1] for px in (x0, x1) for py in (y0, y1)]
+                if min(pa) >= max(pb) + zm or min(pb) >= max(pa) + zm:
+                    sep = True
+                    break
+            if not sep:
+                return False, f'车身会离黄色区/工位 {tuple(int(v) for v in (x0, y0, x1, y1))} 太近'
+        rcx, rcy = (float(v) for v in (rc.get('raw_center_mm') or [1200, 2480])[:2])
+        if dist_pt(rcx, rcy) < float(rc.get('raw_radius_mm', 150)) + zm:
+            return False, '车身会离原料转盘太近'
+        for ox, oy, orr in obstacles or []:
+            d = dist_pt(ox, oy) - orr
+            if d < om:
+                return False, f'离障碍物({ox:.0f},{oy:.0f})只有 {max(0.0, d):.0f}mm'
+        mc = getattr(rp, 'moves_clear', None) if rp is not None else None
+        if mc is not None:
+            try:
+                res = mc(rc, obstacles or [], (x + f0 * fx, y + f0 * fy, h), [('F', float(f1 - f0))])
+                if not res[0]:
+                    return False, f'路线规划的检查不通过({res[3]}，最近 {float(res[1]):.0f}mm)'
+            except Exception as ex:
+                self.log(f'    (route_plan.moves_clear 出错：{ex!r}，只按自己的检查)')
+        return True, ''
+
+    def _qr_search(self):
+        """到 QR 点没读到码：车沿车道前后挪(只挪车头方向 F，不横移)，让扫码器依次对着码板可能的位置(qr_targets_mm)，
+        每个位置停 qr_dwell_s 秒查 QR?。挪之前检查车身扫过的地方离障碍物、黄色区、工位、场地边够不够远，不够就跳过那个位置。
+        不管读没读到，最后都挪回停车点(后面的路线是从停车点算的)。急停时不再动。返回任务码或 None。"""
+        cfg = self.cfg
+        rest = max(0.0, float(cfg['qr_timeout_s']) - float(cfg.get('qr_first_wait_s', 0.6)))
+        pose = self._qr_pose()
+        if pose is None:
+            self.log('    (配置 stops 里没有 QR 停车点的位置：不前后挪着找码，原地再等)')
+            return self._qr_poll(rest)
+        plan = self._qr_offsets(pose)
+        if not plan:
+            return self._qr_poll(rest)
+        obstacles = self._qr_obstacles()
+        if obstacles is None:
+            self.log('    (没有地图障碍物信息：只按黄色区、工位、场地边检查)')
+        self.log('    没读到码：沿车道前后挪，让扫码器依次对着码板 ' + '、'.join(f'{t:.0f}' for t, _f in plan) + ' 再读')
+        dwell = float(cfg.get('qr_dwell_s', 0.8))
+        rpm = cfg.get('qr_move_rpm')
+        code = None
+        aborted = False
+        try:
+            for target, f in plan:
+                self._check_abort()
+                cur = float(self.act.disp['F'])
+                ok, why = self._qr_move_ok(pose, cur, f, obstacles)
+                if not ok:
+                    self.log(f'    扫码器对着 {target:.0f}：要{"前进" if f > cur else "后退"} {abs(f - cur):.0f}mm，{why}，跳过')
+                    continue
+                self.log(f'    扫码器对着 {target:.0f}：底盘{"前进" if f > cur else "后退"} {abs(f - cur):.0f}mm')
+                self._ui('stage', 'QR SEARCH')
+                if rpm:
+                    self.act.chassis_move(0, f - cur, speed=int(rpm))
+                else:
+                    self.act.chassis_move(0, f - cur)
+                code = self._qr_poll(dwell)
+                if code:
+                    self.log(f'    读到了(扫码器对着 {target:.0f} 左右)')
+                    break
+        except (Abort, ArmAbort):
+            aborted = True
+            self._aborted = True
+            raise
+        except ArmError as ex:
+            self.log(f'    ★ 找码时底盘出错：{ex}，不再挪')
+        finally:
+            if not aborted:
+                self._return_to_stop('QR')
+        return code
 
     # ------------------------------------------------------------------ RAW：从原料盘抓进转盘
     def _raw(self, visit):
@@ -438,8 +1091,7 @@ class MissionHooks:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
-            if self.time_left() < 0:
-                self.log('    ★ 时间到，不再抓取')
+            if self._no_time('grab', '抓取'):
                 break
             left = self.in_tray.get(item.slot)
             if left is not None and not same_item(left, item):    # 前面没放出去的物料还在这个槽里：再放进去会砸在它上面
@@ -448,12 +1100,14 @@ class MissionHooks:
                 self._show_stats()
                 continue
             ok = False
+            t_it = self.now()
             try:
                 ok = self._grab_item(item)
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
                 self._recover(f'抓 {item.color_name} 出错：{ex}')
+            self._note_item('grab', t_it)
             self.stats.grab(ok)
             if ok:
                 self.in_tray[item.slot] = item
@@ -481,20 +1135,21 @@ class MissionHooks:
             self._check_abort()
             if self.disabled:
                 break
-            if self.time_left() < 0:
-                self.log('    ★ 时间到，不再抓取')
+            if self._no_time('grab', '抓取'):
                 break
             self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
             self._recenter(min_mm=20.0)
             got = None
+            t_it = self.now()
             try:
                 self.arm.obs('RAW', open_claw=True)
-                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + float(cfg['time_limit_s']))
+                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self._work_deadline())
                 got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
                 self._recover(f'抓取出错：{ex}')
+            self._note_item('grab', t_it)
             if got is None:
                 break
             it = got[2]
@@ -520,7 +1175,7 @@ class MissionHooks:
             self.log(f'    ★ 没标定爪子区域(claw_mask.png)：{item.color_name}物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
         if hasattr(self.vision, 'material_stream'):
             t_end = min(self.now() + max(float(cfg['raw_wait_s']), float(cfg.get('raw_track_s', 30.0))),
-                        self.t0 + float(cfg['time_limit_s']))
+                        self._work_deadline())
             return self._raw_stop_grab(item.color, item.slot, 'grab', t_end, f'抓{item.color_short}')
         # 旧的视觉模块(没有一帧一帧认的功能)：等停稳，再闭环对准
         still, last = self.vision.wait_still(item.color, timeout_s=cfg['raw_wait_s'])
@@ -855,22 +1510,29 @@ class MissionHooks:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
-            if self.time_left() < 0:
-                self.log('    ★ 时间到，不再放置')
-                break
             if not same_item(self.in_tray.get(item.slot), item):
                 self.log(f'    转盘 {item.slot} 号槽里没有 {item.color_name}(没抓到)，不放')
                 continue
-            if self._place_item(item, 'ROUGH', item.ring, stack=False, label=f'粗加工放{item.color_short}'):
+            if self._no_time('place', '放置'):
+                break
+            t_it = self.now()
+            ok = self._place_item(item, 'ROUGH', item.ring, stack=False, label=f'粗加工放{item.color_short}')
+            self._note_item('place', t_it)
+            if ok:
                 placed.append(item)
-        for item in self._pickback_sequence('ROUGH', placed):
+        seq = self._pickback_sequence('ROUGH', placed)
+        k = self._pickback_budget(len(seq))
+        if k < len(seq):
+            seq = seq[:k]                                        # 取回了也来不及去暂存区放的：留在粗加工区(放下时已经算分)
+        for item in seq:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
-            if self.time_left() < 0:
-                self.log('    ★ 时间到，不再取回(物料留在粗加工区)')
+            if self._no_time('pick', '取回(物料留在粗加工区，放在那儿也算分)'):
                 break
+            t_it = self.now()
             self._pickback_item(item, 'ROUGH')
+            self._note_item('pick', t_it)
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在圆环上方)，再挪底盘
         self._return_to_stop('ROUGH')
 
@@ -959,34 +1621,43 @@ class MissionHooks:
         if not self._can_work():
             return
         batch = 1 if visit <= 1 else 2
-        self._zone_start('TEMP', self.plan.items(batch))
+        todo = []
         for item in self.plan.items(batch):
-            self._check_abort()
-            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
-                break
-            if self.time_left() < 0:
-                self.log('    ★ 时间到，不再放置')
-                break
             if not same_item(self.in_tray.get(item.slot), item):
                 self.log(f'    转盘 {item.slot} 号槽里没有 {item.color_name}(不在车上)，不放')
                 continue
             ring, stack = item.ring, False
             if batch == 2:
-                low = self.plan.lower_item(item)
-                if low is not None and self.on_ring.get(('TEMP', low.ring)):
-                    ring, stack = low.ring, True
-                    self.log(f'    {item.color_name} 码垛到环{ring}(下面是第一批的 {low.color_name})')
-                else:
-                    # 没有同色的物料可叠(第一批那个没放成功)：赛题不允许叠在别的颜色上；改放到空着的圆环，没有空环就不放，免得撞倒
-                    free = [r for r in (item.ring, 1, 2, 3) if not self.on_ring.get(('TEMP', r))]
-                    if not free:
-                        self.log(f'    {item.color_name} 没有同色物料可叠、暂存区也没有空环，不放(留在车上)')
-                        continue
-                    ring = free[0]
-                    self.log(f'    {item.color_name} 找不到同色的第一批物料可叠，平放在空着的环{ring}')
+                ring = self._stack_target(item)
+                if ring is None:
+                    # 规则：第二批在暂存区只能码垛在同色的第一批物料上；平放 0 分还白花时间(放置数也不算)
+                    self.log(f'    {item.color_name} 没有同色的第一批物料可叠(第一批那个没放成功)：规则只许码垛，不放、不算放置，留在车上')
+                    continue
+                stack = True
+                self.log(f'    {item.color_name} 码垛到环{ring}(下面是第一批的 {self.plan.lower_item(item).color_name})')
+            todo.append((item, ring, stack))
+        self._zone_start('TEMP', [it for it, _r, _s in todo])
+        for item, ring, stack in todo:
+            self._check_abort()
+            if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
+                break
+            kind = 'stack' if stack else 'place'
+            if self._no_time(kind, '码垛' if stack else '放置'):
+                break
+            t_it = self.now()
             self._place_item(item, 'TEMP', ring, stack=stack, label=('码垛' if stack else '暂存放') + item.color_short)
+            self._note_item(kind, t_it)
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在物料上方)，再挪底盘
         self._return_to_stop('TEMP')
+
+    def _stack_target(self, item):
+        """第二批的 item 在暂存区码垛到哪个环：第一批同色的那个物料放在暂存区的环(按记录确实放在那儿)；没有返回 None。"""
+        low = self.plan.lower_item(item) if self.plan is not None else None
+        if low is None:
+            return None
+        if any(same_item(x, low) for x in self.on_ring.get(('TEMP', low.ring)) or []):
+            return low.ring
+        return None
 
     # ------------------------------------------------------------------ 放到圆环(核心)
     def _place_item(self, item, zone, ring, stack, label):
@@ -1050,9 +1721,11 @@ class MissionHooks:
                 self._ring_ready = self._at_obs = False
                 self.arm.take(item.slot)                         # 去转盘取物料
                 held = True
+                self.holding = item
                 self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
                 self._drop(stack)                                # 下降、松手、抬起
                 held = False
+                self.holding = None
                 ok = True
                 self._ring_ready = True                          # 爪子张着停在这个环上方：去下一个环不用整套 OBS
         except ArmAbort:
@@ -1100,6 +1773,7 @@ class MissionHooks:
         self.ring_gate_px = None
         self._ring_ready = self._at_obs = False
         self._zone_d2 = []
+        self._tilt = None
         try:
             self.arm.params(refresh=True)
         except ArmAbort as ex:
@@ -1108,7 +1782,9 @@ class MissionHooks:
             pass
         if not self.cfg.get('ring_survey', True) or not hasattr(self.vision, 'ring_list'):
             return
-        if self.time_left() < 0 or (items and not any(same_item(self.in_tray.get(it.slot), it) for it in items)):
+        if self._no_time('place', '放置', quiet=True) or (items and not any(same_item(self.in_tray.get(it.slot), it) for it in items)):
+            return
+        if not items:
             return
         try:
             self._survey(zone)
@@ -1120,9 +1796,9 @@ class MissionHooks:
 
     def _jac_f(self, rings0, fresh=False):
         """底盘往前走 1mm，圆环在画面里移动多少像素(2 维向量)。返回 (jf, 这次是不是现测的)；测不出来 jf 是 None。
-        以前测过(servo_cal.json)就直接用(fresh=True 不用)；没有就现测：往前挪 20mm 再看一眼、再退回来(只前后动，不横移)。
-        rings0 = 挪之前看到的圆环(ring_list)。挪 20mm 画面只动几十像素，两个圆环之间隔着两百多像素：
-        取挪动前后离得最近的一对，就是同一个环(不会认成旁边那个)。"""
+        以前测过(servo_cal.json)就直接用(fresh=True 不用)；没有就现测：往前挪 40mm 再看一眼、再退回来(只前后动，不横移)。
+        rings0 = 挪之前看到的圆环(ring_list)。挪 40mm 画面只动几十像素，两个圆环之间隔着两百多像素：
+        取挪动前后离得最近的一对，就是同一个环(不会认成旁边那个)。挪得多一点方向量得准一点(车身斜度要用)。"""
         import numpy as np
         J = self.store.get('RING', 'ch') if (self.store is not None and not fresh) else None
         if J is not None:
@@ -1131,7 +1807,7 @@ class MissionHooks:
                 return jf, False
         if not rings0:
             return None, True
-        step = 20
+        step = 40
         self.log(f'    第一次在圆环这里：底盘前进 {step}mm 再退回来，看画面怎么动(以后不用再测)')
         self.act.chassis_move(0, step)
         try:
@@ -1164,6 +1840,8 @@ class MissionHooks:
         import numpy as np
         v, cfg = self.vision, self.cfg
         self.arm.obs('RING', open_claw=True)
+        self._a2_hint = (self.arm.params() or {}).get('A2P')
+        self._a1_hint = (self.arm.params() or {}).get('A1P')
         self._ring_ready = self._at_obs = True
         rings = v.ring_list(n=cfg.get('survey_frames') or None)
         if not rings:
@@ -1173,6 +1851,7 @@ class MissionHooks:
         if jf is None:
             self.log('    ★ 测不出底盘前后挪和画面的关系：按配置里的圆环间距走')
             return
+        jf = self._jf_best(jf)
         cu, cv_ = v.claw('RING')
         claw = np.array([cu, cv_], float)
         pts = np.array([[r[0], r[1]] for r in rings], float)
@@ -1265,23 +1944,29 @@ class MissionHooks:
         ids = (1, 2, 3) if lr else (3, 2, 1)
         n2 = float(jf @ jf)
         many = n >= 2
+        nrm = np.array([-axis[1], axis[0]])                      # 垂直于这一排的方向(画面里)：离圆环远/近
+        tilt, cos_t = None, 1.0
         if many:
-            # 看到两个以上：沿这一排每毫米多少像素按圆环间距算(比底盘挪 20mm 测出来的准)，底盘往哪边挪画面往哪边动看 jf
+            # 看到两个以上：沿这一排每毫米多少像素按圆环间距算(比底盘挪 40mm 测出来的准)，底盘往哪边挪画面往哪边动看 jf
             m = (1.0 if float(jf @ axis) > 0 else -1.0) * sp_px / sp_mm
-            cosf = abs(float(jf @ axis)) / max(float(np.hypot(*jf)), 1e-9)
-            if cosf < 0.97:                                      # 底盘前后挪时圆环不是顺着这一排动：车身和这一排不平行
-                self.log(f'    ★ 车身和圆环那一排好像不平行(差约 {math.degrees(math.acos(min(1.0, cosf))):.0f}°)：'
-                         '挪到别的环时离圆环会越来越远/近，靠手臂伸缩补；差得多就把车摆正再来')
+            # 车身和这一排的夹角 = 底盘前进时圆环在画面里移动的方向(jf) 和 这一排圆环连线的方向(axis) 差多少
+            jd = jf if float(jf @ axis) > 0 else -jf
+            tilt = math.degrees(math.atan2(float(axis[0] * jd[1] - axis[1] * jd[0]), float(axis @ jd)))
+            if abs(tilt) < 15.0:
+                cos_t = math.cos(math.radians(tilt))             # 车身斜了：前进 1mm 沿这一排只走 cos 那么多
+        jn = float(jf @ nrm) if many else 0.0                    # 底盘每前进 1mm，圆环往"离圆环远/近"的方向动多少像素(车身斜了才不是 0)
+        seen_pts = np.array([[r[0], r[1]] for r in rings], float)
+        perp0 = float(np.mean((pts - claw) @ nrm))               # 现在(看圆环的位置)圆环那一排离爪子点多远(像素，垂直于这一排)
         parts = []
         for k, q in zip(ids, pos):
             off = np.asarray(q, float) - claw
             if many:
-                f = -float(off @ axis) / m                       # 底盘前后挪多少，这个环到爪子点
-                side = off - axis * float(off @ axis)            # 垂直于这一排的偏差(像素)：靠手臂伸缩补
+                f = -float(off @ axis) / (m * cos_t)             # 底盘前后挪多少，这个环到爪子点
+                side = abs(float(off @ nrm) + jn * f)            # 挪到这个环以后垂直于这一排还差多少(像素)：靠手臂伸缩补
             else:
                 f = -float(jf @ off) / n2
-                side = off + jf * f
-            parts.append((k, f, float(np.hypot(*side))))
+                side = float(np.hypot(*(off + jf * f)))
+            parts.append((k, f, side))
         far = max(abs(f) for _k, f, _s in parts)
         if far > 2.6 * sp_mm:
             self.log(f'    ★ 算出来要挪 {far:.0f}mm 才到圆环，不对劲(认错了？)：这次按配置里的间距走')
@@ -1293,7 +1978,7 @@ class MissionHooks:
         vc = getattr(v, 'cfg', None)
         if isinstance(vc, dict) and not vc.get('ring_rmax_cal') and many:
             vc.setdefault('px_per_mm', {})['RING'] = scale       # 没做 vclaw RING：按圆环间距算的比例换算毫米
-        # 对准时只认这么近的圆环：沿这一排不到半个间距(旁边那个环至少隔一个间距)，再加上车离这一排远近的偏差(每个环都差不多)
+        # 对准时只认这么近的圆环：沿这一排不到半个间距(旁边那个环至少隔一个间距)，再加上挪到每个环以后离这一排远近的偏差
         side_px = max(side for _k, _f, side in parts)
         self.ring_gate_px = math.hypot(0.45 * sp_px, side_px + 10.0)
         seen = '、'.join(str(ids[i]) for i in range(3) if any(np.hypot(*(pos[i] - p)) < 0.3 * sp_px for p in pts))
@@ -1301,7 +1986,8 @@ class MissionHooks:
                  f'；爪子点 ({cu:.0f},{cv_:.0f})')
         self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素：' +
                  '  '.join(f'环{k} ' + ('不用挪' if abs(f) < 1 else ('前进' if f > 0 else '后退') + f' {abs(f):.0f}mm') +
-                           f'(横向差 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))
+                           f'(横向差约 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))
+        self._survey_tilt(zone, jf, axis, nrm, tilt, jn, perp0, seen_pts, sp_px, float(d['F']))
         worst = max(side for _k, _f, side in parts) / scale
         if worst > 40.0:
             smax = float(cfg.get('ring_strafe_max_mm') or 0.0)
@@ -1313,6 +1999,161 @@ class MissionHooks:
             if not 0.75 <= ratio <= 1.33:
                 self.log(f'    ★ 按底盘走的距离算是每毫米 {np.hypot(*jf):.2f} 像素，按圆环间距 {sp_mm:g}mm 算是 {scale:.2f}：'
                          '底盘前后走的距离不准(FPPM)，或者圆环间距不是这么多(mission_cfg.ring_spacing_mm)')
+
+    # ---- 车身和圆环那一排不平行(车停斜了)：量出来、提醒、提前补手臂伸缩
+    def _jf_best(self, jf):
+        """车身斜度要用的"底盘前进时画面怎么动"的方向：换环时量准过(RING.ch_f_ref)、而且和现在存的差不多(15° 以内，
+        摄像头没动过)就用量准的那个方向(存的 J 可能被对准时 12mm 的小步探测换掉了，方向差一两度)，大小按现在的。"""
+        import numpy as np
+        ref = self.store.extra('RING', 'ch_f_ref') if (self.store is not None and hasattr(self.store, 'extra')) else None
+        try:
+            r = np.asarray(ref, float)
+            jf = np.asarray(jf, float)
+            nr, nj = float(np.hypot(*r)), float(np.hypot(*jf))
+            if nr > 1e-6 and nj > 1e-6 and float(r @ jf) / (nr * nj) >= math.cos(math.radians(15.0)):
+                return r / nr * nj
+        except Exception:
+            pass
+        return jf
+
+    def _jf_refined(self, jf):
+        """jf(底盘前进时画面怎么动)是不是换环时用一两百毫米量准过的那个(存在 servo_cal.json 的 RING.ch_f_ref)。"""
+        import numpy as np
+        ref = self.store.extra('RING', 'ch_f_ref') if (self.store is not None and hasattr(self.store, 'extra')) else None
+        try:
+            r, j = np.asarray(ref, float), np.asarray(jf, float)
+            return float(r @ j) / max(float(np.hypot(*r)) * float(np.hypot(*j)), 1e-12) >= math.cos(math.radians(0.5))
+        except Exception:
+            return False
+
+    def _survey_tilt(self, zone, jf, axis, nrm, tilt, jn, perp0, seen_pts, sp_px, F0):
+        """看三个环时：报车身和这一排的夹角(斜到 tilt_warn_deg 以上打 ★)，记下提前补手臂要用的东西(self._tilt)。
+        手臂的 J(ID2/ID1 转 1° 画面动多少)知道时：垂直于这一排差 1 像素，ID2/ID1 要转多少度(g)。"""
+        import numpy as np
+        cfg = self.cfg
+        warn = float(cfg.get('tilt_warn_deg', 3.0))
+        refined = self._jf_refined(jf)
+        Ja = self.store.get('RING', 'arm') if self.store is not None else None
+        g = None
+        if Ja is not None:
+            try:
+                g = -np.linalg.solve(np.asarray(Ja, float), nrm)
+            except np.linalg.LinAlgError:
+                g = None
+        pre = bool(cfg.get('tilt_precorrect', True)) and bool(cfg.get('ring_precorrect', True)) and g is not None
+        warned = False
+        if tilt is not None:
+            src = '' if refined else '(按底盘前后挪测的方向算，可能差 1° 左右；换环时再量准)'
+            if abs(tilt) >= warn:
+                warned = True
+                self.log(f'    ★ 车身和圆环那一排斜了 {tilt:+.1f}°{src}：把车摆正(停车时车身要和圆环那一排平行)' +
+                         ('；这次已按斜的角度提前补手臂伸缩' if pre else '；挪到别的环时离圆环会越来越远/近，靠手臂伸缩补'))
+            else:
+                self.log(f'    车身和圆环那一排的夹角 {tilt:+.1f}°{src}')
+        self._tilt = dict(zone=zone, F0=float(F0), perp0=float(perp0), jn=float(jn), nrm=np.asarray(nrm, float),
+                          axis=np.asarray(axis, float), jf=np.asarray(jf, float), angle=tilt, warned=warned,
+                          refined=refined, g=g, rings=np.asarray(seen_pts, float), sp_px=float(sp_px), relooked=False)
+
+    def _relook(self):
+        """刚看完三个环、手臂没动过，底盘开到了第一个要放的环(离看圆环的地方 100mm 以上)：再看一眼画面。
+        圆环在画面里整体移动的方向就是"底盘前进"在画面里的方向；挪了一两百毫米量的比第一次挪 40mm 测的准得多：
+        用它把车身和圆环那一排的夹角量准(存进 servo_cal.json，以后到工位直接用)，这个环和后面的环按它提前补手臂伸缩。
+        顺便返回这个环现在离爪子点多少像素(爪子附近的那个环；没看到返回 None)：手臂直接转过去，省掉对准的第一步。"""
+        import numpy as np
+        t = self._tilt
+        if not t or t.get('relooked') or not self.cfg.get('tilt_precorrect', True):
+            return None
+        dF = float(self.act.disp['F']) - t['F0']
+        if abs(dF) < 100.0:
+            return None
+        t['relooked'] = True
+        try:
+            rings = self.vision.ring_list(n=self.cfg.get('survey_frames') or None)
+        except VisionError:
+            return None
+        if not rings:
+            return None
+        pts1 = np.array([[r[0], r[1]] for r in rings], float)
+        claw = np.array(self.vision.claw('RING'), float)
+        dc = np.hypot(pts1[:, 0] - claw[0], pts1[:, 1] - claw[1])
+        gate = self.ring_gate_px or 0.45 * t['sp_px']
+        p_now = (pts1[int(np.argmin(dc))] - claw) if float(np.min(dc)) <= gate else None
+        if t.get('angle') is None:
+            return p_now
+        shifts = []
+        for q in t['rings']:
+            e = q + t['jf'] * dF                                 # 按原来的 jf 估计它现在在哪
+            dist = np.hypot(pts1[:, 0] - e[0], pts1[:, 1] - e[1])
+            j = int(np.argmin(dist))
+            if float(dist[j]) < 0.3 * t['sp_px']:
+                shifts.append(pts1[j] - q)
+        if not shifts:
+            return p_now
+        jd = np.mean(shifts, axis=0) / dF
+        if float(np.hypot(*jd)) < 0.2:
+            return p_now
+        jf = jd / float(np.hypot(*jd)) * float(np.hypot(*t['jf']))   # 只要方向(走的距离不一定准)，大小按原来的
+        axis, nrm = t['axis'], t['nrm']
+        jdd = jf if float(jf @ axis) > 0 else -jf
+        ang = math.degrees(math.atan2(float(axis[0] * jdd[1] - axis[1] * jdd[0]), float(axis @ jdd)))
+        old = t['angle']
+        t.update(jf=jf, jn=float(jf @ nrm), angle=ang, refined=True)
+        warn = float(self.cfg.get('tilt_warn_deg', 3.0))
+        self.log(f'    换到这个环再看一眼(底盘挪了 {dF:+.0f}mm)：车身和圆环那一排的夹角量准了 {ang:+.1f}°(刚才按 {old:+.1f}° 算)')
+        if abs(ang) >= warn and not t.get('warned'):
+            t['warned'] = True
+            self.log(f'    ★ 车身和圆环那一排斜了 {ang:+.1f}°：把车摆正(停车时车身要和圆环那一排平行)；这次已按斜的角度提前补手臂伸缩')
+        elif abs(ang) < warn and t.get('warned'):
+            self.log(f'    (没有刚才算的那么斜，{ang:+.1f}° 不用管)')
+        st = self.store
+        J = st.get('RING', 'ch') if st is not None else None
+        if J is not None:                                        # 存下量准的方向：以后到工位直接用
+            J = np.array(J, float)
+            if st.synth('RING'):
+                J[:, 0] = (-jf[1], jf[0])
+            J[:, 1] = jf
+            st.put('RING', 'ch', J)
+            st.set_extra('RING', 'ch_f_ref', [round(float(jf[0]), 5), round(float(jf[1]), 5)])
+            st.save()
+        return p_now
+
+    def _arm_to(self, p):
+        """圆环在画面里离爪子点 p 像素(手臂在观察姿态)：手臂 ID2、ID1 各要转多少度才对上(用存着的手臂 J)。没有 J 返回 None。"""
+        import numpy as np
+        Ja = self.store.get('RING', 'arm') if self.store is not None else None
+        if Ja is None:
+            return None
+        try:
+            du = -np.linalg.solve(np.asarray(Ja, float), np.asarray(p, float))
+        except np.linalg.LinAlgError:
+            return None
+        lim1 = 0.9 * float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id1', 12.0))
+        return float(du[0]), max(-lim1, min(lim1, float(du[1])))
+
+    def _survey_line(self):
+        """看三个环时量的(能提前补手臂伸缩才有)：self._tilt；不能补返回 None。"""
+        import numpy as np
+        t = self._tilt
+        if not t or not self.cfg.get('tilt_precorrect', True):
+            return None
+        if t.get('g') is None and self.store is not None:
+            Ja = self.store.get('RING', 'arm')               # 看圆环时还没有手臂的 J(第一次在这里)，对准过一次就有了
+            if Ja is not None:
+                try:
+                    t['g'] = -np.linalg.solve(np.asarray(Ja, float), t['nrm'])
+                except np.linalg.LinAlgError:
+                    t['g'] = None
+        return t if t.get('g') is not None else None
+
+    def _predict_d1(self, d2):
+        """ID2 提前伸缩 d2 度时，ID1 跟着补多少度：车身斜了，伸缩的方向不正好垂直于圆环那一排，ID1 补上沿这一排的那一点。
+        太小(舵机动不了)就不补。"""
+        t = self._survey_line()
+        if t is None or d2 is None or abs(float(t['g'][0])) < 1e-6:
+            return 0.0
+        d1 = float(d2) * float(t['g'][1]) / float(t['g'][0])
+        d1 = max(-3.0, min(3.0, d1))
+        return d1 if abs(d1) >= 0.35 else 0.0
 
     def _frame_size(self):
         cam = (getattr(self.vision, 'cfg', None) or {}).get('camera') or {}
@@ -1345,12 +2186,40 @@ class MissionHooks:
         if cfg.get('zone_gain'):
             kw['gain_arm'] = float(cfg['zone_gain'])
         kw['filt'] = bool(cfg.get('zone_filter', True))
+        # 手臂可能已经提前转过(ring_precorrect/tilt_precorrect)：按机构的行程(观察姿态 ± arm_limit_deg)算这次还能往哪边转多少，
+        # 伸缩够不着的才让车轮横移
+        ang = (getattr(self.arm, 'angle', None) or {}) if self.arm is not None else {}
+        rng = {}
+        for key, env, cur in (('id2', self._a2_env(), ang.get(2) if ang.get(2) is not None else self._a2_hint),
+                              ('id1', self._a1_env(), ang.get(1) if ang.get(1) is not None else self._a1_hint)):
+            if env is not None and cur is not None:
+                rng[key] = (env[0] - float(cur), env[1] - float(cur))
+        if rng:
+            kw['arm_range'] = rng
         kw['wheels_first'] = bool(cfg.get('wheels_first', False))
         if self.servo is not None and kw['wheels_first']:
             for k in ('wheels_step_mm', 'wheels_min_mm', 'wheels_rpm'):
                 if cfg.get(k) is not None:
                     self.servo.cfg[k] = cfg[k]
         return kw
+
+    def _a2_env(self):
+        """ID2(伸缩)在工位里能到的范围(绝对角度)：观察姿态 A2P ± 视觉闭环的 arm_limit_deg.id2(约 ±44mm)，
+        再和 STM32 的 A2 参数范围取交集。不知道 A2P 返回 None。"""
+        P = (self.arm.params() or {}) if self.arm is not None else {}
+        if 'A2P' not in P:
+            return None
+        lim = float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id2', 250.0))
+        a2p = float(P['A2P'])
+        return max(A2_MIN, a2p - lim), min(A2_MAX, a2p + lim)
+
+    def _a1_env(self):
+        """ID1 在工位里能到的范围(绝对角度)：观察角度 A1P ± arm_limit_deg.id1。不知道 A1P 返回 None。"""
+        P = (self.arm.params() or {}) if self.arm is not None else {}
+        if 'A1P' not in P:
+            return None
+        lim = float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id1', 12.0))
+        return float(P['A1P']) - lim, float(P['A1P']) + lim
 
     def _drop(self, stack):
         """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。"""
@@ -1580,41 +2449,83 @@ class MissionHooks:
     def _obs_ring(self):
         """空爪摆到圆环上方的观察姿态。这个工位里已经对准过圆环、手臂还张着爪停在圆环上方(刚放完/刚看完三个环)：
         ID1 回到观察角度 A1P，ID2(伸缩)直接到前面对准时的远近，不先缩回 A2P 再伸出来——省一次大的伸缩修正。
-        其他情况(刚从转盘回来、收过臂…)照常用 STM32 的 OBS。"""
+        其他情况(刚从转盘回来、收过臂…)照常用 STM32 的 OBS。
+        刚看完三个环、开到了第一个要放的环：按看圆环时量的远近和车身斜度，第一次测量之前手臂伸缩(必要时 ID1)就先补上(tilt_precorrect)。"""
         P = self.arm.params() or {}
-        d2 = self._predict_d2() if self.cfg.get('ring_precorrect', True) else None
+        pre = self.cfg.get('ring_precorrect', True)
         at_obs, self._at_obs = self._at_obs, False
+        p_now = None
+        if at_obs and pre and self._ring_ready:
+            p_now = self._relook()                               # 底盘挪了 100mm 以上：再看一眼，把车身斜度量准(顺便看到这个环在哪)
+        d2 = self._predict_d2() if pre else None
+        d1 = None
+        full = self._arm_to(p_now) if (p_now is not None and 'A1P' in P and 'A2P' in P) else None
+        if full is not None:
+            d2, d1 = full                                        # 刚看到这个环在哪：ID2、ID1 一起转过去(相当于对准的第一步)
         if d2 is None and self._ring_ready and at_obs:
             return                                               # 刚看完三个环：手臂还在观察姿态(底盘挪过不影响)，不用再 OBS 一遍
         if d2 is None or not self._ring_ready or not all(k in P for k in ('A1P', 'A2P', 'ZHI', 'ZOBRNG')):
             self.arm.obs('RING', open_claw=True)
+            self._a2_hint = P.get('A2P')
+            self._a1_hint = P.get('A1P')
             self._ring_ready = True
             return
-        a2 = min(-503.5, max(-1220.0, float(P['A2P']) + d2))   # STM32 里 A2 的范围
+        if d1 is None:
+            d1 = self._predict_d1(d2)
+        env = self._a2_env() or (A2_MIN, A2_MAX)
+        a2 = min(env[1], max(env[0], float(P['A2P']) + d2))    # 伸缩的行程(A2P ± arm_limit_deg.id2，STM32 里 A2 的范围)
+        d2 = a2 - float(P['A2P'])
+        a1 = float(P['A1P']) + d1
+        if at_obs:
+            # 手臂还在观察姿态和高度(刚看完三个环)：直接转过去，不用升降
+            if abs(d2) < 2.0 and abs(d1) < 0.35:
+                return
+            t = self._tilt or {}
+            why = '按刚看到的位置' if full is not None else '按看圆环时量的远近'
+            self.log(f'    {why}' + (f'(车身斜 {t["angle"]:+.1f}°)' if t.get('angle') is not None else '') +
+                     f'，手臂先转过去：ID2 {d2:+.0f}°' + (f'、ID1 {d1:+.1f}°' if abs(d1) >= 0.05 else '') + '，再测')
+            self.arm.ap(a1, a2)
+            self._a1_hint, self._a2_hint = a1, a2                # AP 没回报角度时，对准的行程按转到的这个角度算(不是观察角度)
+            return
         if abs(d2) >= 3.0:
-            self.log(f'    手臂伸缩直接到前面对准时的远近(ID2 {d2:+.0f}°)')
+            self.log(f'    手臂伸缩直接到前面对准时的远近(ID2 {d2:+.0f}°)' + (f'，ID1 {d1:+.1f}°' if d1 else ''))
         self.arm.lift(float(P['ZHI']))                       # 和 OBS 一样：先在搬运高度转过去(已经在这个高度就不动)
-        self.arm.ap(float(P['A1P']), a2)
+        self.arm.ap(a1, a2)
+        self._a1_hint, self._a2_hint = a1, a2
         self.arm.lift(float(P['ZOBRNG']))
 
     def _predict_d2(self):
-        """这个工位里前面对准好时，ID2 比 A2P 多转了多少度(= 车离圆环那一排远了/近了多少)；按现在底盘的前后位置推一个。没对准过返回 None。
-        对准过两个隔得够远的环：车身和那一排不平行时远近随位置变，按直线推(不往外推太远)。"""
+        """到现在这个底盘前后位置，对准圆环时 ID2 要比 A2P 多转多少度(= 车离圆环那一排远了/近了多少)。推不出来返回 None。
+          对准过两个隔得够远的环：按这两个(以上)的直线推(车身和那一排不平行时远近随位置变；不往外推太远)；
+          对准过一个：那一次的 + 看圆环时量的车身斜度 × 挪了多少(tilt_precorrect；量不到斜度就照那一次的)；
+          还没对准过：按看圆环时量的(圆环那一排离爪子多远 + 斜度 × 挪了多少)换成 ID2 度数(要有手臂的 J)。"""
         rec = self._zone_d2
-        if not rec:
-            return None
+        t = self._survey_line()
+        F = float(self.act.disp['F']) if self.act is not None else None
+        b = None                                                 # 底盘每前进 1mm，ID2 要多转多少度(看圆环时量的斜度算的)
+        if t is not None:
+            b = max(-0.6, min(0.6, float(t['g'][0]) * float(t['jn'])))
         if len(rec) >= 2:
             fs = [float(r[0]) for r in rec]
             ds = [float(r[1]) for r in rec]
             if max(fs) - min(fs) >= 60.0:
                 fb, db = sum(fs) / len(fs), sum(ds) / len(ds)
                 var = sum((f - fb) ** 2 for f in fs)
-                b = sum((f - fb) * (d - db) for f, d in zip(fs, ds)) / var
-                b = max(-0.6, min(0.6, b))                       # 每毫米最多 0.6°
-                F = float(self.act.disp['F']) if self.act is not None else fb
-                pad = 0.6 * abs(b) * 150.0 + 10.0
-                return float(max(min(ds) - pad, min(max(ds) + pad, db + b * (F - fb))))
-        return float(rec[-1][1])
+                bf = sum((f - fb) * (d - db) for f, d in zip(fs, ds)) / var
+                bf = max(-0.6, min(0.6, bf))                     # 每毫米最多 0.6°
+                Fq = F if F is not None else fb
+                pad = 0.6 * abs(bf) * 150.0 + 10.0
+                return float(max(min(ds) - pad, min(max(ds) + pad, db + bf * (Fq - fb))))
+        if rec:
+            F1, d1 = float(rec[-1][0]), float(rec[-1][1])
+            if b is not None and F is not None:
+                return d1 + b * (F - F1)
+            return d1
+        if t is not None and F is not None:
+            perp = float(t['perp0']) + float(t['jn']) * (F - float(t['F0']))
+            lim = 0.8 * float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id2', 250.0))
+            return max(-lim, min(lim, float(t['g'][0]) * perp))   # 只按手臂的 J 推的：不一下伸到头
+        return None
 
     def _learn_from(self, zone, ring):
         d = self.act.disp
@@ -1643,10 +2554,10 @@ class MissionHooks:
         return True
 
     def _stow_quiet(self):
-        """每个工位做完收臂(开车前手臂要收好)。"""
+        """每个工位做完收臂(开车前手臂要收好)。收不好就停下(带着伸出的手臂开车不安全)。"""
         self._ring_ready = self._at_obs = False
         try:
-            self.arm.stow()
+            self._stow_retry()
         except ArmAbort:
             raise
         except ArmError as ex:
@@ -1654,19 +2565,16 @@ class MissionHooks:
 
     # ------------------------------------------------------------------ START：回到启停区
     def _start(self, visit):
-        if self.arm is not None and not self.disabled:
-            try:
-                self.arm.stow()
-                if self.cfg.get('lift_park_mm') is not None:
-                    self.arm.do(f"LIFT {float(self.cfg['lift_park_mm']):g}")   # 停到开机高度，下次上电编码器能认出来
-            except ArmAbort:
-                raise
-            except ArmError as ex:
-                self.log(f'    收臂失败：{ex}')
-        self._ui('stage', 'DONE')
-        self._show_stats()
-        self._ui('msg', f'T={self.elapsed():.0f}s')
+        if self.arm is not None:
+            self.park()                                          # 收臂、升降停到开机高度 60(下次上电编码器能认出来)；夹着东西时不做
         s = self.stats
-        self.log(f'  ■ 回到启停区。用时 {self.elapsed():.0f}s；{s.grab_text()}，{s.place_text()}')
+        self._ui('stage', 'DONE')
+        self._ui('grab', s.final_grab_text())                    # 回家以后只显示做成的个数(赛规要"正确的数量")
+        self._ui('place', s.final_place_text())
+        self._ui('msg', f'T={self.elapsed():.0f}s')
+        self.log(f'  ■ 回到启停区。用时 {self.elapsed():.0f}s；屏上显示 {s.final_grab_text()}、{s.final_place_text()}'
+                 f'(抓了 {s.grab_total} 次、放了 {s.place_total} 次)')
+        if self.stop_times:
+            self.log('      各停车点用时：' + '  '.join(f'{st} {dt:.0f}s' for st, _r, _v, dt in self.stop_times))
         for zone, ring, stack, err in self.placements:
             self.log(f'      {zone} 环{ring}{" 码垛" if stack else ""}：对准误差 {err:.2f}mm' if err is not None else f'      {zone} 环{ring}')

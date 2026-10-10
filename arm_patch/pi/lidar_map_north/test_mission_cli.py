@@ -213,7 +213,7 @@ class CliTests(unittest.TestCase):
 
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
-        self._plate_world(seed=9)
+        self._plate_world(seed=7)
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1 any')
         text = '\n'.join(self.lines)
@@ -224,7 +224,7 @@ class CliTests(unittest.TestCase):
         self.assertIn('这次停在爪子附近的是', text)
         self.assertIn('不按顺序', text)
         self.assertFalse(self.h.raw_any_once)                              # 只这一次
-        self._plate_world(seed=9)                                          # 同一个世界按顺序抓：要等更久
+        self._plate_world(seed=7)                                          # 同一个世界按顺序抓：要等更久
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1')
         self.assertEqual(self.h.stats.grab_ok, 3, '\n'.join(self.lines))
@@ -718,6 +718,69 @@ class CliTests(unittest.TestCase):
             mission_cli._vmask(self.h, self.log)
             self.assertIsNotNone(calls[-1])
 
+    # ---------------- 10-10：mtest wheels / nofilt、park、码垛跳过、gtest 后夹着东西
+    def test_mtest_wheels_and_nofilt_only_for_this_run(self):
+        """mtest TEMP 1 force wheels：这次对准先动车轮(小步、wheels_rpm)；nofilt：这次不滤波。做完配置恢复原样，报这次用时。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force wheels')
+        text = '\n'.join(self.lines)
+        self.assertIn('wheels：这次对准先动车轮', text)
+        self.assertIn('这次用时', text)
+        self.assertIn('先动车轮', text.split('这次用时')[-1])
+        self.assertTrue(any(sp == 60 for sp in self.w.move_speeds), self.w.move_speeds)
+        self.assertFalse(self.h.cfg['wheels_first'])                 # 只管这一次
+        self.assertEqual(len(self.w.placed), 3, text)
+        seen = []
+        real = self.h.servo.run
+
+        def run(*a, **kw):
+            seen.append(kw.get('filt'))
+            return real(*a, **kw)
+        self.h.servo.run = run
+        for key in [k for k in self.w.rings if k[0] == 'TEMP']:     # 圆环拿空，物料放回车上
+            self.w.rings[key] = []
+        for it in self.h.plan.items(1):
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 1 force nofilt')
+        text = '\n'.join(self.lines)
+        self.assertIn('nofilt：这次对准不用测量滤波', text)
+        self.assertTrue(seen and all(f is False for f in seen), seen)
+        self.assertTrue(self.h.cfg['zone_filter'])
+        with self.assertRaises(ValueError):
+            mission_cli.handle_cli('mtest', ['mtest', 'TEMP', '1', 'wheel'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
+    def test_park_command(self):
+        """park：收臂、升降停 60(终端命令，急停以后也能做)。"""
+        self.h._ensure(self.w.link)
+        self.h._aborted = True
+        self.w.lift_mm = 100.0
+        self.run_cli('park', 'park')
+        self.assertIn('PARK', self.w.requests)
+        self.assertAlmostEqual(self.w.lift_mm, 60.0)
+        self.assertTrue(any('park 完成' in l for l in self.lines), self.lines)
+
+    def test_gtest_leaves_material_in_claw_until_claw_open(self):
+        """gtest 夹起来以后物料还在爪子里：park 不降(会压到车上转盘)；arm CLAW O 以后才算空了。"""
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('RAW', 1)
+        self.w.a1_ref, self.w.a2_ref = self.w.params['A1G'], self.w.params['A2E']
+        self.run_cli('gtest', f'gtest {self.w.raw_items[0]["color"]}')
+        self.assertIsNotNone(self.h.maybe_holding)
+        self.lines.clear()
+        self.run_cli('park', 'park')
+        self.assertNotIn('PARK', self.w.requests)
+        self.assertTrue(any('不收臂停 60' in l for l in self.lines), self.lines)
+        self.run_cli('arm', 'arm CLAW O')
+        self.assertIsNone(self.h.maybe_holding)
+        self.run_cli('park', 'park')
+        self.assertIn('PARK', self.w.requests)
+
+    def test_mcode_says_stack_without_lower_is_skipped(self):
+        self.run_cli('mcode', 'mcode 123+123+456+123')
+        text = '\n'.join(self.lines)
+        self.assertIn('没有同色的第一批物料可叠：不放(规则只许码垛在同色上)', text)
+
     def test_busy_refused(self):
         self.state['busy'] = True
         with self.assertRaises(ValueError):
@@ -836,6 +899,40 @@ class ConfigScriptTests(unittest.TestCase):
         self.assertEqual(mc['chassis_fine_rpm'], 80)                # 用户自己改过的不动
         self.assertEqual(mc['ring_order'], {'ROUGH': 'lr', 'TEMP': 'lr'})   # 新加的项补上
         self.assertIs(mc['chassis_strafe'], False)
+
+    def test_10_10_keys_and_strafe_upgrade(self):
+        """10-10：ring_strafe_max_mm 旧默认 40 升级成 20(用户自己改过的不动)；新加的项(时间、扫码、斜度…)都补上，用户的值不改。"""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'cfg.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'ring_strafe_max_mm': 40.0, 'raw_stop_s': 5.0, 'qr_dwell_s': 1.5}}, f)
+        apply_mission_config.main([path])
+        mc = load(path)['mission_cfg']
+        self.assertEqual(mc['ring_strafe_max_mm'], 20.0)
+        self.assertEqual(mc['raw_stop_s'], 4.0)                     # 以前那次升级也还在
+        self.assertEqual(mc['qr_dwell_s'], 1.5)                     # 用户的值不动
+        for k in ('round_s', 'home_margin_s', 'work_item_s', 'qr_search', 'qr_targets_mm', 'qr_scanner_from_rear_mm',
+                  'qr_scanner_from_right_mm', 'tilt_precorrect', 'tilt_warn_deg', 'keepalive_deg', 'code_plus', 'home_when_idle'):
+            self.assertIn(k, mc)
+        self.assertEqual(mc['wheels_min_mm'], 4.0)
+        self.assertIs(mc['wheels_first'], False)
+        self.assertIs(mc['zone_filter'], True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'ring_strafe_max_mm': 30}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['ring_strafe_max_mm'], 30)   # 用户自己改过的不动
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'ring_strafe_max_mm': 40}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['ring_strafe_max_mm'], 20.0)   # 手写的整数 40 也算旧默认值
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'wheels_min_mm': 1.5}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['wheels_min_mm'], 4.0)        # 旧默认 1.5 -> 4
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'wheels_min_mm': 2.5}}, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['wheels_min_mm'], 2.5)        # 用户自己改过的不动
 
     def test_missing_file(self):
         self.assertEqual(apply_mission_config.main(['/nonexistent/x.json']), 1)

@@ -52,7 +52,7 @@ class SimLink:
         return (ok, reply, info) if collect else (ok, reply)
 
     def move(self, cmd, val, speed=None):
-        return self.w.move(cmd, val)
+        return self.w.move(cmd, val, speed)
 
     def abort(self):
         self.w.abort_flag = True
@@ -61,8 +61,10 @@ class SimLink:
 class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
-                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None):
+                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None,
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC'):
         self.rng = np.random.default_rng(seed)
+        self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
         self.code = code
         self.qr_present = qr_present
@@ -127,6 +129,18 @@ class SimWorld:
         self.plate_r = 150.0
         self.plate_c = np.array([self.plate_r + float(plate_off_mm), 0.0])
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
+        # 二维码：扫码器只有车停在 QR 点前后挪 qr_window=(下限, 上限) mm 以内时才看得到码(None = 一直看得到)；
+        # STM32 读到一次就一直存着(qr_code)，QR CLR 才清掉；qr_latch_moving = 新程序：车在走的时候读到的也存下来；
+        # qr_stale = 开机前(上一轮/调试时)就存着的旧码
+        self.qr_window = tuple(qr_window) if qr_window else None
+        self.qr_latch_moving = bool(qr_latch_moving)
+        self.qr_code = qr_stale
+        self.at = None                                         # 现在停在哪个停车点(角色)
+        self.park_cmd = bool(park_cmd)                         # STM32 认识 PARK(新程序)
+        self.parked = 0                                        # 收到几次 PARK
+        self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
+        self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
+        self.move_speeds = []                                  # 底盘每条指令的速度(转/分；None = 默认)，和 moves 一一对应
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         self.link = SimLink(self)
         self.vision = SimVision(self)
@@ -215,8 +229,9 @@ class SimWorld:
     # ------------------------------------------------------------------ 到达一个工位(由测试代码调用，相当于路线把车开到了停车点)
     def arrive(self, role, batch=1):
         self.zone = role if role in ('RAW', 'ROUGH', 'TEMP') else None
+        self.at = role
         self.off_s = self.off_f = 0.0
-        self.stop_err = np.clip(self.rng.normal(0, self.stop_err_mm / 2.0, 2), -self.stop_err_mm, self.stop_err_mm)
+        self.stop_err = np.clip(self.lay.normal(0, self.stop_err_mm / 2.0, 2), -self.stop_err_mm, self.stop_err_mm)
         self.stop_err[1] += float(self.park.get(role, 0.0))
         self.stop_err[0] += float(self.park_side.get(role, 0.0))
         if role == 'RAW':
@@ -227,18 +242,18 @@ class SimWorld:
                 colors = [1, 2, 3]
             self.raw_items = []
             if self.plate_stop:
-                self.plate_t0 = self.t - self.rng.uniform(0, self.plate_stop + self.plate_move)   # 到的时候转盘在一个周期里的随便哪个时刻
-                shift = int(self.rng.integers(0, 3))
+                self.plate_t0 = self.t - self.lay.uniform(0, self.plate_stop + self.plate_move)   # 到的时候转盘在一个周期里的随便哪个时刻
+                shift = int(self.lay.integers(0, 3))
                 for i, c in enumerate(colors):
                     if not (batch == 1 and c in self.missing_batch1):
-                        self.raw_items.append(dict(color=c, r=self.plate_r + self.rng.normal(0, 1.0),
-                                                   off=-((i + shift) % 3) * 2 * math.pi / 3 + self.rng.normal(0, 0.02)))
+                        self.raw_items.append(dict(color=c, r=self.plate_r + self.lay.normal(0, 1.0),
+                                                   off=-((i + shift) % 3) * 2 * math.pi / 3 + self.lay.normal(0, 0.02)))
                 colors = []
             for c in colors:
                 if batch == 1 and c in self.missing_batch1:
                     continue
                 for _ in range(200):                           # 离停车点 22mm 以内(原料区只动手臂：车要停得让物料在手臂够得着的地方)；两个物料不会叠在一起
-                    pos = self.rng.uniform(-22, 22, 2)
+                    pos = self.lay.uniform(-22, 22, 2)
                     if np.linalg.norm(pos) <= 22.0 and all(np.linalg.norm(pos - it['pos']) >= 20.0 for it in self.raw_items):
                         break
                 self.raw_items.append(dict(color=c, pos=pos))
@@ -309,14 +324,28 @@ class SimWorld:
         return (float(p[0]), float(p[1]))
 
     # ------------------------------------------------------------------ 底盘
-    def move(self, cmd, val):
+    def move(self, cmd, val, speed=None):
         self.advance(1.0 + abs(val) / 150.0)
         self.moves.append((cmd, val, self.zone))
+        self.move_speeds.append(speed)
+        f_before = self.off_f
         if cmd == 'S':
             self.off_s += val * (1 + self.rng.normal(0, 0.03)) + self.rng.normal(0, 1.0)
         elif cmd == 'F':
             self.off_f += val * self.f_gain * (1 + self.rng.normal(0, 0.03)) + self.rng.normal(0, 1.0)
+        if self.qr_latch_moving and self._qr_visible(min(f_before, self.off_f), max(f_before, self.off_f)):
+            self.qr_code = self.code                           # 新程序：走的时候扫到的码也存下来
         return True, 'DONE t=1000 e=10'
+
+    def _qr_visible(self, f0=None, f1=None):
+        """扫码器(车停在 QR 点前后挪了 f0..f1 mm)看不看得到码。"""
+        if not self.qr_present or self.at not in (None, 'QR'):          # 还没到过任何停车点(终端测试)：当作在 QR 点
+            return False
+        if self.qr_window is None:
+            return True
+        f0 = self.off_f if f0 is None else f0
+        f1 = self.off_f if f1 is None else f1
+        return f1 >= self.qr_window[0] and f0 <= self.qr_window[1]
 
     # ------------------------------------------------------------------ 假 STM32
     def handle(self, text):
@@ -355,7 +384,26 @@ class SimWorld:
             P[parts[1]] = float(parts[2])
             return True, 'DONE', info
         if verb == 'LIFT?':
-            info.append(f'LIFT {int(self.lift_known)} {self.lift_mm:.4f}')
+            info.append(f'LIFT {int(self.lift_known)} {self.lift_mm:.4f}' + (f' BOOT={self.lift_boot}' if self.lift_boot else ''))
+            return True, 'DONE', info
+        if verb == 'ZONE?' or verb == 'ZONE':
+            if self.zone_fw is None:
+                return False, 'ERR CMD', info
+            if verb == 'ZONE?':
+                info.append(f'ZONE {int(self.zone_fw[0])} {int(self.zone_fw[1])}')
+            elif len(parts) >= 2 and parts[1] in ('1', '2'):
+                self.zone_fw = (int(parts[1]), 0)
+            return True, 'DONE', info
+        if verb == 'PARK':
+            if not self.park_cmd:
+                return False, 'ERR CMD', info
+            if not self.lift_known:
+                return False, 'ERR NOZERO', info
+            self.parked += 1
+            if P['ARMOK'] >= 0.5:
+                self._lift_to(P['ZHI'])
+                self._servos_to(P['A1H'], P['A2R'], P['ASPD'])
+            self._lift_to(60.0)
             return True, 'DONE', info
         if verb == 'LIFT' and len(parts) == 2:
             if parts[1] == 'ZERO':
@@ -366,9 +414,13 @@ class SimWorld:
             self._lift_to(float(parts[1]))
             return True, 'DONE', info
         if verb == 'QR?':
-            info.append(f'QR {self.code}' if self.qr_present else 'QR NONE')
+            if self.qr_code is None and self._qr_visible():
+                self.qr_code = self.code                       # 车停着、扫码器对着码：读到，存下来
+            info.append(f'QR {self.qr_code}' if self.qr_code else 'QR NONE')
             return True, 'DONE', info
         if verb == 'QR':
+            if len(parts) == 2 and parts[1] == 'CLR':
+                self.qr_code = None
             return True, 'DONE', info
         if verb in ('SCR', 'SCMD'):
             if verb == 'SCR' and len(parts) >= 3:
@@ -687,20 +739,66 @@ class SimVision:
 
 
 # ======================================================================================================
-def run_mission(world, hooks, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lambda m: None):
+def run_mission(world, hooks, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lambda m: None, nav=None):
+    """按停车点顺序把 hooks.task 跑一遍。返回实际去了哪些停车点。
+    nav：模拟新的导航(dict)，不给 = 和以前一样只调 task。给了：一开始 prepare(nav['prepare'] 默认 True)、start_clock；
+      开到每个停车点按 leg_s 秒；到了先 set_home_eta(home_s[角色])；开往下一个停车点之前问 go_home_now，回 True 就直接回家。
+      例：nav=dict(leg_s=10, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})"""
     visits = {}
-    for stop in stops:
+    stops = list(stops)
+    done = []
+    home_s = (nav or {}).get('home_s') or {}
+    leg = float((nav or {}).get('leg_s', 10.0))
+    if nav is not None:
+        if nav.get('prepare', True):
+            hooks.prepare(world.link, log)
+        hooks.start_clock()
+    i = 0
+    while i < len(stops):
+        stop = stops[i]
         role = role_of(stop)
+        if nav is not None:
+            prev = role_of(done[-1]) if done else None
+            world.advance(float(home_s.get(prev, 25.0)) if (role == 'START' and prev) else leg)   # 开过来
+            hooks.set_home_eta(0.0 if role == 'START' else float(home_s.get(role, 25.0)))
         visits[role] = visits.get(role, 0) + 1
         world.arrive(role, visits[role])
         hooks.task(stop, world.link, log)
+        done.append(stop)
+        if nav is not None and i + 1 < len(stops) and role_of(stops[i + 1]) != 'START':
+            nxt = stops[i + 1]
+            if hooks.go_home_now(nxt, leg, float(home_s.get(role_of(nxt), 25.0))):
+                stops = stops[:i + 1] + [s for s in stops[i + 1:] if role_of(s) == 'START'][-1:]
+        i += 1
+    return done
 
 
-def make(world, cfg_extra=None, log=lambda m: None):
+class FakeCtx:
+    """导航的 ctx：aborted() 和 obstacles()(地图上的障碍物 [(x, y, 半径)])。"""
+
+    def __init__(self, obstacles=None, abort=None):
+        self._obs = list(obstacles or [])
+        self._abort = abort or (lambda: False)
+
+    def aborted(self):
+        return bool(self._abort())
+
+    def obstacles(self):
+        return list(self._obs)
+
+
+QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
+            'START1': [2250, 2250, 180], 'START2': [2250, 150, 90]}     # 用户配置里的停车点(10-06)
+
+
+def make(world, cfg_extra=None, log=lambda m: None, raw=None):
+    """raw：配置文件里 mission_cfg 以外的东西(stops、car_length_mm…)，QR 前后挪着找码要用 stops。"""
     cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='',      # 测试里不限时、不读写文件
                ring_order={z: world.ring_order(z) for z in ('ROUGH', 'TEMP')})  # 假摄像头装的方向是随机的
     cfg.update(cfg_extra or {})
-    return MissionHooks({'mission_cfg': cfg}, log=log, vision=world.vision, now=world.now, sleep=world.advance)
+    rc = dict(raw or {})
+    rc['mission_cfg'] = cfg
+    return MissionHooks(rc, log=log, vision=world.vision, now=world.now, sleep=world.advance)
 
 
 def rings_summary(world, zone):
@@ -750,9 +848,9 @@ class MissionSimTests(unittest.TestCase):
         h = make(w)
         run_mission(w, h)
         s = w.screen
-        self.assertEqual((s['t0'], s['t7']), ('156+123', '516+231'))
-        self.assertEqual(s['t2'], 'GRAB 6/6')
-        self.assertEqual(s['t3'], 'PLACE 12/12')
+        self.assertEqual((s['t0'], s['t7']), ('156+123+', '516+231'))     # 屏上的任务码带上两组之间的 +
+        self.assertEqual(s['t2'], 'GRAB 6')                                # 回家以后只显示做成的个数
+        self.assertEqual(s['t3'], 'PLACE 12')
         self.assertEqual(s['t1'], 'DONE')
         self.assertEqual(s['t5'], 'B1 RED1 BLK2 LBL3')
         self.assertEqual(s['t6'], 'B2 BLK2 RED3 LBL1')
@@ -809,16 +907,23 @@ class MissionSimTests(unittest.TestCase):
         with self.assertRaises(Abort):
             run_mission(w, h)
 
-    def test_missing_color_is_skipped_and_stack_falls_back_to_flat(self):
+    def test_missing_color_is_skipped_and_stack_without_lower_is_skipped(self):
+        """第一批的黑色没有：第二批的黑色在暂存区没有同色的可叠，规则只许码垛 -> 不放、不算放置(以前平放：0 分还多算一次放置)。"""
         w = SimWorld(seed=8, code=self.CODE, missing_batch1=(5,))        # 第一批的黑色没有
-        h = make(w)
-        run_mission(w, h)
+        lines = []
+        h = make(w, log=lines.append)
+        run_mission(w, h, log=lines.append)
         self.assertEqual(h.stats.grab_ok, 5)
         temp = rings_summary(w, 'TEMP')
         self.assertEqual(temp[1], [1, 1])
         self.assertEqual(temp[3], [6, 6])
-        self.assertEqual(temp[2], [5])                                  # 第二批的黑色没有下垫，平放在 2 号环
+        self.assertEqual(temp[2], [])                                   # 第二批的黑色没有下垫：不放
         self.assertEqual(w.collisions, 0)
+        # 粗加工区 2+3、暂存区第一批 2、码垛 2：一共 9 次，都成功；没放的那个不算
+        self.assertEqual((h.stats.place_ok, h.stats.place_total), (9, 9))
+        self.assertIn('规则只许码垛，不放、不算放置', '\n'.join(lines))
+        self.assertEqual(w.screen['t3'], 'PLACE 9')
+        self.assertEqual([c for c in w.tray.values() if c], [5])        # 黑色留在车上
 
     def test_stm32_error_on_one_grab_is_recovered(self):
         w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2))
@@ -836,16 +941,20 @@ class MissionSimTests(unittest.TestCase):
         self.assertEqual(w.screen['t1'], 'DONE')
 
     def test_noisy_camera_still_places_within_ring2(self):
-        errs = []
+        """摄像头噪声大(1.5 像素)、停车误差 15mm：平放的照样在 2 环以内(<4mm)；码垛容差本来就是 2.5mm(不掉下来就得分)，放宽到 6mm。"""
+        errs, stacks = [], []
         for seed in range(8):
             w = SimWorld(seed=100 + seed, code=self.CODE, noise_px=1.5, stop_err_mm=15.0)
             h = make(w)
             run_mission(w, h)
-            errs += [e for (_, _, _, e, st) in w.placed]
+            errs += [e for (_, _, _, e, st) in w.placed if not st]
+            stacks += [e for (_, _, _, e, st) in w.placed if st]
             self.assertEqual(w.air, 0)
         errs = np.array(errs)
-        print(f'\n  [噪声 1.5px、停车误差 15mm] 放置真实误差：平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
+        print(f'\n  [噪声 1.5px、停车误差 15mm] 放置真实误差：平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm'
+              f'(码垛最大 {max(stacks):.2f}mm)')
         self.assertLess(errs.max(), 4.0)
+        self.assertLess(max(stacks), 6.0)
 
     def test_cached_calibration_is_reused(self):
         w = SimWorld(seed=11, code=self.CODE)
@@ -1027,21 +1136,21 @@ class ZoneFlowTests(unittest.TestCase):
             self.assertEqual(zone_s, [], f'seed {seed}: {zone_s}')
 
     def test_wheels_move_closer_when_the_arm_cannot_reach(self):
-        """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm。"""
-        for side in (60.0, -60.0):
+        """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm(20)。"""
+        for side in (55.0, -55.0):                               # 手臂伸缩 ±44mm + 横移 20mm 够得着(停车误差 ±8mm)
             for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park_side={'ROUGH': side, 'TEMP': side})):
                 self._assert_all_good(w, h, text, seed)
                 self.assertIn('手臂伸缩够不着：车轮横着挪', text)
                 ext = self._zone_s_extent(w)
                 self.assertGreater(ext, 5.0, text)
-                self.assertLessEqual(ext, 40.0, text)
+                self.assertLessEqual(ext, 20.0, text)
 
     def test_strafe_limit_is_never_exceeded(self):
-        """远近差得太多(手臂伸缩加上横移 40mm 也够不着)：不放(物料留在车上)，车轮横移不超过 40mm；ring_strafe_max_mm=0 时绝不横移。"""
+        """远近差得太多(手臂伸缩加上横移 20mm 也够不着)：不放(物料留在车上)，车轮横移不超过 20mm；ring_strafe_max_mm=0 时绝不横移。"""
         for seed, w, h, text in self._run([1], dict(cam_deg=90.0, park_side={'ROUGH': 120.0, 'TEMP': 120.0}),
                                           stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
-            self.assertLessEqual(self._zone_s_extent(w), 40.0, text)
+            self.assertLessEqual(self._zone_s_extent(w), 20.0, text)
             self.assertIn('车轮横着也挪到上限', text)
         for seed, w, h, text in self._run([2], dict(cam_deg=90.0, park_side={'ROUGH': 60.0, 'TEMP': 60.0}),
                                           cfg=dict(ring_strafe_max_mm=0), stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
@@ -1066,7 +1175,7 @@ class ZoneFlowTests(unittest.TestCase):
             # 最后回停车点那一条要把对准时前后修的都退回去(每次对准最多 ring_fix_max_mm)，放宽到 ±60mm
             self.assertTrue(all(min(abs(abs(v) - 150), abs(abs(v) - 300)) <= 30 for v in big[:-1]), big)
             self.assertLessEqual(abs(abs(big[-1]) - 150), 60, big)
-            fix = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) <= 60 and abs(v) != 20]
+            fix = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) <= 60 and abs(v) != 40]                # 40 = 第一次测"底盘挪 40mm 画面怎么动"
             self.assertLessEqual(len(fix), 4, (fix, text))
             self.assertTrue(all(p[3] < 3.5 for p in w.placed), w.placed)       # 容差 2mm(差不多就行)+测量噪声
 
@@ -1288,6 +1397,117 @@ class ZoneFlowTests(unittest.TestCase):
         text = '\n'.join(lines)
         self.assertEqual(w.collisions, 0, text)
         self.assertIn('号槽里还有没放出去的', text)
+
+    def test_wheels_first_option(self):
+        """wheels_first(mtest … wheels)：沿圆环那一排先让车轮小步慢慢挪——照样全放对，工位里不横移，
+        车轮每次最多 wheels_step_mm、用 wheels_rpm 的速度。"""
+        steps = []
+        for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0),
+                                          cfg=dict(wheels_first=True, wheels_step_mm=15.0, wheels_rpm=60, wheels_min_mm=4.0),
+                                          stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
+            self._assert_all_good(w, h, text, seed, batches=1)
+            self.assertEqual([m for m in w.moves if m[2] in ('ROUGH', 'TEMP') and m[0] == 'S'], [], text)
+            wheel = [(m, sp) for m, sp in zip(w.moves, w.move_speeds) if sp == 60]
+            self.assertTrue(all(m[0] == 'F' and abs(m[1]) <= 15 and m[2] in ('ROUGH', 'TEMP') for m, _sp in wheel), wheel)
+            steps += wheel
+        self.assertTrue(steps, '一次都没先动车轮')
+
+    def test_servo_timeouts_use_the_sim_clock(self):
+        """视觉闭环用模拟的时钟算超时(以前用真的时钟，模拟里永远不超时)：超时设得很短就会超时。"""
+        (seed, w, h, text), = self._run([1], dict(cam_deg=90.0), cfg=dict(servo=dict(timeout_s=0.2)),
+                                        stops=('QR', 'RAW', 'ROUGH', 'START1'))
+        self.assertIn('超时', text)
+        self.assertAlmostEqual(h.servo.clock(), w.t)
+
+
+class TiltTests(unittest.TestCase):
+    """车身和圆环那一排不平行(车停斜了几度)：看三个环时量出角度，挪到每个环以后离圆环远/近多少提前补到手臂上。
+    任务码第一批去 1、3、2 号环：1 号环离看圆环的地方 150mm，3 号环离 1 号 300mm(斜 5° 时远近差 13mm / 26mm)。"""
+    CODE = '156+132+516+231'
+
+    def _run(self, tilt, pre, seeds=range(3)):
+        from visual_servo import JacStore
+        out = []
+        for seed in seeds:
+            w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0, tilt=tilt)
+            st = JacStore(None)
+            st.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))     # 做过 vcal RING(手臂的 J 知道)
+            lines, cur, first = [], [None], {}
+
+            def log(m, lines=lines, cur=cur):
+                lines.append(m)
+                if m.startswith('  ▶') and ' 放 ' in m and '到环' in m:
+                    cur[0] = (m.split('▶ ')[1].split(' ')[0], int(m.split('到环')[1][0]))
+            orig = w.vision.ring_error
+
+            def ring_error(n=None, max_px=None, w=w, cur=cur, first=first, orig=orig):
+                if cur[0] is not None and cur[0] not in first:   # 每次放置对准时第一次测量：那一刻离圆环远/近差多少(真实的)
+                    c = w.claw()
+                    k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
+                    first[cur[0]] = abs(float((w.ring_center(k) - c)[0]))
+                return orig(n, max_px)
+            w.vision.ring_error = ring_error
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', tilt_precorrect=pre,
+                       ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
+            self.assertEqual(h.stats.place_ok, 6, '\n'.join(lines))
+            out.append((w, h, '\n'.join(lines), first))
+        return out
+
+    def test_precorrection_makes_the_first_error_small(self):
+        """斜 5°(粗加工区)/-4°(暂存区)：到 1、3 号环第一次测量时离圆环远近只差几毫米；不提前补时差十几、二十几毫米。"""
+        tilt = {'ROUGH': 5.0, 'TEMP': -4.0}
+        on = [f for _w, _h, _t, f in self._run(tilt, True)]
+        off = [f for _w, _h, _t, f in self._run(tilt, False)]
+        pick = lambda fs: [e for f in fs for (z, r), e in f.items() if r in (1, 3)]
+        print(f'\n  [车身斜 5°/-4°] 1、3 号环第一次测量时远近差：提前补 最大 {max(pick(on)):.1f}mm，不补 平均 {np.mean(pick(off)):.1f}mm')
+        self.assertLess(max(pick(on)), 4.0, on)
+        self.assertGreater(np.mean(pick(off)), 9.0, off)
+
+    def test_warns_at_three_degrees_and_logs_the_angle(self):
+        for _w, _h, text, _f in self._run({'ROUGH': 5.0, 'TEMP': -4.0}, True, seeds=[0]):
+            self.assertIn('★ 车身和圆环那一排斜了 +', text)
+            self.assertIn('★ 车身和圆环那一排斜了 -', text)
+            self.assertIn('把车摆正', text)
+        for _w, _h, text, _f in self._run({'ROUGH': 1.0, 'TEMP': -1.5}, True, seeds=[0, 1]):
+            self.assertNotIn('斜了', text)
+            self.assertGreaterEqual(text.count('车身和圆环那一排的夹角'), 2, text)     # 每个工位都报角度
+
+    def test_refined_direction_is_stored_for_the_next_zone(self):
+        """第一次换环时量准的"底盘前进方向"存下来：到暂存区直接用，不再显示"可能差 1° 左右"。"""
+        (w, h, text, _f), = self._run({'ROUGH': 5.0, 'TEMP': -4.0}, True, seeds=[1])
+        self.assertIsNotNone(h.store.extra('RING', 'ch_f_ref'))
+        temp = text[text.index('TEMP'):]
+        self.assertNotIn('可能差 1° 左右', temp[:temp.index('▶')])
+
+
+class NavFlowTests(unittest.TestCase):
+    """和新的导航一起跑(模拟)：prepare、按 START 计时、每个停车点告诉钩子回家要多久、开往下一个停车点前问来不来得及。"""
+
+    def test_first_batch_fits_in_the_round_with_fast_params(self):
+        """提速参数 + vcal 做过：第一批 QR→原料→粗加工→暂存→回家 在 3 分钟内(路上每段按 10 秒)；时间不够的就不做，一定按时回家。"""
+        from visual_servo import JacStore
+        for seed in range(3):
+            w = SimWorld(seed=seed, code=MissionSimTests.CODE, params=FAST_PARAMS, cam_deg=90.0)
+            st = JacStore(None)
+            st.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
+            st.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+            lines = []
+            cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='',
+                       ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
+                             sleep=w.advance, store=st)
+            nav = dict(leg_s=10.0, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})
+            done = run_mission(w, h, log=lines.append, nav=nav)
+            text = '\n'.join(lines)
+            self.assertLessEqual(w.t, 180.0, text)
+            self.assertEqual(done[-1], 'START1')
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
+            self.assertGreaterEqual(h.stats.place_ok, 3, text)
+            self.assertEqual(w.parked, 1)
+            print(f'\n  [提速参数 + 导航 seed {seed}] 去了 {"→".join(done)}；用时 {w.t:.0f} 秒；抓 {h.stats.grab_ok}、放 {h.stats.place_ok}')
 
 
 def _demo(fast, batches=2, extra=None):
