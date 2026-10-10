@@ -896,7 +896,8 @@ class Planner:
         return out
 
     def _astar(self, T, sn, sh, gn, gh, hb):
-        mec = self.mode == 'mecanum'
+        """A*：状态 = (栅格点, 车头, 上一步方向(4=停着), 这一段已横移的格数)，代价 = 秒。hb = _heur 的启发值。
+        返回动作列表 [('M', 方向) / ('T', 新车头)]，走不通返回 None(搜得太多也返回 None，并置 self._exhausted)。"""
         cap = self.strafe_cap
         RS = (cap + 1) if cap is not None else 1
         offs = (N, 1, -N, -1)

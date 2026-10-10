@@ -218,6 +218,27 @@ class StopTests(unittest.TestCase):
         self.assertLess(math.hypot(end[0] - g[0], end[1] - g[1]), 0.6)
 
 
+class StartTests(unittest.TestCase):
+    def test_start_close_to_obstacle_only_relaxes_that_obstacle(self):
+        # 车已经停在离障碍物 37mm 的地方(要 60)：离开时只对这个障碍物放宽到 37，并写进 note
+        obs = [(2073, 440, 25)]
+        legs, why, _ = rp.plan_mission(CFG, obs, (2208, 233, 90), ['QR'], start_pivot=(2208, 233))
+        self.assertEqual(why, 'OK')
+        self.assertIn('起点离障碍物(2073,440)只有', legs[0]['note'])
+        ok, g, idx, what = rp.moves_clear(dict(CFG, margin_mm=36), obs, (2208, 233, 90), legs[0]['cmds'])
+        self.assertTrue(ok, what)
+
+    def test_grid_api_compat(self):
+        pl = rp.Planner(CFG, [])
+        acts, why = pl.plan_leg((2100, 1200, 90), (1200, 2100, 180))
+        self.assertEqual(why, 'OK')
+        cmds, _ = rp.to_commands((2100, 1200, 90), acts)
+        end = run([dict(cmds=cmds)], (2100, 1200, 90))[0]
+        self.assertEqual((round(end[0]), round(end[1])), (1200, 2100))
+        self.assertTrue(pl.point_free(2100, 1200, 1))
+        self.assertFalse(pl.point_free(1600, 1600, 1))
+
+
 class PlanLegTests(unittest.TestCase):
     def test_home_leg_from_a_stop(self):
         leg = rp.plan_leg(CFG, [], STOPS['TEMP'], 'START2')
