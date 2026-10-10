@@ -290,6 +290,21 @@ class CliTests(unittest.TestCase):
         self.assertIsNotNone(self.h.store.get('RING', 'arm'))
         self.assertEqual(abs(self.w.off_s) + abs(self.w.off_f), 0.0)
 
+    def test_vcal_raw_wheels_first_probes_forward_only_and_returns(self):
+        # 原料区先动车轮：vcal RAW 也测车轮，但只前后挪(不横移，不压进原料区)，测完回到原处
+        self.h.cfg['raw_wheels_first'] = True
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('RAW', 1)
+        for it in self.w.raw_items:
+            if it['color'] == 1:
+                it['pos'] = self.w.claw().copy()
+        self.run_cli('vcal', 'vcal RAW 1')
+        self.assertIsNotNone(self.h.store.get('RAW', 'ch'), '\n'.join(self.lines))
+        self.assertFalse(any(c == 'S' for c, _v, _z in self.w.moves))
+        self.assertTrue(any(c == 'F' for c, _v, _z in self.w.moves))
+        self.assertLess(abs(sum(v for c, v, _z in self.w.moves if c == 'F')), 1.5)     # 挪回原处
+        self.assertEqual(self.w.off_s, 0.0)
+
     def test_vclaw_raw_measures_and_saves(self):
         with tempfile.TemporaryDirectory() as td:
             self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')

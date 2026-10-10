@@ -395,8 +395,12 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             color = int(parts[2])
         chassis = 'arm' not in rest
         if kind == 'RAW' and chassis and str(h.cfg.get('raw_chassis') or 'off').upper() == 'OFF':
-            chassis = False
-            log('(原料区对准不动车轮：只校准手臂，不探测底盘)')
+            if h.cfg.get('raw_wheels_first', True):
+                chassis = 'F'                               # 原料区先动车轮：只前后挪着测(不横移，不会压进原料区)，测完挪回原处
+                log('(原料区先动车轮：车轮只前后小幅挪着测，测完挪回原处)')
+            else:
+                chassis = False
+                log('(原料区对准不动车轮：只校准手臂，不探测底盘)')
 
         def go():
             h._ensure(link)
@@ -932,7 +936,25 @@ def _vcal(h, kind, color, chassis, log):
         mm_ps = np.linalg.norm(Ja, axis=0) / scale_cfg
         log(f'  手臂：ID2 每转 1° ≈ {mm_ps[0]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 0]):.2f} 像素)；'
             f'ID1 每转 1° ≈ {mm_ps[1]:.3f}mm(画面移动 {np.linalg.norm(Ja[:, 1]):.2f} 像素)  [按 {scale_cfg:.3f} 像素/毫米换算]')
-        if chassis:
+        if chassis == 'F':
+            # 只测前进那一列(横移那一列按"和前进垂直、一样大"补上，只为能求逆；原料区对准车轮只前后挪，用不到它)
+            act = h.servo.act
+            f0 = float(act.disp.get('F', 0.0)) if hasattr(act, 'disp') else None
+            h.servo._axes = 'F'
+            try:
+                Jc = h.servo._probe(measure, 'ch')
+            finally:
+                h.servo._axes = None
+                if f0 is not None:
+                    back = f0 - float(act.disp.get('F', 0.0))
+                    if abs(back) >= 1.0:
+                        act.chassis_move(0, round(back))        # 挪回原处
+            h.store.put(kind, 'ch', Jc)
+            h.store.set_synth(kind, True)
+            pf = float(np.linalg.norm(Jc[:, 1]))
+            log(f'  车轮：前进 1mm 画面移动 {pf:.3f} 像素(按 {scale_cfg:.3f} 像素/毫米应该约 {scale_cfg:.3f})' +
+                ('' if abs(pf - scale_cfg) / scale_cfg < 0.2 else '  → 相差 20% 以上：检查 px_per_mm.RAW 或底盘走的距离准不准'))
+        elif chassis:
             Jc = h.servo._probe(measure, 'ch')
             h.store.put(kind, 'ch', Jc)
             h.store.set_synth(kind, False)              # 横移、前进都实测过了
