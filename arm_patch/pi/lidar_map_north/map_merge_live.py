@@ -801,6 +801,9 @@ def main():
                 state['abort']=False;state['aborted']=False;state['confirm']=None;state['auto']=True
                 threading.Thread(target=race_thread,daemon=True).start();return
             if k=='go' and history.views:raise ValueError('go 要从头开始：先 reset 清空历史，并把车放回起点')
+            if k=='go':
+                # 上一次跑完 reset 以后 state['config'] 还是第二站/站点扫描的车位：第一次扫描要按本区的起点车位算
+                state['config']=validate_config(dict(state['config'],car_x_mm=float(raw_cfg['car_x_mm']),car_y_mm=float(raw_cfg['car_y_mm']),car_yaw_deg=float(raw_cfg['car_yaw_deg'])))
             if k=='drive' and len(history.views)<2:raise ValueError('drive 只按已规划好的路线行驶，先完成两次扫描')
             if k=='drive' and (state.get('legs_partial') or not state['legs']):raise ValueError('现在没有完整的路线(上一次 go 在 QR 重新规划过)：先输入 route 重新规划全程')
             state['abort']=False;state['aborted']=False;state['confirm']=None;state['auto']=True

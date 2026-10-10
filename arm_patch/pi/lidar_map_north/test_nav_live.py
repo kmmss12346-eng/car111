@@ -318,6 +318,7 @@ class LiveTests(unittest.TestCase):
         sys.modules.update(stubs)
         sys.modules.pop('map_merge_live', None)
         out = Out()
+        self.out_text = out.text
         timers = []
         state = {'done': False}
 
@@ -425,6 +426,18 @@ class LiveTests(unittest.TestCase):
         self.assertNotIn('输入 y', self.log)
         self.assertGreaterEqual(self.log.count('雷达定位：车在'), 6)
         self.assertEqual(car.requests[-1], 'PARK')
+
+    def test_go_after_reset_scans_at_start_pose(self):
+        # 先在别的车位扫过一次(a X Y 角度)再 reset：state['config'] 还是那个车位。go 的第一次扫描要按本区的起点车位算，
+        # 否则整张地图和所有雷达定位都按错的原点，车会开错
+        def scanned():
+            return '扫描完成，已合并 1 次' in self.out_text()
+        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'a 2000 1000 90'), (scanned, 'reset'), (lambda: True, 'go')], screen_zone=None)
+        self.assertIn('路线全部走完', self.log, self.log[-3000:])
+        goal = auto_run.inset_goal((2250.0, 150.0, 90.0), self.cfg_after)
+        p = car.pose()
+        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'没回到出发位置：{p}')
 
     def test_abort_then_quit_does_not_park(self):
         def moving():
