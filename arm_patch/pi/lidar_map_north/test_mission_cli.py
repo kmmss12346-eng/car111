@@ -213,7 +213,7 @@ class CliTests(unittest.TestCase):
 
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
-        self._plate_world(seed=9)
+        self._plate_world(seed=7)
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1 any')
         text = '\n'.join(self.lines)
@@ -224,7 +224,7 @@ class CliTests(unittest.TestCase):
         self.assertIn('这次停在爪子附近的是', text)
         self.assertIn('不按顺序', text)
         self.assertFalse(self.h.raw_any_once)                              # 只这一次
-        self._plate_world(seed=9)                                          # 同一个世界按顺序抓：要等更久
+        self._plate_world(seed=7)                                          # 同一个世界按顺序抓：要等更久
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1')
         self.assertEqual(self.h.stats.grab_ok, 3, '\n'.join(self.lines))

@@ -63,6 +63,7 @@ class SimWorld:
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None):
         self.rng = np.random.default_rng(seed)
+        self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
         self.code = code
         self.qr_present = qr_present
@@ -216,7 +217,7 @@ class SimWorld:
     def arrive(self, role, batch=1):
         self.zone = role if role in ('RAW', 'ROUGH', 'TEMP') else None
         self.off_s = self.off_f = 0.0
-        self.stop_err = np.clip(self.rng.normal(0, self.stop_err_mm / 2.0, 2), -self.stop_err_mm, self.stop_err_mm)
+        self.stop_err = np.clip(self.lay.normal(0, self.stop_err_mm / 2.0, 2), -self.stop_err_mm, self.stop_err_mm)
         self.stop_err[1] += float(self.park.get(role, 0.0))
         self.stop_err[0] += float(self.park_side.get(role, 0.0))
         if role == 'RAW':
@@ -227,18 +228,18 @@ class SimWorld:
                 colors = [1, 2, 3]
             self.raw_items = []
             if self.plate_stop:
-                self.plate_t0 = self.t - self.rng.uniform(0, self.plate_stop + self.plate_move)   # 到的时候转盘在一个周期里的随便哪个时刻
-                shift = int(self.rng.integers(0, 3))
+                self.plate_t0 = self.t - self.lay.uniform(0, self.plate_stop + self.plate_move)   # 到的时候转盘在一个周期里的随便哪个时刻
+                shift = int(self.lay.integers(0, 3))
                 for i, c in enumerate(colors):
                     if not (batch == 1 and c in self.missing_batch1):
-                        self.raw_items.append(dict(color=c, r=self.plate_r + self.rng.normal(0, 1.0),
-                                                   off=-((i + shift) % 3) * 2 * math.pi / 3 + self.rng.normal(0, 0.02)))
+                        self.raw_items.append(dict(color=c, r=self.plate_r + self.lay.normal(0, 1.0),
+                                                   off=-((i + shift) % 3) * 2 * math.pi / 3 + self.lay.normal(0, 0.02)))
                 colors = []
             for c in colors:
                 if batch == 1 and c in self.missing_batch1:
                     continue
                 for _ in range(200):                           # 离停车点 22mm 以内(原料区只动手臂：车要停得让物料在手臂够得着的地方)；两个物料不会叠在一起
-                    pos = self.rng.uniform(-22, 22, 2)
+                    pos = self.lay.uniform(-22, 22, 2)
                     if np.linalg.norm(pos) <= 22.0 and all(np.linalg.norm(pos - it['pos']) >= 20.0 for it in self.raw_items):
                         break
                 self.raw_items.append(dict(color=c, pos=pos))
@@ -750,9 +751,9 @@ class MissionSimTests(unittest.TestCase):
         h = make(w)
         run_mission(w, h)
         s = w.screen
-        self.assertEqual((s['t0'], s['t7']), ('156+123', '516+231'))
-        self.assertEqual(s['t2'], 'GRAB 6/6')
-        self.assertEqual(s['t3'], 'PLACE 12/12')
+        self.assertEqual((s['t0'], s['t7']), ('156+123+', '516+231'))     # 屏上的任务码带上两组之间的 +
+        self.assertEqual(s['t2'], 'GRAB 6')                                # 回家以后只显示做成的个数
+        self.assertEqual(s['t3'], 'PLACE 12')
         self.assertEqual(s['t1'], 'DONE')
         self.assertEqual(s['t5'], 'B1 RED1 BLK2 LBL3')
         self.assertEqual(s['t6'], 'B2 BLK2 RED3 LBL1')
@@ -809,16 +810,23 @@ class MissionSimTests(unittest.TestCase):
         with self.assertRaises(Abort):
             run_mission(w, h)
 
-    def test_missing_color_is_skipped_and_stack_falls_back_to_flat(self):
+    def test_missing_color_is_skipped_and_stack_without_lower_is_skipped(self):
+        """第一批的黑色没有：第二批的黑色在暂存区没有同色的可叠，规则只许码垛 -> 不放、不算放置(以前平放：0 分还多算一次放置)。"""
         w = SimWorld(seed=8, code=self.CODE, missing_batch1=(5,))        # 第一批的黑色没有
-        h = make(w)
-        run_mission(w, h)
+        lines = []
+        h = make(w, log=lines.append)
+        run_mission(w, h, log=lines.append)
         self.assertEqual(h.stats.grab_ok, 5)
         temp = rings_summary(w, 'TEMP')
         self.assertEqual(temp[1], [1, 1])
         self.assertEqual(temp[3], [6, 6])
-        self.assertEqual(temp[2], [5])                                  # 第二批的黑色没有下垫，平放在 2 号环
+        self.assertEqual(temp[2], [])                                   # 第二批的黑色没有下垫：不放
         self.assertEqual(w.collisions, 0)
+        # 粗加工区 2+3、暂存区第一批 2、码垛 2：一共 9 次，都成功；没放的那个不算
+        self.assertEqual((h.stats.place_ok, h.stats.place_total), (9, 9))
+        self.assertIn('规则只许码垛，不放、不算放置', '\n'.join(lines))
+        self.assertEqual(w.screen['t3'], 'PLACE 9')
+        self.assertEqual([c for c in w.tray.values() if c], [5])        # 黑色留在车上
 
     def test_stm32_error_on_one_grab_is_recovered(self):
         w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2))
@@ -1027,21 +1035,21 @@ class ZoneFlowTests(unittest.TestCase):
             self.assertEqual(zone_s, [], f'seed {seed}: {zone_s}')
 
     def test_wheels_move_closer_when_the_arm_cannot_reach(self):
-        """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm。"""
-        for side in (60.0, -60.0):
+        """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm(20)。"""
+        for side in (55.0, -55.0):                               # 手臂伸缩 ±44mm + 横移 20mm 够得着(停车误差 ±8mm)
             for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park_side={'ROUGH': side, 'TEMP': side})):
                 self._assert_all_good(w, h, text, seed)
                 self.assertIn('手臂伸缩够不着：车轮横着挪', text)
                 ext = self._zone_s_extent(w)
                 self.assertGreater(ext, 5.0, text)
-                self.assertLessEqual(ext, 40.0, text)
+                self.assertLessEqual(ext, 20.0, text)
 
     def test_strafe_limit_is_never_exceeded(self):
-        """远近差得太多(手臂伸缩加上横移 40mm 也够不着)：不放(物料留在车上)，车轮横移不超过 40mm；ring_strafe_max_mm=0 时绝不横移。"""
+        """远近差得太多(手臂伸缩加上横移 20mm 也够不着)：不放(物料留在车上)，车轮横移不超过 20mm；ring_strafe_max_mm=0 时绝不横移。"""
         for seed, w, h, text in self._run([1], dict(cam_deg=90.0, park_side={'ROUGH': 120.0, 'TEMP': 120.0}),
                                           stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
-            self.assertLessEqual(self._zone_s_extent(w), 40.0, text)
+            self.assertLessEqual(self._zone_s_extent(w), 20.0, text)
             self.assertIn('车轮横着也挪到上限', text)
         for seed, w, h, text in self._run([2], dict(cam_deg=90.0, park_side={'ROUGH': 60.0, 'TEMP': 60.0}),
                                           cfg=dict(ring_strafe_max_mm=0), stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
@@ -1066,7 +1074,7 @@ class ZoneFlowTests(unittest.TestCase):
             # 最后回停车点那一条要把对准时前后修的都退回去(每次对准最多 ring_fix_max_mm)，放宽到 ±60mm
             self.assertTrue(all(min(abs(abs(v) - 150), abs(abs(v) - 300)) <= 30 for v in big[:-1]), big)
             self.assertLessEqual(abs(abs(big[-1]) - 150), 60, big)
-            fix = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) <= 60 and abs(v) != 20]
+            fix = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) <= 60 and abs(v) != 40]                # 40 = 第一次测"底盘挪 40mm 画面怎么动"
             self.assertLessEqual(len(fix), 4, (fix, text))
             self.assertTrue(all(p[3] < 3.5 for p in w.placed), w.placed)       # 容差 2mm(差不多就行)+测量噪声
 
