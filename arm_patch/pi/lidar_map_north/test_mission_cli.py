@@ -104,8 +104,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sorted(c for c in self.w.tray.values() if c), [1, 5, 6])
 
     def test_mtest_raw_out_of_reach_is_skipped_not_chased(self):
-        """物料停在手臂够不着的地方：跳过，不开车去追。"""
+        """raw_seek 关掉时(以前的做法)：物料停在手臂够不着的地方就跳过，不开车去追。默认开着时见 test_raw_plate_too_far_wheels_seek_until_reachable。"""
         moves = self._raw_setup()
+        self.h.cfg['raw_seek'] = False
         self.w.raw_items[0]['pos'] = self.w.raw_items[0]['pos'] * 0 + (0.0, 60.0)
         self.run_cli('mtest', 'mtest RAW 1')
         text = '\n'.join(self.lines)
@@ -210,6 +211,32 @@ class CliTests(unittest.TestCase):
         self.assertIn('按现在的位置夹', text)
         self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
         self.assertEqual(self.w.air, 0, text)
+
+    def test_raw_plate_too_far_wheels_seek_until_reachable(self):
+        """物料每次都停在离车远 70mm(原料盘那边)的地方，手臂够不着：车往右(原料盘那边)挪 4cm、2cm、1cm……(一次比一次少)，够得着就夹；做完挪回停车点。"""
+        for off in (70.0,):
+            self._plate_world(seed=7, plate_off_mm=off)
+            self.run_cli('mtest', 'mtest RAW 1 force any')
+            text = '\n'.join(self.lines)
+            self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+            self.assertEqual(self.w.air, 0, text)
+            self.assertIn('车往右(原料盘那边)挪 40mm(第 1 次)', text)
+            self.assertEqual([m for m in self.w.moves if m[0] == 'F'], [], text)          # 只往右挪，不前后挪
+            self.assertLess(abs(self.h.act.disp['S']), 1.0)                              # 挪回停车点了
+            self.assertGreaterEqual(abs(self.h._raw_seek_S), 40.0)
+
+    def test_raw_keeps_the_first_grab_pose(self):
+        """原料区第一次对准夹到以后记下手臂姿态，后面的物料 OBS RAW 以后直接转到这个姿态再等。"""
+        self._plate_world(seed=7)
+        self.run_cli('mtest', 'mtest RAW 1 force any')
+        text = '\n'.join(self.lines)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(text.count('记下这次夹的位置'), 1, text)
+        self.assertIsNotNone(self.h._raw_pose)
+        req = self.w.requests
+        a1, a2 = self.h._raw_pose
+        i = [k for k, r in enumerate(req) if r.startswith('OBS RAW')][-1]
+        self.assertEqual(req[i + 1], f'AP {a1:.3f} {a2:.3f}', req[i:i + 3])
 
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
@@ -690,7 +717,7 @@ class CliTests(unittest.TestCase):
         text = '\n'.join(self.lines)
         self.assertIn('按记录环2 上还放着 BLACK', text)
         self.assertIn('不是摄像头看到的', text)
-        self.assertEqual([p[1] for p in self.w.placed], [1, 3], text)
+        self.assertEqual(sorted(p[1] for p in self.w.placed), [1, 3], text)
         self.assertEqual(self.w.collisions, 0, text)
 
     def test_gtest_nogo_and_needs_zero(self):
@@ -931,7 +958,7 @@ class ConfigScriptTests(unittest.TestCase):
             self.assertIn(k, mc)
         self.assertEqual(mc['wheels_min_mm'], 4.0)
         self.assertIs(mc['wheels_first'], False)         # 10-10 晚：工位换回 1010i 的做法(先动手臂)
-        self.assertIs(mc['raw_any_order'], False)        # 10-10 晚：原料区换回 1010i 的做法(按任务码顺序)
+        self.assertIs(mc['raw_any_order'], True)         # 10-11 用户：原料区来一个夹一个
         self.assertIs(mc['raw_wheels_first'], False)      # 10-10：原料区只动爪子
         self.assertIs(mc['zone_filter'], False)
         with open(path, 'w', encoding='utf-8') as f:

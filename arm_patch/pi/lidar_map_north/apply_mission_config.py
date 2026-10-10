@@ -31,7 +31,7 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 (None, 'ring_strafe_max_mm'): ((40.0, 40), 20.0),   # 10-10：工位里横移最多 20mm(停车点离白区只有 60mm，40 太近)
                 (None, 'wheels_min_mm'): (1.5, 4.0),
                 # 10-10 晚：原料区夹取、工位放置/取回都换回 1010i 的做法(用户定的)：下面这些新做法的开关关掉
-                (None, 'raw_any_order'): (True, False),
+                (None, 'raw_any_order'): (False, True),     # 10-11 用户：原料区来一个夹一个(不按任务码顺序等颜色)
                 (None, 'wheels_first'): (True, False),
                 (None, 'take_first'): (True, False),
                 (None, 'zone_filter'): (True, False),
