@@ -51,6 +51,8 @@ except Exception:                       # 单独测试时没有 auto_run
         pass
 
 
+RAW_CAR_FIXED = True   # (10-11 用户：写死)原料区：车开到停车点就不动，只动手臂对准夹取——不挪车找物料、对准时车轮不动(配置里的 raw_seek / raw_chassis / raw_wheels_first 都不管)
+
 DEFAULTS = dict(
     enabled=True,
     time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)。
@@ -1241,7 +1243,7 @@ class MissionHooks:
         if J is not None and float(np.hypot(*np.asarray(J, float)[:, 1])) > 0.2:
             self._seek['jf'] = np.asarray(J, float)[:, 1]
         f, sv = float(self._raw_seek_F), float(self._raw_seek_S)
-        if self.cfg.get('raw_seek', True) and self.act is not None and (abs(f) >= 3 or abs(sv) >= 3):
+        if not RAW_CAR_FIXED and self.cfg.get('raw_seek', True) and self.act is not None and (abs(f) >= 3 or abs(sv) >= 3):
             self.log(f'    原料区：上次挪到 前后 {f:+.0f}mm、横移 {sv:+.0f}mm 够得着物料，直接挪过去')
             self.act.chassis_move(int(round(sv)), int(round(f)))
 
@@ -1257,7 +1259,7 @@ class MissionHooks:
     def _raw_recenter(self):
         """挪回原料区的工作位置：停车点，或者挪着找到的够得着物料的地方(raw_seek)。"""
         d = self.act.disp
-        on = self.cfg.get('raw_seek', True)
+        on = self.cfg.get('raw_seek', True) and not RAW_CAR_FIXED
         s = (float(self._raw_seek_S) if on else 0.0) - float(d['S'])
         f = (float(self._raw_seek_F) if on else 0.0) - float(d['F'])
         if math.hypot(s, f) < 20.0:
@@ -1269,7 +1271,7 @@ class MissionHooks:
         """原料盘停下了，要夹的物料扫不到/手臂够不着：车往原料盘那边(默认车的右边)挪一步(用户 10-11 定的：先 4cm，再 2cm、1cm、0.5cm，
         一次比一次少)，下一次停下再看。每次停下最多挪一次。挪了返回 True。"""
         cfg, sk = self.cfg, self._seek
-        if not cfg.get('raw_seek', True) or sk is None or self.act is None or sk.get('stop') == stop_id:
+        if RAW_CAR_FIXED or not cfg.get('raw_seek', True) or sk is None or self.act is None or sk.get('stop') == stop_id:
             return False
         sk['stop'] = stop_id
         steps = list(cfg.get('raw_seek_steps_mm') or [])
@@ -1317,9 +1319,7 @@ class MissionHooks:
             return False
         if not still:
             self.log('    原料盘还没停稳，按现在的位置先试(只动手臂，不用车轮去追)')
-        mode = str(cfg.get('raw_chassis') or 'off').upper()
-        allow = still and mode in ('F', 'SF')
-        kw = dict(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0)) if allow and mode == 'F' else {}
+        allow, kw = False, {}                       # (10-11 用户：写死)原料区车不动，只动手臂
         res = self.servo.run('RAW', lambda: self.vision.material_error(item.color), self.vision.scale('RAW'),
                              cfg['tol_mm']['RAW'], allow_chassis=allow, label=f'抓{item.color_short}', bounds=self.vision.bounds('RAW'),
                              confirm=False, **kw)
@@ -1514,7 +1514,7 @@ class MissionHooks:
                         q = errs.get(c[0])
                         if q is not None:
                             d = math.hypot(q[0], q[1]) / v.scale('RAW')
-                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None) else ''
                             seen.append((d, far_c, c, np.array(q, float)))
                     near = [x for x in seen if not x[1]]
                     if not near:
@@ -1533,7 +1533,7 @@ class MissionHooks:
                     if cand[2] is not None:
                         lab = f'抓{cand[2].color_short}'
                         self.log(f'  {tag} 这次停在爪子附近的是{cand[2].color_name}：先夹它(放 {cand[1]} 号槽)')
-                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                far = self._raw_reachable(J, e) if (J is not None) else ''
                 if far:
                     if ('far', stop_id) not in said:
                         said.add(('far', stop_id))
@@ -1589,7 +1589,7 @@ class MissionHooks:
     def _raw_wheels(self):
         """原料区这次对准先不先动车轮：配置(或 mtest RAW … wheels)要求，而且存了车轮和画面的对应关系(vcal RAW 颜色号)。"""
         want = bool(self.cfg.get('raw_wheels_first', True)) or bool(getattr(self, 'raw_wheels_once', False))
-        if not want:
+        if RAW_CAR_FIXED or not want:
             return False
         if self.store is None or self.store.get('RAW', 'ch') is None:
             if not getattr(self, '_raw_wheels_said', False):
@@ -1611,10 +1611,7 @@ class MissionHooks:
                   timeout_s=max(0.01, budget - 0.4))          # 修一下 + 再看一眼大约 0.4 秒：留出来，不超过必须下爪的时刻
         if probe:
             kw = dict(fixed_j=False, timeout_s=max(0.3, budget))
-        cmode = str(cfg.get('raw_chassis') or 'off').upper()
-        allow = cmode in ('F', 'SF')                         # 默认 'off'：只动手臂，车轮不动
-        if cmode == 'F':
-            kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0))
+        allow = False                                        # (10-11 用户：写死)原料区车轮不动，只动手臂(配置里的 raw_chassis 不管)
         res = self.servo.run('RAW', _first(tuple(e0), lambda: v.material_error(color, n=n)), v.scale('RAW'), tol,
                              allow_chassis=allow, label=label, bounds=v.bounds('RAW'), confirm=False, **kw)
         self.log(f'    对准结果：{res}')

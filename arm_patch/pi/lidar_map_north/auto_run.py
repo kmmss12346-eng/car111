@@ -1322,8 +1322,12 @@ class _Drive:
                 ux, uy = _axis(self.nav.real()[2], c)
                 sg = 1.0 if v >= 0 else -1.0
                 if any(sg*(ux*wx + uy*wy) > 0.5 for wx, wy in self.leg_cuts):
-                    self.log(f'    (没定位成功：刚才离边线/区域太近少走的 {c} {v:+d} 不按推算补，宁短不长)')
-                    continue
+                    home = is_pre or str(stop).upper().startswith('START')
+                    if home or not g('fill_cut_no_reloc', True):
+                        self.log(f'    (没定位成功：刚才离边线/区域太近少走的 {c} {v:+d} 不按推算补，宁短不长)')
+                        continue
+                    # (10-11 用户：规划怎么走就怎么走，要停到规定的点)工位停车点：定位没成功也按推算补上少走的那段
+                    self.log(f'    (没定位成功：按推算把刚才少走的 {c} {v:+d} 补上，停到规定的停车点)')
             if self.nav.world:
                 v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
                 if v2 != v:

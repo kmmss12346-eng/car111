@@ -114,6 +114,7 @@ class CliTests(unittest.TestCase):
         self.assertIn('手臂够不着的地方就跳过', text)
         self.assertEqual(self.w.air + self.w.collisions, 0, text)
 
+    @unittest.skip('10-11 用户：原料区写死车不动(mission_hooks.RAW_CAR_FIXED)')
     def test_raw_chassis_f_only_moves_forward_back(self):
         moves = self._raw_setup()
         self.h.cfg['raw_chassis'] = 'F'
@@ -212,6 +213,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
         self.assertEqual(self.w.air, 0, text)
 
+    @unittest.skip('10-11 用户：原料区写死车不动(mission_hooks.RAW_CAR_FIXED)')
     def test_raw_plate_too_far_wheels_seek_until_reachable(self):
         """物料每次都停在离车远 70mm(原料盘那边)的地方，手臂够不着：车往右(原料盘那边)挪 4cm、2cm、1cm……(一次比一次少)，够得着就夹；做完挪回停车点。"""
         for off in (70.0,):
@@ -225,6 +227,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual([m for m in self.w.moves if m[0] == 'F'], [], text)          # 只往右挪，不前后挪
             self.assertLess(abs(self.h.act.disp['S']), 1.0)                              # 挪回停车点了
             self.assertGreaterEqual(abs(self.h._raw_seek_S), 40.0)
+
+    def test_raw_car_never_moves_even_if_config_says_so(self):
+        """(10-11 用户：写死)原料区车停在停车点不动：配置里 raw_seek / raw_chassis / raw_wheels_first 开着也不动车，只动手臂。"""
+        self._plate_world(seed=7, plate_off_mm=70.0)
+        self.h.cfg.update(raw_seek=True, raw_chassis='SF', raw_wheels_first=True)
+        self.run_cli('mtest', 'mtest RAW 1 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual([m for m in self.w.moves if m[0] in ('F', 'S')], [], text)
+        self.assertNotIn('车往右', text)
+        self.assertIn('手臂够不着', text)
 
     def test_raw_keeps_the_first_grab_pose(self):
         """原料区第一次对准夹到以后记下手臂姿态，后面的物料 OBS RAW 以后直接转到这个姿态再等。"""
@@ -318,6 +330,7 @@ class CliTests(unittest.TestCase):
         self.assertIsNotNone(self.h.store.get('RING', 'arm'))
         self.assertEqual(abs(self.w.off_s) + abs(self.w.off_f), 0.0)
 
+    @unittest.skip('10-11 用户：原料区写死车不动(mission_hooks.RAW_CAR_FIXED)')
     def test_vcal_raw_wheels_first_probes_forward_only_and_returns(self):
         # 原料区先动车轮：vcal RAW 也测车轮，但只前后挪(不横移，不压进原料区)，测完回到原处
         self.h.cfg['raw_wheels_first'] = True
