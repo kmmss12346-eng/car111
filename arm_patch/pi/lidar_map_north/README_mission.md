@@ -84,7 +84,7 @@
 | `claw_px` | RAW、RING 都是 [336.8, 282.9] | 爪子点(物料夹正时圆心在画面里的位置)。**用 `vclaw RAW <颜色>` / `vclaw RING` 实测**，存在 `vision_cal.json`，比这里的优先 |
 | `px_per_mm` | RAW 1.97 / RING 2.96 | 每毫米多少像素，只用来把像素换成毫米判断容差。RAW 认到物料后按物料半径和 `material_diam_mm`(50) 现算；RING 在 `vclaw RING` 量过圆环后按 `ring_outer_diam_mm`(95) 算，没量过就在到工位看清圆环时按圆环间距算(现场约 1.46) |
 | `tol_mm` | RAW 2.0、RING 1.2、PICK 2.5、STACK 2.5 | 对准到多小算好。赛规：物料偏心 <1.5mm 是 1 环(15 分)，<4mm 是 2 环(10 分)，<7.5mm 是 3 环(7 分)。RING 1.2 冲 1 环(要先 `vclaw RING` 把爪子点量准)；时间不够改 2.0~3.0。码垛只要不掉就得分 |
-| `accept_mm` | RAW 4.0、RING 2.5、PICK 5.0、STACK 4.0 | 修正次数用完后，误差不超过这个仍然夹/放，超过就跳过这个物料(爪子每边只有约 5mm 余量) |
+| `accept_mm` | RAW 4.0、RING 3.5、PICK 5.0、STACK 4.0 | 修正次数用完后，误差不超过这个仍然夹/放，超过就跳过这个物料(爪子每边只有约 5mm 余量) |
 | `place_confirm` | true | 放物料对准到容差内后再拍一次确认(零点几秒，防止一次测量的噪声把偏了的当成对准了) |
 | `align_max_iter` | 6 | 工位里对准最多修正几次 |
 | `detector` / `ring_detector` | `circle` / `arcs` | 识别方法：换回原来的写 `wuliao` / `contour` |

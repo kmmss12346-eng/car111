@@ -57,7 +57,7 @@ DEFAULTS = dict(
     # 对准到多小算好。赛规：1 环外径 = 物料底径 + 3mm，物料偏心不到 1.5mm 才是 1 环(15 分)；2 环 4mm 以内(10 分)；3 环 7.5mm 以内(7 分)
     #   RING 1.2 = 冲 1 环(要先做 vclaw RING 把爪子点量准)；时间不够就改 2.0~3.0(多半是 2 环)。码垛只要不掉下来就得分，放宽
     tol_mm=dict(RAW=2.0, RING=1.2, PICK=2.5, STACK=2.5),
-    accept_mm=dict(RAW=4.0, RING=2.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量)
+    accept_mm=dict(RAW=4.0, RING=3.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量；RING 3.5 = 还在 2 环，放了 10 分，不放 0 分)
     place_confirm=True,                 # 放物料对准到容差以内后再拍一次确认(多花零点几秒，防止一次测量的噪声把偏了的当成对准了)
     align_max_iter=6,                   # 粗加工区/暂存区对准(放、码垛、取回)最多修正几次(车停得很偏、第一次测 J 时要多动几下；平时 1~2 次就到容差)
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
