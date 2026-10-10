@@ -525,8 +525,14 @@ def _zone_preflight(h, zone, batch, force, log):
     if survey:
         order = (h.cfg.get('ring_order') or {}).get(zone, 'lr')
         lr = (str(order).lower() != 'rl') != bool(h.ring_rev)
-        log('   先看清三个圆环(摄像头画面里从左到右是 ' + ('1 2 3' if lr else '3 2 1') + ')，再按看到的位置前后挪过去；'
-            + ('不横移' if not h.cfg.get('chassis_strafe', False) else '允许横移') + '，离圆环远近靠手臂伸缩补')
+        smax = float(h.cfg.get('ring_strafe_max_mm') or 0.0)
+        if h.cfg.get('chassis_strafe', False):
+            how = '对准时底盘可以随便横移'
+        elif smax > 0:
+            how = f'离圆环远近先靠手臂伸缩补，补不过来车轮再横着靠近/退远(最多 {smax:.0f}mm)'
+        else:
+            how = '不横移，离圆环远近全靠手臂伸缩补'
+        log('   先看清三个圆环(摄像头画面里从左到右是 ' + ('1 2 3' if lr else '3 2 1') + ')，再按看到的位置前后挪过去；' + how)
     if not force and not h.nogo:
         from mission_hooks import same_item
         missing = [it for it in items if not same_item(h.in_tray.get(it.slot), it)]

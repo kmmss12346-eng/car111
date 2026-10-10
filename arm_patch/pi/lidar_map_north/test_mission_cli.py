@@ -411,14 +411,14 @@ class CliTests(unittest.TestCase):
             mission_cli.handle_cli('mtest', ['mtest', 'TEMP', '1', 'xyz'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
 
     def test_mtest_zone_holds_heading_surveys_and_does_not_retract(self):
-        """mtest ROUGH/TEMP：先把现在的车头方向记为要保持的方向(HOME)，再看清三个圆环；放完不缩回(不发 DROP)；不横移。"""
+        """mtest ROUGH/TEMP：先把现在的车头方向记为要保持的方向(HOME)，再看清三个圆环；放完不缩回(不发 DROP)；手臂够得着就不横移。"""
         self._zone_setup('TEMP')
         self.run_cli('mtest', 'mtest TEMP 1 force')
         text = '\n'.join(self.lines)
         self.assertEqual(self.w.homed, 1, text)
         self.assertIn('车头方向：以现在的方向为准', text)
         self.assertIn('个圆环(认出', text)
-        self.assertIn('不横移', text)
+        self.assertIn('补不过来车轮再横着靠近/退远', text)
         self.assertFalse([r for r in self.w.requests if r.startswith('DROP')], text)
         self.assertEqual([m for m in self.w.moves if m[0] == 'S'], [], text)
         self.assertEqual(len(self.w.placed), 3, text)

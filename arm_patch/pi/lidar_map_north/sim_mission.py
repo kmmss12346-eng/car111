@@ -53,7 +53,8 @@ class SimLink:
 
 class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
-                 missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None):
+                 missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
+                 park_side=None):
         self.rng = np.random.default_rng(seed)
         self.t = 0.0
         self.code = code
@@ -105,6 +106,7 @@ class SimWorld:
         self.scale = dict(RAW=4.36, RING=1.46, PICK=1.46 * 1.3)   # RING：现场画面里圆环间距 150mm ≈ 219 像素；PICK：物料顶面(比地面近，像素/毫米大)
         self.f_gain = float(f_gain)                            # 底盘前后实际走的距离 = 指令 × 这个(测"走得不准")
         self.park = dict(park or {})                           # 工位 -> 车停的位置沿圆环那一排偏了多少毫米(测"车没停在 2 号环")
+        self.park_side = dict(park_side or {})                 # 工位 -> 车离圆环那一排远/近了多少毫米(测"手臂伸缩够不着")
         self.moves = []                                        # 底盘每条指令 (S/F, 毫米, 当时在哪个工位)
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
@@ -198,6 +200,7 @@ class SimWorld:
         self.off_s = self.off_f = 0.0
         self.stop_err = np.clip(self.rng.normal(0, self.stop_err_mm / 2.0, 2), -self.stop_err_mm, self.stop_err_mm)
         self.stop_err[1] += float(self.park.get(role, 0.0))
+        self.stop_err[0] += float(self.park_side.get(role, 0.0))
         if role == 'RAW':
             # 转盘转到、停稳在爪子够得着的区域里的物料(视野只有 147x110mm，所以只会在 ±30mm 左右)
             try:
@@ -903,12 +906,46 @@ class ZoneFlowTests(unittest.TestCase):
         if batches == 2:
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, f'seed {seed}')
 
+    def _zone_s_extent(self, w):
+        """工位里车轮横移离停车点最远到过多少毫米(每次到工位从 0 算，做完会挪回去)。"""
+        cur = worst = 0.0
+        last = None
+        for c, v, z in w.moves:
+            if z != last:
+                cur, last = 0.0, z
+            if z in ('ROUGH', 'TEMP') and c == 'S':
+                cur += v
+                worst = max(worst, abs(cur))
+        return worst
+
     def test_never_strafes_in_the_zones(self):
-        """粗加工区、暂存区里底盘只前后挪(横移会压进工位)；原料区照常可以横移。"""
+        """粗加工区、暂存区里手臂伸缩够得着时底盘只前后挪(横移会压进工位)；原料区照常可以横移。"""
         for seed, w, h, text in self._run(range(6)):
             self._assert_all_good(w, h, text, seed)
             zone_s = [m for m in w.moves if m[2] in ('ROUGH', 'TEMP') and m[0] == 'S']
             self.assertEqual(zone_s, [], f'seed {seed}: {zone_s}')
+
+    def test_wheels_move_closer_when_the_arm_cannot_reach(self):
+        """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm。"""
+        for side in (60.0, -60.0):
+            for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park_side={'ROUGH': side, 'TEMP': side})):
+                self._assert_all_good(w, h, text, seed)
+                self.assertIn('手臂伸缩够不着：车轮横着挪', text)
+                ext = self._zone_s_extent(w)
+                self.assertGreater(ext, 5.0, text)
+                self.assertLessEqual(ext, 40.0, text)
+
+    def test_strafe_limit_is_never_exceeded(self):
+        """远近差得太多(手臂伸缩加上横移 40mm 也够不着)：不放(物料留在车上)，车轮横移不超过 40mm；ring_strafe_max_mm=0 时绝不横移。"""
+        for seed, w, h, text in self._run([1], dict(cam_deg=90.0, park_side={'ROUGH': 120.0, 'TEMP': 120.0}),
+                                          stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
+            self.assertLessEqual(self._zone_s_extent(w), 40.0, text)
+            self.assertIn('车轮横着也挪到上限', text)
+        for seed, w, h, text in self._run([2], dict(cam_deg=90.0, park_side={'ROUGH': 60.0, 'TEMP': 60.0}),
+                                          cfg=dict(ring_strafe_max_mm=0), stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
+            self.assertEqual([m for m in w.moves if m[2] in ('ROUGH', 'TEMP') and m[0] == 'S'], [], text)
 
     def test_drives_straight_to_each_ring_in_code_order(self):
         """到工位先看清三个圆环，按任务码顺序一次开到位：每段一条 ±150/300mm 的指令，对准时底盘只修很少几下(其余靠手臂)。"""

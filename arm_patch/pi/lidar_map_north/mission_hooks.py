@@ -61,7 +61,9 @@ DEFAULTS = dict(
     ring_survey=True,                   # 到工位先用摄像头一次看清三个圆环，算出到 1、2、3 号环底盘各要前后挪多少，直接开过去(不靠估计的 150mm)
     ring_order=dict(ROUGH='lr', TEMP='lr'),   # 摄像头画面里 1、2、3 号环的排列：'lr' = 从左到右是 1 2 3；'rl' = 从左到右是 3 2 1
     ring_spacing_mm=150.0,              # 相邻两个圆环中心的距离(毫米)：用来从画面里算每毫米多少像素
-    chassis_strafe=False,               # 工位里对准时底盘能不能横移。False = 只沿圆环那一排前后挪，车不会横着压进工位；离得远近靠手臂伸缩补
+    chassis_strafe=False,               # True = 工位里对准时底盘随便横移(不推荐，会压进工位)。False = 沿圆环那一排前后挪；离圆环远近先靠手臂伸缩补，
+                                        #   手臂伸缩到头还够不着，车轮才横着挪(靠近/远离圆环)，只挪够不着的那一段、累计不超过 ring_strafe_max_mm
+    ring_strafe_max_mm=40.0,            # 工位里车轮横着挪(靠近/远离圆环)累计最多多少毫米(相对停车点)。0 = 绝不横移，全靠手臂伸缩
     ring_fix_max_mm=60.0,               # 对准一个圆环时，底盘最多再为对准前后挪这么多毫米(超过就停下：多半认错了环)
     ring_move_min_mm=15.0,              # 到下一个圆环要挪的距离小于这个就不动底盘(手臂够得着)
     drop_retract=False,                 # 放下物料后要不要缩回伸缩舵机。False = 只抬起来，接着去下一个环，这个工位做完再收臂(省时间)
@@ -473,9 +475,7 @@ class MissionHooks:
         if not rec or not self.cfg.get('pickback_fast', True):
             return False
         d = self.act.disp
-        dS, dF = int(round(rec['S'] - d['S'])), int(round(rec['F'] - d['F']))
-        if not self.cfg.get('chassis_strafe', False):
-            dS = 0
+        dS, dF = int(round(rec['S'] - d['S'])), int(round(rec['F'] - d['F']))   # 放下时横移过(手臂够不着)的话也回到那里
         if dS or dF:
             self.log(f'    底盘回到放下时的位置：前进 {dF:+d}mm、横移 {dS:+d}mm')
             self.act.chassis_move(dS, dF)
@@ -852,14 +852,19 @@ class MissionHooks:
         vc = getattr(v, 'cfg', None)
         if isinstance(vc, dict) and not vc.get('ring_rmax_cal') and many:
             vc.setdefault('px_per_mm', {})['RING'] = scale       # 没做 vclaw RING：按圆环间距算的比例换算毫米
-        self.ring_gate_px = 0.45 * sp_px
+        # 对准时只认这么近的圆环：沿这一排不到半个间距(旁边那个环至少隔一个间距)，再加上车离这一排远近的偏差(每个环都差不多)
+        side_px = max(side for _k, _f, side in parts)
+        self.ring_gate_px = math.hypot(0.45 * sp_px, side_px + 10.0)
         seen = '、'.join(str(ids[i]) for i in range(3) if any(np.hypot(*(pos[i] - p)) < 0.3 * sp_px for p in pts))
         self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素：' +
                  '  '.join(f'环{k} ' + ('不用挪' if abs(f) < 1 else ('前进' if f > 0 else '后退') + f' {abs(f):.0f}mm') +
                            f'(横向差 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))
         worst = max(side for _k, _f, side in parts) / scale
         if worst > 40.0:
-            self.log(f'    ★ 车离圆环那一排的远近差了约 {worst:.0f}mm：手臂伸缩可能补不过来，车停得再正一点')
+            smax = float(cfg.get('ring_strafe_max_mm') or 0.0)
+            self.log(f'    ★ 车离圆环那一排的远近差了约 {worst:.0f}mm：手臂伸缩补不过来的部分' +
+                     (f'车轮会横着挪(最多 {smax:.0f}mm)' if smax > 0 and not cfg.get('chassis_strafe') else '补不了') +
+                     '；车停得再正一点更快')
         if n2 > 0 and many:
             ratio = (float(np.hypot(*jf)) / scale)
             if not 0.75 <= ratio <= 1.33:
@@ -878,11 +883,17 @@ class MissionHooks:
         return self.vision.ring_error
 
     def _zone_servo_kw(self):
-        """工位里对准的底盘限制：不横移(只前后挪)、为对准最多挪 ring_fix_max_mm。"""
+        """工位里对准的底盘限制：前后挪最多 ring_fix_max_mm；横移只在手臂伸缩够不着时用，离停车点累计不超过 ring_strafe_max_mm。"""
         cfg = self.cfg
         kw = {}
         if not cfg.get('chassis_strafe', False):
-            kw['chassis_axes'] = 'F'
+            smax = float(cfg.get('ring_strafe_max_mm') or 0.0)
+            if smax > 0:
+                ds = float(self.act.disp['S']) if self.act is not None else 0.0
+                kw['chassis_axes'] = 'Fs'
+                kw['chassis_s_range'] = (-smax - ds, smax - ds)
+            else:
+                kw['chassis_axes'] = 'F'
         if cfg.get('ring_fix_max_mm'):
             kw['chassis_fix_max_mm'] = float(cfg['ring_fix_max_mm'])
         return kw

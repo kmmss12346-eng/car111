@@ -51,8 +51,10 @@ DEFAULTS = dict(
     broyden_gain=0.5,
     broyden_max_rel=0.5,        # 实际移动和预计差太多(比如原料盘自己在转)就不拿来修正 J
     max_cond=40.0,              # J 的条件数超过这个说明两个轴在画面里几乎平行，没法解
-    chassis_axes='SF',          # 底盘能动哪几个方向：'SF' = 横移和前后；'F' = 只前后(粗加工区/暂存区：车不横着挪，不会压进工位)
-    chassis_fix_max_mm=None,    # 一次对准里底盘最多累计挪多少毫米，超过就停下(多半是认错了目标)；None = 不限
+    chassis_axes='SF',          # 底盘能动哪几个方向：'SF' = 横移和前后；'F' = 只前后；
+                                #   'Fs' = 前后随便挪，横移(靠近/远离目标)只在手臂伸缩够不着时用，而且只挪够不着的那一段(粗加工区/暂存区)
+    strafe_margin=0.2,          # 'Fs' 横移时给手臂伸缩留的余量(行程上限的比例)：横移到手臂伸缩还剩这么多余量就够了，不多挪
+    chassis_fix_max_mm=None,    # 一次对准里底盘最多累计前后挪多少毫米，超过就停下(多半是认错了目标)；None = 不限
 )
 
 
@@ -170,6 +172,11 @@ class VisualServo:
         self.dev = np.zeros(2)          # 手臂 [ID2, ID1] 相对开始对准时的偏移(度)
         self._axes = None               # 这一次对准底盘能动的方向(run 里设，结束清掉)
         self._ch_synth = False          # 现在的底盘 J 的横移那一列是不是补出来的(只测过前后)
+        self._need_s = False            # 'Fs'：这一步手臂伸缩够不着，要横移
+        self._s_frac = 1.0              # 'Fs'：横移只挪够不着的那一段(占整段的比例)
+        self._s_range = None            # 这次对准横移累计允许的范围 (下限, 上限) 毫米；None = 不限
+        self._s_used = 0.0              # 这次对准已经横移了多少毫米
+        self._s_clipped = False         # 横移被范围卡住过
 
     # ------------------------------------------------------------------ 测量
     def _measure(self, measure, tries=3):
@@ -221,8 +228,17 @@ class VisualServo:
         self.sleep(self.cfg['settle_arm_s'])
         return applied, sat
 
+    def _mode(self):
+        m = str(getattr(self, '_axes', None) or self.cfg.get('chassis_axes') or 'SF')
+        if m.upper() == 'F':
+            return 'F'
+        if m == 'Fs' or m.upper() == 'F+S':
+            return 'Fs'
+        return 'SF'
+
     def _f_only(self):
-        return str(getattr(self, '_axes', None) or self.cfg.get('chassis_axes') or 'SF').upper() == 'F'
+        """这一步底盘只能前后挪：'F'；或者 'Fs' 而这一步不需要横移。"""
+        return self._mode() != 'SF' and not self._need_s
 
     def _ch_cmd(self, Jc, p):
         """底盘这一步怎么动 (S, F)。只许前后动时：只用 J 的 F 那一列，按最小二乘算前后挪多少(横向的偏差留给手臂)。"""
@@ -234,17 +250,26 @@ class VisualServo:
                 return 0.0, 0.0
             return 0.0, float(-c['gain_ch'] * float(jf @ p) / n2)
         sf = -c['gain_ch'] * np.linalg.solve(Jc, p)
+        if self._need_s:
+            return float(sf[0]) * self._s_frac, float(sf[1])      # 只横移手臂伸缩够不着的那一段
         return float(sf[0]), float(sf[1])
 
     def _apply_chassis(self, s_mm, f_mm):
         c = self.cfg
         if self._f_only():
             s_mm = 0.0                                   # 不横移
+        elif self._s_range is not None:                  # 横移累计不超过允许的范围(不压进工位)
+            lo, hi = self._s_range
+            s_cl = max(lo - self._s_used, min(hi - self._s_used, s_mm))
+            if abs(s_cl - s_mm) > 0.5:
+                self._s_clipped = True
+            s_mm = s_cl
         s_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], s_mm))
         f_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], f_mm))
         s_mm, f_mm = float(round(s_mm)), float(round(f_mm))      # STM32 的 S/F 只收整数毫米
         if s_mm == 0 and f_mm == 0:
             return np.zeros(2)
+        self._s_used += s_mm
         self.act.chassis_move(s_mm, f_mm)
         self.sleep(c['settle_ch_s'])
         return np.array([s_mm, f_mm])
@@ -336,27 +361,47 @@ class VisualServo:
         return J
 
     # ------------------------------------------------------------------ 主循环
+    def _short(self, need, i):
+        """手臂第 i 个轴(0 = ID2，1 = ID1)要再转 need 度：超出这次对准的总行程吗？超出返回超出了多少度，没超出返回 0。"""
+        lim = float(self.cfg['arm_limit_deg'][('id2', 'id1')[i]])
+        return max(0.0, abs(float(self.dev[i]) + float(need)) - lim)
+
     def _decide(self, J, p, e, allow_chassis):
-        """这一次用手臂还是底盘。偏差大、或者手臂这一步够不着(超出行程)就用底盘；其余用手臂(精度高)。"""
+        """这一次用手臂还是底盘。偏差大、或者手臂这一步够不着(超出行程)就用底盘；其余用手臂(精度高)。
+        'F' / 'Fs'(工位里)：底盘前后挪只管沿圆环那一排的偏差；横向(离圆环远近)靠手臂伸缩，
+        'Fs' 时手臂伸缩到头还够不着，才让车轮横着挪(只挪够不着的那一段)。"""
         c = self.cfg
+        self._need_s = False
         if not allow_chassis or e < c['chassis_min_mm']:
             return 'arm'
-        if self._f_only() and J['ch'] is not None:
+        mode = self._mode()
+        if mode != 'SF' and J['ch'] is not None:
             jf = np.asarray(J['ch'], float)[:, 1]
             along = e * abs(float(jf @ p)) / max(_norm(jf) * _norm(p), 1e-9)   # 偏差里沿着"底盘前后"方向的那一段(毫米)
-            if along < c['chassis_min_mm']:
-                return 'arm'                             # 主要是横向的偏差：底盘不能横移，只能靠手臂伸缩
-            if along > c['arm_cover_mm']:
-                return 'ch'                              # 沿着圆环那一排差得多：底盘前后挪
-            if J['arm'] is not None:                     # 差得不多：沿这一排动的那个舵机够得着就用手臂(底盘尽量少动)
+            sat_a = short_r = False
+            if J['arm'] is not None:
                 Ja = np.asarray(J['arm'], float)
-                want = -c['gain_arm'] * np.linalg.solve(Ja, p)
+                need = -np.linalg.solve(Ja, p)                      # 手臂要再转多少度才对准(不打折)
+                want = c['gain_arm'] * need
                 got, _sat = self._clip_arm(want)
                 ju = jf / max(_norm(jf), 1e-9)
                 ia = int(np.argmax([abs(float(Ja[:, i] @ ju)) / max(_norm(Ja[:, i]), 1e-9) for i in (0, 1)]))
-                # 只看沿这一排的那个舵机(一般是 ID1)够不够得着：横向(ID2 伸缩)够不着，底盘前后挪也帮不上
-                sat = abs(want[ia]) > 1e-9 and abs(want[ia] - got[ia]) > 0.3 * abs(want[ia])
-                return 'ch' if sat else 'arm'
+                ir = 1 - ia                                         # 沿圆环那一排动的舵机(一般 ID1) / 管远近的舵机(一般 ID2)
+                sat_a = abs(want[ia]) > 1e-9 and abs(want[ia] - got[ia]) > 0.3 * abs(want[ia])
+                if mode == 'Fs':
+                    over = self._short(need[ir], ir)
+                    if over > 0:                                    # 远近差得多，手臂伸缩到头也够不着
+                        lim = float(c['arm_limit_deg'][('id2', 'id1')[ir]])
+                        keep = float(c.get('strafe_margin', 0.2)) * lim
+                        self._s_frac = min(1.0, (over + keep) / max(abs(float(need[ir])), 1e-9))
+                        short_r = True
+            if short_r:
+                self._need_s = True                              # 车轮横着挪(靠近/远离)，只挪手臂够不着的那一段
+                return 'ch'
+            if along < c['chassis_min_mm']:
+                return 'arm'                             # 主要是横向的偏差：手臂伸缩够得着
+            if along > c['arm_cover_mm'] or sat_a:
+                return 'ch'                              # 沿着圆环那一排差得多(或者沿这一排的舵机够不着)：底盘前后挪
             return 'arm'
         if e > c['arm_cover_mm']:
             return 'ch'
@@ -367,14 +412,21 @@ class VisualServo:
         return 'arm'
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
-            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None):
-        """对准(见 _run)。chassis_axes 只管这一次：结束后恢复成配置里的(vcal 之类单独探测时不受影响)。"""
+            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None):
+        """对准(见 _run)。chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
+        chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。"""
         self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
+        self._s_range = tuple(chassis_s_range) if chassis_s_range is not None else None
+        self._s_used = 0.0
+        self._s_clipped = False
+        self._need_s = False
         try:
             return self._run(kind, measure, scale_px_per_mm, tol_mm, allow_chassis, max_iter, timeout_s, label, bounds, confirm,
                              chassis_fix_max_mm)
         finally:
             self._axes = None
+            self._s_range = None
+            self._need_s = False
 
     def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
              bounds=None, confirm=None, chassis_fix_max_mm=None):
@@ -386,8 +438,8 @@ class VisualServo:
         allow_chassis 偏差大、手臂够不着时允许动底盘
         bounds        画面范围换算成 p 的上下限 ((u 下限, v 下限), (u 上限, v 上限))，用来在目标靠近画面边缘时缩小探测步长
         confirm       达标后是否再测一次确认；None=用配置里的 confirm。对精度要求不高的(夹原料、取回)可以关掉省时间
-        chassis_axes  这次底盘能动的方向('SF' / 'F')；None = 用配置里的
-        chassis_fix_max_mm  这次对准底盘最多累计挪多少毫米；None = 用配置里的
+        chassis_axes  这次底盘能动的方向('SF' / 'F' / 'Fs')；None = 用配置里的
+        chassis_fix_max_mm  这次对准底盘最多累计前后挪多少毫米(横移另有 chassis_s_range)；None = 用配置里的
         """
         c = self.cfg
         fix_max = chassis_fix_max_mm if chassis_fix_max_mm is not None else c.get('chassis_fix_max_mm')
@@ -496,6 +548,8 @@ class VisualServo:
                     bad = 0
 
                 group = self._decide(J, p, e, allow_chassis)
+                if group == 'ch' and self._need_s and J['ch'] is not None and self._ch_synth:
+                    J['ch'] = None                           # 横移那一列是补出来的(只测过前后)：要横移先实测一次
                 if J[group] is None:
                     moved()
                     J[group] = self._probe(measure, group, bounds)
@@ -519,7 +573,9 @@ class VisualServo:
                     moved()
                     applied = self._apply_chassis(sf[0], sf[1])
                     used_ch = True
-                    ch_moved[0] += _norm(applied)
+                    ch_moved[0] += abs(float(applied[1]))
+                    if self._need_s and abs(float(applied[0])) > 0:
+                        self.log(f'  {tag} 手臂伸缩够不着：车轮横着挪 {applied[0]:+.0f}mm(离圆环近一点/远一点)')
                 if _norm(applied) < 1e-9:
                     fresh[0] = True                          # 回读说一点没动：上次测的偏差还是现在的
                 else:
@@ -546,10 +602,12 @@ class VisualServo:
                         moved()
                         applied = self._apply_chassis(sf[0], sf[1])
                         used_ch = True
-                        ch_moved[0] += _norm(applied)
+                        ch_moved[0] += abs(float(applied[1]))
                         group = 'ch'
                     if _norm(applied) < 1e-9:
                         fresh[0] = True
+                        if self._s_clipped:
+                            return finish(False, f'离目标远近差得太多：手臂伸缩到头、车轮横着也挪到上限了，还差 {e:.2f}mm')
                         return finish(False, f'手臂已到行程极限、底盘也不用动，还差 {e:.2f}mm')
                 prev_e = e
                 moves += 1
