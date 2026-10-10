@@ -791,8 +791,8 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
             'START1': [2250, 2250, 180], 'START2': [2250, 150, 90]}     # 用户配置里的停车点(10-06)
 
 
-LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False)
-LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True)
+LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False)
+LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True)
 
 
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
@@ -943,6 +943,27 @@ class MissionSimTests(unittest.TestCase):
             self.assertEqual(h.stats.place_ok, 12)
             self.assertEqual(w.air, 0)
             self.assertLess(max(e for (_, _, _, e, st) in w.placed if not st), 2.5)
+
+    def test_take_first_places_without_the_empty_claw_trip(self):
+        """工位先取物料、带着物料对准一次就放下(10-10 用户选的)：全放对；平放时不再"空爪先对准再回去取"。"""
+        import mission_hooks
+        calls = []
+        orig = mission_hooks.MissionHooks._place_take_first
+
+        def spy(h, *a):
+            r = orig(h, *a)
+            calls.append(r[0])
+            return r
+        mission_hooks.MissionHooks._place_take_first = spy
+        try:
+            w = SimWorld(seed=401, code=self.CODE)
+            h = make(w, dict(LIVE_DEFAULTS))
+            run_mission(w, h)
+        finally:
+            mission_hooks.MissionHooks._place_take_first = orig
+        self.assertEqual(h.stats.place_ok, 12)
+        self.assertEqual(calls.count(True), 9)                          # 9 个平放都这样放(3 个码垛照旧)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
     def test_stm32_error_on_one_grab_is_recovered(self):
         w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2))
@@ -1466,7 +1487,7 @@ class TiltTests(unittest.TestCase):
                     first[cur[0]] = abs(float((w.ring_center(k) - c)[0]))
                 return orig(n, max_px)
             w.vision.ring_error = ring_error
-            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', tilt_precorrect=pre,
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', tilt_precorrect=pre, take_first=False,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)

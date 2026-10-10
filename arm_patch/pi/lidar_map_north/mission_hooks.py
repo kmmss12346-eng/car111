@@ -120,6 +120,9 @@ DEFAULTS = dict(
     zone_frames=2,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
     zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
     zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
+    take_first=True,                    # (10-10 用户：B) 平放时先去转盘取物料，再到圆环上方带着物料对准一次就放下(不再"空爪先对准、
+                                        #   去取、再回到原位")。看不到圆环/对不准：物料放回转盘，这个环按以前的做法。码垛照旧
+    take_first_clear_mm=15.0,           # take_first：观察高度 ZOBRNG 时手里物料底面离地至少这么多(ZOBRNG-ZPLC)，不够就按以前的做法
     wheels_first=True,                  # (10-10 用户要的：尽量先慢慢动车)True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
                                         #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)。
                                         #   模拟里比默认慢、失败多(车轮只能走整毫米，小步不准)，所以默认关；上车对比：mtest TEMP 1 force wheels
@@ -1673,6 +1676,68 @@ class MissionHooks:
         return None
 
     # ------------------------------------------------------------------ 放到圆环(核心)
+    def _place_take_first(self, item, zone, ring, label):
+        """先去转盘取物料，再到圆环上方带着物料对准一次就放下(用户 10-10 选的做法，省掉"空爪先对准、再回去取、再回到原位")。
+        返回 (这个物料处理完没有, 放成没有, 误差mm)。处理不了(高度不够、看不到圆环、对不准)：物料放回转盘槽，
+        返回 (False, …)，调用的地方按以前的做法(空爪先对准)再放这一个。"""
+        cfg = self.cfg
+        P = self.arm.params() or {}
+        if not all(k in P for k in ('ZOBRNG', 'ZPLC', 'ZHI', 'A1P', 'A2P')):
+            return False, False, None
+        up = 1.0 if float(P['ZHI']) >= float(P['ZPLC']) else -1.0     # 升降往上是加(现在的车)还是减(以前/模拟)
+        clear = up * (float(P['ZOBRNG']) - float(P['ZPLC']))
+        if clear < float(cfg.get('take_first_clear_mm', 15.0)):
+            if not getattr(self, '_tf_said', False):
+                self._tf_said = True
+                self.log(f'    (先取物料再对准：观察高度 ZOBRNG 时物料底面离地只有 {clear:.0f}mm，太低会蹭到圆环/地面，按以前的做法空爪先对准)')
+            return False, False, None
+        self._goto_ring(zone, ring)
+        self._ring_ready = self._at_obs = False
+        self.arm.take(item.slot)                                 # 先去转盘取物料
+        self.holding = item
+        try:
+            d2 = self._predict_d2() if cfg.get('ring_precorrect', True) else None
+            d1 = self._predict_d1(d2) if d2 is not None else 0.0
+            env = self._a2_env() or (A2_MIN, A2_MAX)
+            a2 = min(env[1], max(env[0], float(P['A2P']) + (d2 or 0.0)))
+            a1 = float(P['A1P']) + (d1 or 0.0)
+            self.log(f'    先取了物料，带着它到圆环上方对准(ID2 {a2 - float(P["A2P"]):+.0f}°)，对准一次就放下')
+            self.arm.ap(a1, a2)                                  # 搬运高度转过去
+            self.arm.lift(float(P['ZOBRNG']))                    # 降到看圆环的高度(物料底面离地 clear mm)
+            self._a1_hint, self._a2_hint = a1, a2
+            res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+                                 allow_chassis=True, label=label, bounds=self.vision.bounds('RING'),
+                                 confirm=bool(cfg.get('place_confirm', False)), **self._zone_servo_kw())
+            self.log(f'    对准结果(手里带着物料)：{res}')
+            aligned = res is not None and math.isfinite(res.err_mm) and (res.ok or res.err_mm <= cfg['accept_mm']['RING'])
+            if aligned and cfg.get('check_ring_empty', True) and self._ring_taken_why(zone, ring):
+                aligned = False
+                self.log(f'    ★ 环{ring} 的白心里好像有东西：不放')
+            if not aligned:
+                self._put_back(item, '带着物料看不清圆环/对不准：物料放回转盘，这个环按以前的做法(空爪先对准)')
+                self.holding = None
+                self._tf_off = True                              # 这个工位剩下的也按以前的做法，免得每个都白取一趟
+                return False, False, None
+            self._learn_from(zone, ring)
+            if hasattr(self.vision, 'note_ring_size'):
+                self.vision.note_ring_size(getattr(self.vision, 'last_ring_rmax', None))   # 圆环外圈大小：取回时白心被盖住也认得出
+            a1n, a2n = self.arm.read_angles()
+            d = self.act.disp
+            if a1n is not None and a2n is not None:
+                self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1n, a2=a2n)
+                self._zone_d2.append((float(d['F']), float(a2n) - float(P['A2P'])))
+            self._drop(False)                                    # 下降、松手、抬起
+            self.holding = None
+            self._ring_ready = True
+            return True, True, res.err_mm
+        except ArmAbort:
+            raise
+        except (ArmError, VisionError) as ex:
+            if self.holding is not None:
+                self._put_back(item, f'先取物料再对准时出错：{ex}')
+                self.holding = None
+            return False, False, None
+
     def _place_item(self, item, zone, ring, stack, label):
         cfg = self.cfg
         key = 'STACK' if stack else 'RING'
@@ -1688,6 +1753,20 @@ class MissionHooks:
             self.stats.place(False)
             self._show_stats()
             return False
+        if not stack and not self.nogo and cfg.get('take_first', True) and not getattr(self, '_tf_off', False):
+            done, ok_tf, err_tf = self._place_take_first(item, zone, ring, label)
+            if not done and self.disabled:
+                self.stats.place(False)
+                self._show_stats()
+                return False
+            if done:
+                self.stats.place(ok_tf)
+                if ok_tf:
+                    self.in_tray.pop(item.slot, None)
+                    self.on_ring.setdefault((zone, ring), []).append(item)
+                    self.placements.append((zone, ring, False, err_tf))
+                self._show_stats()
+                return ok_tf
         try:
             self._goto_ring(zone, ring)
             self._obs_ring()                                     # 空爪到圆环上方：圆环不会被挡住
@@ -1784,6 +1863,7 @@ class MissionHooks:
         没有要放的物料、或者时间到了，就不看(省时间)。"""
         self.ring_f = {}
         self.ring_gate_px = None
+        self._tf_off = False
         self._ring_ready = self._at_obs = False
         self._zone_d2 = []
         self._tilt = None
@@ -1801,6 +1881,13 @@ class MissionHooks:
             return
         try:
             self._survey(zone)
+            if self.cfg.get('take_first', True) and hasattr(self.vision, 'note_claw_clear'):
+                # 先取物料再对准时，对准时爪子里有物料：趁现在爪子空着、在观察姿态，记下干净的爪子区域(取回蓝色物料要用)
+                try:
+                    self.vision.ring_error(n=1)
+                    self.vision.note_claw_clear()
+                except (VisionError, TypeError):
+                    pass
         except ArmAbort as ex:
             raise Abort(str(ex))
         except (ArmError, VisionError) as ex:
