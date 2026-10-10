@@ -1013,6 +1013,7 @@ class _Drive:
             ref_next, want = self.nav.turn_cmd(val)
             self._turn(want, ref_next[2])
             self.nav.ref = ref_next
+            self._after_turn()
             return
         ref_next, want = self.nav.lin_cmd(cmd, val)
         label = ''
@@ -1035,6 +1036,50 @@ class _Drive:
         self._send(cmd, v, speed, label)
         self.nav.moved(cmd, v)
         self.nav.ref = ref_next
+
+    def _after_turn(self):
+        """路线中间转完弯、接下来是一条长直行(>= reloc_split_mm)、上次定位以后又走了 >= reloc_min_travel_mm：先用雷达定位一次。
+        前一条长直行走多走少的误差，转弯以后就变成了横向偏差，一路带着往黄区/工位区那边偏；在这里修掉
+        (车头和横向偏差马上修，沿着下一条方向的偏差并进下一条)。"""
+        g = self.cfg.get
+        if not (self.nav.world and self.reloc_on and g('reloc_after_turn', True)):
+            return
+        nxt = None
+        for j in range(self.k + 1, len(self.seq)):
+            c = self.seq[j][1]
+            if c is None or c == 'R':
+                return
+            if c in ('F', 'S'):
+                nxt = (c, self.seq[j][2])
+                break
+        if nxt is None or abs(nxt[1]) < float(g('reloc_split_mm', 1200)) or self.travel < max(self.min_travel, 1.0):
+            return
+        meas = _reloc(self.ctx, self.nav.real(), self.reloc_frames)
+        if not meas.get('ok'):
+            self.log(f"    ◆ 转弯后雷达定位没成功：{meas.get('why')}。照推算的走。")
+            return
+        self.travel = 0.0
+        p = meas['pose']
+        self.log(f"    ◆ 转弯后、长直行前雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°"
+                 f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒）")
+        self.nav.measured(p, self.e_last)
+        need = float(g('reloc_check_margin_mm', 10))
+        obs = self._obstacles()
+        off = self.nav.yaw_off
+        yt = max(float(g('reloc_yaw_tol_deg', 1.0)) if not self.caps.get('rdec') else min(float(g('reloc_yaw_tol_deg', 1.0)),
+                 float(g('reloc_yaw_min_deg', 0.3))), turn_min_deg(self.caps))
+        if abs(off) >= yt:
+            v = clamp_move(self.cfg, obs, self.nav.real(), 'R', round(-off, 1), need, unit=0.1 if self.caps.get('rdec') else 1.0)
+            if v and abs(v) >= turn_min_deg(self.caps):
+                self._turn(v, self.nav.est[2], '(修车头)', toward_zero=True)
+        f, s = self.nav.owed()
+        side = ('F', f) if nxt[0] == 'S' else ('S', s)       # 和下一条直行垂直的那个方向
+        if abs(side[1]) >= float(g('reloc_lateral_tol_mm', 15)):
+            c, v = side[0], int(round(side[1]))
+            v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
+            if abs(v2) >= STOP_MIN_MM:
+                self._send(c, v2, self.fine, '(转弯后定位修正)')
+                self.nav.moved(c, v2)
 
     def _approach_cut(self, cmd, want):
         """朝场地边线/黄区/工位区/转盘/障碍物走的一条，按推算走满时离它很近：距离差 1~2%(长横移更多)就会压上。

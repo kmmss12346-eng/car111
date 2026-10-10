@@ -418,6 +418,30 @@ class MiscDriveTests(unittest.TestCase):
         self.assertTrue(any('出发时原地转回' in l for l in logs))
         self.assertEqual(car.sent[0][:2], ('R', 60))
 
+    def test_reloc_after_turn_before_long_straight(self):
+        # 一段里：前进 1500(多走 2%=30mm) -> 左转 -> 横移 1500。转弯后先定位：前一条多走的 30mm 现在是横向偏差，修掉再走
+        car = SimCar((1200.0, 330.0, 0.0), scale=0.02)
+        ctx = SimCtx(car)
+        legs = [dict(stop='A', goal=(2100.0, 1830.0, 90.0), cmds=[('F', 900), ('R', 90), ('F', 1500)])]
+        logs = []
+        h = Hooks(car)
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=h, speeds={}, motion=None,
+                       cfg=dict(CFG, reloc_min_travel_mm=500, reloc_split_mm=1200),
+                       start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
+        self.assertTrue(any('转弯后、长直行前雷达定位' in l for l in logs))
+        corr = [(c, v, sp) for c, v, sp in car.sent if sp == 60]
+        self.assertEqual(corr[0][0], 'S', '车头朝北以后，前一条多走的 18mm 是横向(S)')
+        self.assertTrue(12 <= corr[0][1] <= 25, corr)                     # 多走到了东边：左移(向西)修回来
+        self.assertEqual(ctx.calls, 2)
+        # 不长的直行、或者上次定位以后没走多远：转弯后不定位
+        car = SimCar((1200.0, 330.0, 0.0))
+        ctx = SimCtx(car)
+        legs = [dict(stop='A', goal=(2100.0, 830.0, 90.0), cmds=[('F', 900), ('R', 90), ('F', 500)])]
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500),
+                       start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
+        self.assertEqual(ctx.calls, 1)
+
     def test_reloc_skipped_after_short_travel(self):
         car = SimCar((1200.0, 1000.0, 90.0))
         ctx = SimCtx(car)

@@ -606,6 +606,7 @@ def main():
                 # STM32 开跑时 HOME：要保持的车头 = 出发时的车头；第二站顺时针转 cw 度以后 = 出发车头 - cw
                 state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
                 state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None   # 不用上一次的路线
+                if not scanned:state['preplan']=None;state['home_routes']={}          # go：没有开跑前的预先规划
             run_mission(Ctx(),link,log=log,first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,cfg=raw_cfg,scanned=scanned)
         except Abort as e:
             print('★ 已停止：',e,flush=True)
