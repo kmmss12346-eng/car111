@@ -134,6 +134,16 @@ class ClockTests(unittest.TestCase):
         h.cfg['home_when_idle'] = False
         h.out_of_time = False
         self.assertFalse(h.go_home_now('RAW', 10.0, 30.0))
+        w2 = SimWorld(seed=1, code=CODE, armok=False)               # 机械臂没标定：QR 点还是要去(读到码本身有分)，读完再回家
+        h2, lines2 = hooks(w2)
+        h2.prepare(w2.link, lines2.append)
+        h2.start_clock()
+        self.assertIsNotNone(h2.disabled)
+        self.assertFalse(h2.go_home_now('QR', 10.0, 25.0))
+        w2.arrive('QR')
+        h2.task('QR', w2.link, lines2.append)
+        self.assertEqual(h2.plan.code, CODE)
+        self.assertTrue(h2.go_home_now('RAW', 10.0, 30.0))
 
     def test_home_eta_stops_items_in_time_without_raising(self):
         """按回家时间判断：每个物料开始前算"这个物料 + 收臂 + 回家 + 余量"，来不及就不开始，记下 out_of_time，不抛异常。"""

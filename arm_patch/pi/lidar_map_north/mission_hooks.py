@@ -539,10 +539,13 @@ class MissionHooks:
         return k
 
     def _idle_for_good(self):
-        """这一轮后面再也没有夹放可做了(返回原因)：机械臂不能用；或者到过 QR 点(后面的停车点也问过)还是没有任务码。否则 None。"""
+        """这一轮后面再也没有夹放可做了(返回原因)：到过 QR 点以后，机械臂不能用、或者还是没有任务码。否则 None。
+        QR 点还没去过不算(读到任务码本身就有分，机械臂不能用也照样去读)。"""
+        if not self.visits.get('QR'):
+            return None
         if self.disabled:
             return f'本轮不做夹放({self.disabled})'
-        if self.plan is None and self.visits.get('QR'):
+        if self.plan is None:
             return '没有读到任务码'
         return None
 
