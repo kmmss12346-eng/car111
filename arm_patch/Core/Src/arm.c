@@ -1101,6 +1101,7 @@ static void Screen_Clear(void)
 #define ZP_BTN_W    236        /* 按钮 1：x 0~235；按钮 2：x 244~479(中间 8 像素的缝按了不算) */
 #define ZR_START_Y  128        /* 准备页：START 从 y=128 到底，整个宽度 */
 #define ZR_BACK_X   336        /* 准备页：BACK 画在右上角 x 336~471、y 8~71(认触摸时右上角 x≥330、y<80 都算) */
+#define ZONE_TAP_GUARD_MS 500u /* 换页以后这么久以内按下的不算：手指抖一下、连按两下，不会选完区顺手就按到 START */
 
 #define SCR_FB      12
 static uint8_t          scr_rx;
@@ -1112,6 +1113,7 @@ static volatile uint8_t scr_boot = 0;      /* 屏刚上电(收到 88 FF FF FF)�
 static volatile uint8_t zone_ui = ZUI_OFF; /* 现在显示哪一页(中断里按它认按钮) */
 static volatile uint8_t scr_down = 0;      /* 按下时落在哪个按钮上(0 = 没落在按钮上) */
 static volatile uint8_t scr_tap = 0;       /* 按下、松开都在同一个按钮里：按钮号，主循环取走后清 0 */
+static volatile uint32_t zone_page_at = 0; /* 最近一次换页/画完页面的时刻(毫秒) */
 static uint8_t          zone_sel = 0;      /* 选了几区：0 = 还没选 */
 static uint8_t          zone_go = 0;       /* 1 = 上次 ZONE ASK / ZONE n / 选区以后按过 START */
 static char             zone_msg[21];      /* 状态行(ZONE MSG 写的，最多 20 个字) */
@@ -1143,6 +1145,10 @@ static void Zone_Touch(uint16_t x, uint16_t y, uint8_t ev)
 
     if (ev == 0x01)
     {
+        if ((uint32_t)(HAL_GetTick() - zone_page_at) < ZONE_TAP_GUARD_MS)
+        {
+            b = 0;                                 /* 页面刚换(或还在画)：这一下不算 */
+        }
         scr_down = b;
     }
     else if (ev == 0x00)
@@ -1273,6 +1279,7 @@ static void Zone_Show(uint8_t xy)
         Zone_ShowButtons();
     }
     Zone_ShowMsg();
+    zone_page_at = HAL_GetTick();                  /* 画完才开始算保护时间(画的时候按的也不算) */
 }
 
 /* 换页：先换状态再画。关中断把还没处理的按下/触摸清掉，免得上一页的按钮算到这一页上。
@@ -1283,6 +1290,7 @@ static void Zone_Page(uint8_t ui, uint8_t sel, uint8_t xy)
     zone_ui = ui;
     scr_down = 0;
     scr_tap = 0;
+    zone_page_at = HAL_GetTick();
     __enable_irq();
     zone_sel = sel;
     zone_go = (ui == ZUI_GO) ? 1 : 0;
@@ -1367,6 +1375,7 @@ static volatile uint8_t  qr_new = 0;       /* 1 = qr_latch 里有主循环还没
 static char              qr_code[16];
 static uint8_t           qr_valid = 0;
 static uint8_t           qr_show = 0;      /* 1 = 新码还没写屏、还没告诉树莓派 */
+static uint8_t           qr_said = 0;      /* 1 = 新码已经在 QR? 的回复里告诉树莓派了：Arm_Poll 只写屏，不再主动发 */
 
 /* 在 s 里找 "ddd+ddd+ddd+ddd" 这种 15 个字符的格式，找到就复制到 out。前后有多余字符也没关系 */
 static int QR_Match(const char *s, int len, char *out)
@@ -1448,6 +1457,7 @@ static void QR_Accept(const char *c)
         memcpy(qr_code, c, sizeof(qr_code));
         qr_valid = 1;
         qr_show = 1;
+        qr_said = 0;
     }
 }
 
@@ -1536,8 +1546,12 @@ void Arm_Poll(void)
         {
             QR_Draw();
         }
-        snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
-        Say(m);
+        if (!qr_said)
+        {
+            snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
+            Say(m);
+        }
+        qr_said = 0;
     }
 }
 
@@ -1954,6 +1968,10 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         char m[32];
 
         QR_Fetch();                                /* 中断里刚锁存、主循环还没取走的码也算 */
+        if (qr_show)
+        {
+            qr_said = 1;                           /* 这里已经回了：Arm_Poll 写屏时不再主动发一遍 */
+        }
         if (qr_valid)  snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
         else           snprintf(m, sizeof(m), "QR NONE\r\n");
         Say(m);

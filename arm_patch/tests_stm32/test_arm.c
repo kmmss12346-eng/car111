@@ -139,9 +139,12 @@ static void scr_in(const uint8_t *f, int n) {
         scr_armed = 0; *scrp = f[i]; HAL_UART_RxCpltCallback(&huart2);
     }
 }
-/* 触摸帧：67 XH XL YH YL 事件 FF FF FF(事件 1 = 按下，0 = 松开) */
+/* 触摸帧：67 XH XL YH YL 事件 FF FF FF(事件 1 = 按下，0 = 松开)。
+ * 按下之前先过 touch_gap 毫秒(默认 600，比换页后的保护时间 0.5 秒长：人正常地看一眼再按) */
+static uint32_t touch_gap = 600;
 static void touch(int x, int y, int ev) {
     uint8_t f[9];
+    if (ev == 1) now += touch_gap;
     f[0] = 0x67; f[1] = (uint8_t)(x >> 8); f[2] = (uint8_t)x; f[3] = (uint8_t)(y >> 8); f[4] = (uint8_t)y; f[5] = (uint8_t)ev;
     f[6] = f[7] = f[8] = 0xFF;
     scr_in(f, 9);
@@ -389,6 +392,18 @@ int main(void) {
           "ZONE 1：和在屏上按 1 一样，画准备页");
     tap(240, 250);
     CHECK(zone_is("ZONE 1 1"), "ZONE 1 以后屏上按 START：s=1");
+    /* 换页以后 0.5 秒内按下的不算：选区时手指抖一下/连按两下，不会顺手按到 START(START 就在按钮 1、2 的下半部分) */
+    run("ZONE ASK");
+    touch_gap = 50; tap(100, 250);
+    CHECK(zone_is("ZONE 0 0"), "ZONE ASK 刚画完 50ms 就按：不算");
+    touch_gap = 600; tap(100, 250);
+    CHECK(zone_is("ZONE 1 0"), "过了保护时间再按：选 1 区");
+    touch_gap = 100; tap(100, 250); touch_gap = 300; tap(100, 250);
+    CHECK(zone_is("ZONE 1 0"), "选好区以后 0.1 秒、0.3 秒又在同一个地方按了两下(手指抖)：都不算 START");
+    touch_gap = 50; touch(100, 250, 1); touch_gap = 600; touch(100, 250, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 1 0"), "保护时间内按下、过了保护时间才松开：也不算");
+    touch_gap = 600; tap(100, 250);
+    CHECK(zone_is("ZONE 1 1"), "正常再按一次 START：s=1");
     CHECK(run("ZONE 2") == 1 && zone_is("ZONE 2 0"), "ZONE 2：START 清掉(s=0)");
     touch(240, 250, 1); run("ZONE 2"); touch(240, 250, 0); Arm_Poll();
     CHECK(zone_is("ZONE 2 0"), "按下 START 以后页面重画了(换页)，再松开不算(按下的那一下属于上一页)");
@@ -432,7 +447,7 @@ int main(void) {
     {
         static const uint8_t sleepf[] = { 0x68, 0x01, 0xC0, 0x00, 0x96, 0x01, 0xFF, 0xFF, 0xFF };   /* 屏睡眠时的触摸帧 68，x=448 y=150 */
         static const uint8_t sleepr[] = { 0x68, 0x01, 0xC0, 0x00, 0x96, 0x00, 0xFF, 0xFF, 0xFF };
-        run("ZONE ASK");
+        run("ZONE ASK"); now += 600;
         scr_in(sleepf, 9); scr_in(sleepr, 9); Arm_Poll();
         CHECK(zone_is("ZONE 2 0"), "屏睡眠时的 68 帧也认(x=448 在右半边 = 2 区)");
     }
@@ -498,7 +513,10 @@ int main(void) {
     for (i = 0; i < 300; i++) qr_feed("x");          /* 后面一直来字节(缓冲满了好几次) */
     CHECK(run("QR?") == 1 && pis("QR 156+123+516+231"), "Arm_Poll 没跑时扫到的码在中断里已经锁存：后面的字节挤满缓冲也不丢，QR? 读得到");
     clear(); Arm_Poll();
-    CHECK(pis("QR 156+123+516+231") && scrs("\"156+123+\"") && scrs("\"516+231\""), "主循环再写屏(t0 带 +)、告诉树莓派");
+    CHECK(!pis("QR ") && scrs("\"156+123+\"") && scrs("\"516+231\""), "主循环再写屏(t0 带 +)；QR? 已经回过这个码了，不再主动发一遍");
+    run("QR CLR"); clear();
+    qr_feed("156+123+516+231\r\n"); Arm_Poll();
+    CHECK(pis("QR 156+123+516+231") && scrs("\"156+123+\""), "没被 QR? 取走的新码：主循环写屏、主动告诉树莓派");
     clear(); Arm_Poll(); qr_feed("156+123+516+231\r\n"); Arm_Poll();
     CHECK(pi[0] == 0 && scr[0] == 0, "同一个码再扫到：不重复发、不重写屏");
     run("QR CLR"); clear();
