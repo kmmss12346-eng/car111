@@ -593,50 +593,101 @@ class Vision:
         outer = float(self.cfg.get('ring_outer_diam_mm') or 95.0) / 2.0 * float(self.cfg['px_per_mm']['RING'])   # 最外圈半径，像素(估计)
         return 0.35 * outer, 2.0 * outer             # 还没量过：放宽(要看到两圈同心圆才算，不会把别的圆当成圆环)
 
-    def _rings_in_frame(self, fr, any_size=False):
+    def _rings_in_frame(self, fr, any_size=False, roi=None):
         """检测到的圆环列表 [(x, y, r, ...)]。只保留"最外圈够大"的，物料自己的圆(小)和别的杂圆不算圆环。
-        any_size=True：不按大小过滤(只去掉最外圈小于 20 像素的)，vclaw RING 第一次量圆环大小用。"""
+        any_size=True：不按大小过滤(只去掉最外圈小于 20 像素的)，vclaw RING 第一次量圆环大小用。
+        roi=(x0, y0, x1, y1)：只在画面这一块里找(对准时只要爪子附近那个环，要拟合的边缘少一大半，快好几倍)；返回的还是整幅画面的坐标。"""
         det = self._ring_det()
+        x0 = y0 = 0
+        sub = fr
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            sub = fr[y0:y1, x0:x1]
         if getattr(det, 'wants_claw', False):
             self.last_claw = self.claw_mask(fr)
+            mask = self.last_claw
+            if roi is not None and mask is not None:
+                if mask.shape[:2] != fr.shape[:2]:
+                    import cv2
+                    mask = cv2.resize(mask, (fr.shape[1], fr.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask = mask[y0:y1, x0:x1]
             rexp = None
             if not any_size and (self.cfg.get('ring_rmax_px') or self.cfg.get('ring_rmax_cal')):
                 rexp = self._ring_rmax_range()          # 圆环大小已知：中间被物料盖住、只剩最外圈时也能认
             elif not any_size and self.cfg.get('ring_rmax_seen'):
                 r = float(self.cfg['ring_rmax_seen'])   # 没量过，但这次放物料时认到过空圆环：按那个大小认
                 rexp = (0.85 * r, 1.2 * r)
-            rings = det(fr, self.last_claw, r_expect=rexp)
+            rings = det(sub, mask, r_expect=rexp)
         else:
-            rings = det(fr)
+            rings = det(sub)
+        if x0 or y0:
+            rings = [(r[0] + x0, r[1] + y0) + tuple(r[2:]) for r in rings]
         rr = self.cfg.get('ring_r_px')
         if rr:
             rings = [r for r in rings if rr[0] <= r[2] <= rr[1]]
         lo, hi = (20.0, 1e9) if any_size else self._ring_rmax_range()
         return [r for r in rings if len(r) < 4 or lo <= r[3] <= hi]
 
+    def _ring_r_bound(self):
+        """圆环最外圈半径最大可能有多少像素(只用来定 roi 的大小，宁大勿小)。"""
+        if self.cfg.get('ring_rmax_px'):
+            return float(self.cfg['ring_rmax_px'][1])
+        if self.cfg.get('ring_rmax_cal'):
+            return 1.2 * float(self.cfg['ring_rmax_cal'])
+        for k in ('ring_rmax_seen', 'ring_rmax_hint'):          # 这次放物料时认到过 / 到工位看三个环时认到过
+            if self.cfg.get(k):
+                return 1.3 * float(self.cfg[k])
+        return self._ring_rmax_range()[1]
+
+    def _ring_roi(self, shape, ex, reach):
+        """离 ex 不到 reach 像素的圆环整个都在里面的那一块画面 (x0, y0, x1, y1)。比整幅画面小不了多少就返回 None(不裁)。"""
+        if not reach or not self.cfg.get('ring_roi', True):
+            return None
+        h, w = shape[:2]
+        half = float(reach) + min(self._ring_r_bound(), 300.0) + 8.0
+        x0, x1 = max(0, int(ex[0] - half)), min(w, int(math.ceil(ex[0] + half)))
+        y0, y1 = max(0, int(ex[1] - half)), min(h, int(math.ceil(ex[1] + half)))
+        if x1 - x0 < 16 or y1 - y0 < 16 or (x1 - x0) * (y1 - y0) > 0.85 * w * h:
+            return None
+        return x0, y0, x1, y1
+
     def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
         """离 expect(默认=爪子像素)最近的那个圆环的中心像素，多帧稳健平均；看不到返回 None。
-        max_px：最近的那个也离 expect 超过这么多像素，就当没看到(不去追旁边那个圆环)。
+        max_px：最近的那个也离 expect 超过这么多像素，就当没看到(不去追旁边那个圆环)。给了它就只在 expect 附近那一块画面里找(快)；
+        对准过程中上一次刚认到过(圆环正往爪子点靠)，找的那一块再缩小到"上次的位置到爪子点"附近，没找到再用整块找一次。
         self.last_ring_rmax = 这几帧里那个圆环最外圈半径(像素)的中值。"""
         n = int(n or self.cfg['frames'])
         ex = expect or self.claw('RING')
         pts = []
         rmax = []
+        reach_full = float(max_px) if max_px else None
+        reach = reach_full
+        tr = getattr(self, '_ring_track', None)
+        if reach and tr is not None and time.monotonic() - tr[1] < 2.5:
+            reach = min(reach, 1.3 * math.hypot(tr[0][0] - ex[0], tr[0][1] - ex[1]) + 30.0)
         for fr in self._frames(n):
             if fr is not None:
-                rings = self._rings_in_frame(fr, any_size)
-                best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2) if rings else None
-                if best is not None and max_px and math.hypot(best[0] - ex[0], best[1] - ex[1]) > float(max_px):
-                    best = None
+                best = rings = None
+                for r_try in ((reach, reach_full) if reach != reach_full else (reach_full,)):
+                    rings = self._rings_in_frame(fr, any_size, self._ring_roi(fr.shape, ex, r_try))
+                    best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2) if rings else None
+                    if best is not None and max_px and math.hypot(best[0] - ex[0], best[1] - ex[1]) > float(max_px):
+                        best = None
+                    if best is not None:
+                        break
+                    reach = reach_full                      # 小的那块里没找到：这次测量剩下的帧都用整块
                 self._publish(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
                 if best is not None:
                     pts.append((best[0], best[1]))
                     if len(best) >= 4:
                         rmax.append(float(best[3]))
         self.last_ring_rmax = sorted(rmax)[len(rmax) // 2] if rmax else None
-        if len(pts) < max(2, n // 2 + 1):
+        if len(pts) < (1 if n <= 2 else max(2, n // 2 + 1)):          # 一两帧(对准时要快)：认到一帧就算
+            self._ring_track = None
             return None
-        return _robust_mean(pts, self.cfg['reject_px'])
+        p = _robust_mean(pts, self.cfg['reject_px'])
+        self._ring_track = (p, time.monotonic()) if max_px else None
+        return p
 
     def note_ring_size(self, r):
         """对准空圆环时认到的最外圈半径(像素)。没做 vclaw RING 量圆环大小时记下来(只在这次运行里有效)：
@@ -810,7 +861,7 @@ class Vision:
                 pts.append(p)
                 rr.append(float(res['radius']))
         self.last_pick_r = sorted(rr)[len(rr) // 2] if rr else None
-        if len(pts) < max(2, n // 2 + 1):
+        if len(pts) < (1 if n <= 2 else max(2, n // 2 + 1)):          # 一两帧(对准时要快)：认到一帧就算
             return None
         return _robust_mean(pts, self.cfg['reject_px'])
 

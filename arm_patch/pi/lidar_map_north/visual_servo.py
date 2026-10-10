@@ -35,7 +35,7 @@ DEFAULTS = dict(
     settle_arm_s=0.20,          # 手臂动完等多久再拍(摄像头在手臂上，要等它不抖)
     settle_ch_s=0.35,           # 底盘动完等多久
     arm_limit_deg=dict(id2=250.0, id1=12.0),    # 手臂相对开始对准时的姿态，最多再偏多少度(ID2 约 0.175mm/度：250° ≈ 伸缩 ±44mm，车离圆环远一点近一点都靠它补)
-    step_limit_deg=dict(id2=90.0, id1=4.0),     # 手臂每次最多动多少度
+    step_limit_deg=dict(id2=150.0, id1=4.0),    # 手臂每次最多动多少度(ID2 150° ≈ 伸缩 26mm：车离圆环远近差 2cm 也一次修到)
     min_step_deg=dict(id2=0.35, id1=0.35),      # 舵机比这小的一步动不了(STM32 的到位误差 ATOL=0.3°)：小于它的一步要么放大到它，要么不动
     chassis_step_max_mm=60.0,   # 底盘每次最多动多少毫米
     chassis_min_mm=6.0,         # 偏差小于这个就不动底盘(底盘只能到几毫米精度)
@@ -46,6 +46,7 @@ DEFAULTS = dict(
     probe_max_scale=6.0,
     diverge_ratio=1.4,          # 这次误差比上次大这么多倍就认为发散
     confirm=True,               # 误差够小时再测一次确认
+    confirm_skip=0.6,           # 偏差不到容差的这么多倍(明显在容差里)就不用再测一次确认了
     near_avg=1.3,               # 偏差比容差大、但在容差的这么多倍以内：先再测一次取平均再决定动不动(差一点点超出容差时不去追测量噪声)
     broyden_min_px=6.0,         # 预计移动超过这么多像素才用来在线修正 J
     broyden_gain=0.5,
@@ -527,7 +528,7 @@ class VisualServo:
                         return finish(True)                  # 两次的平均已经在容差内(相当于复测过了)
 
                 if e <= tol_mm:
-                    if do_confirm and not confirmed:
+                    if do_confirm and not confirmed and e > float(c.get('confirm_skip') or 0.0) * tol_mm:
                         confirmed = True
                         p = meas()
                         e2 = _norm(p) / scale_px_per_mm

@@ -77,6 +77,10 @@ DEFAULTS = dict(
     accept_mm=dict(RAW=4.0, RING=3.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量；RING 3.5 = 还在 2 环，放了 10 分，不放 0 分)
     place_confirm=True,                 # 放物料对准到容差以内后再拍一次确认(多花零点几秒，防止一次测量的噪声把偏了的当成对准了)
     align_max_iter=6,                   # 粗加工区/暂存区对准(放、码垛、取回)最多修正几次(车停得很偏、第一次测 J 时要多动几下；平时 1~2 次就到容差)
+    zone_frames=2,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
+    zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
+    ring_precorrect=True,               # 同一个工位里对准过一个环以后，去下一个环时手臂伸缩直接伸到同样的远近(不先缩回观察姿态再伸出来，省一次大的修正)
+    survey_frames=3,                    # 到工位看三个圆环时拍几帧
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
@@ -101,6 +105,7 @@ DEFAULTS = dict(
     learn_pick=False,                   # True = 还没量过 claw_px.PICK 时，放下第一个物料后回去再拍一张量一次(要多花几秒)；默认不量，取回按圆环对准
     stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
+    return_bias=True,                   # 回到记下的姿态时，按前几次"转回来总是多转/少转几度"提前补上(省掉"再转一次")
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
@@ -182,6 +187,9 @@ class MissionHooks:
         self.raw_cycle = {}                 # 最近一次看到原料盘停下的时刻 't_stop'：按"停多久+转多久"的周期推算以后每次停下的时刻
         self.ring_f = {}                    # (区, 圆环号) -> 这个环正对爪子时底盘的前后位移(毫米)，到工位时用摄像头看出来的(_survey)
         self.ring_gate_px = None            # 对准时只认离爪子点这么多像素以内的圆环(不去追旁边那个)
+        self._ring_ready = False            # 手臂现在就在这个工位的圆环上方、爪子张开(刚放完/刚看完圆环)：去下一个环不用整套 OBS
+        self._zone_d2 = []                  # 这个工位里每次对准好时 (底盘前后位移, ID2 比 A2P 多转的度数)：车离圆环那一排的远近
+        self._ret_bias = [0.0, 0.0]         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -326,6 +334,7 @@ class MissionHooks:
     def _recover(self, why):
         """单个物料出错后：尽量把手臂收好。收不好就停下整个路线(带着伸出的手臂乱走不安全)。"""
         self.log(f'    ★ {why}；收臂')
+        self._ring_ready = False
         try:
             self.arm.stow()
         except ArmAbort as ex:
@@ -869,7 +878,7 @@ class MissionHooks:
         if dS or dF:
             self.log(f'    底盘回到放下时的位置：前进 {dF:+d}mm、横移 {dS:+d}mm')
             self.act.chassis_move(dS, dF)
-        self._return_to_pose(rec['a1'], rec['a2'])
+        self._return_to_pose(rec['a1'], rec['a2'], from_tray=not self._ring_ready)   # 刚把上一个夹回转盘：从转盘那边转回来
         zobr = float(self.arm.params().get('ZOBRNG', 0.0))
         if zobr > 0.05:
             self.arm.lift(zobr)                              # 摄像头标定比例时用的高度
@@ -903,7 +912,7 @@ class MissionHooks:
             recorded = self._goto_recorded(zone, item)
             if not recorded:
                 self._goto_ring(zone, item.ring)
-                self.arm.obs('RING', open_claw=True)
+                self._obs_ring()
             res, how = self._align_covered(item.color, 'PICK', f'取回{item.color_short}', confirm=False)
             if res is None:
                 if not recorded:
@@ -925,6 +934,7 @@ class MissionHooks:
             if self.nogo:
                 self.log('    (nogo：到了取回的位置，不夹)')
                 return True
+            self._ring_ready = False                             # 夹起来放进转盘，手臂停在转盘上方
             self.arm.pick_here(item.slot)
         except ArmAbort:
             raise
@@ -982,7 +992,7 @@ class MissionHooks:
         held = False                                             # 爪子里夹着从转盘取出来的物料
         try:
             self._goto_ring(zone, ring)
-            self.arm.obs('RING', open_claw=True)                 # 空爪到圆环上方：圆环不会被挡住
+            self._obs_ring()                                     # 空爪到圆环上方：圆环不会被挡住
             if stack:                                            # 下面那层物料盖住了白心：先认它的顶面对准
                 res, how = self._align_covered(item.color, key, label, confirm=bool(cfg.get('place_confirm', False)))
             else:
@@ -1012,15 +1022,20 @@ class MissionHooks:
                     raise ArmError('读不到对准时的手臂角度(A? 没回复)，不去取物料')
                 d = self.act.disp
                 self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2)
+                a2p = (self.arm.params() or {}).get('A2P')
+                if a2p is not None:
+                    self._zone_d2.append((float(d['F']), float(a2) - float(a2p)))   # 车离圆环那一排的远近：下一个环直接伸到这么远
                 if self.nogo:
                     self.log('    (nogo：对准好了，不取物料、不放)')
                     return True
+                self._ring_ready = False
                 self.arm.take(item.slot)                         # 去转盘取物料
                 held = True
-                self._return_to_pose(a1, a2)                     # 回到记下的角度
+                self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
                 self._drop(stack)                                # 下降、松手、抬起
                 held = False
                 ok = True
+                self._ring_ready = True                          # 爪子张着停在这个环上方：去下一个环不用整套 OBS
         except ArmAbort:
             raise
         except (ArmError, VisionError) as ex:
@@ -1064,6 +1079,8 @@ class MissionHooks:
         没有要放的物料、或者时间到了，就不看(省时间)。"""
         self.ring_f = {}
         self.ring_gate_px = None
+        self._ring_ready = False
+        self._zone_d2 = []
         try:
             self.arm.params(refresh=True)
         except ArmAbort as ex:
@@ -1100,7 +1117,7 @@ class MissionHooks:
         self.act.chassis_move(0, step)
         try:
             self.sleep(0.3)
-            rings1 = self.vision.ring_list()
+            rings1 = self.vision.ring_list(n=self.cfg.get('survey_frames') or None)
         finally:
             self.act.chassis_move(0, -step)
         if not rings1:
@@ -1128,7 +1145,8 @@ class MissionHooks:
         import numpy as np
         v, cfg = self.vision, self.cfg
         self.arm.obs('RING', open_claw=True)
-        rings = v.ring_list()
+        self._ring_ready = True
+        rings = v.ring_list(n=cfg.get('survey_frames') or None)
         if not rings:
             self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
             return
@@ -1185,6 +1203,9 @@ class MissionHooks:
             sp_px = jf_px()
         h_img, w_img = self._frame_size()
         rmax = float(np.median([r[2] for r in rings]))
+        vc = getattr(v, 'cfg', None)
+        if isinstance(vc, dict):
+            vc['ring_rmax_hint'] = rmax                          # 圆环在画面里多大：对准时只在爪子附近那一块画面里找要用
 
         def inside(q):
             return rmax <= q[0] <= w_img - rmax and rmax <= q[1] <= h_img - rmax
@@ -1281,9 +1302,10 @@ class MissionHooks:
     def _ring_measure(self):
         """对准圆环用的测量：只认离爪子点 ring_gate_px 以内的圆环(看清过三个环以后才有)，不去追旁边那个。"""
         gate = self.ring_gate_px
+        n = self.cfg.get('zone_frames') or None
         if gate:
-            return lambda: self.vision.ring_error(max_px=gate)
-        return self.vision.ring_error
+            return lambda: self.vision.ring_error(n=n, max_px=gate)
+        return lambda: self.vision.ring_error(n=n)
 
     def _zone_servo_kw(self):
         """工位里对准的底盘限制：前后挪最多 ring_fix_max_mm；横移只在手臂伸缩够不着时用，离停车点累计不超过 ring_strafe_max_mm。"""
@@ -1301,6 +1323,8 @@ class MissionHooks:
             kw['chassis_fix_max_mm'] = float(cfg['ring_fix_max_mm'])
         if cfg.get('align_max_iter'):
             kw['max_iter'] = int(cfg['align_max_iter'])
+        if cfg.get('zone_gain'):
+            kw['gain_arm'] = float(cfg['zone_gain'])
         return kw
 
     def _drop(self, stack):
@@ -1327,11 +1351,12 @@ class MissionHooks:
         返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
         v, cfg = self.vision, self.cfg
         tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
+        n = cfg.get('zone_frames') or None
         if int(color) in PICK_COLORS and hasattr(v, 'has_pick') and v.has_pick():
-            e = v.pick_error(color)
+            e = v.pick_error(color, n=n)
             if e is not None:
                 self._seed_pick_jac()
-                res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color)), v.scale('PICK'), tol, allow_chassis=True,
+                res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color, n=n)), v.scale('PICK'), tol, allow_chassis=True,
                                      label=label, bounds=v.bounds('PICK'), confirm=confirm, **self._zone_servo_kw())
                 if res.ok or res.err_mm <= acc:
                     return res, '物料'
@@ -1435,14 +1460,18 @@ class MissionHooks:
         except Exception:
             return False
 
-    def _return_to_pose(self, a1, a2):
-        """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。"""
+    def _return_to_pose(self, a1, a2, from_tray=False):
+        """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。
+        from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。"""
         if a1 is None or a2 is None:
             raise ArmError('读不到对准时的手臂角度(A? 没回复)，不知道回哪里')
         pre = self.cfg.get('return_preload_deg') or [0.0, 0.0]
+        learn = bool(self.cfg.get('return_bias', True)) and from_tray
+        bias = self._ret_bias if learn else [0.0, 0.0]
+        c1, c2 = a1 - bias[0], a2 - bias[1]                      # 前几次转回来总是多转/少转多少，这次提前补上
         if abs(pre[0]) > 1e-6 or abs(pre[1]) > 1e-6:
-            self.arm.ap(a1 + pre[0], a2 + pre[1])                # 先从反方向靠近，再回来，消除齿轮间隙
-        self.arm.ap(a1, a2)
+            self.arm.ap(c1 + pre[0], c2 + pre[1])                # 先从反方向靠近，再回来，消除齿轮间隙
+        self.arm.ap(c1, c2)
         tol = float(self.cfg.get('return_tol_deg') or 0.4)
         try:
             tol = max(tol, float((self.arm.params() or {}).get('ATOL', 0.0)) + 0.05)   # 比 ATOL 还小的差舵机不会再动
@@ -1459,6 +1488,10 @@ class MissionHooks:
             except ArmError as ex:                               # 物料已经在爪子里：读不到角度也照常放，不能带着物料收臂
                 self.log(f'    回读角度失败({ex})，按已经回到位继续')
                 return
+            if k == 0 and learn and b1 is not None and b2 is not None:
+                # 只学第一下(从转盘那边大幅转回来)：后面"再转一次"是小幅修正，走法不一样
+                self._ret_bias = [max(-2.5, min(2.5, self._ret_bias[0] + 0.6 * (b1 - a1))),
+                                  max(-2.5, min(2.5, self._ret_bias[1] + 0.6 * (b2 - a2)))]
             if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= tol):
                 return
             if k == 2:
@@ -1515,6 +1548,42 @@ class MissionHooks:
         self.log(f'    底盘挪到环{ring}：前进 {dF:+d}mm' + (f'、横移 {dS:+d}mm' if dS else ''))
         self.act.chassis_move(dS, dF)
 
+    def _obs_ring(self):
+        """空爪摆到圆环上方的观察姿态。这个工位里已经对准过圆环、手臂还张着爪停在圆环上方(刚放完/刚看完三个环)：
+        ID1 回到观察角度 A1P，ID2(伸缩)直接到前面对准时的远近，不先缩回 A2P 再伸出来——省一次大的伸缩修正。
+        其他情况(刚从转盘回来、收过臂…)照常用 STM32 的 OBS。"""
+        P = self.arm.params() or {}
+        d2 = self._predict_d2() if self.cfg.get('ring_precorrect', True) else None
+        if d2 is None or not self._ring_ready or not all(k in P for k in ('A1P', 'A2P', 'ZHI', 'ZOBRNG')):
+            self.arm.obs('RING', open_claw=True)
+            self._ring_ready = True
+            return
+        a2 = min(-503.5, max(-1220.0, float(P['A2P']) + d2))   # STM32 里 A2 的范围
+        if abs(d2) >= 3.0:
+            self.log(f'    手臂伸缩直接到前面对准时的远近(ID2 {d2:+.0f}°)')
+        self.arm.lift(float(P['ZHI']))                       # 和 OBS 一样：先在搬运高度转过去(已经在这个高度就不动)
+        self.arm.ap(float(P['A1P']), a2)
+        self.arm.lift(float(P['ZOBRNG']))
+
+    def _predict_d2(self):
+        """这个工位里前面对准好时，ID2 比 A2P 多转了多少度(= 车离圆环那一排远了/近了多少)；按现在底盘的前后位置推一个。没对准过返回 None。
+        对准过两个隔得够远的环：车身和那一排不平行时远近随位置变，按直线推(不往外推太远)。"""
+        rec = self._zone_d2
+        if not rec:
+            return None
+        if len(rec) >= 2:
+            fs = [float(r[0]) for r in rec]
+            ds = [float(r[1]) for r in rec]
+            if max(fs) - min(fs) >= 60.0:
+                fb, db = sum(fs) / len(fs), sum(ds) / len(ds)
+                var = sum((f - fb) ** 2 for f in fs)
+                b = sum((f - fb) * (d - db) for f, d in zip(fs, ds)) / var
+                b = max(-0.6, min(0.6, b))                       # 每毫米最多 0.6°
+                F = float(self.act.disp['F']) if self.act is not None else fb
+                pad = 0.6 * abs(b) * 150.0 + 10.0
+                return float(max(min(ds) - pad, min(max(ds) + pad, db + b * (F - fb))))
+        return float(rec[-1][1])
+
     def _learn_from(self, zone, ring):
         d = self.act.disp
         self.learn = {'S': d['S'], 'F': d['F'] - self._ring_nominal(zone, ring)}
@@ -1543,6 +1612,7 @@ class MissionHooks:
 
     def _stow_quiet(self):
         """每个工位做完收臂(开车前手臂要收好)。"""
+        self._ring_ready = False
         try:
             self.arm.stow()
         except ArmAbort:
