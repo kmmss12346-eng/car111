@@ -590,10 +590,11 @@ class SimVision:
         while True:
             t_cap, p = w.t, None
             moved = None
+            # color_id=None：只看画面动没动
             if t_prev is not None:
                 moved = 0.03 if (w.plate_phase(t_cap)[1] or w.plate_phase(t_prev)[1]) else abs(float(w.rng.normal(0, 0.0005)))
             t_prev = t_cap
-            items = [it for it in w.raw_items if it['color'] == int(color_id)] if w.zone == 'RAW' else []
+            items = [it for it in w.raw_items if it['color'] == int(color_id)] if (w.zone == 'RAW' and color_id is not None) else []
             if items:
                 c = w.claw()
                 it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
@@ -602,6 +603,23 @@ class SimVision:
                     p = (self.TRUE_CLAW[0] + float(e[0]), self.TRUE_CLAW[1] + float(e[1]))
             w.advance(FRAME_S)
             yield t_cap, p, moved
+
+    def material_errors(self, colors):
+        """同一帧里认这几个颜色(和真的 Vision.material_errors 一样)。"""
+        w = self.w
+        out = {}
+        c = w.claw()
+        for col in colors:
+            items = [it for it in w.raw_items if it['color'] == int(col)]
+            q = None
+            if items:
+                it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
+                e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
+                if abs(e[0]) <= 300 and abs(e[1]) <= 220:
+                    q = self._off('RAW', (float(e[0]), float(e[1])))
+            out[int(col)] = q
+        w.advance(0.05 + 0.07 * len(colors))
+        return out
 
     def wait_still(self, color_id, timeout_s=10.0, **kw):
         """和真的 Vision.wait_still 一样：要在画面里检测到才算(不在画面里 = 看不到)。"""

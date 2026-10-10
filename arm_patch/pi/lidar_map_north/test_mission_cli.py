@@ -203,13 +203,32 @@ class CliTests(unittest.TestCase):
     def test_time_up_grabs_with_current_error(self):
         """没修到容差以内、但停的时间到了：只要偏差不超过 raw_grab_max_mm 就按现在的位置下爪，不放过这一次。"""
         self._plate_world()
-        self.h.cfg['tol_mm'] = dict(self.h.cfg['tol_mm'], RAW=0.01)      # 永远修不到
+        self.h.cfg['raw_tol_mm'] = 0.01                                     # 永远修不到
         self.h.cfg['raw_max_iter'] = 1
         self.run_cli('mtest', 'mtest RAW 1')
         text = '\n'.join(self.lines)
         self.assertIn('按现在的位置夹', text)
         self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
         self.assertEqual(self.w.air, 0, text)
+
+    def test_any_order_grabs_whatever_stops_under_the_claw(self):
+        """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
+        self._plate_world(seed=9)
+        t0 = self.w.t
+        self.run_cli('mtest', 'mtest RAW 1 any')
+        text = '\n'.join(self.lines)
+        t_any = self.w.t - t0
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(self.w.air, 0, text)
+        self.assertEqual(self.w.tray, {1: 1, 2: 5, 3: 6}, text)            # 每个颜色在它自己的槽里
+        self.assertIn('这次停在爪子附近的是', text)
+        self.assertIn('不按顺序', text)
+        self.assertFalse(self.h.raw_any_once)                              # 只这一次
+        self._plate_world(seed=9)                                          # 同一个世界按顺序抓：要等更久
+        t0 = self.w.t
+        self.run_cli('mtest', 'mtest RAW 1')
+        self.assertEqual(self.h.stats.grab_ok, 3, '\n'.join(self.lines))
+        self.assertLess(t_any, self.w.t - t0)
 
     def test_stop_phase_from_measured_cycle(self):
         """量到过停多久、转多久：一开始就看到它停着时，按周期推算已经停了几秒(知道还剩多久)。"""

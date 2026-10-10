@@ -58,6 +58,9 @@ DEFAULTS = dict(
     raw_max_iter=3,                     # 原料区对准最多修正几次(果断：差不多就下爪)
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
     raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
+    raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
+    raw_any_order=False,                # True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
+                                        #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
@@ -412,6 +415,9 @@ class MissionHooks:
             raise
         except ArmError:
             pass
+        if (self.cfg.get('raw_any_order') or getattr(self, 'raw_any_once', False)) and hasattr(self.vision, 'material_stream'):
+            self._raw_any(self.plan.items(batch))
+            return
         for item in self.plan.items(batch):
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
@@ -436,6 +442,54 @@ class MissionHooks:
             if ok:
                 self.in_tray[item.slot] = item
             self._show_stats()
+        self._stow_quiet()
+
+    def _raw_any(self, items):
+        """不按任务码顺序抓：每次原料盘停下，要抓的几个颜色里哪个停在爪子附近、够得着，就先夹哪个，放进它自己的槽。"""
+        cfg = self.cfg
+        todo = []
+        for item in items:
+            left = self.in_tray.get(item.slot)
+            if left is not None and not same_item(left, item):
+                self.log(f'    ★ 转盘 {item.slot} 号槽里还有没放出去的 {left.color_name}，{item.color_name} 不夹')
+                self.stats.grab(False)
+                continue
+            todo.append(item)
+        self.log('  原料区：不按任务码顺序，哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)：'
+                 + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
+        md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
+        if md is not None and hasattr(md, 'need_vmask') and any(md.need_vmask(it.color) for it in todo) and not self._warned_vmask:
+            self._warned_vmask = True
+            self.log('    ★ 没标定爪子区域(claw_mask.png)：蓝色/浅蓝物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
+        while todo:
+            self._check_abort()
+            if self.disabled:
+                break
+            if self.time_left() < 0:
+                self.log('    ★ 时间到，不再抓取')
+                break
+            self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
+            self._recenter(min_mm=20.0)
+            got = None
+            try:
+                self.arm.obs('RAW', open_claw=True)
+                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + float(cfg['time_limit_s']))
+                got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
+            except (ArmError, VisionError) as ex:
+                if isinstance(ex, ArmAbort):
+                    raise
+                self._recover(f'抓取出错：{ex}')
+            if got is None:
+                break
+            it = got[2]
+            self.stats.grab(True)
+            self.in_tray[it.slot] = it
+            todo.remove(it)
+            self._show_stats()
+        for it in todo:
+            self.log(f'    ★ {it.color_name} 没夹到')
+            self.stats.grab(False)
+        self._show_stats()
         self._stow_quiet()
 
     def _grab_item(self, item):
@@ -482,7 +536,7 @@ class MissionHooks:
     def _raw_stream(self, color):
         """一帧一帧认物料的数据流(Vision.material_stream)；没有这个功能(旧的视觉模块)返回 None。"""
         f = getattr(self.vision, 'material_stream', None)
-        return f(int(color)) if f is not None else None
+        return f(None if color is None else int(color)) if f is not None else None
 
     def _raw_close_delay(self, mode):
         """从发出下爪指令到夹爪合上要多久(秒)：升降从 ZOBRAW 降到 ZGRAB(和 STM32 算等待时间的办法一样，含 LFMRG) + 夹爪合上。"""
@@ -518,12 +572,21 @@ class MissionHooks:
         return t - el
 
     def _raw_stop_grab(self, color, slot, mode, t_end, label):
-        """原料盘转一会儿、停一会儿(大约转 3 秒停 6 秒，不一定准)：
+        """只抓这一个颜色(按任务码顺序时、gtest)。返回是否成功。"""
+        return self._raw_stop_pick([(int(color), slot, None)], mode, t_end, label) is not None
+
+    def _raw_stop_pick(self, cands, mode, t_end, label):
+        """cands = [(颜色, 槽位, 物料), ...]。只有一个：每帧都认这个颜色(跟踪最准)；
+        好几个(不按顺序抓)：每帧只看画面动没动(快)，停下以后把这几个颜色各认一次，哪个在爪子附近、够得着就对准夹哪个。
+        原料盘转一会儿、停一会儿(大约转 3 秒停 6 秒，不一定准)：
           - 从画面判断盘在转还是停着(整个画面变了多少 + 物料位置变没变)，每次停、转多久都实测记下来
           - 要抓的物料停在爪子附近、手臂够得着：马上对准(只用存好的 J，最多修正几次)，下爪前再拍一帧确认没动、位置准，马上下爪
           - 这一次停下剩的时间不够、停在够不着的地方、对准中途转起来了：回到 OBS RAW 姿态，等下一次停
-        mode：'grab' = GRAB slot H(夹进车上转盘)；'lift' = gtest：下降、夹紧、抬起；'nogo' = 只对准不夹。返回是否成功。"""
+        mode：'grab' = GRAB slot H(夹进车上转盘)；'lift' = gtest：下降、夹紧、抬起；'nogo' = 只对准不夹。
+        返回夹到(nogo：对准到)的那一项，没有返回 None。"""
         cfg, v = self.cfg, self.vision
+        single = len(cands) == 1
+        color = cands[0][0] if single else None
         tag = f'[{label}]'
         J = self.store.get('RAW', 'arm') if self.store is not None else None
         static_s = float(cfg.get('raw_static_s', 9.0))
@@ -547,19 +610,23 @@ class MissionHooks:
         stop_seen = False                                     # 这一次停下是亲眼看到的(不是推算的)
         hist = []
         said = set()
-        self.log(f'    盯着{label[1:] if label.startswith("抓") else ""}物料：原料盘一停、物料在爪子附近就马上对准下爪'
+        self.log(f'    盯着{label[1:] if (single and label.startswith("抓")) else ""}物料：原料盘一停、物料在爪子附近就马上对准下爪'
                  f'(下爪到夹住约 {T:.2f} 秒；每次停先按 {self._raw_stop_len():.1f} 秒算，看到实际的就按实际的)')
         keep_s = float(cfg.get('raw_keepalive_s', 12.0) or 0.0)
         t_arm = self.now()                                    # 手臂最后一次动的时刻
         stream = self._raw_stream(color)
+        fresh = 0                                             # 这个画面流(手臂上次动完以后)看了几帧
         try:
             while True:
                 t, p, moved = next(stream)
+                fresh += 1
+                if not single:
+                    p = None                                  # 好几个颜色：只看画面动没动
                 self._check_abort()
                 now = self.now()
                 if now > t_end:
                     self.log(f'  {tag} ★ 等了 {float(cfg.get("raw_track_s", 30.0)):.0f} 秒没等到它停在爪子附近，跳过')
-                    return False
+                    return None
                 if (keep_s > 0 and now - t_arm > keep_s and home[0] is not None and home[1] is not None
                         and not (state == 'stop' and p is not None)):
                     self.log(f'  {tag} 手臂 {now - t_arm:.0f} 秒没动了：轻轻摆一下(规则：机器人停止运行 15 秒、等转盘时 23 秒，本轮结束)')
@@ -569,7 +636,7 @@ class MissionHooks:
                     t_arm = self.now()
                     stream.close()
                     stream = self._raw_stream(color)          # 手臂动过：重新比画面
-                    hist, cnt = [], 0
+                    hist, cnt, fresh = [], 0, 0
                     continue
                 if p is not None:
                     hist = ([q for q in hist if t - q[0] <= 0.8] + [(t, p)])[-6:]
@@ -615,11 +682,13 @@ class MissionHooks:
                         elif want == 'move':
                             t_still = None
                         state, cnt = want, 0
-                if state != 'stop' or len(hist) < 2 or t - hist[-1][0] > 0.3:
+                if single and (state != 'stop' or len(hist) < 2 or t - hist[-1][0] > 0.3):
                     if not hist and state == 'stop' and ('none', stop_id) not in said:
                         said.add(('none', stop_id))
                         self.log(f'  {tag} 停下了，画面里没有这个颜色的物料：等它转过来')
                     continue
+                if not single and (state != 'stop' or fresh < 3):
+                    continue                                  # 手臂刚动过：先看两三帧确认转盘真的还停着
                 static = t_still is not None and now - t_still >= static_s     # 一直没转过：转盘是关着的
                 if tries >= (5 if static else 2):
                     continue                                  # 这一次停下已经试了两次：等下一次
@@ -632,7 +701,32 @@ class MissionHooks:
                         self.log(f'  {tag} 这一次停下只剩 {max(0.0, left):.1f} 秒，来不及：等下一次停')
                     tries = 2
                     continue
-                e = np.array(hist[-1][1], float) - np.array(v.claw('RAW'), float)
+                cand, lab = cands[0], label
+                if single:
+                    e = np.array(hist[-1][1], float) - np.array(v.claw('RAW'), float)
+                else:
+                    # 停下了：要抓的几个颜色各认一次(同一帧)，挑离爪子最近、手臂够得着的
+                    errs = v.material_errors([c[0] for c in cands]) if hasattr(v, 'material_errors') else \
+                        {c[0]: v.material_error(c[0], n=1) for c in cands}
+                    seen = []
+                    for c in cands:
+                        q = errs.get(c[0])
+                        if q is not None:
+                            d = math.hypot(q[0], q[1]) / v.scale('RAW')
+                            far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                            seen.append((d, far_c, c, np.array(q, float)))
+                    near = [x for x in seen if not x[1]]
+                    if not near:
+                        if ('none', stop_id) not in said:
+                            said.add(('none', stop_id))
+                            what = '、'.join(f'{x[2][2].color_name if x[2][2] is not None else x[2][0]} {x[0]:.0f}mm' for x in seen) or '一个也没看到'
+                            self.log(f'  {tag} 这次停下，爪子附近没有要夹的颜色({what})：等下一次停')
+                        tries = 2
+                        continue
+                    d, _f, cand, e = min(near, key=lambda x: x[0])
+                    if cand[2] is not None:
+                        lab = f'抓{cand[2].color_short}'
+                        self.log(f'  {tag} 这次停在爪子附近的是{cand[2].color_name}：先夹它(放 {cand[1]} 号槽)')
                 far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
                 if far:
                     if ('far', stop_id) not in said:
@@ -655,15 +749,15 @@ class MissionHooks:
                     deadline = now + max(0.8, (t_still if t_still is not None else now) + stop_len - now - T - 0.15)
                 self.log(f'  {tag} 停着，离爪子点 {np.linalg.norm(e) / v.scale("RAW"):.1f}mm：马上对准'
                          + ('' if left is None else f'(这次停下大约还剩 {left:.1f} 秒)'))
-                if self._raw_align_go(color, slot, mode, e, deadline, label, probe=probe):
-                    return True
+                if self._raw_align_go(cand[0], cand[1], mode, e, deadline, lab, probe=probe):
+                    return cand
                 J = self.store.get('RAW', 'arm') if self.store is not None else None
                 if home[0] is not None and home[1] is not None:
                     self.arm.ap(home[0], home[1])             # 回到 OBS RAW 姿态等
                 t_arm = self.now()
                 stream.close()
-                stream = self._raw_stream(color)              # 手臂动过：重新比画面(不然会把手臂动当成转盘在转)
-                hist, cnt = [], 0
+                stream = self._raw_stream(color)              # 手臂动过：重新比画面(不然会把手臂动当成转盘在转)；好几个颜色时 color=None 只看画面
+                hist, cnt, fresh = [], 0, 0
         finally:
             stream.close()
 
@@ -687,7 +781,7 @@ class MissionHooks:
         probe=True：还没有 J、原料盘一直停着：按普通的闭环对准(先小幅动几下测 J，存下来)。"""
         cfg, v = self.cfg, self.vision
         n = int(cfg.get('raw_frames', 1))
-        tol = float(cfg['tol_mm']['RAW'])
+        tol = float(cfg.get('raw_tol_mm') or cfg['tol_mm']['RAW'])
         grab_max = float(cfg.get('raw_grab_max_mm', 5.0))
         budget = deadline - self.now()
         kw = dict(fixed_j=True, max_iter=int(cfg.get('raw_max_iter', 3)), gain_arm=float(cfg.get('raw_gain', 1.0)), near_avg=0.0,

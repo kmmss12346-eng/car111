@@ -528,8 +528,8 @@ class Vision:
                 yield t, None, None
                 continue
             t_last = t
-            p = det(fr, color_id)
-            self._publish(fr, 'RAW', p, color_id=color_id)
+            p = det(fr, color_id) if color_id is not None else None        # None：只看画面动没动(不按顺序抓时，停下以后再认颜色)
+            self._publish(fr, 'RAW', p, color_id=color_id if color_id is not None else 'any')
             g = cv2.GaussianBlur(cv2.resize(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (160, 120), interpolation=cv2.INTER_AREA), (3, 3), 0)
             moved = None
             if g_last is not None and g_last.shape == g.shape:
@@ -542,6 +542,17 @@ class Vision:
                     moved = float(diff.mean())
             g_last = g
             yield t, p, moved
+
+    def material_errors(self, colors):
+        """同一帧里认这几个颜色：{颜色: 偏差像素 (物料 - 爪子) 或 None}。不按顺序抓时，原料盘停下以后看哪个在爪子附近。"""
+        det = self._material_det()
+        fr = self._frame()
+        out = {}
+        cu, cv_ = self.claw('RAW')
+        for c in colors:
+            p = det(fr, int(c)) if fr is not None else None
+            out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        return out
 
     def material_error(self, color_id, n=None):
         """物料偏差像素 = 物料 - 爪子(RAW)。看不到返回 None。"""
@@ -872,7 +883,7 @@ class Vision:
             if target is not None and res is not None:
                 cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
                 info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
-            what = f'MATERIAL {color_id}'
+            what = 'WATCHING PLATE' if color_id == 'any' else f'MATERIAL {color_id}'
             if kind == 'PICK':
                 what += ' on ring' + ('' if self.has_pick() else ' (PICK point not learned)')
         if target is not None:

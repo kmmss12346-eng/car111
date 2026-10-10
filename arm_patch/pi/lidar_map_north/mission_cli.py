@@ -392,7 +392,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
     if k == 'mtest':
         if len(parts) < 2:
-            raise ValueError('格式：mtest QR / mtest RAW 1 [force] / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
+            raise ValueError('格式：mtest QR / mtest RAW 1 [force] [any] / mtest ROUGH 1 [force] [nogo] [rev] / mtest TEMP 1 [force] [nogo] [rev] / mtest START / mtest reset')
         what = parts[1].upper()
         if what == 'RESET':
             release()                                   # 关掉摄像头(后台线程)再丢掉记录，不然摄像头一直被占着
@@ -402,10 +402,10 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             raise ValueError('mtest 后面是 QR / RAW / ROUGH / TEMP / START / reset')
         batch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         opts = {p.lower() for p in parts[2:]}
-        force, nogo, rev = 'force' in opts, 'nogo' in opts, 'rev' in opts
-        bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in ('force', 'nogo', 'rev')]
+        force, nogo, rev, anyo = 'force' in opts, 'nogo' in opts, 'rev' in opts, 'any' in opts
+        bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in ('force', 'nogo', 'rev', 'any')]
         if bad:
-            raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev')
+            raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev、any(原料区不按顺序抓)')
 
         def go():
             h._ensure(link)
@@ -415,6 +415,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             if what == 'RAW':
                 if h.plan is None:
                     raise ValueError('还没有任务码：先 qr 或者 mcode 143+213+413+321')
+                h._any_next = anyo
                 _raw_preflight(h, batch, force, log)    # 转盘里记着有物料又没加 force：在这里停下，手臂不动
                 if h.act is not None:
                     h.act.reset_disp()                  # 车是手放到原料区的：底盘位移从 0 算(不会按上一个工位剩下的位移开回去)
@@ -438,10 +439,11 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     for it in h.plan.items(1):
                         h.on_ring.setdefault(('TEMP', it.ring), []).append(it)
                     log('  (force：假定暂存区已经平放了第一批)')
+            h.raw_any_once = anyo and what == 'RAW'
             try:
                 h.run_role(what, batch)
             finally:
-                h.nogo, h.ring_rev = False, False
+                h.nogo, h.ring_rev, h.raw_any_once = False, False, False
             log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
             if what in ('ROUGH', 'TEMP'):
                 tray = '  '.join(f'{s}号槽={it.color_name}' for s, it in sorted(h.in_tray.items())) or '空'
@@ -540,9 +542,12 @@ def _raw_preflight(h, batch, force, log):
     for s in full:
         h.in_tray.pop(s, None)
     mode = str(h.cfg.get('raw_chassis') or 'off').upper()
-    log(f'== 原料区 第{batch}批：按这个顺序抓，放进车上转盘 ==')
+    anyo = bool(h.cfg.get('raw_any_order')) or bool(getattr(h, '_any_next', False))
+    log(f'== 原料区 第{batch}批：' + ('不按顺序，哪个先停在爪子附近就先夹哪个' if anyo else '按这个顺序抓') + '，放进车上转盘 ==')
     for it in items:
         log(f'   {it.color_name} -> {it.slot}号槽')
+    if anyo:
+        log('   注意：规则是按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放到圆环上的分不受影响)')
     if full:
         log('   (force：车上转盘当作已经拿空了)')
     log('   原料盘转一会儿停一会儿：物料一停下、在爪子附近，就马上对准下爪；这次停的时间不够或者停在够不着的地方，就等下一次停'
