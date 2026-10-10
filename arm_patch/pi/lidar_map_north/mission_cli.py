@@ -6,7 +6,7 @@ arm <指令>                 直接给 STM32 发一条机械臂指令并打印�
                              arm AD 1 0.5         ID1 再转 0.5 度
                              arm GET              看全部参数(含机械臂的)
 qr                         读 STM32 里存的任务码
-mcode <任务码>             手动设置任务码(不扫码也能测)，例如：mcode 156+123+516+231
+mcode <任务码>             手动设置任务码(不扫码也能测)，例如：mcode 156+123+516+231；也可以直接输入 156+123+516+231
 vmask                      标定爪子在画面里占的区域(存 claw_mask.png)：手臂在原料盘上方、爪子张开、爪子附近没有物料时用
 vclaw RAW <颜色号>         实测"爪子夹物料时，物料在画面里的位置"(claw_px.RAW，存 vision_cal.json)：
                              先 arm OBS RAW O，把一个物料放在爪子正下方，再输入 vclaw RAW 1(颜色号)；
@@ -331,7 +331,18 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
     if k == 'qr':
         def go():
             h._ensure_arm_only(link)
-            log(f'STM32 里的任务码：{h.arm.qr() or "没有"}')
+            code = h.arm.qr()
+            if not code:
+                log('STM32 里的任务码：没有(还没扫到码)。把任务码纸放到扫码头前面扫一下再输入 qr；'
+                    '不扫码也行：直接输入任务码，例如 652+312+526+231(和 mcode 652+312+526+231 一样)')
+                return
+            log(f'STM32 里的任务码：{code}')
+            try:
+                h.plan = parse_code(code)
+            except TaskError as ex:
+                log(f'  这个码看不懂：{ex}')
+                return
+            log(f'任务码已设置：{h.plan.code}  {h.plan.describe()}')
         return _run_async(state, log, go)
 
     if k == 'mcode':

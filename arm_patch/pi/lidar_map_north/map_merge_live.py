@@ -5,7 +5,7 @@
 import os
 for key in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):
     os.environ[key]='1'
-import argparse,copy,json,math,queue,threading,time
+import argparse,copy,json,math,queue,re,threading,time
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -648,6 +648,8 @@ def main():
         import unicodedata
         line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
         parts=line.strip().split();k=parts[0].lower() if parts else 'scan'
+        if len(parts)==1 and re.fullmatch(r'\d{3}(\+\d{3}){3}',parts[0]):
+            parts=['mcode',parts[0]];k='mcode'      # 直接输入任务码(例如 652+312+526+231) = mcode 任务码
         # ---- 行驶/比赛线程让界面线程做的事
         if k.startswith('__'):
             try:
