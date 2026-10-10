@@ -1052,12 +1052,12 @@ class _Drive:
         frac = float(g('approach_guard_frac_s', 0.03)) if cmd == 'S' else float(g('approach_guard_frac', 0.02))   # 麦轮横移误差大一些
         guard = frac * abs(want) + float(g('approach_guard_mm', 10))
         cut, label = 0.0, ''
-        if c1 < c0 and c1 < guard:
+        if c1 < c0 - 1.0 and c1 < guard:                  # 只管"越走越近"的(沿着边线/区域平行走的不管)
             cut = guard - max(c1, 0.0) if c1 >= 0 else guard
             label = f'(终点离{what}只有 {c1:.0f}mm：先少走 {cut:.0f}mm，到停车点再慢速修)'
         if self.final_leg:
             e0, e1 = edge_clearance(p, model), edge_clearance(end, model)
-            if e1 < e0 and e1 < self.home_short + 10 and self.home_short > cut:
+            if e1 < e0 - 1.0 and e1 < self.home_short + 10 and self.home_short > cut:
                 cut = self.home_short
                 label = f'(进启停区先少走 {self.home_short:.0f}mm，到了再慢速修进去)'
         return min(cut, abs(want)), label

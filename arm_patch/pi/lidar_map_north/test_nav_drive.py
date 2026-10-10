@@ -396,6 +396,13 @@ class GuardTests(unittest.TestCase):
                        motion=None, cfg=dict(CFG), start=dict(est=(2250.0, 400.0, 90.0), ref=(2250.0, 400.0, 90.0)),
                        caps={'rdec': False})
         self.assertEqual(car.sent[0][:2], ('F', 1200))
+        # 沿着中间车道走，离两边黄区一样近(雷达那边 30mm)：也不少走
+        car = SimCar((1200.0, 560.0, 90.0))
+        legs = [dict(stop='A', goal=(1200.0, 990.0, 90.0), cmds=[('F', 430)])]
+        auto_run.drive(SimCtx(car), car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG, approach_guard_frac=0.1), start=dict(est=(1200.0, 560.0, 90.0), ref=(1200.0, 560.0, 90.0)),
+                       caps={'rdec': False})
+        self.assertEqual(car.sent[0][:2], ('F', 430))
 
 
 class MiscDriveTests(unittest.TestCase):
