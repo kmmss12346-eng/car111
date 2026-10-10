@@ -730,6 +730,7 @@ def main():
             state['busy']=True
             def pworker():
                 try:
+                    sync_now()      # 刚重新烧录过：STM32 里 ARMOK=0、收臂角度是默认值，PARK 只会降升降、手臂不动。先把配置里的参数发过去
                     if park_arm(link,state.get('hooks'),log,force=True):state['aborted']=False
                 finally:state['busy']=False
             threading.Thread(target=pworker,daemon=True).start();return
