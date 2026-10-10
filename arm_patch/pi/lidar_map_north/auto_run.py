@@ -607,7 +607,8 @@ def make_tick(hooks, cfg, now=time.monotonic):
     只在行驶线程里调用。没有 hooks.keepalive 返回 None。"""
     if hooks is None or not hasattr(hooks, 'keepalive'):
         return None
-    period = float((cfg or {}).get('keepalive_s', 4.0))
+    # 默认 5.5 秒：hooks.keepalive 离上次调用不到 5 秒时什么都不做，隔 4 秒调会每隔一次被跳过(实际 8 秒才摆一次)
+    period = float((cfg or {}).get('keepalive_s', 5.5))
     last = [now()]
 
     def tick():
@@ -728,6 +729,8 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
     rpm = int(g('home_fix_rpm', g('reloc_slow_rpm', 60)))
     edge = float(g('home_edge_mm', 3))
     short = float(g('home_short_mm', 15))
+    long_mm = float(g('home_long_mm', 100))
+    frac = float(g('approach_guard_frac', 0.02))
     need = float(g('home_check_margin_mm', 0))
     limit = float(max_move if max_move is not None else g('home_max_move_mm', 150))
     zone = start_rect(goal, cfg)
@@ -784,10 +787,14 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
         else:
             comps.sort(key=lambda cv: -edge_clearance(apply_move(p, cv[0], cv[1]), model))
         for c, v in comps:
-            if final:
-                e0 = edge_clearance(p, model)
-                if edge_clearance(apply_move(p, c, v), model) < e0:
-                    v = math.copysign(max(0.0, abs(v) - short), v)     # 朝边线走的少走一点：宁短不长
+            e0 = edge_clearance(p, model)
+            toward = edge_clearance(apply_move(p, c, v), model) < e0
+            if final and toward:
+                v = math.copysign(max(0.0, abs(v) - short), v)     # 朝边线走的少走一点：宁短不长
+            elif toward and abs(v) > long_mm:
+                # 离得远(没有 PREHOME、从 home_cut 的地方过来，几百 mm)：距离差 1~2% 就会冲出场地。
+                # 先少走 approach_guard_frac × 距离 + home_short_mm，下一轮雷达定位后再慢慢修进去
+                v = math.copysign(max(0.0, abs(v) - (frac*abs(v) + short)), v)
             v = clamp_move(cfg, obstacles, p, c, int(round(v)), need, edge)
             if v:
                 moves.append((c, v))
@@ -1179,7 +1186,10 @@ class _Drive:
         self.log(f'  ★ 到达 {stop}   (已用 {time.monotonic()-self.t_start:.1f} 秒)')
         goal = self.nav.ref
         if is_start:
-            if self.approach is None or self.approach.get('status') not in ('ok', 'near'):
+            ap = self.approach or {}
+            done = ap.get('status') == 'ok' or (ap.get('status') == 'near' and ap.get('pose') is not None
+                                                 and in_rect(ap['pose'], start_rect(goal, self.cfg)))
+            if not done:                # 回家前定位'near'但还在启停区外(修正被限幅了)：到这里再对准一次
                 t_h = time.monotonic()
                 if self.nav.world and hasattr(self.ctx, 'relocalize'):
                     res = home_approach(self.ctx, self.link, self.log, self.nav, goal, self.cfg, self.caps, self._obstacles(),
@@ -1743,7 +1753,19 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
             if still:
                 msg('SCAN')
                 log('  车放好了：第一次扫描(车别动)……')
-                ctx.scan()
+                try:
+                    ctx.scan()
+                except Abort as e:
+                    if ctx.aborted():
+                        raise
+                    # 扫描失败(雷达超时等)：开跑前还能重来，不要整个 race 退出(退出了就得再碰电脑)
+                    log(f'  第一次扫描失败：{e}。过一会儿重新扫描。')
+                    msg('SCAN ERR')
+                    ctx.zone_select(zone)
+                    yaws = []
+                    t_zone = now()
+                    sleep(poll_s)
+                    continue
                 scanned = True
                 yaw_ref = ctx.gyro_yaw() if hasattr(ctx, 'gyro_yaw') else None
                 msg('PLAN')

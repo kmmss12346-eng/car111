@@ -199,6 +199,7 @@ def main():
     def select_zone(z):
         """切换启停区(只在还没扫描/重新开始时)：起点车位、START 停车点、PREHOME、第二站动作一次改完，并清空历史。"""
         s=apply_zone(raw_cfg,z,zone_snap)
+        state['preplan_gen']=state.get('preplan_gen',0)+1
         history.objects.clear();history.views.clear()
         state.update(plan_start=None,replan_from=None,preplan=None,ref=None,ref_key=None,ref1=None,legs=[],path=[],reason='NOT SCANNED',
                      plan_key=None,plan_obj_key=None,route_ref=None,home_routes={},legs_partial=False)
@@ -550,6 +551,7 @@ def main():
             return gyro.value/100.0
         def preplan_start(self):
             """第一次扫描以后，按推算的第二站车位和第一次扫描的障碍物在后台先规划一遍(开跑后第二次扫描没变化就直接用)。"""
+            state['preplan_gen']=state.get('preplan_gen',0)+1;gen=state['preplan_gen']   # 车又被挪了/重新选区：旧的后台规划结果作废
             state['preplan']=dict(status='run')
             def work():
                 try:
@@ -564,10 +566,11 @@ def main():
                                 obs=seen)
                         if pp['status']=='ok':print_route()
                         state['plan_start']=None
+                    if state.get('preplan_gen')!=gen:return
                     state['preplan']=pp;commands.put('__redraw')
                     if pp['status']=='ok':start_home_routes()
                 except Exception as e:
-                    state['preplan']=dict(status=f'出错：{e!r}')
+                    if state.get('preplan_gen')==gen:state['preplan']=dict(status=f'出错：{e!r}')
             threading.Thread(target=work,daemon=True).start()
         def preplan_state(self):
             pp=state.get('preplan');return None if not pp else pp.get('status')
