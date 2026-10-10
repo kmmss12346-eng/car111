@@ -51,8 +51,10 @@ DEFAULTS = dict(
     claw_px=dict(RAW=[336.8, 282.9], RING=[336.8, 282.9]),      # 爪子轴线在画面里的位置
     px_per_mm=dict(RAW=1.97, RING=2.96),                         # 每毫米多少像素(只用来换算容差)。RAW：现场画面物料半径 49 像素 = 25mm
     material_diam_mm=50.0,                                       # 物料顶面直径(毫米)：有它就用认到的物料半径现算 RAW 的每毫米像素(观察高度变了也准)；0 = 用 px_per_mm.RAW
-    tol_mm=dict(RAW=2.0, RING=1.0, PICK=2.5, STACK=2.0),         # 对准到多小算好
-    accept_mm=dict(RAW=4.0, RING=2.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量)
+    tol_mm=dict(RAW=2.0, RING=2.0, PICK=2.5, STACK=2.5),         # 对准到多小算好(差不多就行，不为零点几毫米反复微调；想更准把 RING 改小)
+    accept_mm=dict(RAW=4.0, RING=3.0, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量)
+    place_confirm=True,                 # 放物料对准到容差以内后再拍一次确认(多花零点几秒，防止一次测量的噪声把偏了的当成对准了)
+    align_max_iter=6,                   # 粗加工区/暂存区对准(放、码垛、取回)最多修正几次(车停得很偏、第一次测 J 时要多动几下；平时 1~2 次就到容差)
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
@@ -594,10 +596,11 @@ class MissionHooks:
             self._goto_ring(zone, ring)
             self.arm.obs('RING', open_claw=True)                 # 空爪到圆环上方：圆环不会被挡住
             if stack:                                            # 下面那层物料盖住了白心：先认它的顶面对准
-                res, how = self._align_covered(item.color, key, label, confirm=None)
+                res, how = self._align_covered(item.color, key, label, confirm=bool(cfg.get('place_confirm', False)))
             else:
                 res, how = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm'][key],
-                                          allow_chassis=True, label=label, bounds=self.vision.bounds('RING'), **self._zone_servo_kw()), '圆环'
+                                          allow_chassis=True, label=label, bounds=self.vision.bounds('RING'),
+                                          confirm=bool(cfg.get('place_confirm', False)), **self._zone_servo_kw()), '圆环'
             if res is not None:
                 self.log('    对准结果' + (f'(按{how})' if stack else '') + f'：{res}')
                 err_mm = res.err_mm
@@ -908,6 +911,8 @@ class MissionHooks:
                 kw['chassis_axes'] = 'F'
         if cfg.get('ring_fix_max_mm'):
             kw['chassis_fix_max_mm'] = float(cfg['ring_fix_max_mm'])
+        if cfg.get('align_max_iter'):
+            kw['max_iter'] = int(cfg['align_max_iter'])
         return kw
 
     def _drop(self, stack):

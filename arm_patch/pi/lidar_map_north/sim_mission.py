@@ -961,10 +961,11 @@ class ZoneFlowTests(unittest.TestCase):
             big = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) > 60]
             # 放：去环1 +150、去环3 -300；取回(按任务码顺序)：环2 +150、环1 +150、环3 -300；最后回停车点 +150
             self.assertEqual(len(big), 6, (big, text))
-            self.assertTrue(all(min(abs(abs(v) - 150), abs(abs(v) - 300)) <= 15 for v in big), big)
+            # 第一次对准时手臂要先小幅动几下测 J(探测)，之后可能前后修一下，所以放宽到 ±30mm
+            self.assertTrue(all(min(abs(abs(v) - 150), abs(abs(v) - 300)) <= 30 for v in big), big)
             fix = [v for c, v, z in w.moves if z == 'ROUGH' and abs(v) <= 60 and abs(v) != 20]
             self.assertLessEqual(len(fix), 4, (fix, text))
-            self.assertTrue(all(p[3] < 2.5 for p in w.placed), w.placed)
+            self.assertTrue(all(p[3] < 3.5 for p in w.placed), w.placed)       # 容差 2mm(差不多就行)+测量噪声
 
     def test_side_ring_missed_when_parked_at_ring2(self):
         """车停在 2 号环前面，画面里一边的圆环没认出来(被爪子挡住、反光)：不能当成"车停在 3 号(1 号)环"把整排认错一位
