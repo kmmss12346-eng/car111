@@ -2081,7 +2081,7 @@ class MissionHooks:
         step = axis * sp_px
         n = len(pts)
         covered = any(st for (z, _k), st in self.on_ring.items() if z == zone)   # 圆环上已经放着物料(白心被盖住，可能认不全)
-        dist = np.hypot(pts[:, 0] - cu, pts[:, 1] - cv_)
+        dist = np.abs((pts - claw) @ axis)                      # 沿这一排离爪子点多远(离圆环远近的差靠手臂伸缩补，不算在里面)
         guess = False
         if n == 3:
             first = 0                                            # pts[0] 是排在最前面(左/上)的那个
@@ -2117,6 +2117,14 @@ class MissionHooks:
         nrm = np.array([-axis[1], axis[0]])                      # 垂直于这一排的方向(画面里)：离圆环远/近
         tilt, cos_t = None, 1.0
         if many:
+            jd = jf if float(jf @ axis) > 0 else -jf
+            t0 = math.degrees(math.atan2(float(axis[0] * jd[1] - axis[1] * jd[0]), float(axis @ jd)))
+            tmax = float(cfg.get('survey_tilt_max_deg', 12.0))
+            if abs(t0) > tmax:
+                # 车不可能停斜这么多：是"底盘挪 40mm 看画面怎么动"测歪了(挪的时候认错了环、画面抖)。方向按圆环连线算，不按它
+                self.log(f'    ★ 按底盘挪动测出来车身斜了 {t0:+.0f}°，不可信(车停得没这么斜)：方向按看到的圆环连线算')
+                jf = (1.0 if float(jf @ axis) > 0 else -1.0) * axis * float(np.hypot(*jf))
+                n2 = float(jf @ jf)
             # 看到两个以上：沿这一排每毫米多少像素按圆环间距算(比底盘挪 40mm 测出来的准)，底盘往哪边挪画面往哪边动看 jf
             m = (1.0 if float(jf @ axis) > 0 else -1.0) * sp_px / sp_mm
             # 车身和这一排的夹角 = 底盘前进时圆环在画面里移动的方向(jf) 和 这一排圆环连线的方向(axis) 差多少

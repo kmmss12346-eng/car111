@@ -1256,6 +1256,31 @@ class ZoneFlowTests(unittest.TestCase):
                 self._assert_all_good(w, h, text, seed)
                 self.assertIn('没认出来', text)
 
+    def test_survey_real_log_parked_at_ring2_far_from_row(self):
+        """10-10 实车日志：车停在 2 号环前(爪子点正对它，离这一排约 80mm)，画面里只认出两个环，"底盘挪 40mm"测歪了 35°。
+        以前按直线距离认，把 2 号认成了 1 号，往后开了 286mm 到环3(实际 150mm)。现在：沿这一排算远近，爪子前面那个就是 2 号；斜 35° 不信。"""
+        w = SimWorld(seed=0, code=self.CODE, cam_deg=90.0)
+        lines = []
+        h = make(w, log=lines.append)
+        h.prepare(w.link, lines.append)
+        w.arrive('ROUGH')
+        rings = [(338.0, 168.0, 67.0), (554.0, 209.0, 72.0)]
+        h.vision.ring_list = lambda n=None: list(rings)
+        h.vision.claw = lambda what='RING': (337.0, 283.0)
+        axis = np.array([216.0, 41.0]) / np.hypot(216.0, 41.0)
+        a = math.radians(-35.5)
+        jf = 1.99 * np.array([axis[0] * math.cos(a) - axis[1] * math.sin(a), axis[0] * math.sin(a) + axis[1] * math.cos(a)])
+        h._jac_f = lambda r, fresh=False: (jf, True)
+        h._survey('ROUGH')
+        f0 = h.act.disp['F']
+        f = {k: h.ring_f[('ROUGH', k)] - f0 for k in (1, 2, 3)}
+        text = '\n'.join(lines)
+        self.assertLess(abs(f[2]), 25, (f, text))
+        self.assertLess(abs(abs(f[1]) - 150), 15, (f, text))
+        self.assertLess(abs(abs(f[3]) - 150), 15, (f, text))
+        self.assertLess(f[1] * f[3], 0, f)
+        self.assertIn('不可信', text)
+
     def test_car_parked_between_rings_still_finds_the_right_rings(self):
         """车停得离 2 号环偏了 55mm(两个环中间偏 2 号)：照样认对、放对。
         (停在 1 号/3 号环正前面、画面里只看到两个环时，按"车停在 2 号环"算，会认错一位：车要停在 2 号环前面)"""
