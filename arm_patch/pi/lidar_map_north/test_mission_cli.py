@@ -930,10 +930,10 @@ class ConfigScriptTests(unittest.TestCase):
                   'qr_scanner_from_right_mm', 'tilt_precorrect', 'tilt_warn_deg', 'keepalive_deg', 'code_plus', 'home_when_idle'):
             self.assertIn(k, mc)
         self.assertEqual(mc['wheels_min_mm'], 4.0)
-        self.assertIs(mc['wheels_first'], True)          # 10-10：先慢慢动车轮
-        self.assertIs(mc['raw_any_order'], True)         # 10-10：爪子下面停的是哪个就夹哪个
+        self.assertIs(mc['wheels_first'], False)         # 10-10 晚：工位换回 1010i 的做法(先动手臂)
+        self.assertIs(mc['raw_any_order'], False)        # 10-10 晚：原料区换回 1010i 的做法(按任务码顺序)
         self.assertIs(mc['raw_wheels_first'], False)      # 10-10：原料区只动爪子
-        self.assertIs(mc['zone_filter'], True)
+        self.assertIs(mc['zone_filter'], False)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'ring_strafe_max_mm': 30}}, f)
         apply_mission_config.main([path])

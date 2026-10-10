@@ -98,7 +98,7 @@ DEFAULTS = dict(
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
     raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
-    raw_any_order=True,                 # 不再起作用(10-10 写死：原料区来一个夹一个)。以前：True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
+    raw_any_order=False,                # (10-10 晚：按 1010i 的做法，默认按任务码顺序；mtest RAW 1 force any 这一次不按顺序) True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
@@ -119,28 +119,28 @@ DEFAULTS = dict(
     accept_mm=dict(RAW=4.0, RING=3.5, PICK=5.0, STACK=4.0),      # 修正次数用完后，误差不超过这个也照常夹/放，超过就跳过(RAW：爪子每边只有约 5mm 余量；RING 3.5 = 还在 2 环，放了 10 分，不放 0 分)
     place_confirm=True,                 # 放物料对准到容差以内后再拍一次确认(多花零点几秒，防止一次测量的噪声把偏了的当成对准了)
     align_max_iter=6,                   # 粗加工区/暂存区对准(放、码垛、取回)最多修正几次(车停得很偏、第一次测 J 时要多动几下；平时 1~2 次就到容差)
-    zone_frames=2,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
-    zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
-    zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
-    take_first=True,                    # (10-10 用户：B) 平放时先去转盘取物料，再到圆环上方带着物料对准一次就放下(不再"空爪先对准、
+    zone_frames=None,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
+    zone_gain=0.85,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
+    zone_filter=False,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
+    take_first=False,                    # (10-10 用户：B) 平放时先去转盘取物料，再到圆环上方带着物料对准一次就放下(不再"空爪先对准、
                                         #   去取、再回到原位")。看不到圆环/对不准：物料放回转盘，这个环按以前的做法。码垛照旧
     take_first_iter=4,                  # take_first：带着物料最多修正几次(用存好的 J，不现场探测)；修完按当时的位置放下
     take_first_drop_mm=12.0,
     take_first_retry_max_mm=40.0,       # take_first：第一次修完还差这么多以上(可能看成了旁边的环)就不接着追，放回转盘按空爪做法            # take_first：修正次数用完、偏差不超过这个就照样放下(还在 4~5 环里，有分)；物料绝不放回车上
-    place_shift_mm=dict(F=-20.0, S=0.0),   # 放下的位置整体挪多少(毫米，F=车头方向，正=往前；S=往左)。10-10 实测物料都偏前约 20mm → F=-20。
+    place_shift_mm=dict(F=0.0, S=0.0),   # 放下的位置整体挪多少(毫米，F=车头方向，正=往前；S=往左)。10-10 实测物料都偏前约 20mm → F=-20。
                                         #   做了 vclaw RING 把爪子点量准以后改回 0
     take_first_clear_mm=15.0,           # take_first：观察高度 ZOBRNG 时手里物料底面离地至少这么多(ZOBRNG-ZPLC)，不够就按以前的做法
-    wheels_first=True,                  # (10-10 用户要的：尽量先慢慢动车)True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
+    wheels_first=False,                  # (10-10 用户要的：尽量先慢慢动车)True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
                                         #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)。
                                         #   模拟里比默认慢、失败多(车轮只能走整毫米，小步不准)，所以默认关；上车对比：mtest TEMP 1 force wheels
     wheels_step_mm=15.0,                # wheels_first：车轮每次最多挪多少毫米
     wheels_min_mm=4.0,                  # wheels_first：沿那一排的偏差比这个小就交给手臂(1.5 时模拟里失败多，4 好一些)
     wheels_rpm=60,                      # wheels_first：车轮小步挪的速度(转/分，慢一点准一点)
-    ring_precorrect=True,               # 同一个工位里对准过一个环以后，去下一个环时手臂伸缩直接伸到同样的远近(不先缩回观察姿态再伸出来，省一次大的修正)
-    tilt_precorrect=True,               # 车身和圆环那一排不平行(车停斜了)：看三个环时算出斜了几度，挪到每个环以后离圆环远/近多少，
+    ring_precorrect=False,               # 同一个工位里对准过一个环以后，去下一个环时手臂伸缩直接伸到同样的远近(不先缩回观察姿态再伸出来，省一次大的修正)
+    tilt_precorrect=False,               # 车身和圆环那一排不平行(车停斜了)：看三个环时算出斜了几度，挪到每个环以后离圆环远/近多少，
                                         #   第一次测量之前手臂伸缩(必要时 ID1)就先补上
     tilt_warn_deg=3.0,                  # 斜到这么多度就在终端打 ★ 提醒"把车摆正"
-    survey_frames=3,                    # 到工位看三个圆环时拍几帧
+    survey_frames=None,                    # 到工位看三个圆环时拍几帧
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',
@@ -167,7 +167,7 @@ DEFAULTS = dict(
     learn_pick=False,                   # True = 还没量过 claw_px.PICK 时，放下第一个物料后回去再拍一张量一次(要多花几秒)；默认不量，取回按圆环对准
     stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
-    return_bias=True,                   # 回到记下的姿态时，按前几次"转回来总是多转/少转几度"提前补上(省掉"再转一次")
+    return_bias=False,                   # 回到记下的姿态时，按前几次"转回来总是多转/少转几度"提前补上(省掉"再转一次")
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
@@ -1120,7 +1120,8 @@ class MissionHooks:
             pass
         # 10-10 用户定的(写死，配置改不了)：原料区来一个夹一个——爪子下面停的是要抓的哪个颜色就夹哪个，放进它自己的槽
         # (_raw_in_order 只给以前按顺序写的模拟测试用)
-        if (not getattr(self, '_raw_in_order', False) or getattr(self, 'raw_any_once', False)) and hasattr(self.vision, 'material_stream'):
+        if ((self.cfg.get('raw_any_order') and not getattr(self, '_raw_in_order', False)) or getattr(self, 'raw_any_once', False)) \
+                and hasattr(self.vision, 'material_stream'):
             self._raw_any(self.plan.items(batch))
             return
         for item in self.plan.items(batch):

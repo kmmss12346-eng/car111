@@ -791,8 +791,10 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
             'START1': [2250, 2250, 180], 'START2': [2250, 150, 90]}     # 用户配置里的停车点(10-06)
 
 
-LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False)
-LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True)
+LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
+              zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
+              survey_frames=3)   # 这些测试写的时候工位用的是新做法；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
 
 
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
@@ -932,6 +934,20 @@ class MissionSimTests(unittest.TestCase):
         self.assertIn('规则只许码垛，不放、不算放置', '\n'.join(lines))
         self.assertEqual(w.screen['t3'], 'PLACE 9')
         self.assertEqual([c for c in w.tray.values() if c], [5])        # 黑色留在车上
+
+    def test_1010i_defaults_place_everything(self):
+        """10-10 晚用户定的默认(按 1010i 的做法)：原料区按任务码顺序抓、工位空爪先对准再取再放、不先动车轮、不滤波、5 帧。全抓到、全放对。"""
+        import mission_hooks
+        D = mission_hooks.DEFAULTS
+        self.assertEqual((D['raw_any_order'], D['take_first'], D['wheels_first'], D['zone_filter']), (False, False, False, False))
+        for seed in range(3):
+            w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0)
+            keep = {k: D[k] for k in ('raw_any_order', 'raw_wheels_first', 'wheels_first', 'take_first', 'zone_filter',
+                                     'ring_precorrect', 'tilt_precorrect', 'return_bias', 'zone_frames', 'zone_gain', 'survey_frames')}
+            h = make(w, keep)
+            run_mission(w, h)
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), f'seed {seed}')
+            self.assertEqual(h.stats.place_ok, h.stats.place_total)
 
     def test_live_defaults_whatever_stops_under_the_claw_and_wheels_first(self):
         """比赛默认(10-10 用户要的)：原料区爪子下面停的是哪个就夹哪个(只动爪子)、工位对准先慢慢动车轮：全抓到、全放对、不空夹。"""
@@ -1487,7 +1503,7 @@ class TiltTests(unittest.TestCase):
                     first[cur[0]] = abs(float((w.ring_center(k) - c)[0]))
                 return orig(n, max_px)
             w.vision.ring_error = ring_error
-            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False,
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False, ring_precorrect=True, zone_filter=True, zone_frames=2, zone_gain=1.0,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
