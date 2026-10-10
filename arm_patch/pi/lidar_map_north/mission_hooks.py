@@ -102,7 +102,8 @@ DEFAULTS = dict(
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_seek=True,                      # (10-11 用户：自由移动到够得着为止)原料盘停下时要夹的物料都停在手臂够不着的地方：车轮沿车头方向前后挪过去
                                         #   (不横移，不压线)，下一次停下再夹；记住这个位置，同一轮第二批到原料区直接挪到这里
-    raw_seek_steps_mm=[40, 20, 10, 5],  # (10-11 用户)原料盘停下时扫不到/够不着要夹的物料：车往前挪 4cm，再不行挪 2cm、1cm、0.5cm，一次比一次少
+    raw_seek_steps_mm=[40, 20, 10, 5],  # (10-11 用户)原料盘停下时扫不到/够不着要夹的物料：车往原料盘那边(车的右边)挪 4cm，再不行挪 2cm、1cm、0.5cm，一次比一次少
+    raw_seek_dir='right',               # 往哪边挪：'right' = 车的右边(原料盘那边，横移)；'left'；'forward' / 'back' = 沿车头前后
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停。
@@ -301,7 +302,8 @@ class MissionHooks:
         self._at_obs = False                # 手臂就在观察姿态(刚 OBS 过、还没动过)：去第一个环不用再 OBS 一遍
         self._zone_d2 = []                  # 这个工位里每次对准好时 (底盘前后位移, ID2 比 A2P 多转的度数)：车离圆环那一排的远近
         self._ret_bias = [0.0, 0.0]
-        self._raw_seek_F = 0.0              # 原料区：车停在停车点前后多少毫米时够得着物料(挪着找到的，第二批直接用)
+        self._raw_seek_F = 0.0              # 原料区：车离停车点挪了多少(前后 F、横移 S)时够得着物料(挪着找到的，第二批直接用)
+        self._raw_seek_S = 0.0
         self._seek = None         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
@@ -1217,10 +1219,10 @@ class MissionHooks:
         J = self.store.get('RAW', 'ch') if self.store is not None else None
         if J is not None and float(np.hypot(*np.asarray(J, float)[:, 1])) > 0.2:
             self._seek['jf'] = np.asarray(J, float)[:, 1]
-        f = float(self._raw_seek_F)
-        if self.cfg.get('raw_seek', True) and self.act is not None and abs(f) >= 3:
-            self.log(f'    原料区：上次在停车点{"前面" if f > 0 else "后面"} {abs(f):.0f}mm 够得着物料，直接挪过去')
-            self.act.chassis_move(0, int(round(f)))
+        f, sv = float(self._raw_seek_F), float(self._raw_seek_S)
+        if self.cfg.get('raw_seek', True) and self.act is not None and (abs(f) >= 3 or abs(sv) >= 3):
+            self.log(f'    原料区：上次挪到 前后 {f:+.0f}mm、横移 {sv:+.0f}mm 够得着物料，直接挪过去')
+            self.act.chassis_move(int(round(sv)), int(round(f)))
 
     def _raw_seek_end(self):
         """原料区做完：车挪回停车点(路线下一段从停车点算)。"""
@@ -1234,16 +1236,17 @@ class MissionHooks:
     def _raw_recenter(self):
         """挪回原料区的工作位置：停车点，或者挪着找到的够得着物料的地方(raw_seek)。"""
         d = self.act.disp
-        tgt = float(self._raw_seek_F) if self.cfg.get('raw_seek', True) else 0.0
-        s, f = -float(d['S']), tgt - float(d['F'])
+        on = self.cfg.get('raw_seek', True)
+        s = (float(self._raw_seek_S) if on else 0.0) - float(d['S'])
+        f = (float(self._raw_seek_F) if on else 0.0) - float(d['F'])
         if math.hypot(s, f) < 20.0:
             return
         self.log(f'    底盘挪回原料区的工作位置：前进 {f:+.0f}mm、横移 {s:+.0f}mm')
         self.act.chassis_move(int(round(s)), int(round(f)))
 
     def _raw_seek(self, e, tag, stop_id):
-        """原料盘停下了，要夹的物料扫不到/手臂够不着：车往前挪一步(用户 10-11 定的：先 4cm，再 2cm、1cm、0.5cm，一次比一次少)，
-        下一次停下再看。每次停下最多挪一次，只往前挪(不横移，不压线)。挪了返回 True。"""
+        """原料盘停下了，要夹的物料扫不到/手臂够不着：车往原料盘那边(默认车的右边)挪一步(用户 10-11 定的：先 4cm，再 2cm、1cm、0.5cm，
+        一次比一次少)，下一次停下再看。每次停下最多挪一次。挪了返回 True。"""
         cfg, sk = self.cfg, self._seek
         if not cfg.get('raw_seek', True) or sk is None or self.act is None or sk.get('stop') == stop_id:
             return False
@@ -1253,13 +1256,18 @@ class MissionHooks:
         if k >= len(steps):
             if not sk['told']:
                 sk['told'] = True
-                self.log(f'  {tag} 往前已经挪了 {self.act.disp["F"]:.0f}mm 还是扫不到/够不着：不再挪，原料区停车点要调')
+                d = self.act.disp
+                self.log(f'  {tag} 已经挪了 前后 {d["F"]:+.0f}mm、横移 {d["S"]:+.0f}mm 还是扫不到/够不着：不再挪，原料区停车点要调')
             return False
-        f = float(steps[k])
+        step = float(steps[k])
         sk['k'] = k + 1
-        self.log(f'  {tag} 扫不到/够不着要夹的物料：车往前挪 {f:g}mm(第 {k + 1} 次)，下一次停下再看')
-        self.act.chassis_move(0, int(round(f)))
+        way = str(cfg.get('raw_seek_dir') or 'right').lower()
+        sv, f = {'right': (-step, 0.0), 'left': (step, 0.0), 'forward': (0.0, step), 'back': (0.0, -step)}.get(way, (-step, 0.0))
+        name = {'right': '往右(原料盘那边)', 'left': '往左', 'forward': '往前', 'back': '往后'}.get(way, '往右(原料盘那边)')
+        self.log(f'  {tag} 扫不到/够不着要夹的物料：车{name}挪 {step:g}mm(第 {k + 1} 次)，下一次停下再看')
+        self.act.chassis_move(int(round(sv)), int(round(f)))
         self._raw_seek_F = float(self.act.disp['F'])
+        self._raw_seek_S = float(self.act.disp['S'])
         return True
 
     def _grab_item(self, item):

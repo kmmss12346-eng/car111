@@ -213,17 +213,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.w.air, 0, text)
 
     def test_raw_plate_too_far_wheels_seek_until_reachable(self):
-        """物料每次都停在车前方约 70mm 的地方，手臂够不着：车往前挪 4cm、2cm、1cm……(一次比一次少，不横移)，够得着就夹；做完挪回停车点。"""
+        """物料每次都停在离车远 70mm(原料盘那边)的地方，手臂够不着：车往右(原料盘那边)挪 4cm、2cm、1cm……(一次比一次少)，够得着就夹；做完挪回停车点。"""
         for off in (70.0,):
-            self._plate_world(seed=7, plate_off_tan=off)
+            self._plate_world(seed=7, plate_off_mm=off)
             self.run_cli('mtest', 'mtest RAW 1 force any')
             text = '\n'.join(self.lines)
             self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
             self.assertEqual(self.w.air, 0, text)
-            self.assertIn('车往前挪 40mm(第 1 次)', text)
-            self.assertEqual([m for m in self.w.moves if m[0] == 'S'], [], text)          # 不横移
-            self.assertLess(abs(self.h.act.disp['F']), 1.0)                              # 挪回停车点了
-            self.assertGreater(abs(self.h._raw_seek_F), 40.0)
+            self.assertIn('车往右(原料盘那边)挪 40mm(第 1 次)', text)
+            self.assertEqual([m for m in self.w.moves if m[0] == 'F'], [], text)          # 只往右挪，不前后挪
+            self.assertLess(abs(self.h.act.disp['S']), 1.0)                              # 挪回停车点了
+            self.assertGreaterEqual(abs(self.h._raw_seek_S), 40.0)
 
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
