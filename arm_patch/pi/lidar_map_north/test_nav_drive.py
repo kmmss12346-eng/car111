@@ -375,6 +375,19 @@ class GuardTests(unittest.TestCase):
             self.assertLess(abs(car.x - 2250.0), 7, scale)
             self.assertTrue(any('先少走' in l for l in logs))
 
+    def test_cut_not_readded_when_lidar_fails(self):
+        # 横移多走 1.5%，到 PREHOME 雷达定位失败：刚才少走的那一点不按推算补(补了就出场地)
+        car = SimCar((340.0, 400.0, 90.0), scale=0.015)
+        ctx = SimCtx(car, fail_from=1)
+        legs = [dict(stop='PREHOME', goal=(2250.0, 400.0, 90.0), cmds=[('S', -1910)])]
+        logs = []
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG), start=dict(est=(340.0, 400.0, 90.0), ref=(340.0, 400.0, 90.0)),
+                       caps={'rdec': False})
+        self.assertEqual(len([c for c, v, sp in car.sent if c == 'S']), 1)
+        self.assertGreaterEqual(edge_min(car.trace, CFG), 15.0)
+        self.assertTrue(any('宁短不长' in l for l in logs))
+
     def test_moves_along_a_wall_are_not_shortened(self):
         car = SimCar((2250.0, 400.0, 90.0))
         ctx = SimCtx(car)
@@ -383,6 +396,44 @@ class GuardTests(unittest.TestCase):
                        motion=None, cfg=dict(CFG), start=dict(est=(2250.0, 400.0, 90.0), ref=(2250.0, 400.0, 90.0)),
                        caps={'rdec': False})
         self.assertEqual(car.sent[0][:2], ('F', 1200))
+
+
+class MiscDriveTests(unittest.TestCase):
+    def test_turn_back_sweep_warned(self):
+        # 第二站 (2208,233) 车头 30°，转回 90° 时车角扫出东边线一点：只提醒，照常走
+        car = SimCar((2208.0, 233.0, 30.0))
+        car.T = 30.0
+        logs = []
+        legs = [dict(stop='A', goal=(2208.0, 800.0, 90.0), cmds=[('F', 567)])]
+        auto_run.drive(SimCtx(car), car, auto_run.flatten(60, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG, reloc_enabled=False),
+                       start=dict(est=(2208.0, 233.0, 30.0), ref=(2208.0, 233.0, 30.0), yaw_real=30.0), caps={'rdec': False})
+        self.assertTrue(any('出发时原地转回' in l for l in logs))
+        self.assertEqual(car.sent[0][:2], ('R', 60))
+
+    def test_reloc_skipped_after_short_travel(self):
+        car = SimCar((1200.0, 1000.0, 90.0))
+        ctx = SimCtx(car)
+        legs = route((1200.0, 1000.0, 90.0), [('A', (1200.0, 1600.0, 90.0)), ('B', (1200.0, 1900.0, 90.0))])
+        logs = []
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500),
+                       start=dict(est=(1200.0, 1000.0, 90.0), ref=(1200.0, 1000.0, 90.0)), caps={'rdec': False})
+        self.assertEqual(ctx.calls, 1, 'A 走了 600mm 定位；B 只走了 300mm 不定位')
+        self.assertTrue(any('不到 reloc_min_travel_mm' in l for l in logs))
+
+    def test_home_move_that_does_not_happen_stops_correcting(self):
+        class Stuck(SimCar):
+            def move(self, cmd, val, speed=None):
+                self.sent.append((cmd, val, speed))
+                return True, 'DONE t=500 e=-1500'          # 车头还差 15°：车没按指令动
+        car = Stuck((2250.0, 200.0, 90.0))
+        nav = auto_run.Nav(dict(est=(2250.0, 200.0, 90.0), ref=(2250.0, 200.0, 90.0)))
+        logs = []
+        res = auto_run.home_approach(SimCtx(car, noise=(0, 0)), car, logs.append, nav, ZONE2, CFG, {'rdec': False})
+        self.assertEqual(res['status'], 'fail_moved')
+        self.assertEqual(len(car.sent), 1)
+        self.assertTrue(any('mot' in l for l in logs))
 
 
 class HomeTests(unittest.TestCase):

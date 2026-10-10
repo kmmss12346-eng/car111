@@ -704,7 +704,7 @@ def inset_goal(goal, cfg, edge_mm=None):
 
 
 def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=None, order=None, label='回启停区对准',
-                  aborted=None):
+                  aborted=None, e_last=0.0):
     """回到启停区：雷达定位 -> 按实际位置小步(home_fix_rpm，默认 60 转/分，STM32 精确模式)修到出发时手放的位置，最多 2 轮。
     每一步都先限幅：车身(含雷达)不出场地(离边线至少 home_edge_mm)、不碰别的区域，最后要停在启停区里。
     返回 dict(status, pose)。status：
@@ -716,6 +716,9 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
       'off'          没有雷达定位(桌面模拟/没有参考扫描)"""
     g = (cfg or {}).get
     if not nav.world or not hasattr(ctx, 'relocalize'):
+        return dict(status='off', pose=None)
+    if not g('home_fix_enabled', True):
+        log(f'    {label}：配置里关掉了(home_fix_enabled=false)，不做')
         return dict(status='off', pose=None)
     aborted = aborted or (lambda: ctx.aborted())
     rounds = max(1, min(2, int(g('home_fix_rounds', 2))))
@@ -736,7 +739,7 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
     obstacles = list(obstacles or [])
     moved = False
     last_good = None
-    e_last = [0.0]
+    e_last = [float(e_last or 0.0)]             # 上一条指令 DONE 里的车头误差(STM32 下一条自己会修)
 
     def send(cmd, v):
         if cmd == 'R':
@@ -754,8 +757,10 @@ def home_approach(ctx, link, log, nav, goal, cfg, caps, obstacles=(), max_move=N
             log(f"      {({'R': '转', 'S': '横移', 'F': '前后'})[cmd]} {_fmt(sent)} -> {'完成' if ok else reply}")
             err = parse_done(reply).get('err') if ok else None
             e_last[0] = err or 0.0
-        if not ok:
-            log(f'      {cmd} {sent} 失败：{reply}')
+            bad = check_move(cmd, sent, ok, reply)
+            if bad:
+                log(f'      ★ {bad}')                   # 车没按指令动：不再修(再修只会越错越远)
+                return False
         return ok
 
     def plan_moves(final):
@@ -896,6 +901,10 @@ class _Drive:
         self.final_leg = False                  # 正在走进启停区的最后一段：朝场地边线的那一条先少走 home_short_mm
         self.t_start = time.monotonic()
         self.t_move = 0.0
+        self.travel = 0.0                       # 上次雷达定位以后走了多少(mm，转一次弯按 200mm 算)
+        self.min_travel = float(g('reloc_min_travel_mm', 0))
+        self.yaw_real0 = (start or {}).get('yaw_real')
+        self.leg_cuts = []                      # 这一段里因为离边线/区域太近少走的方向(世界坐标单位向量)
 
     # ------------------------------------------------------------ 工具
     def _recut(self):
@@ -946,6 +955,7 @@ class _Drive:
         bad = check_move(cmd, v, ok, reply)
         if bad:
             raise Abort(f'第{self.i}条指令 {bad}')
+        self.travel += abs(v)
 
     def _turn(self, deg, target_yaw, label='', toward_zero=False):
         """发一条转弯(route 或修正)。target_yaw = 转完以后 est 的车头。"""
@@ -966,9 +976,23 @@ class _Drive:
         if bad:
             raise Abort(f'第{self.i}条指令 {bad}')
         self.nav.turned(target_yaw, sent)
+        if abs(sent) >= 45:
+            self.travel += 200.0
 
     # ------------------------------------------------------------ 主循环
+    def _check_turn_back(self):
+        """出发时第一条 R(从第二站转回出发时的车头)：规划不检查它扫过的范围。车角扫出场地/碰到东西就提醒(还在启停区里，规则不管)。"""
+        if not self.nav.world or not self.seq or self.seq[0][1] != 'R' or self.yaw_real0 is None:
+            return
+        _, want = self.nav.turn_cmd(self.seq[0][2])
+        p = (self.nav.est[0], self.nav.est[1], float(self.yaw_real0))
+        best, _, what, _ = moves_clearance(self.cfg, self._obstacles(), p, [('R', want)])
+        if best < 0:
+            self.log(f'  ⚠ 出发时原地转回 {want:+.0f}° 时车角离{what} {best:.0f}mm(会扫出一点；还在启停区里，规则不管)。'
+                     '车放在启停区里时尽量离东边线远一点')
+
     def run(self):
+        self._check_turn_back()
         while self.k < len(self.seq):
             stop, cmd, val = self.seq[self.k]
             self._aborted()
@@ -996,6 +1020,9 @@ class _Drive:
             cut, label = self._approach_cut(cmd, want)
             if cut > 0:
                 want = math.copysign(max(0.0, abs(want) - cut), want)
+                ux, uy = _axis(self.nav.real()[2], cmd)
+                sg = 1.0 if want >= 0 else -1.0
+                self.leg_cuts.append((sg*ux, sg*uy))
         v = int(round(want))
         if abs(v) < STOP_MIN_MM:
             self.nav.ref = ref_next                       # 差得太少：这一条不发，带到后面
@@ -1055,7 +1082,7 @@ class _Drive:
                 t_h = time.monotonic()
                 if self.nav.world and hasattr(self.ctx, 'relocalize'):
                     res = home_approach(self.ctx, self.link, self.log, self.nav, goal, self.cfg, self.caps, self._obstacles(),
-                                        aborted=self.ctx.aborted)
+                                        aborted=self.ctx.aborted, e_last=self.e_last)
                     self.log(f"    回家对准：{res['status']}，用时 {time.monotonic()-t_h:.1f} 秒")
                 elif hasattr(self.ctx, 'home_fix'):
                     self.ctx.home_fix(self.link, self.log)     # 旧 ctx：回到启停区，和出发时的扫描对齐后小步修回去
@@ -1063,6 +1090,7 @@ class _Drive:
         else:
             meas = self._measure(stop)
             self._correct(stop, meas, is_pre)
+            self.leg_cuts = []
             nxt = self._next_marker(self.k)
             if nxt is not None and str(self.seq[nxt][0]).upper().startswith('START') and not self.cut:
                 self.final_leg = True
@@ -1105,12 +1133,16 @@ class _Drive:
             self.log(f'    站点扫描用时 {time.monotonic()-t_s:.1f} 秒')
         elif self.reloc_on and (self.reloc_stops is None or up in self.reloc_stops or
                                 any(up.startswith(s) for s in self.reloc_stops)):
-            meas = _reloc(self.ctx, self.nav.real(), self.reloc_frames)
+            if self.travel < self.min_travel and not up.startswith('PREHOME'):
+                self.log(f'    (上次定位以后才走了 {self.travel:.0f}mm，不到 reloc_min_travel_mm={self.min_travel:.0f}，这里不定位)')
+            else:
+                meas = _reloc(self.ctx, self.nav.real(), self.reloc_frames)
         if meas is not None:
             if meas.get('ok'):
+                self.travel = 0.0
                 p = meas['pose']
-                self.log(f"    ◆ 雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°，比推算的 前后/左右偏 "
-                         f"({meas.get('dx', 0):+.0f},{meas.get('dy', 0):+.0f})mm 车头{meas.get('dyaw', 0):+.1f}°"
+                self.log(f"    ◆ 雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°，比推算的偏 "
+                         f"x{meas.get('dx', 0):+.0f} y{meas.get('dy', 0):+.0f}mm 车头{meas.get('dyaw', 0):+.1f}°"
                          f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒）")
             else:
                 self.log(f"    ◆ 雷达定位没成功：{meas.get('why')}。按推算的位置走。")
@@ -1169,6 +1201,12 @@ class _Drive:
             moves.sort(key=lambda cv: -pose_clearance(self.cfg, obs, apply_move(p, cv[0], cv[1]), model)[0])
         for c, v in moves:
             v = int(round(v))
+            if not ok and self.nav.world and self.leg_cuts:
+                ux, uy = _axis(self.nav.real()[2], c)
+                sg = 1.0 if v >= 0 else -1.0
+                if any(sg*(ux*wx + uy*wy) > 0.5 for wx, wy in self.leg_cuts):
+                    self.log(f'    (没定位成功：刚才离边线/区域太近少走的 {c} {v:+d} 不按推算补，宁短不长)')
+                    continue
             if self.nav.world:
                 v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
                 if v2 != v:
@@ -1236,7 +1274,8 @@ class _Drive:
         p, g = self.cut['pose'], self.cut['goal']
         self.log(f'  ◆ 离启停区还有约 {math.hypot(g[0]-p[0], g[1]-p[1]):.0f}mm：停下来用雷达定位，按实际位置走进去（不照原路线最后几步走）')
         res = home_approach(self.ctx, self.link, self.log, self.nav, g, self.cfg, self.caps, self._obstacles(),
-                            max_move=self.cut['max_move'], order=self.cut['order'], label='回家前定位', aborted=self.ctx.aborted)
+                            max_move=self.cut['max_move'], order=self.cut['order'], label='回家前定位', aborted=self.ctx.aborted,
+                            e_last=self.e_last)
         self.approach = res
         st = res['status']
         if st in ('fail_unmoved', 'off'):

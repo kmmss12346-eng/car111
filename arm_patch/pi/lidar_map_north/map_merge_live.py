@@ -401,7 +401,7 @@ def main():
         修正量 > reloc_confirm_mm 时再扫一次，两次一致才信。返回 reloc.relocalize 的 dict。"""
         bad=lambda why:dict(ok=False,why=why,pose=None,dx=0.0,dy=0.0,dyaw=0.0,rms=0.0,inlier=0.0,t=0.0)
         if SIM is not None:return bad('桌面模拟不做雷达定位')
-        if not raw_cfg.get('home_fix_enabled',True) or not raw_cfg.get('reloc_enabled',True):return bad('配置里关掉了(reloc_enabled/home_fix_enabled)')
+        if not raw_cfg.get('reloc_enabled',True):return bad('配置里关掉了(reloc_enabled=false)')
         try:ref=reference(only_first)
         except Exception as e:return bad(f'建参考点云出错：{e!r}')
         if ref is None:return bad('没有出发时的扫描数据')
@@ -636,7 +636,7 @@ def main():
         finally:state['auto']=False
     def command(line):
         import unicodedata
-        line=unicodedata.normalize('NFKC',line).replace('　',' ')   # 中文输入法打出的全角字母/空格也能认
+        line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
         parts=line.strip().split();k=parts[0].lower() if parts else 'scan'
         # ---- 行驶/比赛线程让界面线程做的事
         if k.startswith('__'):
