@@ -1376,6 +1376,11 @@ static char              qr_code[16];
 static uint8_t           qr_valid = 0;
 static uint8_t           qr_show = 0;      /* 1 = 新码还没写屏、还没告诉树莓派 */
 static uint8_t           qr_said = 0;      /* 1 = 新码已经在 QR? 的回复里告诉树莓派了：Arm_Poll 只写屏，不再主动发 */
+/* 诊断(QR RAW)：扫码器到底发来了什么。收到的字节数、串口出错次数、最后一条(收到换行或缓冲满时存下) */
+static volatile uint32_t qr_nbytes = 0;
+static volatile uint16_t qr_nerr = 0;
+static char              qr_last[QR_BUF];
+static volatile uint8_t  qr_last_len = 0;
 
 /* 在 s 里找 "ddd+ddd+ddd+ddd" 这种 15 个字符的格式，找到就复制到 out。前后有多余字符也没关系 */
 static int QR_Match(const char *s, int len, char *out)
@@ -1424,8 +1429,14 @@ void Arm_QR_RxCplt(void)
 {
     char ch = (char)qr_rx;
 
+    qr_nbytes++;
     if (ch == '\r' || ch == '\n')
     {
+        if (qr_len > 0)
+        {
+            memcpy(qr_last, qr_buf, qr_len);       /* 诊断用：存下这一条 */
+            qr_last_len = qr_len;
+        }
         QR_Latch();
         qr_len = 0;
     }
@@ -1433,6 +1444,8 @@ void Arm_QR_RxCplt(void)
     {
         if (qr_len >= QR_BUF - 1)
         {
+            memcpy(qr_last, qr_buf, qr_len);
+            qr_last_len = qr_len;
             QR_Latch();                            /* 太长(没有换行、连着发)：清空前先找一遍 */
             qr_len = 0;
         }
@@ -1444,6 +1457,7 @@ void Arm_QR_RxCplt(void)
 
 void Arm_QR_RxRestart(void)
 {
+    qr_nerr++;
     qr_len = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
 }
@@ -1529,6 +1543,8 @@ void Arm_Poll(void)
         __disable_irq();
         n = qr_len;
         memcpy(tmp, qr_buf, (size_t)n);
+        memcpy(qr_last, qr_buf, (size_t)n);
+        qr_last_len = (uint8_t)n;
         qr_len = 0;
         __enable_irq();
         if (QR_Match(tmp, n, newc))
@@ -1974,6 +1990,28 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         }
         if (qr_valid)  snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
         else           snprintf(m, sizeof(m), "QR NONE\r\n");
+        Say(m);
+        return 1;
+    }
+    if (strcmp(v, "QR") == 0 && n == 2 && strcmp(t[1], "RAW") == 0)
+    {
+        /* 诊断：QRRAW n=收到的字节数 err=串口出错次数 last=最后一条(看不见的字符写成 <十六进制>) */
+        char m[120];
+        char l[QR_BUF];
+        int k, ln, pos;
+
+        __disable_irq();
+        ln = qr_last_len;
+        memcpy(l, qr_last, (size_t)ln);
+        __enable_irq();
+        pos = snprintf(m, sizeof(m), "QRRAW n=%lu err=%u last=", (unsigned long)qr_nbytes, (unsigned)qr_nerr);
+        for (k = 0; k < ln && pos < (int)sizeof(m) - 8; k++)
+        {
+            unsigned char ch = (unsigned char)l[k];
+            if (ch >= 0x20 && ch < 0x7F) m[pos++] = (char)ch;
+            else                          pos += snprintf(m + pos, sizeof(m) - (size_t)pos, "<%02X>", ch);
+        }
+        m[pos++] = '\r'; m[pos++] = '\n'; m[pos] = 0;
         Say(m);
         return 1;
     }

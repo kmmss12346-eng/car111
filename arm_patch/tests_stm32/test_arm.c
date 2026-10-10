@@ -507,6 +507,14 @@ int main(void) {
     CHECK(zone_is("ZONE 1 0"), "再试开起来以后屏上能选");
     clear(); Arm_Init(); run("ZONE LOCK");          /* 恢复：接收开着，比赛布局 */
 
+    /* ---- QR RAW 诊断：扫码器发来的内容不是任务码格式时也看得到 ---- */
+    run("QR CLR"); clear();
+    qr_feed("ABC 12\x01\r\n");
+    CHECK(run("QR RAW") == 1 && pis("last=ABC 12<01>"), "QR RAW：显示最后一条原样内容(看不见的字符写成十六进制)");
+    CHECK(pis("QRRAW n="), "QR RAW：带收到的字节数");
+    run("QR?");
+    CHECK(pis("QR NONE"), "不是任务码格式的内容不当成任务码");
+
     /* ---- 二维码在中断里锁存：长指令阻塞(主循环不跑 Arm_Poll)时扫到的码不丢 ---- */
     run("QR CLR"); clear();
     qr_feed("xx156+123+516+231\r\n");
