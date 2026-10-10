@@ -1803,13 +1803,17 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
 
 
 # ================================================================ 待机：收臂、升降停 60mm
-def park_arm(link, hooks=None, log=print):
+def park_arm(link, hooks=None, log=print, force=False):
     """收臂并把升降停到 60mm(开机自动认高度要求升降在 60 附近)。有 hooks.park 用它；
-    否则发 PARK，旧固件(ERR CMD)改成 STOW + LIFT 60。尽力而为：失败只记日志。"""
+    否则发 PARK，旧固件(ERR CMD)改成 STOW + LIFT 60。尽力而为：失败只记日志。
+    force=True：用户自己输入了 park(急停以后 hooks 默认不动，这时要听用户的)。"""
     if hooks is not None and hasattr(hooks, 'park'):
         try:
-            hooks.park()
-            return True
+            try:
+                r = hooks.park(force=force)
+            except TypeError:                       # 旧的 hooks.park() 没有 force
+                r = hooks.park()
+            return True if r is None else bool(r)   # 不回结果的旧 hooks 当作做了
         except Exception as e:
             log(f'  收臂停 60mm 出错：{e!r}')
             return False

@@ -728,7 +728,7 @@ def main():
             state['busy']=True
             def pworker():
                 try:
-                    if park_arm(link,state.get('hooks'),log):state['aborted']=False
+                    if park_arm(link,state.get('hooks'),log,force=True):state['aborted']=False
                 finally:state['busy']=False
             threading.Thread(target=pworker,daemon=True).start();return
         if k=='home':

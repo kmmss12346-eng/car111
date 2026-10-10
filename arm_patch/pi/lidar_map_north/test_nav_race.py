@@ -158,6 +158,20 @@ class RaceTests(unittest.TestCase):
 
 
 class ParkTests(unittest.TestCase):
+    def test_terminal_park_forces_after_abort(self):
+        # 急停以后 hooks.park() 默认不动；用户自己输入 park 时 force=True，要听用户的
+        car = SimCar((0, 0, 0))
+
+        class H:
+            got = []
+
+            def park(self, link=None, force=False):
+                H.got.append(force)
+                return force
+        self.assertFalse(auto_run.park_arm(car, H(), lambda m: None))
+        self.assertTrue(auto_run.park_arm(car, H(), lambda m: None, force=True))
+        self.assertEqual(H.got, [False, True])
+
     def test_hooks_park_preferred(self):
         car = SimCar((0, 0, 0))
 
