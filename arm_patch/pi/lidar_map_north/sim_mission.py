@@ -26,6 +26,8 @@ from task_plan import parse_code, role_of
 
 DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03)
 MEASURE_S = 0.35
+CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
+FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
 
 DEFAULT_PARAMS = dict(ARMOK=1.0, ZHI=0.0, ZGRAB=100.0, ZDROP=60.0, ZPLC=100.0, ZSTK=40.0, ZOBRAW=0.0, ZOBRNG=0.0,
                       A1G=500.0, A1D=430.0, A1H=410.0, A1P=470.0, A2E=-800.0, A2R=-1100.0, A2P=-780.0,
@@ -54,7 +56,7 @@ class SimLink:
 class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
-                 park_side=None):
+                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None):
         self.rng = np.random.default_rng(seed)
         self.t = 0.0
         self.code = code
@@ -108,6 +110,15 @@ class SimWorld:
         self.park = dict(park or {})                           # 工位 -> 车停的位置沿圆环那一排偏了多少毫米(测"车没停在 2 号环")
         self.park_side = dict(park_side or {})                 # 工位 -> 车离圆环那一排远/近了多少毫米(测"手臂伸缩够不着")
         self.moves = []                                        # 底盘每条指令 (S/F, 毫米, 当时在哪个工位)
+        if raw_scale:
+            self.scale['RAW'] = float(raw_scale)               # 真车上原料区画面约 1.97 像素/毫米(看得比较大一片)
+        # 原料盘转一会儿停一会儿(停 plate_stop_s 秒、转 plate_move_s 秒，每次转 120°，三个物料轮流停到爪子附近；None = 一直停着)：
+        # 物料在半径 150mm 的圆上，停下时离爪子最近的那个在爪子外面 plate_off_mm(车停得偏一点)
+        self.plate_stop = float(plate_stop_s) if plate_stop_s else None
+        self.plate_move = float(plate_move_s)
+        self.plate_t0 = 0.0
+        self.plate_r = 150.0
+        self.plate_c = np.array([self.plate_r + float(plate_off_mm), 0.0])
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         self.link = SimLink(self)
@@ -208,12 +219,20 @@ class SimWorld:
             except Exception:
                 colors = [1, 2, 3]
             self.raw_items = []
+            if self.plate_stop:
+                self.plate_t0 = self.t - self.rng.uniform(0, self.plate_stop + self.plate_move)   # 到的时候转盘在一个周期里的随便哪个时刻
+                shift = int(self.rng.integers(0, 3))
+                for i, c in enumerate(colors):
+                    if not (batch == 1 and c in self.missing_batch1):
+                        self.raw_items.append(dict(color=c, r=self.plate_r + self.rng.normal(0, 1.0),
+                                                   off=-((i + shift) % 3) * 2 * math.pi / 3 + self.rng.normal(0, 0.02)))
+                colors = []
             for c in colors:
                 if batch == 1 and c in self.missing_batch1:
                     continue
-                for _ in range(200):                           # 离停车点 30mm 以内；两个物料不会叠在一起(不然夹的时候分不清夹到的是哪个)
-                    pos = self.rng.uniform(-30, 30, 2)
-                    if np.linalg.norm(pos) <= 30.0 and all(np.linalg.norm(pos - it['pos']) >= 20.0 for it in self.raw_items):
+                for _ in range(200):                           # 离停车点 22mm 以内(原料区只动手臂：车要停得让物料在手臂够得着的地方)；两个物料不会叠在一起
+                    pos = self.rng.uniform(-22, 22, 2)
+                    if np.linalg.norm(pos) <= 22.0 and all(np.linalg.norm(pos - it['pos']) >= 20.0 for it in self.raw_items):
                         break
                 self.raw_items.append(dict(color=c, pos=pos))
         if role in ('ROUGH', 'TEMP'):
@@ -221,6 +240,26 @@ class SimWorld:
                 self.rings.setdefault((role, k), [])
 
     # ------------------------------------------------------------------ 几何
+    def plate_phase(self, t=None):
+        """(原料盘转过的角度, 现在是不是在转)。"""
+        if not self.plate_stop:
+            return 0.0, False
+        cyc = self.plate_stop + self.plate_move
+        tau = (self.t if t is None else t) - self.plate_t0
+        k = math.floor(tau / cyc)
+        r = tau - k * cyc
+        step = 2 * math.pi / 3
+        if r < self.plate_stop:
+            return k * step, False
+        return k * step + step * (r - self.plate_stop) / self.plate_move, True
+
+    def raw_pos(self, it, t=None):
+        """原料盘上物料现在的位置(转盘转起来时随时间变)。"""
+        if 'r' not in it:
+            return it['pos']
+        th = self.plate_phase(t)[0] + it['off']
+        return np.array([self.plate_c[0] - it['r'] * math.cos(th), self.plate_c[1] + it['r'] * math.sin(th)])
+
     def claw(self):
         """爪子在工位坐标系里的位置(rad, tan)。"""
         if self.a1_ref is None:
@@ -372,11 +411,14 @@ class SimWorld:
             if len(parts) != 3 or parts[2] != 'H':
                 return False, 'ERR ARG', info
             self._open_claw()                                      # arm.c 下降前先张开爪子
-            c = self.claw()                                        # 夹的那一刻爪子在哪
+            self._tt_go(slot)
+            self._lift_to(P['ZGRAB'] if verb == 'GRAB' else P['ZPLC'])
+            self.advance(CLAW_CLOSE_S)                             # 夹爪合上的那一刻(原料盘在转的话物料又走了一点)
+            c = self.claw()
             got = None
             if verb == 'GRAB' and self.zone == 'RAW':
-                best = min(self.raw_items, key=lambda it: np.linalg.norm(it['pos'] - c), default=None)
-                if best is not None and np.linalg.norm(best['pos'] - c) <= 8.0 and self.claw_open:
+                best = min(self.raw_items, key=lambda it: np.linalg.norm(self.raw_pos(it) - c), default=None)
+                if best is not None and np.linalg.norm(self.raw_pos(best) - c) <= 8.0 and self.claw_open:
                     got = best['color']
                     self.raw_items.remove(best)
             elif verb == 'PICK' and self.zone in ('ROUGH', 'TEMP'):
@@ -391,9 +433,7 @@ class SimWorld:
                 if self.tray[slot] is not None:
                     self.collisions += 1
                 self.tray[slot] = got
-            self._tt_go(slot)
-            self._lift_to(P['ZGRAB'] if verb == 'GRAB' else P['ZPLC'])
-            self._claw_wait()
+            self.advance(max(0.0, self.params['CLWAIT'] / 1000.0 - CLAW_CLOSE_S))
             self._lift_to(P['ZHI'])
             self._servos_to(P['A1D'], P['A2R'], P['ASPD'])
             self._lift_to(P['ZDROP'])
@@ -539,8 +579,28 @@ class SimVision:
             w.advance(MEASURE_S)
             return None
         c = w.claw()
-        it = min(items, key=lambda i: np.linalg.norm(i['pos'] - c))
-        return self._off('RAW', w.pixel_error(it['pos'], 'RAW'))
+        it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
+        return self._off('RAW', w.pixel_error(w.raw_pos(it), 'RAW'))
+
+    def material_stream(self, color_id):
+        """和真的 Vision.material_stream 一样：每认完一帧 yield (这帧拍下的时间, 像素位置或 None, 画面变了的比例或 None)；认一帧要 FRAME_S。"""
+        w = self.w
+        t_prev = None
+        while True:
+            t_cap, p = w.t, None
+            moved = None
+            if t_prev is not None:
+                moved = 0.03 if (w.plate_phase(t_cap)[1] or w.plate_phase(t_prev)[1]) else abs(float(w.rng.normal(0, 0.0005)))
+            t_prev = t_cap
+            items = [it for it in w.raw_items if it['color'] == int(color_id)] if w.zone == 'RAW' else []
+            if items:
+                c = w.claw()
+                it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
+                e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
+                if abs(e[0]) <= 300 and abs(e[1]) <= 220:
+                    p = (self.TRUE_CLAW[0] + float(e[0]), self.TRUE_CLAW[1] + float(e[1]))
+            w.advance(FRAME_S)
+            yield t_cap, p, moved
 
     def wait_still(self, color_id, timeout_s=10.0, **kw):
         """和真的 Vision.wait_still 一样：要在画面里检测到才算(不在画面里 = 看不到)。"""
@@ -550,11 +610,11 @@ class SimVision:
         if not items:
             return False, None
         c = w.claw()
-        it = min(items, key=lambda i: np.linalg.norm(i['pos'] - c))
-        e = w.scale['RAW'] * (w.Rcam @ (it['pos'] - c))
+        it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
+        e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c))
         if abs(e[0]) > 280 or abs(e[1]) > 200:
             return False, None
-        return True, (0.0, 0.0)
+        return not w.plate_phase()[1], (0.0, 0.0)
 
     def ring_error(self, n=None, max_px=None):
         w = self.w

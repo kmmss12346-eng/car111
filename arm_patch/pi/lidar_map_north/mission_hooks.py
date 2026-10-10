@@ -25,6 +25,8 @@
 import math
 import time
 
+import numpy as np
+
 from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
 from task_plan import parse_code, TaskError, role_of, Stats
 from visual_servo import VisualServo, JacStore
@@ -45,6 +47,14 @@ DEFAULTS = dict(
     raw_chassis='off',                  # 原料区对准时车轮能不能动：'off' = 只动手臂，车轮不动(不会压进原料区)；
                                         #   'F' = 只许沿车头方向前后挪，最多 raw_fix_max_mm；'SF' = 前后、横着都能挪(以前的做法，可能压进原料区)
     raw_fix_max_mm=40.0,                # raw_chassis='F' 时一次对准车轮最多前后挪多少毫米
+    raw_track_s=30.0,                   # 等要抓的物料转过来、停在爪子下面最多等多久(秒)。原料盘转 3 秒停 6 秒、三个物料轮流停过来，一圈约 27 秒
+    raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
+    raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
+    raw_motion_frac=0.004,              # 前后两帧画面(爪子以外)变了的地方超过这个比例 = 原料盘在转
+    raw_static_s=9.0,                   # 还没做 vcal RAW(没有手臂和画面的对应关系)时：看到原料盘连续这么多秒都不转(关了)，才现场小幅动几下测
+    raw_frames=2,                       # 原料区对准时每次测量用几帧(少一点快，停下来的时间有限)
+    raw_max_iter=3,                     # 原料区对准最多修正几次(果断：差不多就下爪)
+    raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停
     camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
@@ -158,6 +168,7 @@ class MissionHooks:
         self.nogo = False                   # mtest ... nogo：只认圆环、对准，不取物料、不放、不夹回
         self.ring_rev = False               # mtest ... rev：这一次圆环的前后方向反过来(车头朝向和配置的相反)
         self._pick_tries = 0                # 量 claw_px.PICK 试了几次(认不到就下一个物料再试，最多 3 次)
+        self.raw_stops = []                 # 看到的原料盘每次停了多久(秒)，用来估计这一次停下还剩多少时间
         self.ring_f = {}                    # (区, 圆环号) -> 这个环正对爪子时底盘的前后位移(毫米)，到工位时用摄像头看出来的(_survey)
         self.ring_gate_px = None            # 对准时只认离爪子点这么多像素以内的圆环(不去追旁边那个)
 
@@ -387,6 +398,12 @@ class MissionHooks:
         if not self._can_work():
             return
         batch = 1 if visit <= 1 else 2
+        try:
+            self.arm.params(refresh=True)                         # 升降速度可能刚 set 过：算下爪提前量要用最新的
+        except ArmAbort:
+            raise
+        except ArmError:
+            pass
         for item in self.plan.items(batch):
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
@@ -423,6 +440,11 @@ class MissionHooks:
         if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(item.color) and not self._warned_vmask:
             self._warned_vmask = True
             self.log(f'    ★ 没标定爪子区域(claw_mask.png)：{item.color_name}物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
+        if hasattr(self.vision, 'material_stream'):
+            t_end = min(self.now() + max(float(cfg['raw_wait_s']), float(cfg.get('raw_track_s', 30.0))),
+                        self.t0 + float(cfg['time_limit_s']))
+            return self._raw_stop_grab(item.color, item.slot, 'grab', t_end, f'抓{item.color_short}')
+        # 旧的视觉模块(没有一帧一帧认的功能)：等停稳，再闭环对准
         still, last = self.vision.wait_still(item.color, timeout_s=cfg['raw_wait_s'])
         if last is None and self._recenter(min_mm=3.0):
             self.log('    看不到，底盘挪回停车点再找一次')
@@ -432,7 +454,7 @@ class MissionHooks:
             self._ui('msg', f'NO {item.color_short}')
             return False
         if not still:
-            self.log('    原料盘还没停稳，按现在的位置先试(对准过程中会继续跟；只动手臂，不用车轮去追)')
+            self.log('    原料盘还没停稳，按现在的位置先试(只动手臂，不用车轮去追)')
         mode = str(cfg.get('raw_chassis') or 'off').upper()
         allow = still and mode in ('F', 'SF')
         kw = dict(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0)) if allow and mode == 'F' else {}
@@ -446,6 +468,226 @@ class MissionHooks:
             self._recover(f'没对准({res.reason})，不夹，免得夹偏')
             return False
         self.arm.grab_here(item.slot)
+        return True
+
+    # ------------------------------------------------------------------ 原料盘转一会儿、停一会儿：物料一停下就对准、下爪
+    def _raw_stream(self, color):
+        """一帧一帧认物料的数据流(Vision.material_stream)；没有这个功能(旧的视觉模块)返回 None。"""
+        f = getattr(self.vision, 'material_stream', None)
+        return f(int(color)) if f is not None else None
+
+    def _raw_close_delay(self, mode):
+        """从发出下爪指令到夹爪合上要多久(秒)：升降从 ZOBRAW 降到 ZGRAB(和 STM32 算等待时间的办法一样，含 LFMRG) + 夹爪合上。"""
+        P = self.arm.params() or {}
+        try:
+            sps = float(P['LFRPM']) / 60.0 * float(P['LFSPR'])
+            lift = abs(float(P['ZOBRAW']) - float(P['ZGRAB'])) * float(P['LFPPM']) / sps + float(P.get('LFMRG', 0.0)) / 1000.0
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            lift = 0.45
+        return lift + float(self.cfg.get('raw_claw_close_s', 0.15)) + (0.04 if mode == 'lift' else 0.02)
+
+    def _raw_stop_len(self):
+        """原料盘每次停多久：看到过完整的停(从停下到开始转)就按实测的中值打九折，没看到过按配置的 raw_stop_s。"""
+        seen = sorted(self.raw_stops[-5:])
+        if seen:
+            return 0.9 * seen[len(seen) // 2]
+        return float(self.cfg.get('raw_stop_s', 5.0))
+
+    def _raw_stop_grab(self, color, slot, mode, t_end, label):
+        """原料盘转一会儿、停一会儿(大约转 3 秒停 6 秒，不一定准)：
+          - 从画面判断盘在转还是停着(整个画面变了多少 + 物料位置变没变)，每次停、转多久都实测记下来
+          - 要抓的物料停在爪子附近、手臂够得着：马上对准(只用存好的 J，最多修正几次)，下爪前再拍一帧确认没动、位置准，马上下爪
+          - 这一次停下剩的时间不够、停在够不着的地方、对准中途转起来了：回到 OBS RAW 姿态，等下一次停
+        mode：'grab' = GRAB slot H(夹进车上转盘)；'lift' = gtest：下降、夹紧、抬起；'nogo' = 只对准不夹。返回是否成功。"""
+        cfg, v = self.cfg, self.vision
+        tag = f'[{label}]'
+        J = self.store.get('RAW', 'arm') if self.store is not None else None
+        static_s = float(cfg.get('raw_static_s', 9.0))
+        if J is None:
+            self.log('    ★ 还没有原料区手臂和画面的对应关系(没做 vcal RAW)：原料盘一停一转时现测会测错，'
+                     f'要看到它连续 {static_s:.0f} 秒都不转(转盘关了)才现测。赛前先让原料盘停转，做一次 vcal RAW 颜色号 arm')
+        T = self._raw_close_delay(mode)
+        still_px = float(cfg.get('raw_still_px', 6.0))
+        thr = float(cfg.get('raw_motion_frac', 0.004))
+        try:
+            home = self.arm.read_angles()                     # OBS RAW 的姿态：没夹成就回到这里等下一次停
+        except ArmAbort:
+            raise
+        except ArmError:
+            home = (None, None)
+        state, cnt, t_cand = None, 0, None                    # 原料盘：'move' / 'stop' / None(还不知道)；连着几帧和现在的状态不一样
+        t_stop0 = None                                        # 这一次停下的时刻(亲眼看到它从转到停才有)
+        t_move0 = None
+        stop_id, tries = 0, 0                                 # 第几次停；这一次停下试了几次
+        t_still = None                                        # 从什么时候起一直停着(没做 vcal 时用来判断转盘是不是关了)
+        hist = []
+        said = set()
+        self.log(f'    盯着{label[1:] if label.startswith("抓") else ""}物料：原料盘一停、物料在爪子附近就马上对准下爪'
+                 f'(下爪到夹住约 {T:.2f} 秒；每次停先按 {self._raw_stop_len():.1f} 秒算，看到实际的就按实际的)')
+        stream = self._raw_stream(color)
+        try:
+            while True:
+                t, p, moved = next(stream)
+                self._check_abort()
+                now = self.now()
+                if now > t_end:
+                    self.log(f'  {tag} ★ 等了 {float(cfg.get("raw_track_s", 30.0)):.0f} 秒没等到它停在爪子附近，跳过')
+                    return False
+                if p is not None:
+                    hist = (hist + [(t, p)])[-6:]
+                else:
+                    hist = []
+                # ---- 原料盘在转还是停着：看得到物料时看物料位置变没变(最准)；看不到时看整个画面变了多少
+                now_moving = None
+                if len(hist) >= 2 and t - hist[-2][0] < 0.5:
+                    prev = [q[1] for q in hist[-3:-1] if t - q[0] < 0.6]          # 和前一两帧(的中值)比，少受识别抖动影响
+                    ref = np.median(np.array(prev, float), axis=0)
+                    now_moving = math.hypot(hist[-1][1][0] - ref[0], hist[-1][1][1] - ref[1]) > still_px
+                elif moved is not None:
+                    now_moving = moved > thr
+                if now_moving is not None:
+                    want = 'move' if now_moving else 'stop'
+                    if want == state:
+                        cnt = 0
+                    else:
+                        cnt += 1
+                        if cnt == 1:
+                            t_cand = t                        # 第一帧和现在的状态不一样
+                    if state is None or cnt >= 2:
+                        if state == 'stop' and want == 'move':
+                            t_move0 = t_cand
+                            if t_stop0 is not None:
+                                self.raw_stops.append(t_move0 - t_stop0)
+                                self.log(f'  {tag} 原料盘开始转(这次停了 {t_move0 - t_stop0:.1f} 秒)')
+                        elif state == 'move' and want == 'stop':
+                            t_stop0 = t_cand - 0.07           # 停下大概在第一帧停着的帧之前一点点
+                            stop_id, tries = stop_id + 1, 0
+                            self.log(f'  {tag} 原料盘停了' + (f'(这次转了 {t_stop0 - t_move0:.1f} 秒)' if t_move0 is not None else ''))
+                        elif want == 'stop':
+                            t_stop0 = None                    # 一开始就停着：不知道已经停了多久
+                        if want == 'stop' and state != 'stop':
+                            t_still = t if state is None else t_cand
+                        elif want == 'move':
+                            t_still = None
+                        state, cnt = want, 0
+                if state != 'stop' or p is None or len(hist) < 2:
+                    if p is None and state == 'stop' and 'none' not in said:
+                        said.add('none')
+                        self.log(f'  {tag} 停下了，但画面里没有这个颜色的物料：等它转过来')
+                    continue
+                static = t_still is not None and now - t_still >= static_s     # 一直没转过：转盘是关着的
+                if tries >= (5 if static else 2):
+                    continue                                  # 这一次停下已经试了两次：等下一次
+                # ---- 停着、看得到物料：够不够时间、够不够得着
+                stop_len = self._raw_stop_len()
+                left = None if (static or t_stop0 is None) else t_stop0 + stop_len - now
+                if left is not None and left < T + 0.5:
+                    if ('late', stop_id) not in said:
+                        said.add(('late', stop_id))
+                        self.log(f'  {tag} 这一次停下只剩 {max(0.0, left):.1f} 秒，来不及：等下一次停')
+                    tries = 2
+                    continue
+                e = np.array(hist[-1][1], float) - np.array(v.claw('RAW'), float)
+                far = self._raw_reachable(J, e) if (J is not None and str(cfg.get('raw_chassis') or 'off').upper() == 'OFF') else ''
+                if far:
+                    if ('far', stop_id) not in said:
+                        said.add(('far', stop_id))
+                        self.log(f'  {tag} 物料停在手臂够不着的地方({far})：等下一次停')
+                    tries = 2
+                    continue
+                probe = False
+                if J is None:
+                    if not static:
+                        continue                              # 没有对应关系：等确定转盘是一直停着的再说
+                    probe = True
+                    self.log(f'  {tag} 原料盘 {now - t_still:.0f} 秒都没转，当它是停着的：先小幅动几下测出手臂和画面的对应关系(只测这一次)')
+                tries += 1
+                if static:
+                    deadline = now + 20.0
+                elif left is not None:
+                    deadline = now + left - T - 0.3
+                else:                                         # 一开始就停着，不知道已经停了多久：按刚看到它时才停下算(果断先试)
+                    deadline = now + max(1.0, (t_still if t_still is not None else now) + stop_len - now - T - 0.3)
+                self.log(f'  {tag} 停着，离爪子点 {np.linalg.norm(e) / v.scale("RAW"):.1f}mm：马上对准'
+                         + ('' if left is None else f'(这次停下大约还剩 {left:.1f} 秒)'))
+                if self._raw_align_go(color, slot, mode, e, deadline, label, probe=probe):
+                    return True
+                J = self.store.get('RAW', 'arm') if self.store is not None else None
+                if home[0] is not None and home[1] is not None:
+                    self.arm.ap(home[0], home[1])             # 回到 OBS RAW 姿态等
+                stream.close()
+                stream = self._raw_stream(color)              # 手臂动过：重新比画面(不然会把手臂动当成转盘在转)
+                hist, cnt = [], 0
+        finally:
+            stream.close()
+
+    def _raw_reachable(self, J, e):
+        """按手臂和画面的对应关系 J 算：对准偏差 e(像素)要转多少度，超出手臂能转的范围就返回说明，够得着返回 ''。"""
+        try:
+            d = -np.linalg.solve(np.asarray(J, float), np.asarray(e, float))       # [ID2, ID1] 度
+        except np.linalg.LinAlgError:
+            return ''
+        lim = (self.servo.cfg.get('arm_limit_deg') or {}) if self.servo is not None else {}
+        out = []
+        for i, key in enumerate(('id2', 'id1')):
+            lm = 0.95 * float(lim.get(key, 250.0 if key == 'id2' else 12.0))
+            if abs(d[i]) > lm:
+                out.append(f'{"ID2" if i == 0 else "ID1"} 要转 {d[i]:+.0f}°，最多 ±{lm:.0f}°')
+        return '，'.join(out)
+
+    def _raw_align_go(self, color, slot, mode, e0, deadline, label, probe=False):
+        """物料停着：只动手臂快速对准(用存好的 J，不探测、不改 J，最多 raw_max_iter 次)；
+        对好了再拍一帧确认物料没动(原料盘没开始转)、偏差在范围里，马上下爪。
+        probe=True：还没有 J、原料盘一直停着：按普通的闭环对准(先小幅动几下测 J，存下来)。"""
+        cfg, v = self.cfg, self.vision
+        n = int(cfg.get('raw_frames', 2))
+        tol, acc = float(cfg['tol_mm']['RAW']), float(cfg['accept_mm']['RAW'])
+        kw = dict(fixed_j=True, max_iter=int(cfg.get('raw_max_iter', 3)))
+        if probe:
+            kw = dict(fixed_j=False)
+        cmode = str(cfg.get('raw_chassis') or 'off').upper()
+        allow = cmode in ('F', 'SF')                         # 默认 'off'：只动手臂，车轮不动
+        if cmode == 'F':
+            kw.update(chassis_axes='F', chassis_fix_max_mm=float(cfg.get('raw_fix_max_mm') or 40.0))
+        res = self.servo.run('RAW', _first(tuple(e0), lambda: v.material_error(color, n=n)), v.scale('RAW'), tol,
+                             allow_chassis=allow, timeout_s=max(0.3, deadline - self.now()),
+                             label=label, bounds=v.bounds('RAW'), confirm=False, **kw)
+        self.log(f'    对准结果：{res}')
+        if not (res.ok or res.err_mm <= acc):
+            self.log(f'    ★ 没对准({res.reason})：不下爪，等下一次停')
+            if '误差变大' in (res.reason or ''):
+                self._raw_bad_j = getattr(self, '_raw_bad_j', 0) + 1
+                if self._raw_bad_j == 2:
+                    self.log('    ★ 连着两次越对越偏：存的原料区对应关系(J)可能不对(以前在转盘转的时候测的？)。'
+                             '先让原料盘停转，物料放在爪子下面，重新做一次 vcal RAW 颜色号 arm')
+            return False
+        chk = v.material_error(color, n=1)                    # 下爪前最后看一眼
+        still_px = float(cfg.get('raw_still_px', 6.0))
+        if chk is None:
+            self.log('    ★ 下爪前最后看一眼没看到物料：不下爪，等下一次停')
+            return False
+        jump = math.hypot(chk[0] - res.p[0], chk[1] - res.p[1])
+        err = math.hypot(chk[0], chk[1]) / v.scale('RAW')
+        if jump > 2.0 * still_px:
+            self.log(f'    ★ 下爪前物料动了 {jump:.0f} 像素(原料盘开始转了)：不下爪，等下一次停')
+            return False
+        if err > acc:
+            self.log(f'    ★ 下爪前偏差 {err:.1f}mm，超过 {acc:g}mm：不下爪，等下一次停')
+            return False
+        if self.now() > deadline:
+            self.log(f'    ★ 对准用的时间太长，原料盘快要转了：不下爪，等下一次停')
+            return False
+        if mode == 'nogo':
+            self.log(f'    nogo：对准了(下爪前偏差 {err:.1f}mm)，不夹。看看爪子是不是在物料正上方')
+            return True
+        self.log(f'    下爪(偏差 {err:.1f}mm)')
+        if mode == 'lift':
+            P = self.arm.params() or {}
+            self.arm.do(f'LIFT {float(P["ZGRAB"]):g}')
+            self.arm.do('CLAW C')
+            self.arm.do(f'LIFT {float(P["ZHI"]):g}')
+            return True
+        self.arm.grab_here(slot)
         return True
 
     # ------------------------------------------------------------------ ROUGH：放下，再取回

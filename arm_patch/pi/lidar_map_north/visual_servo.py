@@ -412,9 +412,12 @@ class VisualServo:
         return 'arm'
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
-            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None):
+            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False):
         """对准(见 _run)。chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
-        chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。"""
+        chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。
+        fixed_j = True：只用存好的 J——不探测、不丢、不改存着的 J；误差变大就直接停(原料盘停下的几秒钟里对准用：
+        万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。"""
+        self._fixed = bool(fixed_j)
         self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
         self._s_range = tuple(chassis_s_range) if chassis_s_range is not None else None
         self._s_used = 0.0
@@ -427,6 +430,7 @@ class VisualServo:
             self._axes = None
             self._s_range = None
             self._need_s = False
+            self._fixed = False
 
     def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
              bounds=None, confirm=None, chassis_fix_max_mm=None):
@@ -483,7 +487,7 @@ class VisualServo:
             return fix_max is not None and ch_moved[0] >= float(fix_max)
 
         def finish(ok, reason=''):
-            if ok or probed:
+            if (ok or probed) and not getattr(self, '_fixed', False):
                 for g in ('arm', 'ch'):
                     if J[g] is not None:
                         self.store.put(kind, g, J[g])
@@ -535,6 +539,8 @@ class VisualServo:
                 if prev_e is not None and e > prev_e * c['diverge_ratio'] + 0.6:
                     bad += 1
                     self.log(f'  {tag} 误差变大了({prev_e:.2f}→{e:.2f}mm)，J 可能不对')
+                    if getattr(self, '_fixed', False):
+                        return finish(False, '误差变大了(目标自己在动？)，停下')
                     if bad >= 2 or reprobes >= 1:
                         for g in ('arm', 'ch'):
                             self.store.drop(kind, g)
@@ -551,6 +557,8 @@ class VisualServo:
                 if group == 'ch' and self._need_s and J['ch'] is not None and self._ch_synth:
                     J['ch'] = None                           # 横移那一列是补出来的(只测过前后)：要横移先实测一次
                 if J[group] is None:
+                    if getattr(self, '_fixed', False):
+                        return finish(False, '没有存好的对应关系(J)，这次不探测')
                     moved()
                     J[group] = self._probe(measure, group, bounds)
                     probed = True

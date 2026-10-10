@@ -509,6 +509,40 @@ class Vision:
             return None
         return _robust_mean(pts, self.cfg['reject_px'])
 
+    def material_stream(self, color_id):
+        """原料盘转一会儿停一会儿时用：一直读新画面，每帧单独认这个颜色的物料(不取平均，免得慢)，
+        再和上一帧比一比整个画面(爪子以外)有多少地方变了——原料盘在转，盘面上的线条、物料都在动，变的地方就多。
+        每认完一帧 yield (这帧拍下的时间, 物料像素 (u, v) 或 None, 变了的比例 0~1 或 None)；时间和 time.monotonic() 同一个钟。"""
+        import cv2
+        import numpy as np
+        det = self._material_det()
+        md = getattr(det, 'detector', None)
+        t_last, g_last = None, None
+        while True:
+            fr = self._frame(after=t_last, fresh=False)
+            t = getattr(self.camera, 'last_t', None) if self._threaded() else None
+            if t is None or t == t_last:
+                t = time.monotonic()
+            if fr is None:
+                g_last = None
+                yield t, None, None
+                continue
+            t_last = t
+            p = det(fr, color_id)
+            self._publish(fr, 'RAW', p, color_id=color_id)
+            g = cv2.GaussianBlur(cv2.resize(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (160, 120), interpolation=cv2.INTER_AREA), (3, 3), 0)
+            moved = None
+            if g_last is not None and g_last.shape == g.shape:
+                diff = cv2.absdiff(g, g_last) > int(self.cfg.get('motion_diff', 25))
+                claw = getattr(md, 'last_claw', None) if md is not None else None
+                if claw is not None and getattr(claw, 'shape', None) is not None and claw.any():
+                    keep = cv2.resize(claw, (160, 120), interpolation=cv2.INTER_NEAREST) == 0
+                    moved = float(diff[keep].mean()) if keep.any() else float(diff.mean())
+                else:
+                    moved = float(diff.mean())
+            g_last = g
+            yield t, p, moved
+
     def material_error(self, color_id, n=None):
         """物料偏差像素 = 物料 - 爪子(RAW)。看不到返回 None。"""
         p = self.material_px(color_id, n)

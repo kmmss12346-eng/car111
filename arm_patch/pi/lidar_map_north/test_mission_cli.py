@@ -141,6 +141,74 @@ class CliTests(unittest.TestCase):
         text = '\n'.join(self.lines)
         self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
 
+    # ---------------- 原料盘转一会儿停一会儿(大约转 3 秒停 6 秒)
+    def _plate_world(self, stop_s=6.0, move_s=3.0, seed=5, seed_j=True, **kw):
+        """换一个原料盘会转的模拟世界；seed_j = 已经做过 vcal RAW(手臂和画面的对应关系存好了)。"""
+        import numpy as np
+        from sim_mission import make
+        self.w = SimWorld(seed=seed, code='156+123+516+231', plate_stop_s=stop_s, plate_move_s=move_s, raw_scale=1.97,
+                          params=dict(ZOBRAW=100.0, ZGRAB=80.0, LFRPM=150.0, LFMRG=100.0), **kw)
+        self.h = make(self.w)
+        mission_cli._S['hooks'] = self.h
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.h._ensure(self.w.link)
+        if seed_j:
+            w = self.w
+            J = -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1])        # 真实的：手臂 ID2/ID1 转 1° 画面里物料移动多少像素
+            self.h.store.put('RAW', 'arm', J)
+        self.w.arrive('RAW', 1)
+        self.w.requests.clear()
+        self.lines.clear()
+
+    def test_stop_go_plate_grabs_when_it_stops(self):
+        self._plate_world()
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(self.w.air, 0, text)
+        self.assertEqual(sorted(c for c in self.w.tray.values() if c), [1, 5, 6])
+        self.assertIn('原料盘停了', text)
+        self.assertIn('下爪', text)
+        self.assertNotIn('探测', text)                              # 停下的几秒里不现测 J
+
+    def test_stop_go_plate_shorter_stops_still_work(self):
+        """停的时间比说的短(可能更快)：照样一停就夹，不会在转盘转起来以后才下爪。"""
+        for stop in (3.0, 4.0):
+            self._plate_world(stop_s=stop, move_s=2.0, seed=7)
+            self.run_cli('mtest', 'mtest RAW 1')
+            text = '\n'.join(self.lines)
+            self.assertEqual(self.w.air, 0, f'停 {stop}s\n{text}')
+            self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), f'停 {stop}s\n{text}')
+
+    def test_stop_too_short_never_grabs_a_moving_material(self):
+        """停的时间短到来不及对准：不夹(不会夹空/把物料碰倒)，到时间就跳过。"""
+        self._plate_world(stop_s=1.0, move_s=2.0, seed=3)
+        self.h.cfg['raw_track_s'] = 20.0
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertEqual(self.w.air, 0, text)
+
+    def test_stop_go_without_vcal_does_not_probe(self):
+        """没做 vcal RAW：转盘一停一转时不现测(测出来是错的还会存下来)，提示先停转盘做 vcal。"""
+        self._plate_world(seed_j=False)
+        self.h.cfg['raw_track_s'] = 15.0
+        self.run_cli('mtest', 'mtest RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('vcal RAW', text)
+        self.assertIsNone(self.h.store.get('RAW', 'arm'))
+        self.assertEqual(self.w.air, 0, text)
+        self.assertFalse([r for r in self.w.requests if r.startswith('GRAB')], text)
+
+    def test_gtest_nogo_on_stop_go_plate(self):
+        self._plate_world()
+        self.run_cli('gtest', 'gtest 1 nogo')
+        text = '\n'.join(self.lines)
+        self.assertIn('nogo', text)
+        self.assertIn('原料盘', text)
+        self.assertNotIn('CLAW C', self.w.requests)
+        self.assertFalse([r for r in self.w.requests if r.startswith('GRAB')])
+
     def test_mtest_force_assumes_tray(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
         self.w.arrive('ROUGH', 1)

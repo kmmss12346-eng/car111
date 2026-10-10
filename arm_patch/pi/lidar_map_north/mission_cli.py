@@ -485,6 +485,18 @@ def _gtest(h, link, color, nogo, log):
     log('① 张开夹爪，手臂先升到最高再摆到原料上方(OBS RAW，和比赛时一样)')
     h.arm.obs('RAW', open_claw=True)
     _warn_blue(h, color, log)
+    if hasattr(h.vision, 'material_stream') and hasattr(h, '_raw_stop_grab'):
+        log(f'② 盯着{name}色物料：原料盘一停、物料在爪子附近，就马上对准' + ('(nogo：只对准，不夹)' if nogo else '、下降夹紧、抬起'))
+        ok = h._raw_stop_grab(color, None, 'nogo' if nogo else 'lift', h.now() + float(h.cfg.get('raw_track_s', 30.0)), f'测试{name}')
+        if not ok:
+            saved = h.vision.save_debug('vdebug.png', 'RAW', color) if hasattr(h.vision, 'save_debug') else False
+            raise ValueError('这次没对准/没夹(原因见上面)。' + ('画面存到了 vdebug.png。' if saved else '') +
+                             '另开桌面终端运行 python3 vview.py 可以看摄像头画面')
+        if nogo:
+            log('nogo：只对准，没夹。看看爪子是不是在物料正上方。')
+        else:
+            log('完成。夹起来了吗？没夹到：夹的位置太高就把 ZGRAB 调小(set ZGRAB 数字)，太低撞到就调大；夹偏了先用 nogo 看对准。松开：arm CLAW O')
+        return
     log(f'② 摄像头找{name}色物料……')
     still, last = h.vision.wait_still(color, timeout_s=h.cfg['raw_wait_s'])
     if last is None:
@@ -533,7 +545,10 @@ def _raw_preflight(h, batch, force, log):
         log(f'   {it.color_name} -> {it.slot}号槽')
     if full:
         log('   (force：车上转盘当作已经拿空了)')
-    log(f'   原料盘会转：每个物料先等它停稳(最多 {float(h.cfg.get("raw_wait_s", 10.0)):g} 秒)再对准；一直没停稳就按当时的位置试')
+    log('   原料盘转一会儿停一会儿：物料一停下、在爪子附近，就马上对准下爪；这次停的时间不够或者停在够不着的地方，就等下一次停'
+        f'(每个物料最多等 {float(h.cfg.get("raw_track_s", 30.0)):g} 秒)')
+    if getattr(h, 'store', None) is not None and h.store.get('RAW', 'arm') is None:
+        log('   ★ 还没做 vcal RAW(手臂和画面的对应关系)：原料盘转着的时候不会现测。先让原料盘停转，物料放在爪子下面，输入 vcal RAW 颜色号 arm')
     log('   对准只动手臂，车轮不动(不会压进原料区)；物料停在手臂够不着的地方就跳过' if mode == 'OFF' else
         (f'   对准时车轮只会前后挪，最多 {float(h.cfg.get("raw_fix_max_mm") or 40.0):g}mm，不横着挪' if mode == 'F' else
          '   ★ raw_chassis=SF：对准时车轮前后、横着都会挪，小心压进原料区'))
