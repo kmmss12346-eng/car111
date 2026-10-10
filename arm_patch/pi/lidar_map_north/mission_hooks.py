@@ -79,6 +79,12 @@ DEFAULTS = dict(
     align_max_iter=6,                   # 粗加工区/暂存区对准(放、码垛、取回)最多修正几次(车停得很偏、第一次测 J 时要多动几下；平时 1~2 次就到容差)
     zone_frames=2,                      # 粗加工区/暂存区对准时每次测量拍几帧(2 帧快；偏差刚好超出一点点时会自动再测一次取平均)
     zone_gain=1.0,                      # 粗加工区/暂存区对准时手臂每次修正掉偏差的多少(J 是 vcal 测好、每次对准都在修正的，一下修到位)
+    zone_filter=True,                   # 粗加工区/暂存区对准时把几次测量合起来用(按动作推算 + 这次测的)：不按一次测量的噪声来回微调
+    wheels_first=False,                 # True = 粗加工区/暂存区对准时沿圆环那一排先让车轮前后小步慢慢挪(每次最多 wheels_step_mm)，
+                                        #   差不到 wheels_min_mm 再动手臂；离圆环的远近还是手臂伸缩(车轮不横着往圆环那边挪，不压线)
+    wheels_step_mm=15.0,                # wheels_first：车轮每次最多挪多少毫米
+    wheels_min_mm=1.5,                  # wheels_first：沿那一排的偏差比这个小就交给手臂
+    wheels_rpm=60,                      # wheels_first：车轮小步挪的速度(转/分，慢一点准一点)
     ring_precorrect=True,               # 同一个工位里对准过一个环以后，去下一个环时手臂伸缩直接伸到同样的远近(不先缩回观察姿态再伸出来，省一次大的修正)
     survey_frames=3,                    # 到工位看三个圆环时拍几帧
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
@@ -188,6 +194,7 @@ class MissionHooks:
         self.ring_f = {}                    # (区, 圆环号) -> 这个环正对爪子时底盘的前后位移(毫米)，到工位时用摄像头看出来的(_survey)
         self.ring_gate_px = None            # 对准时只认离爪子点这么多像素以内的圆环(不去追旁边那个)
         self._ring_ready = False            # 手臂现在就在这个工位的圆环上方、爪子张开(刚放完/刚看完圆环)：去下一个环不用整套 OBS
+        self._at_obs = False                # 手臂就在观察姿态(刚 OBS 过、还没动过)：去第一个环不用再 OBS 一遍
         self._zone_d2 = []                  # 这个工位里每次对准好时 (底盘前后位移, ID2 比 A2P 多转的度数)：车离圆环那一排的远近
         self._ret_bias = [0.0, 0.0]         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
 
@@ -334,7 +341,7 @@ class MissionHooks:
     def _recover(self, why):
         """单个物料出错后：尽量把手臂收好。收不好就停下整个路线(带着伸出的手臂乱走不安全)。"""
         self.log(f'    ★ {why}；收臂')
-        self._ring_ready = False
+        self._ring_ready = self._at_obs = False
         try:
             self.arm.stow()
         except ArmAbort as ex:
@@ -934,7 +941,7 @@ class MissionHooks:
             if self.nogo:
                 self.log('    (nogo：到了取回的位置，不夹)')
                 return True
-            self._ring_ready = False                             # 夹起来放进转盘，手臂停在转盘上方
+            self._ring_ready = self._at_obs = False              # 夹起来放进转盘，手臂停在转盘上方
             self.arm.pick_here(item.slot)
         except ArmAbort:
             raise
@@ -990,6 +997,13 @@ class MissionHooks:
         err_mm = None
         ok = False
         held = False                                             # 爪子里夹着从转盘取出来的物料
+        if not stack and cfg.get('check_ring_empty', True) and self.on_ring.get((zone, ring)):
+            names = '、'.join(it.color_name for it in self.on_ring[(zone, ring)])
+            self.log(f'    ★ 按记录环{ring} 上还放着 {names}(程序记着之前放在这里、没取回；不是摄像头看到的)：'
+                     '不去这个环、不放，免得砸上去；物料留在车上')
+            self.stats.place(False)
+            self._show_stats()
+            return False
         try:
             self._goto_ring(zone, ring)
             self._obs_ring()                                     # 空爪到圆环上方：圆环不会被挡住
@@ -1002,15 +1016,20 @@ class MissionHooks:
             if res is not None:
                 self.log('    对准结果' + (f'(按{how})' if stack else '') + f'：{res}')
                 err_mm = res.err_mm
+            aligned = res is not None and (res.ok or res.err_mm <= cfg['accept_mm'][key])
+            taken = self._ring_taken_why(zone, ring) if (aligned and not stack and cfg.get('check_ring_empty', True)) else None
             if res is None:
                 self._recover('下面那层物料和圆环都看不到，物料留在车上，不放')
-            elif not res.ok and res.err_mm > cfg['accept_mm'][key]:
+            elif not aligned:
                 if not math.isfinite(res.err_mm) and (zone, int(ring)) in self.ring_f:
                     self.log(f'    ★ 开到算出来的环{ring}位置，爪子附近没看到圆环：可能认错了是几号环(车要停在 2 号环正对爪子)，'
                              '或者这个环被挡住了/反光')
                 self._recover(f'没对准({res.reason})，物料留在车上，不放')
-            elif not stack and cfg.get('check_ring_empty', True) and self._ring_taken(zone, ring):
-                self._recover(f'环{ring} 的白心里已经有东西了(别的物料？)，不放，免得砸上去；物料留在车上')
+            elif taken == 'record':
+                names = '、'.join(it.color_name for it in self.on_ring.get((zone, ring)) or [])
+                self._recover(f'按记录环{ring} 上还放着 {names}(程序记着之前放在这里、没取回；不是摄像头看到的)，不放，免得砸上去；物料留在车上')
+            elif taken:
+                self._recover(f'摄像头看到环{ring} 的白心里有东西(别的物料？)，不放，免得砸上去；物料留在车上')
             else:
                 self._learn_from(zone, ring)                     # 底盘为了对准挪了多少，下一个圆环直接带上
                 if not stack and hasattr(self.vision, 'note_ring_size'):
@@ -1028,7 +1047,7 @@ class MissionHooks:
                 if self.nogo:
                     self.log('    (nogo：对准好了，不取物料、不放)')
                     return True
-                self._ring_ready = False
+                self._ring_ready = self._at_obs = False
                 self.arm.take(item.slot)                         # 去转盘取物料
                 held = True
                 self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
@@ -1079,7 +1098,7 @@ class MissionHooks:
         没有要放的物料、或者时间到了，就不看(省时间)。"""
         self.ring_f = {}
         self.ring_gate_px = None
-        self._ring_ready = False
+        self._ring_ready = self._at_obs = False
         self._zone_d2 = []
         try:
             self.arm.params(refresh=True)
@@ -1145,7 +1164,7 @@ class MissionHooks:
         import numpy as np
         v, cfg = self.vision, self.cfg
         self.arm.obs('RING', open_claw=True)
-        self._ring_ready = True
+        self._ring_ready = self._at_obs = True
         rings = v.ring_list(n=cfg.get('survey_frames') or None)
         if not rings:
             self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
@@ -1325,6 +1344,12 @@ class MissionHooks:
             kw['max_iter'] = int(cfg['align_max_iter'])
         if cfg.get('zone_gain'):
             kw['gain_arm'] = float(cfg['zone_gain'])
+        kw['filt'] = bool(cfg.get('zone_filter', True))
+        kw['wheels_first'] = bool(cfg.get('wheels_first', False))
+        if self.servo is not None and kw['wheels_first']:
+            for k in ('wheels_step_mm', 'wheels_min_mm', 'wheels_rpm'):
+                if cfg.get(k) is not None:
+                    self.servo.cfg[k] = cfg[k]
         return kw
 
     def _drop(self, stack):
@@ -1448,17 +1473,21 @@ class MissionHooks:
         return None
 
     def _ring_taken(self, zone=None, ring=None):
-        """对准的那个圆环白心里明显放着东西(返回 True)；空的或看不清都返回 False(看不清就照常放)。
-        记录里这个环上还留着我们放的物料(比如取回失败)：不用看，一定是占着的。"""
+        """对准的那个圆环白心里明显放着东西(返回 True)；空的或看不清都返回 False(看不清就照常放)。"""
+        return self._ring_taken_why(zone, ring) is not None
+
+    def _ring_taken_why(self, zone=None, ring=None):
+        """圆环占着的话按什么判断的：'record' = 记录里这个环上还留着我们放的物料(比如取回失败；不用看，一定是占着的)；
+        'vision' = 摄像头看到白心里明显放着东西；空的或看不清返回 None(看不清就照常放)。"""
         if zone is not None and self.on_ring.get((zone, ring)):
-            return True
+            return 'record'
         f = getattr(self.vision, 'ring_centre_free', None)
         if f is None:
-            return False
+            return None
         try:
-            return f() is False
+            return 'vision' if f() is False else None
         except Exception:
-            return False
+            return None
 
     def _return_to_pose(self, a1, a2, from_tray=False):
         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。
@@ -1554,6 +1583,9 @@ class MissionHooks:
         其他情况(刚从转盘回来、收过臂…)照常用 STM32 的 OBS。"""
         P = self.arm.params() or {}
         d2 = self._predict_d2() if self.cfg.get('ring_precorrect', True) else None
+        at_obs, self._at_obs = self._at_obs, False
+        if d2 is None and self._ring_ready and at_obs:
+            return                                               # 刚看完三个环：手臂还在观察姿态(底盘挪过不影响)，不用再 OBS 一遍
         if d2 is None or not self._ring_ready or not all(k in P for k in ('A1P', 'A2P', 'ZHI', 'ZOBRNG')):
             self.arm.obs('RING', open_claw=True)
             self._ring_ready = True
@@ -1612,7 +1644,7 @@ class MissionHooks:
 
     def _stow_quiet(self):
         """每个工位做完收臂(开车前手臂要收好)。"""
-        self._ring_ready = False
+        self._ring_ready = self._at_obs = False
         try:
             self.arm.stow()
         except ArmAbort:

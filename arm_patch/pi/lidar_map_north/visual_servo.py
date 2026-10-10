@@ -56,6 +56,15 @@ DEFAULTS = dict(
                                 #   'Fs' = 前后随便挪，横移(靠近/远离目标)只在手臂伸缩够不着时用，而且只挪够不着的那一段(粗加工区/暂存区)
     strafe_margin=0.2,          # 'Fs' 横移时给手臂伸缩留的余量(行程上限的比例)：横移到手臂伸缩还剩这么多余量就够了，不多挪
     chassis_fix_max_mm=None,    # 一次对准里底盘最多累计前后挪多少毫米，超过就停下(多半是认错了目标)；None = 不限
+    # 先动车轮('F' / 'Fs'，工位里)：沿圆环那一排的偏差先让车轮前后小步慢慢挪，剩下不到 wheels_min_mm 才动手臂；离圆环远近还是手臂伸缩
+    wheels_first=False,
+    wheels_min_mm=1.5,          # 沿那一排的偏差比这个小就不再动车轮(车轮只能按整毫米挪)，交给手臂
+    wheels_step_mm=15.0,        # 车轮每次最多挪多少毫米(小步)
+    wheels_rpm=None,            # 车轮小步挪的速度(转/分)；None = 用 chassis_fine_rpm
+    # 测量滤波：把每次测到的偏差和"按刚才的动作推算的偏差"合在一起(相当于多次测量取平均)，不去追一次测量的噪声
+    filter=False,
+    meas_sigma_px=0.8,          # 一次测量的噪声(像素)的初始估计；同一个位置连着测两次时自动更新
+    filter_gate=12.0,           # 测到的和推算的差得太多(J 不准、目标动了)：只信这次测的，重新开始
 )
 
 
@@ -178,6 +187,10 @@ class VisualServo:
         self._s_range = None            # 这次对准横移累计允许的范围 (下限, 上限) 毫米；None = 不限
         self._s_used = 0.0              # 这次对准已经横移了多少毫米
         self._s_clipped = False         # 横移被范围卡住过
+        self._wheels = False            # 这次对准先动车轮(run 里设)
+        self._rpm = None                # 这次对准车轮小步挪的速度
+        self._flt = False               # 这次对准用测量滤波
+        self.meas_var = {}              # kind -> 一次测量的噪声方差(像素²，每个方向)：同一个位置连着测两次时更新
 
     # ------------------------------------------------------------------ 测量
     def _measure(self, measure, tries=3):
@@ -249,7 +262,11 @@ class VisualServo:
             n2 = float(jf @ jf)
             if n2 < 1e-12:
                 return 0.0, 0.0
-            return 0.0, float(-c['gain_ch'] * float(jf @ p) / n2)
+            f = float(-c['gain_ch'] * float(jf @ p) / n2)
+            if self._wheels:                                 # 先动车轮：小步(每次最多 wheels_step_mm)
+                m = float(c.get('wheels_step_mm') or 15.0)
+                f = max(-m, min(m, f))
+            return 0.0, f
         sf = -c['gain_ch'] * np.linalg.solve(Jc, p)
         if self._need_s:
             return float(sf[0]) * self._s_frac, float(sf[1])      # 只横移手臂伸缩够不着的那一段
@@ -271,7 +288,10 @@ class VisualServo:
         if s_mm == 0 and f_mm == 0:
             return np.zeros(2)
         self._s_used += s_mm
-        self.act.chassis_move(s_mm, f_mm)
+        if self._rpm:
+            self.act.chassis_move(s_mm, f_mm, speed=self._rpm)
+        else:
+            self.act.chassis_move(s_mm, f_mm)
         self.sleep(c['settle_ch_s'])
         return np.array([s_mm, f_mm])
 
@@ -373,7 +393,7 @@ class VisualServo:
         'Fs' 时手臂伸缩到头还够不着，才让车轮横着挪(只挪够不着的那一段)。"""
         c = self.cfg
         self._need_s = False
-        if not allow_chassis or e < c['chassis_min_mm']:
+        if not allow_chassis or (e < c['chassis_min_mm'] and not self._wheels):
             return 'arm'
         mode = self._mode()
         if mode != 'SF' and J['ch'] is not None:
@@ -399,6 +419,9 @@ class VisualServo:
             if short_r:
                 self._need_s = True                              # 车轮横着挪(靠近/远离)，只挪手臂够不着的那一段
                 return 'ch'
+            if self._wheels:
+                # 先动车轮：沿圆环那一排还差 wheels_min_mm 以上就让车轮前后小步挪；剩下的(和离圆环的远近)交给手臂
+                return 'ch' if along >= float(c.get('wheels_min_mm') or 1.5) else 'arm'
             if along < c['chassis_min_mm']:
                 return 'arm'                             # 主要是横向的偏差：手臂伸缩够得着
             if along > c['arm_cover_mm'] or sat_a:
@@ -414,13 +437,18 @@ class VisualServo:
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
             bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False,
-            gain_arm=None, near_avg=None):
+            gain_arm=None, near_avg=None, wheels_first=None, filt=None):
         """对准(见 _run)。chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
         chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。
         fixed_j = True：只用存好的 J——不探测、不丢、不改存着的 J；误差变大就直接停(原料盘停下的几秒钟里对准用：
         万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。
-        gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。"""
+        gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。
+        wheels_first / filt：只这一次 先动车轮(只在 'F'/'Fs' 时有用) / 测量滤波；None = 用配置里的。"""
         self._fixed = bool(fixed_j)
+        self._wheels = bool(self.cfg.get('wheels_first') if wheels_first is None else wheels_first) and \
+            str(chassis_axes or self.cfg.get('chassis_axes') or 'SF') != 'SF'
+        self._rpm = (self.cfg.get('wheels_rpm') or None) if self._wheels else None
+        self._flt = bool(self.cfg.get('filter') if filt is None else filt)
         saved = {}
         for k, val in (('gain_arm', gain_arm), ('near_avg', near_avg)):
             if val is not None:
@@ -439,6 +467,9 @@ class VisualServo:
             self._s_range = None
             self._need_s = False
             self._fixed = False
+            self._wheels = False
+            self._rpm = None
+            self._flt = False
             self.cfg.update(saved)
 
     def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
@@ -453,6 +484,10 @@ class VisualServo:
         confirm       达标后是否再测一次确认；None=用配置里的 confirm。对精度要求不高的(夹原料、取回)可以关掉省时间
         chassis_axes  这次底盘能动的方向('SF' / 'F' / 'Fs')；None = 用配置里的
         chassis_fix_max_mm  这次对准底盘最多累计前后挪多少毫米(横移另有 chassis_s_range)；None = 用配置里的
+
+        测量滤波(filter)：每动一下，先按 J 推算偏差该变成多少，再和这次测到的按各自的可信程度合起来；
+        离目标近、动得少的时候推算很准，几次测量的噪声就被平均掉了，不会每次都按一次测量的噪声去动。
+        测到的和推算的差得太多(J 不准、目标自己动了)就只信这次测的。
         """
         c = self.cfg
         fix_max = chassis_fix_max_mm if chassis_fix_max_mm is not None else c.get('chassis_fix_max_mm')
@@ -482,15 +517,55 @@ class VisualServo:
         fresh = [False]                 # p 是不是最后一次动作以后测的(动了以后没测到 = 不知道现在偏多少)
         avg = [False]                   # 这个位置已经测过两次取了平均
         stalls = 0
+        flt = bool(self._flt)
+        if flt and kind not in self.meas_var:
+            self.meas_var[kind] = float(c.get('meas_sigma_px') or 0.8) ** 2
+        # 滤波状态：est = 估计的偏差(像素)，var = 它的方差(每个方向)；pred = 上次测量以后按动作推算偏差变了多少(None = 不知道，下次只信测量)
+        fs = dict(est=None, var=0.0, pred=None, q=0.0, raw=None, still=False)
+        q_still = 0.15 ** 2             # 没动时两次测量之间可能的漂移(像素²)
 
         def meas():
-            v = self._measure(measure)
+            z = self._measure(measure)
             fresh[0] = True
-            return v
+            if not flt:
+                return z
+            R = self.meas_var[kind]
+            if fs['still'] and fs['raw'] is not None:
+                # 同一个位置连着测了两次：两次之差 = 测量噪声，更新噪声估计
+                smp = float((z - fs['raw']) @ (z - fs['raw'])) / 4.0
+                R = self.meas_var[kind] = min(25.0, max(0.04, 0.75 * R + 0.25 * smp))
+            pred = fs['pred']
+            if fs['est'] is None or pred is None:
+                fs['est'], fs['var'] = z.copy(), R
+            else:
+                prior = fs['est'] + pred
+                P = fs['var'] + fs['q']
+                S = P + R
+                nu = z - prior
+                if float(nu @ nu) > float(c.get('filter_gate') or 12.0) * S:
+                    fs['est'], fs['var'] = z.copy(), R       # 和推算的差太多：只信这次测的
+                else:
+                    K = P / S
+                    fs['est'] = prior + K * nu
+                    fs['var'] = (1.0 - K) * P
+            fs['raw'] = z
+            fs['pred'], fs['q'], fs['still'] = np.zeros(2), q_still, True
+            return fs['est'].copy()
 
         def moved():
             fresh[0] = False
             avg[0] = False
+            fs['pred'], fs['still'] = None, False        # 动了但还不知道动了多少(探测之类)：下次只信测量
+
+        def expect(group, applied):
+            """动了 applied(手臂度数 / 底盘毫米)：按 J 推算偏差会变多少，给下一次测量的滤波用。"""
+            if not flt or J.get(group) is None:
+                return
+            pred = np.asarray(J[group], float) @ np.asarray(applied, float)
+            q_abs = 0.35 if group == 'arm' else 1.2 * scale_px_per_mm     # 舵机回读 / 车轮走的距离 的误差
+            fs['pred'] = pred
+            fs['q'] = (0.12 * _norm(pred)) ** 2 + q_abs ** 2
+            fs['still'] = False
 
         def over_budget():
             return fix_max is not None and ch_moved[0] >= float(fix_max)
@@ -520,7 +595,7 @@ class VisualServo:
                 near = float(c.get('near_avg') or 0.0)
                 if tol_mm < e <= near * tol_mm and fresh[0] and not avg[0]:
                     avg[0] = True                            # 离目标很近：再测一次取平均，免得按一次测量的噪声去动
-                    p = (p + meas()) / 2.0
+                    p = meas() if flt else (p + meas()) / 2.0
                     e = _norm(p) / scale_px_per_mm
                     self.log(f'  {tag} 再测一次取平均 {e:.2f}mm')
                     if e <= tol_mm:
@@ -594,6 +669,7 @@ class VisualServo:
                     ch_moved[0] += abs(float(applied[1]))
                     if self._need_s and abs(float(applied[0])) > 0:
                         self.log(f'  {tag} 手臂伸缩够不着：车轮横着挪 {applied[0]:+.0f}mm(离圆环近一点/远一点)')
+                expect(group, applied)
                 if _norm(applied) < 1e-9:
                     fresh[0] = True                          # 回读说一点没动：上次测的偏差还是现在的
                 else:
@@ -622,6 +698,7 @@ class VisualServo:
                         used_ch = True
                         ch_moved[0] += abs(float(applied[1]))
                         group = 'ch'
+                        expect(group, applied)
                     if _norm(applied) < 1e-9:
                         fresh[0] = True
                         if self._s_clipped:
@@ -630,10 +707,12 @@ class VisualServo:
                 prev_e = e
                 moves += 1
 
+                p_before = p
+                pred = J[group] @ applied
                 p_new = meas()
                 # 在线修正 J：用这次实际的"动了多少 → 画面变了多少"(差得太多说明是别的原因，比如原料盘在转，不拿来修)
-                dp = p_new - p
-                pred = J[group] @ applied
+                # 滤波时用这次测到的原始值(滤波后的值偏向推算值，会让 J 修不动)
+                dp = (fs['raw'] if flt else p_new) - p_before
                 ratio = _norm(dp) / max(_norm(pred), 1e-9)
                 cosang = float(dp @ pred) / max(_norm(dp) * _norm(pred), 1e-9)
                 # 方向对、只是大小差几倍(J 的比例不对，比如观察高度改过)也修；方向不对的(原料盘在转)不修

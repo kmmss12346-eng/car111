@@ -217,14 +217,14 @@ class ArmActuators:
             return None                                   # 没读回来，按指令的量算
         return (a2_1 - a2_0, a1_1 - a1_0)
 
-    def chassis_move(self, s_mm, f_mm):
-        """底盘横移 s_mm(向左为正)、前进 f_mm(向前为正)，一条一条发，等 DONE。"""
+    def chassis_move(self, s_mm, f_mm, speed=None):
+        """底盘横移 s_mm(向左为正)、前进 f_mm(向前为正)，一条一条发，等 DONE。speed = 这次的速度(转/分)；None = 小距离用 fine_speed。"""
         for cmd, v in (('S', s_mm), ('F', f_mm)):
             v = int(round(v))
             if v == 0:
                 continue
-            speed = self.fine_speed if abs(v) <= 60 else None        # 小距离慢一点准一点；大距离用默认速度
-            ok, reply = self.link.move(cmd, v, speed)
+            sp = int(speed) if speed else (self.fine_speed if abs(v) <= 60 else None)   # 小距离慢一点准一点；大距离用默认速度
+            ok, reply = self.link.move(cmd, v, sp)
             if 'ABORT' in (reply or ''):
                 raise ArmAbort(f'{cmd} {v} -> {reply}')
             if not ok:

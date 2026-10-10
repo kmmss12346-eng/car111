@@ -322,7 +322,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             raise ValueError(str(ex))
         log(f'任务码已设置：{h.plan.code}  {h.plan.describe()}')
         for b in (1, 2):
-            log(f'  第{b}批放在转盘：' + '  '.join(f'{it.slot}号槽={it.color_name}(去环{it.ring})' for it in h.plan.items(b)))
+            log(f'  第{b}批放在转盘：' + '  '.join(f'{it.slot}号槽={it.color_name}({_rings_text(h.plan, it)})' for it in h.plan.items(b)))
         return None
 
     if k == 'vmask':
@@ -430,15 +430,19 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 h.nogo, h.ring_rev = nogo, rev
                 if h.cfg.get('mtest_hold_heading', True) and hasattr(h, 'hold_heading'):
                     h.hold_heading()                    # 车是手搬过来的：现在的车头方向就是要保持的方向
+                if what == 'ROUGH' or batch == 1:
+                    _clear_zone_records(h, what, batch, log)    # 圆环是空的(用手拿空了)：上次测试记着的不算
                 _zone_preflight(h, what, batch, force, log)
             if force and h.plan is not None and what in ('ROUGH', 'TEMP'):
                 for it in h.plan.items(batch):
                     h.in_tray[it.slot] = it
                 log('  (force：假定转盘里已经有这批物料)')
                 if what == 'TEMP' and batch == 2:
+                    for key in [k for k in h.on_ring if k[0] == 'TEMP']:
+                        del h.on_ring[key]              # 只记第一批(不重复记)
                     for it in h.plan.items(1):
-                        h.on_ring.setdefault(('TEMP', it.ring), []).append(it)
-                    log('  (force：假定暂存区已经平放了第一批)')
+                        h.on_ring[('TEMP', it.ring)] = [it]
+                    log('  (force：假定暂存区已经平放了第一批：' + '  '.join(f'环{it.ring}={it.color_name}' for it in h.plan.items(1)) + ')')
             h.raw_any_once = anyo and what == 'RAW'
             try:
                 h.run_role(what, batch)
@@ -454,6 +458,27 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
 
 
 COLOR_NAMES = {1: '红', 2: '黄', 3: '蓝', 4: '绿', 5: '黑', 6: '浅蓝'}
+
+
+def _rings_text(plan, it):
+    """这个物料去哪个环：第一批粗加工区、暂存区是同一个环；第二批暂存区码垛在同色的第一批物料上(那个环)。"""
+    if it.batch == 1:
+        return f'粗加工区、暂存区都去环{it.ring}'
+    sr = plan.stack_ring(it)
+    return f'粗加工区去环{it.ring}，暂存区' + (f'码垛到环{sr}' if sr is not None else '没有同色的第一批物料可叠，平放在空着的环')
+
+
+def _clear_zone_records(h, zone, batch, log):
+    """mtest 粗加工区 / 暂存区第一批开始时：圆环已经用手拿空了，清掉程序里记着"放在这个工位圆环上"的物料和放下时的位置。
+    不清的话每个环都按记录当成占着，一个都不放。"""
+    old = sorted(((k, v) for k, v in h.on_ring.items() if k[0] == zone and v), key=lambda kv: kv[0][1])
+    for key in [k for k in h.on_ring if k[0] == zone]:
+        del h.on_ring[key]
+    for key in [k for k in getattr(h, 'pose_at', {}) if k[0] == zone]:
+        del h.pose_at[key]
+    if old:
+        log(f'  ({zone} 第{batch}批：程序里记着圆环上还放着 ' + '  '.join(f'环{r}={"、".join(it.color_name for it in v)}' for (_z, r), v in old) +
+            '，已清掉记录(按圆环已经用手拿空了算)')
 
 
 def _tools(h, link):
@@ -569,13 +594,19 @@ def _zone_preflight(h, zone, batch, force, log):
     sign = -1.0 if h.ring_rev else 1.0
     log(f'== {zone} 第{batch}批' + ('(nogo：只对准，不取不放)' if h.nogo else '') + '：车要停在 2 号环正对手臂的位置，车身和圆环那一排平行 ==')
     survey = h.cfg.get('ring_survey', True)
+    stack = zone == 'TEMP' and batch == 2
     for it in items:
-        if survey:
-            log(f'   {it.slot}号槽 {it.color_name} -> 环{it.ring}')
+        ring = h.plan.stack_ring(it) if stack else it.ring
+        if stack and ring is None:
+            log(f'   {it.slot}号槽 {it.color_name} -> 第一批里没有{it.color_name}可叠：平放在空着的环')
             continue
-        off = sign * float(offs.get(str(it.ring), 0.0))
+        what = (f'码垛到环{ring}(叠在第一批的{h.plan.lower_item(it).color_name}上)' if stack else f'环{ring}')
+        if survey:
+            log(f'   {it.slot}号槽 {it.color_name} -> {what}')
+            continue
+        off = sign * float(offs.get(str(ring), 0.0))
         where = '不挪' if abs(off) < 1 else f'底盘{"前进" if off > 0 else "后退"} {abs(off):.0f}mm'
-        log(f'   {it.slot}号槽 {it.color_name} -> 环{it.ring}({where})')
+        log(f'   {it.slot}号槽 {it.color_name} -> {what}({where})')
     if survey:
         order = (h.cfg.get('ring_order') or {}).get(zone, 'lr')
         lr = (str(order).lower() != 'rl') != bool(h.ring_rev)
@@ -593,6 +624,12 @@ def _zone_preflight(h, zone, batch, force, log):
         if missing:
             log('   ★ 转盘里没有记录这些物料：' + '、'.join(f'{it.slot}号槽{it.color_name}' for it in missing) +
                 '(没跑过 mtest RAW 的话加 force，并且按上面手放进转盘)')
+        if stack:
+            low = [h.plan.lower_item(it) for it in items]
+            gone = [lo for lo in low if lo is not None and not any(same_item(x, lo) for x in h.on_ring.get(('TEMP', lo.ring)) or [])]
+            if gone:
+                log('   ★ 程序里没有记着暂存区第一批的这些物料：' + '、'.join(f'环{lo.ring}{lo.color_name}' for lo in gone) +
+                    '(码垛要叠在它们上面；没跑过 mtest TEMP 1 的话，手摆好第一批再加 force)')
     if 'RING' not in (cal.get('claw_px') or {}):
         log('   ★ 还没做 vclaw RING：放的位置按估计的爪子点，可能偏几毫米')
     covered = zone == 'ROUGH' or batch == 2                 # 取回 / 码垛：圆环白心被物料盖住

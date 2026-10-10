@@ -624,7 +624,59 @@ class CliTests(unittest.TestCase):
 
     def test_mcode_lists_slots(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
-        self.assertTrue(any('1号槽=' in l for l in self.lines), self.lines)
+        text = '\n'.join(self.lines)
+        self.assertIn('1号槽=RED(粗加工区、暂存区都去环1)', text)
+        # 第二批：粗加工区按任务码第四组；暂存区码垛在同色的第一批物料上(红在 1 号环)，不是粗加工区的环
+        self.assertIn('2号槽=RED(粗加工区去环3，暂存区码垛到环1)', text)
+        self.assertIn('3号槽=LIGHT_BLUE(粗加工区去环1，暂存区码垛到环3)', text)
+
+    def test_mtest_zone_batch1_starts_with_empty_rings(self):
+        """mtest 暂存区/粗加工区第一批：圆环已经用手拿空了，上次测试记着的"环上有物料"要清掉，不然每个环都当成占着、一个都不放。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        self.assertEqual(len(self.w.placed), 3)
+        for key in [k for k in self.w.rings if k[0] == 'TEMP']:      # 用手把圆环拿空，物料放回车上转盘
+            self.w.rings[key] = []
+        for it in self.h.plan.items(1):
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('已清掉记录', text)
+        self.assertNotIn('按记录环', text)
+        self.assertEqual(len(self.w.placed), 6, text)
+        self.assertEqual(self.w.collisions, 0, text)
+        self.assertEqual({k: [it.color for it in v] for (z, k), v in self.h.on_ring.items() if z == 'TEMP' and v},
+                         {1: [1], 2: [5], 3: [6]})
+
+    def test_mtest_temp2_force_records_batch1_once(self):
+        """mtest TEMP 2 force：暂存区记成"第一批各一个"(跑过 TEMP 1 也不重复记)；开头显示码垛去的环(同色那个环)。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        for it in self.h.plan.items(2):
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 2 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('2号槽 RED -> 码垛到环1(叠在第一批的RED上)', text)
+        self.assertIn('1号槽 BLACK -> 码垛到环2(叠在第一批的BLACK上)', text)
+        self.assertEqual({k: [(it.batch, it.color) for it in v] for (z, k), v in self.h.on_ring.items() if z == 'TEMP' and v},
+                         {1: [(1, 1), (2, 1)], 2: [(1, 5), (2, 5)], 3: [(1, 6), (2, 6)]}, text)
+        self.assertEqual(rings_summary(self.w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, text)
+
+    def test_ring_taken_by_record_says_so(self):
+        """程序记着某个环上还放着物料(取回失败留下的)：不去那个环，提示里写清是按记录判断的(不是摄像头看到的)。"""
+        self._zone_setup('ROUGH')
+        self.h._ensure(self.w.link)
+        self.h.in_tray = {it.slot: it for it in self.h.plan.items(1)}
+        self.h.on_ring[('ROUGH', 2)] = [self.h.plan.items(2)[0]]     # 记着 2 号环上留着第二批的黑色
+        self.h.visits = {}
+        self.h.run_role('ROUGH', 1)
+        text = '\n'.join(self.lines)
+        self.assertIn('按记录环2 上还放着 BLACK', text)
+        self.assertIn('不是摄像头看到的', text)
+        self.assertEqual([p[1] for p in self.w.placed], [1, 3], text)
+        self.assertEqual(self.w.collisions, 0, text)
 
     def test_gtest_nogo_and_needs_zero(self):
         self.w.lift_known = False                            # 模拟急停打断升降后位置丢了

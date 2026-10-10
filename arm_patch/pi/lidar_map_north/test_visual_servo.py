@@ -272,6 +272,18 @@ class ServoTests(unittest.TestCase):
         self.assertLessEqual(abs(sv.dev[0]), 40.0 * 1.05 + 0.1)
         self.assertLessEqual(abs(sv.dev[1]), 3.0 * 1.05 + 0.1)
 
+    def test_clearly_inside_tolerance_skips_the_confirm(self):
+        """偏差明显在容差里(不到 confirm_skip × 容差)：不再拍一次确认，直接算对准；刚好在容差边上才复测。"""
+        rng = np.random.default_rng(26)
+        for err, tol, want in ((0.3, 1.2, 1), (1.0, 1.2, 2)):
+            pl = SimPlant(rng, err_mm=err, noise_px=0.0)
+            store = JacStore(None)
+            store.put('RING', 'arm', pl.A)
+            res = make_servo(pl, store=store).run('RING', pl.measure, pl.scale, tol, allow_chassis=False, confirm=True)
+            self.assertTrue(res.ok, res)
+            self.assertEqual(res.iters, 0)
+            self.assertEqual(pl.n_measure, want, (err, tol))
+
     def test_store_roundtrip(self):
         import os, tempfile
         d = tempfile.mkdtemp()

@@ -161,6 +161,69 @@ class RingTests(unittest.TestCase):
         v = quiet_vision(camera=FakeCam(None))
         self.assertIsNone(v.ring_px(n=3))
 
+    @staticmethod
+    def _two_rings():
+        """现场的比例(相邻两个环隔 219 像素 = 150mm)：爪子下面一个环，右边还有一个。"""
+        img = np.minimum(draw_rings(300, 250, 1.46), draw_rings(300 + 219, 250, 1.46))
+        return img, dict(claw_px=dict(RING=[310.0, 245.0]), ring_rmax_hint=48.25 * 1.46)
+
+    @staticmethod
+    def _spy_roi(v, blind_first=False):
+        rois, orig = [], v._rings_in_frame
+
+        def spy(fr, any_size=False, roi=None):
+            rois.append(roi)
+            if blind_first and len(rois) == 1:
+                return []                                    # 第一块里"没找到"(比如那一帧刚好被挡住)
+            return orig(fr, any_size, roi)
+        v._rings_in_frame = spy
+        return rois
+
+    def test_ring_search_near_claw_gives_the_same_centre(self):
+        """对准时只在爪子点附近那一块画面里找(快好几倍)：找到的圆心和在整幅画面里找的一样，旁边那个环不会被当成目标。"""
+        img, cfg = self._two_rings()
+        full = quiet_vision(camera=FakeCam(img), cfg=cfg).ring_px(n=2)
+        v = quiet_vision(camera=FakeCam(img), cfg=cfg)
+        rois = self._spy_roi(v)
+        near = v.ring_px(n=2, max_px=100.0)
+        self.assertIsNotNone(rois[0])                        # 真的只看了一块
+        x0, y0, x1, y1 = rois[0]
+        self.assertLess((x1 - x0) * (y1 - y0), 0.6 * 640 * 480)
+        self.assertLess(math.hypot(near[0] - full[0], near[1] - full[1]), 0.3)
+        self.assertLess(math.hypot(near[0] - 300, near[1] - 250), 0.6)
+        du, dv = v.ring_error(n=2, max_px=100.0)
+        self.assertLess(math.hypot(du + 10.0, dv - 5.0), 0.6)
+
+    def test_ring_search_falls_back_when_the_small_crop_misses(self):
+        """对准中上一次刚认到过：先在"上次的位置到爪子点"那一小块里找；没找到就用整块(max_px 那么大)再找，这次测量剩下的帧也用整块。"""
+        img, cfg = self._two_rings()
+        v = quiet_vision(camera=FakeCam(img), cfg=cfg)
+        v._ring_track = ((302.0, 249.0), time.monotonic())   # 上一次刚认到，离爪子点很近
+        rois = self._spy_roi(v, blind_first=True)
+        p = v.ring_px(n=2, max_px=100.0)
+        self.assertIsNotNone(p)
+        self.assertLess(math.hypot(p[0] - 300, p[1] - 250), 0.6)
+        self.assertEqual(len(rois), 3, rois)
+        area = [(r[2] - r[0]) * (r[3] - r[1]) for r in rois]
+        self.assertLess(area[0], area[1])                    # 先找小的一块
+        self.assertEqual(rois[2], rois[1])                   # 第二帧直接用整块
+
+    def test_two_frame_measurement_accepts_one_detection(self):
+        """对准时一次测量只拍 2 帧：认到 1 帧就算(要快)；3 帧以上还是要一半以上认到。"""
+        img = draw_rings(340, 290, 2.96)
+        blank = np.full_like(img, 235)
+
+        class SeqCam:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def read(self):
+                return self.frames.pop(0).copy() if self.frames else None
+        p = quiet_vision(camera=SeqCam([blank, img])).ring_px(n=2)
+        self.assertIsNotNone(p)
+        self.assertLess(math.hypot(p[0] - 340, p[1] - 290), 0.6)
+        self.assertIsNone(quiet_vision(camera=SeqCam([blank, img, blank])).ring_px(n=3))
+
 
 class MaterialTests(unittest.TestCase):
     def test_outlier_rejected(self):

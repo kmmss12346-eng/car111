@@ -29,6 +29,11 @@ MEASURE_S = 0.35
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
 
+
+def _frames_dt(n):
+    """拍 n 帧、认 n 次要多久(秒)。没给 n = 默认的 5 帧(MEASURE_S)。"""
+    return MEASURE_S if not n else 0.05 + 0.06 * int(n)
+
 DEFAULT_PARAMS = dict(ARMOK=1.0, ZHI=0.0, ZGRAB=100.0, ZDROP=60.0, ZPLC=100.0, ZSTK=40.0, ZOBRAW=80.0, ZOBRNG=0.0,
                       A1G=500.0, A1D=430.0, A1H=410.0, A1P=470.0, A2E=-800.0, A2R=-1100.0, A2P=-780.0,
                       LFPPM=80.0, LFRPM=150.0, LFSPR=3200.0, LFMRG=200.0, ASPD=90.0, ASPDF=40.0, ATOLC=1.0, ATOL=0.3,
@@ -56,7 +61,7 @@ class SimLink:
 class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
-                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None):
+                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None):
         self.rng = np.random.default_rng(seed)
         self.t = 0.0
         self.code = code
@@ -110,6 +115,8 @@ class SimWorld:
         self.park = dict(park or {})                           # 工位 -> 车停的位置沿圆环那一排偏了多少毫米(测"车没停在 2 号环")
         self.park_side = dict(park_side or {})                 # 工位 -> 车离圆环那一排远/近了多少毫米(测"手臂伸缩够不着")
         self.moves = []                                        # 底盘每条指令 (S/F, 毫米, 当时在哪个工位)
+        self.tilt = dict(tilt or {})                           # 工位 -> 车身和圆环那一排差多少度(车是手摆的)：车头、底盘前后、手臂、摄像头一起转了这么多
+        self.ap_bias = tuple(ap_bias) if ap_bias else None     # 大幅 AP(从转盘那边转回来)总是多转 (ID1, ID2) 度(齿轮间隙、舵机过冲)
         if raw_scale:
             self.scale['RAW'] = float(raw_scale)               # 真车上原料区画面约 1.97 像素/毫米(看得比较大一片)
         # 原料盘转一会儿停一会儿(停 plate_stop_s 秒、转 plate_move_s 秒，每次转 120°，三个物料轮流停到爪子附近；None = 一直停着)：
@@ -260,12 +267,22 @@ class SimWorld:
         th = self.plate_phase(t)[0] + it['off']
         return np.array([self.plate_c[0] - it['r'] * math.cos(th), self.plate_c[1] + it['r'] * math.sin(th)])
 
+    def _rot(self, zone=None):
+        """车身相对圆环那一排转了多少(tilt)：车上的方向(手臂伸缩、底盘前后) -> 工位坐标系。"""
+        t = math.radians(float(self.tilt.get(zone or self.zone, 0.0)))
+        c, s = math.cos(t), math.sin(t)
+        return np.array([[c, -s], [s, c]])
+
+    def _cam(self, zone=None):
+        """工位坐标系里的偏差 -> 画面里的方向(摄像头装在车上，跟着车身一起转)。"""
+        return self.Rcam @ self._rot(zone).T
+
     def claw(self):
-        """爪子在工位坐标系里的位置(rad, tan)。"""
+        """爪子在工位坐标系里的位置(rad, tan)。车身斜了(tilt)：手臂和底盘的动作都按车身的方向走。"""
         if self.a1_ref is None:
             return np.array([0.0, 0.0])
-        return np.array([self.k2 * (self.a2 - self.a2_ref) - self.off_s + self.stop_err[0],
-                         self.k1 * (self.a1 - self.a1_ref) + self.off_f + self.stop_err[1]])
+        d = np.array([self.k2 * (self.a2 - self.a2_ref) - self.off_s, self.k1 * (self.a1 - self.a1_ref) + self.off_f])
+        return self.stop_err + self._rot() @ d
 
     def ring_center(self, k):
         return np.array([0.0, self.ring_tan[self.zone][k]])
@@ -273,7 +290,7 @@ class SimWorld:
     def ring_order(self, zone):
         """这个假摄像头里，zone 的 1、2、3 号环在画面里怎么排('lr' / 'rl')：和 mission_hooks._survey 一样的定方向办法。"""
         t = self.ring_tan[zone]
-        d = self.Rcam @ np.array([0.0, t[3] - t[1]])          # 画面里从 1 号到 3 号的方向
+        d = self._cam(zone) @ np.array([0.0, t[3] - t[1]])     # 画面里从 1 号到 3 号的方向
         a = d / np.linalg.norm(d)
         if abs(a[0]) >= abs(a[1]):
             a = a if a[0] > 0 else -a
@@ -281,9 +298,11 @@ class SimWorld:
             a = a if a[1] > 0 else -a
         return 'lr' if float(a @ d) > 0 else 'rl'
 
-    def pixel_error(self, target, kind, dt=MEASURE_S):
+    def pixel_error(self, target, kind, dt=MEASURE_S, n=None):
+        """目标在画面里离爪子点多少像素。n = 这次测量拍几帧：noise_px 是默认 5 帧取平均的噪声，帧少噪声大(按根号算)。"""
         e = np.asarray(target, float) - self.claw()
-        p = self.scale[kind] * (self.Rcam @ e) + self.rng.normal(0, self.noise_px, 2)
+        sd = self.noise_px * (math.sqrt(5.0 / max(1, int(n))) if n else 1.0)
+        p = self.scale[kind] * (self._cam() @ e) + self.rng.normal(0, sd, 2)
         self.advance(dt)
         if abs(p[0]) > 280 or abs(p[1]) > 200:
             return None                                   # 出了画面
@@ -383,9 +402,11 @@ class SimWorld:
         if verb == 'AP':
             a1_, a2_ = float(parts[1]), float(parts[2])
             spd = P['ASPDF'] * 2.0
-            if abs(a1_ - self.a1) > 10.0 or abs(a2_ - self.a2) > 10.0:
+            big = abs(a1_ - self.a1) > 10.0 or abs(a2_ - self.a2) > 10.0
+            if big:
                 spd = max(spd, P['ASPD'])                       # 角度变化大：用大动作速度(和 arm.c 一致)
-            self._servos_to(a1_, a2_, spd, fine=True)
+            b1, b2 = self.ap_bias if (big and self.ap_bias) else (0.0, 0.0)
+            self._servos_to(a1_ + b1, a2_ + b2, spd, fine=True)
             ang(1)
             ang(2)
             return True, 'DONE', info
@@ -506,11 +527,11 @@ class SimVision:
         self.last_pick_r = None
         tops = [st[-1] for (z, k), st in w.rings.items() if z == w.zone and st and st[-1]['color'] == int(color_id)]
         if w.zone not in ('ROUGH', 'TEMP') or not tops or int(color_id) in self.hide_pick:
-            w.advance(MEASURE_S)
+            w.advance(_frames_dt(n))
             return None
         c = w.claw()
         it = min(tops, key=lambda i: np.linalg.norm(i['pos'] - c))
-        e = w.pixel_error(it['pos'], 'PICK')
+        e = w.pixel_error(it['pos'], 'PICK', _frames_dt(n), n)
         if e is None:
             return None
         self.last_pick_r = 25.0 * w.scale['PICK']
@@ -598,7 +619,7 @@ class SimVision:
             if items:
                 c = w.claw()
                 it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
-                e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
+                e = w.scale['RAW'] * (w._cam() @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
                 if abs(e[0]) <= 300 and abs(e[1]) <= 220:
                     p = (self.TRUE_CLAW[0] + float(e[0]), self.TRUE_CLAW[1] + float(e[1]))
             w.advance(FRAME_S)
@@ -614,7 +635,7 @@ class SimVision:
             q = None
             if items:
                 it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
-                e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
+                e = w.scale['RAW'] * (w._cam() @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
                 if abs(e[0]) <= 300 and abs(e[1]) <= 220:
                     q = self._off('RAW', (float(e[0]), float(e[1])))
             out[int(col)] = q
@@ -630,7 +651,7 @@ class SimVision:
             return False, None
         c = w.claw()
         it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
-        e = w.scale['RAW'] * (w.Rcam @ (w.raw_pos(it) - c))
+        e = w.scale['RAW'] * (w._cam() @ (w.raw_pos(it) - c))
         if abs(e[0]) > 280 or abs(e[1]) > 200:
             return False, None
         return not w.plate_phase()[1], (0.0, 0.0)
@@ -641,7 +662,7 @@ class SimVision:
             return None
         c = w.claw()
         k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
-        e = self._off('RING', w.pixel_error(w.ring_center(k), 'RING'))
+        e = self._off('RING', w.pixel_error(w.ring_center(k), 'RING', _frames_dt(n), n))
         if e is not None and max_px and math.hypot(e[0] + self.claw('RING')[0] - self.TRUE_CLAW[0],
                                                      e[1] + self.claw('RING')[1] - self.TRUE_CLAW[1]) > max_px:
             return None                                       # 离爪子点太远：不是要对的那个环
@@ -650,13 +671,14 @@ class SimVision:
     def ring_list(self, n=None):
         """画面里看得到的所有圆环 [(u, v, 最外圈半径)]，按 u 排。"""
         w = self.w
-        w.advance(MEASURE_S)
+        w.advance(_frames_dt(n))
         if w.zone not in ('ROUGH', 'TEMP'):
             return []
         c = w.claw()
         out = []
+        sd = w.noise_px * (math.sqrt(5.0 / max(1, int(n))) if n else 1.0)
         for k in (1, 2, 3):
-            e = w.scale['RING'] * (w.Rcam @ (w.ring_center(k) - c)) + w.rng.normal(0, w.noise_px, 2)
+            e = w.scale['RING'] * (w._cam() @ (w.ring_center(k) - c)) + w.rng.normal(0, sd, 2)
             if abs(e[0]) > 280 or abs(e[1]) > 200:
                 continue
             out.append((self.TRUE_CLAW[0] + float(e[0]), self.TRUE_CLAW[1] + float(e[1]), 48.25 * w.scale['RING']))
@@ -1185,6 +1207,68 @@ class ZoneFlowTests(unittest.TestCase):
         text = '\n'.join(lines)
         self._assert_all_good(w, h, text, 6)
         self.assertNotIn('ERR READ', text)
+
+    def test_two_frame_measurements_are_faster(self):
+        """工位里对准时每次测量只拍 2 帧(zone_frames=2)：比 5 帧快，照样全放对，误差还在 2 环以内(<4mm)。"""
+        tot, errs = {}, {}
+        for nf in (2, 5):
+            tot[nf], errs[nf] = 0.0, []
+            for seed in range(4):
+                w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0)
+                lines = []
+                h = make(w, dict(zone_frames=nf), log=lines.append)
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
+                self._assert_all_good(w, h, '\n'.join(lines), seed, batches=1)
+                tot[nf] += w.t
+                errs[nf] += [p[3] for p in w.placed]
+        self.assertLess(tot[2], tot[5] - 4.0, tot)
+        self.assertLess(max(errs[2]), 4.0, errs)
+
+    def test_next_ring_starts_at_the_reach_of_the_last_one(self):
+        """车离圆环那一排远了 30mm：对准过一个环以后，去下一个环时手臂伸缩直接伸到同样远(ring_precorrect)，
+        不再每个环都 OBS(缩回观察姿态)再伸出来；刚看完三个环时手臂还在观察姿态，第一个环也不用再 OBS。"""
+        res = {}
+        for pre in (True, False):
+            obs, first = [], []
+            for seed in range(3):
+                w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0, park_side={'ROUGH': 30.0, 'TEMP': 30.0})
+                lines = []
+                h = make(w, dict(ring_precorrect=pre), log=lines.append)
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
+                self._assert_all_good(w, h, '\n'.join(lines), seed, batches=1)
+                obs.append(sum(1 for r in w.requests if r.startswith('OBS RING')))
+                first += self._start_errors(lines)[1:3] + self._start_errors(lines)[4:6]   # 每个工位第 2、3 个环
+            res[pre] = (obs, first)
+        self.assertEqual(res[True][0], [2, 2, 2], res)            # 每个工位只在看三个环时 OBS 一次
+        self.assertEqual(res[False][0], [6, 6, 6], res)           # 不预先伸：每个工位第 2、3 个环各 OBS 一次
+        self.assertLess(max(res[True][1]), 12.0, res)             # 一到就差不多(只剩底盘走得不准的那几毫米)
+        self.assertGreater(min(res[False][1]), 20.0, res)         # 缩回观察姿态：每次都差 30mm 左右
+
+    @staticmethod
+    def _start_errors(lines):
+        """每次放置(按日志顺序)对准时第一次测到的偏差(毫米)。"""
+        out, want = [], False
+        for l in lines:
+            if l.startswith('  ▶') and ' 放 ' in l:
+                want = True
+            elif want and '] 偏差 ' in l:
+                out.append(float(l.split('] 偏差 ')[1].split('mm')[0]))
+                want = False
+        return out
+
+    def test_return_from_the_tray_learns_its_bias(self):
+        """从转盘那边转回对准姿态总是多转一点(舵机过冲/齿轮间隙)：学出来提前补上，后面不用每次都"再转一次"。"""
+        n = {}
+        for learn in (True, False):
+            w = SimWorld(seed=5, code=self.CODE, cam_deg=90.0, ap_bias=(0.9, 1.6))
+            lines = []
+            h = make(w, dict(return_bias=learn), log=lines.append)
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._assert_all_good(w, h, text, 5)
+            n[learn] = text.count('再转一次')
+        self.assertGreaterEqual(n[False], 12, n)                  # 12 次放置，每次都差得多
+        self.assertLessEqual(n[True], 4, n)
 
     def test_occupied_tray_slot_is_not_grabbed_into(self):
         """第一批有物料没放出去还在转盘里：第二批同一个槽的物料不夹(放进去会砸在上面)，也不会把它当成第二批的去放。"""
