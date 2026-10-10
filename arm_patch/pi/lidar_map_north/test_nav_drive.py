@@ -442,6 +442,28 @@ class MiscDriveTests(unittest.TestCase):
                        start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
         self.assertEqual(ctx.calls, 1)
 
+    def test_reloc_before_tight_turn(self):
+        # 沿中间车道往南开到 (1200,375) 再原地转(车角离粗加工区约 30mm)；前进多走 4% -> 实际已经往南多走了 29mm。
+        # 转之前按推算位置算离得太近(比可能差的距离还近)：先雷达定位、修回转弯点再转，车角不碰粗加工区
+        def run(before):
+            car = SimCar((1200.0, 1100.0, -90.0), scale=0.04)
+            car.T = -90.0
+            ctx = SimCtx(car)
+            legs = [dict(stop='A', goal=(1200.0, 375.0, 0.0), cmds=[('F', 725), ('R', 90)])]
+            auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
+                           motion=None, cfg=dict(CFG, reloc_before_turn=before, approach_guard_travel_frac=0.05, reloc_stops=[]),
+                           start=dict(est=(1200.0, 1100.0, -90.0), ref=(1200.0, 1100.0, -90.0)), caps={'rdec': False})
+            m = auto_run.body_model(CFG)
+            regs = auto_run.regions(CFG, [])
+            return car, ctx, min(auto_run.pose_clearance(CFG, [], q, m, regs)[0] for q in car.trace if q[1] < 600)
+        car, ctx, worst = run(False)
+        self.assertLess(worst, 5.0, '不先定位：转弯时车角离粗加工区很近')
+        car, ctx, worst = run(True)
+        self.assertEqual(ctx.calls, 1)
+        self.assertEqual(car.sent[1][0], 'F')
+        self.assertTrue(-35 <= car.sent[1][1] <= -20, car.sent)        # 车头朝南：后退(往北)退回多走的那一截
+        self.assertGreater(worst, 20.0)
+
     def test_reloc_skipped_after_short_travel(self):
         car = SimCar((1200.0, 1000.0, 90.0))
         ctx = SimCtx(car)

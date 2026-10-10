@@ -1010,6 +1010,7 @@ class _Drive:
 
     def _command(self, cmd, val):
         if cmd == 'R':
+            self._before_turn(val)
             ref_next, want = self.nav.turn_cmd(val)
             self._turn(want, ref_next[2])
             self.nav.ref = ref_next
@@ -1037,6 +1038,49 @@ class _Drive:
         self.nav.moved(cmd, v)
         self.nav.ref = ref_next
 
+    def _uncert(self):
+        """上次雷达定位以后，按推算的位置可能差多少(mm)：approach_guard_travel_frac × 走过的距离。"""
+        return float(self.cfg.get('approach_guard_travel_frac', 0.015)) * self.travel
+
+    def _before_turn(self, val):
+        """路线里原地转弯：规划按"车在计划的位置"检查过转弯扫过的范围。车按推算走了一段，实际位置可能差几厘米，
+        转的时候车角就可能扫到黄区/工位区/转盘/场地边。按推算的位置算，扫过的地方离它们比"可能差的距离"还近：先用雷达定位，
+        把车修回计划的转弯点再转。"""
+        g = self.cfg.get
+        if not (self.nav.world and self.reloc_on and g('reloc_before_turn', True)):
+            return
+        if self.travel < float(g('reloc_before_turn_min_mm', 300)):
+            return
+        _, want = self.nav.turn_cmd(val)
+        if abs(want) < 1:
+            return
+        obs = self._obstacles()
+        best, _, what, _ = moves_clearance(self.cfg, obs, self.nav.real(), [('R', want)], step_deg=3.0)
+        u = self._uncert() + float(g('approach_guard_mm', 10))
+        if best >= u:
+            return
+        self.log(f'    (要原地转 {want:+.0f}°：按推算的位置转，车角离{what}只有 {best:.0f}mm，可能已经差了 {self._uncert():.0f}mm：先雷达定位)')
+        meas = _reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4)))   # 路线中间：少拍几帧，快
+        if not meas.get('ok'):
+            self.log(f"    ◆ 转弯前雷达定位没成功：{meas.get('why')}。照推算的转。")
+            return
+        self.travel = 0.0
+        p = meas['pose']
+        self.log(f"    ◆ 转弯前雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°"
+                 f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒）")
+        self.nav.measured(p, self.e_last)
+        need = float(g('reloc_check_margin_mm', 10))
+        f, s = self.nav.owed()
+        moves = [(c, v) for c, v in (('S', s), ('F', f)) if abs(v) >= float(g('reloc_turn_tol_mm', 8))]
+        model = body_model(self.cfg)
+        q = self.nav.real()
+        moves.sort(key=lambda cv: -pose_clearance(self.cfg, obs, apply_move(q, cv[0], cv[1]), model)[0])
+        for c, v in moves:
+            v2 = clamp_move(self.cfg, obs, self.nav.real(), c, int(round(v)), need)
+            if abs(v2) >= STOP_MIN_MM:
+                self._send(c, v2, self.fine, '(转弯前定位修正)')
+                self.nav.moved(c, v2)
+
     def _after_turn(self):
         """路线中间转完弯、接下来是一条长直行(>= reloc_split_mm)、上次定位以后又走了 >= reloc_min_travel_mm：先用雷达定位一次。
         前一条长直行走多走少的误差，转弯以后就变成了横向偏差，一路带着往黄区/工位区那边偏；在这里修掉
@@ -1054,7 +1098,7 @@ class _Drive:
                 break
         if nxt is None or abs(nxt[1]) < float(g('reloc_split_mm', 1200)) or self.travel < max(self.min_travel, 1.0):
             return
-        meas = _reloc(self.ctx, self.nav.real(), self.reloc_frames)
+        meas = _reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4)))   # 路线中间：少拍几帧，快
         if not meas.get('ok'):
             self.log(f"    ◆ 转弯后雷达定位没成功：{meas.get('why')}。照推算的走。")
             return
@@ -1083,8 +1127,8 @@ class _Drive:
 
     def _approach_cut(self, cmd, want):
         """朝场地边线/黄区/工位区/转盘/障碍物走的一条，按推算走满时离它很近：距离差 1~2%(长横移更多)就会压上。
-        先少走一点(终点至少留 approach_guard_frac(横移 approach_guard_frac_s) × 距离 + approach_guard_mm)，
-        到停车点用雷达定位后再慢速修过去。
+        先少走一点(终点至少留 approach_guard_frac(横移 approach_guard_frac_s) × 距离 + approach_guard_mm
+        + 上次定位以后可能已经差的 approach_guard_travel_frac × 走过的距离)，到停车点用雷达定位后再慢速修过去。
         走进启停区的最后一条(场地角上，车身离边线只有几毫米)另外先少走 home_short_mm。返回 (少走多少 mm, 日志)。"""
         g = self.cfg.get
         model = body_model(self.cfg)
@@ -1095,7 +1139,7 @@ class _Drive:
         c0, _ = pose_clearance(self.cfg, obs, p, model, regs)
         c1, what = pose_clearance(self.cfg, obs, end, model, regs)
         frac = float(g('approach_guard_frac_s', 0.03)) if cmd == 'S' else float(g('approach_guard_frac', 0.02))   # 麦轮横移误差大一些
-        guard = frac * abs(want) + float(g('approach_guard_mm', 10))
+        guard = frac * abs(want) + float(g('approach_guard_mm', 10)) + self._uncert()     # 加上上次定位以后已经可能差的
         cut, label = 0.0, ''
         if c1 < c0 - 1.0 and c1 < guard:                  # 只管"越走越近"的(沿着边线/区域平行走的不管)
             cut = guard - max(c1, 0.0) if c1 >= 0 else guard
