@@ -32,7 +32,9 @@
   keepalive()          车长时间不动时手臂轻轻摆一下(规则：停止运行 15 秒本轮结束)
   park()               收臂、升降停到 60mm(跑完回到启停区、退出程序时；急停以后不自动做)
 """
+import json
 import math
+import os
 import time
 
 import numpy as np
@@ -141,7 +143,8 @@ DEFAULTS = dict(
     survey_frames=3,                    # 到工位看三个圆环时拍几帧
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
-    vision_cal_file='vision_cal.json',  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
+    vision_cal_file='vision_cal.json',
+    place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
     chassis_fine_rpm=100,               # 视觉微调时底盘前后挪的速度(转/分)
     # 粗加工区 / 暂存区：
     ring_survey=True,                   # 到工位先用摄像头一次看清三个圆环，算出到 1、2、3 号环底盘各要前后挪多少，直接开过去(不靠估计的 150mm)
@@ -196,6 +199,26 @@ def vision_cfg(cfg):
     vc.setdefault('detector', 'circle')
     vc['matdet'] = cfg.get('matdet') or {}
     return vc
+
+
+def load_place_adj(path):
+    """pcal 存的放置补偿 {'RING': [d1, d2], 'STACK': [d1, d2]}；没有文件返回 {}。"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_place_adj(path, key, d1, d2):
+    d = load_place_adj(path)
+    d[key] = [round(float(d1), 2), round(float(d2), 2)]
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    return d
 
 
 def same_item(a, b):
@@ -1625,6 +1648,7 @@ class MissionHooks:
                 self.log('    (nogo：到了取回的位置，不夹)')
                 return True
             self._ring_ready = self._at_obs = False              # 夹起来放进转盘，手臂停在转盘上方
+            self._apply_adj('RING')                              # 夹回时爪子也按第一层的补偿对正(和放下时一样的偏差)
             self.arm.pick_here(item.slot)
         except ArmAbort:
             raise
@@ -1753,6 +1777,7 @@ class MissionHooks:
             if a1n is not None and a2n is not None:
                 self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1n, a2=a2n)
                 self._zone_d2.append((float(d['F']), float(a2n) - float(P['A2P'])))
+            self._apply_adj('RING')                              # pcal 1 量过：按第一层的补偿再转一点
             self._drop(False)                                    # 下降、松手、抬起
             self.holding = None
             self._ring_ready = True
@@ -1854,7 +1879,11 @@ class MissionHooks:
                 self.arm.take(item.slot)                         # 去转盘取物料
                 held = True
                 self.holding = item
-                self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
+                adj = self.place_adj('STACK' if stack else 'RING')
+                if adj is not None:                              # pcal 量过：落点按这一层的补偿挪
+                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True)
+                else:
+                    self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
                 self._drop(stack)                                # 下降、松手、抬起
                 held = False
                 self.holding = None
@@ -2320,6 +2349,8 @@ class MissionHooks:
     def _place_shift_px(self):
         """place_shift_mm 换成画面里的像素偏移(对准时要让"圆环 - 爪子点"等于它)。用底盘 J：车往前走 1mm 地上的东西在画面里动 J[:,1]；
         要放的点往前挪 d(车往前走 d 才对准)，对准时"圆环 - 爪子点"就该是 J[:,1]·d。没有底盘 J 或者挪 0 返回 None。"""
+        if self.place_adj('RING') is not None:                  # pcal 实测过补偿，就不用这个估计的整体挪动了
+            return None
         sh = self.cfg.get('place_shift_mm') or {}
         try:
             f, sl = float(sh.get('F', 0.0) or 0.0), float(sh.get('S', 0.0) or 0.0)
@@ -2394,6 +2425,30 @@ class MissionHooks:
             return None
         lim = float(((self.servo.cfg if self.servo is not None else {}).get('arm_limit_deg') or {}).get('id1', 12.0))
         return float(P['A1P']) - lim, float(P['A1P']) + lim
+
+    def place_adj(self, key):
+        """pcal 实测的放置补偿：摄像头对准以后，ID1、ID2 再多转多少度物料才正好落在圆环(RING=第一层)/下面那个物料(STACK=第二层)正中。
+        没量过返回 None。"""
+        if not hasattr(self, '_adj'):
+            self._adj = load_place_adj(self.cfg.get('place_adj_file'))
+        v = self._adj.get(key)
+        if not v:
+            return None
+        try:
+            return float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _apply_adj(self, key):
+        """手臂在摄像头对准的姿态上：按 pcal 的补偿再转一点(第一层/第二层各自的)。返回补偿了没有。"""
+        adj = self.place_adj(key)
+        if adj is None or (abs(adj[0]) < 0.05 and abs(adj[1]) < 0.05):
+            return False
+        a1, a2 = self.arm.read_angles()
+        if a1 is None or a2 is None:
+            return False
+        self._return_to_pose(a1 + adj[0], a2 + adj[1])
+        return True
 
     def _drop(self, stack):
         """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。"""

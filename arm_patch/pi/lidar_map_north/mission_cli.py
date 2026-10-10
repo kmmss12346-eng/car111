@@ -26,6 +26,11 @@ mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这�
                              rev = 这次圆环前后方向反过来(1 号、3 号环跑反了时用)。车是手放到工位上的，位移从 0 算
                              wheels = 这次对准先动车轮(沿圆环那一排小步慢慢挪，差不多了再动手臂；默认是先动手臂)
                              nofilt = 这次对准不用测量滤波(默认用)。两个都只管这一次，用来上车对比哪种快、准
+pcal 1 [槽号]              放置补偿(第一层，平放在圆环上)：车停在暂存区/粗加工区 2 号环前(圆环上空着)。程序先空爪用摄像头对准 2 号环、记下姿态，
+                             再去转盘取物料、回到这个姿态、降到离地几毫米停住。你用 arm AD 1 +0.5(沿圆环那一排)、arm AD 2 +10(离圆环远近)
+                             把物料挪到圆环正中，输入 pcal save：记下补偿并放下。不想要：pcal cancel(物料放回转盘)
+pcal 2 [槽号]              放置补偿(第二层，码垛)：2 号环上先放好一个第一层物料，其他和 pcal 1 一样，物料挪到下面那个物料正上方
+pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 mtest START                单独测回家后的显示(会收臂、升降停 60)
 mtest reset                清空任务码和记录，重新开始
 park                       收臂、升降停到 60mm(下次开机编码器才认得准)；急停以后要自己输入这个
@@ -40,6 +45,7 @@ mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)
 mot en                     让 5 个驱动器解除堵转保护并使能，然后再看一次状态
 """
 import math
+import os
 import re
 import threading
 
@@ -408,6 +414,9 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 raise ValueError(h.disabled)
             _vcal(h, kind, color, chassis, log)
         return _run_async(state, log, go, vision=True)
+
+    if k == 'pcal':
+        return _pcal(h, link, parts, state, log)
 
     if k == 'mtest':
         if len(parts) < 2:
@@ -981,3 +990,93 @@ def _vcal(h, kind, color, chassis, log):
         log('  校准结果已存进 ' + str(h.store.path) + '，以后对准直接用。' if h.store.path else '  (没有配置存储文件，校准结果只在这次运行里有效)')
     except ServoError as ex:
         raise ValueError(f'校准失败：{ex}')
+
+
+# ---------------------------------------------------------------- pcal：第一层/第二层放置补偿(用物料实测，弥补爪子夹物料的偏差)
+_PC = {}
+
+
+def _pcal(h, link, parts, state, log):
+    from mission_hooks import save_place_adj, load_place_adj
+    sub = parts[1].lower() if len(parts) > 1 else ''
+    path = h.cfg.get('place_adj_file') or 'place_adj.json'
+    if sub == 'show':
+        d = load_place_adj(path)
+        log('放置补偿(度)：' + ('  '.join(f'{"第一层" if k == "RING" else "第二层"} ID1 {v[0]:+.2f} ID2 {v[1]:+.2f}'
+                                       for k, v in d.items()) or '还没量过'))
+        return None
+    if sub == 'clear':
+        if os.path.exists(path):
+            os.remove(path)
+        if hasattr(h, '_adj'):
+            del h._adj
+        log('放置补偿已清掉(以后按摄像头对准的位置直接放)')
+        return None
+    if sub in ('save', 'cancel'):
+        st = _PC.get('st')
+        if not st:
+            raise ValueError('先 pcal 1 或 pcal 2')
+
+        def fin():
+            h._ensure(link)
+            if sub == 'cancel':
+                h._put_back(st['item'], 'pcal cancel')
+                _PC.clear()
+                return
+            a1, a2 = h.arm.read_angles()
+            d1, d2 = a1 - st['a1'], a2 - st['a2']
+            save_place_adj(path, st['key'], d1, d2)
+            if hasattr(h, '_adj'):
+                del h._adj
+            log(f'已存{"第一层" if st["key"] == "RING" else "第二层"}放置补偿：ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path})；现在放下')
+            h._drop(st['key'] == 'STACK')
+            h.holding = None
+            _PC.clear()
+            log('放好了。量一下物料中心离圆环中心多少；不满意就再 pcal 一次(会覆盖)')
+        return _run_async(state, log, fin)
+    if sub not in ('1', '2'):
+        raise ValueError('格式：pcal 1 [槽号](第一层) / pcal 2 [槽号](第二层码垛) / pcal save / pcal cancel / pcal show / pcal clear')
+    slot = int(parts[2]) if len(parts) > 2 and parts[2] in ('1', '2', '3') else 1
+    key = 'RING' if sub == '1' else 'STACK'
+
+    def go():
+        from task_plan import Item
+        h._ensure(link)
+        h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+        state['abort'] = False
+        h._aborted = False
+        if h.act is not None:
+            h.act.reset_disp()
+        h.ring_gate_px = None
+        P = h.arm.params(refresh=True) or {}
+        log(f'== pcal {sub}：{"第一层平放" if key == "RING" else "第二层码垛"}的放置补偿；车停在 2 号环前，转盘 {slot} 号槽里放一个物料 ==')
+        h.arm.obs('RING', open_claw=True)
+        cfg = h.cfg
+        if key == 'RING':
+            res = h.servo.run('RING', h._ring_measure(), h.vision.scale('RING'), cfg['tol_mm']['RING'], allow_chassis=False,
+                              label='pcal', bounds=h.vision.bounds('RING'), confirm=True)
+        else:
+            res, _how = h._align_covered(1, 'STACK', 'pcal', confirm=True)
+        log(f'  摄像头对准：{res}')
+        if res is None or not (res.ok or res.err_mm <= cfg['accept_mm']['RING']):
+            h._recover('没对准圆环，pcal 不做')
+            return
+        a1, a2 = h.arm.read_angles()
+        item = Item(1, slot - 1, 1, 2)
+        h.arm.take(slot)
+        h.holding = item
+        adj = h.place_adj(key)
+        if adj:
+            log(f'  先按上次量的补偿(ID1 {adj[0]:+.2f}°、ID2 {adj[1]:+.2f}°)放到位置上，在这个基础上再微调')
+            h._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True)
+        else:
+            h._return_to_pose(a1, a2, from_tray=True)
+        up = 1.0 if float(P['ZHI']) >= float(P['ZPLC']) else -1.0
+        z = float(P['ZSTK' if key == 'STACK' else 'ZPLC']) + up * float(cfg.get('pcal_hover_mm', 8.0))
+        h.arm.lift(z)
+        _PC['st'] = dict(key=key, a1=a1, a2=a2, item=item)
+        log(f'  物料停在离{"地面" if key == "RING" else "下面那个物料"}约 {cfg.get("pcal_hover_mm", 8.0):g}mm 的地方。从正上方看：')
+        log('    arm AD 1 +0.5 / arm AD 1 -0.5 ：沿圆环那一排挪(1° 约 4mm)')
+        log('    arm AD 2 +10 / arm AD 2 -10   ：离圆环远/近挪(10° 约 1.7mm)')
+        log('  物料正好在中间了输入 pcal save(记下并放下)；不要了输入 pcal cancel(放回转盘)')
+    return _run_async(state, log, go, vision=True)

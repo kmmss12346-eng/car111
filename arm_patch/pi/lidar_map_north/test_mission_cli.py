@@ -957,3 +957,55 @@ class ConfigScriptTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)
+
+
+class PcalTests(unittest.TestCase):
+    """pcal 1 / pcal 2：带着物料停在圆环上方，手动微调，pcal save 记下第一层/第二层各自的放置补偿。"""
+
+    def setUp(self):
+        import tempfile, os
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, 'place_adj.json')
+        self.w = SimWorld(seed=21, code='156+123+516+231')
+        self.h = make(self.w, dict(place_adj_file=self.path))
+        mission_cli._S['hooks'] = self.h
+        self.lines, self.state = [], {}
+        self.log = self.lines.append
+        self.w.arrive('TEMP')
+        self.w.tray[1] = 1
+
+    def run_cli(self, k, text):
+        mission_cli.handle_cli(k, text.split(), link=self.w.link, raw_cfg={}, state=self.state, log=self.log)
+        wait_idle(self.state)
+
+    def test_pcal1_saves_the_nudge_and_places(self):
+        import json
+        self.run_cli('pcal', 'pcal 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('pcal save', text)
+        self.assertIsNotNone(self.w.held, text)                     # 夹着物料停在圆环上方
+        self.run_cli('arm', 'arm AD 1 1.5')
+        self.run_cli('arm', 'arm AD 2 -20')
+        self.run_cli('pcal', 'pcal save')
+        with open(self.path) as f:
+            d = json.load(f)
+        self.assertAlmostEqual(d['RING'][0], 1.5, delta=0.2)
+        self.assertAlmostEqual(d['RING'][1], -20.0, delta=0.5)
+        self.assertIsNone(self.w.held)                              # 放下了
+        self.assertEqual(len(self.w.placed), 1)
+        self.assertEqual(self.h.place_adj('RING'), (d['RING'][0], d['RING'][1]))
+        self.assertIsNone(self.h._place_shift_px())                 # 量过补偿就不再用估计的 place_shift_mm
+
+    def test_pcal_cancel_puts_it_back(self):
+        self.run_cli('pcal', 'pcal 1')
+        self.run_cli('pcal', 'pcal cancel')
+        self.assertEqual(self.w.tray[1], 1)
+        self.assertIsNone(self.h.place_adj('RING'))
+
+    def test_show_and_clear(self):
+        from mission_hooks import save_place_adj
+        save_place_adj(self.path, 'STACK', 0.5, 12)
+        self.run_cli('pcal', 'pcal show')
+        self.assertIn('第二层 ID1 +0.50 ID2 +12.00', '\n'.join(self.lines))
+        self.run_cli('pcal', 'pcal clear')
+        self.assertIsNone(self.h.place_adj('STACK'))
