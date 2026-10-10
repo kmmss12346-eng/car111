@@ -668,7 +668,7 @@ class MissionHooks:
                 else:
                     self.disabled = '升降位置不知道了(急停打断过升降？)：把升降放到最低点，输入 arm LIFT ZERO'
                 if not self.disabled and self.cfg.get('stow_at_start', True):
-                    self.arm.stow()                 # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
+                    self._stow_retry()              # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
                     self.log('  手臂已收到待机姿态')
         except ArmAbort as ex:
             raise Abort(str(ex))

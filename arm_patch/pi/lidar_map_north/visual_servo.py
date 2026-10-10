@@ -618,8 +618,9 @@ class VisualServo:
             return fix_max is not None and ch_moved[0] >= float(fix_max)
 
         def finish(ok, reason=''):
-            # 对准成功：把这次用实际移动修正过的 J 存下来(fixed_j 时也存：成功说明目标没在动，修正是对的)；探测过的也存(fixed_j 不探测)
-            if ok or (probed and not getattr(self, '_fixed', False)):
+            # 对准成功：把这次用实际移动修正过的 J 存下来(fixed_j 时也存：成功说明目标没在动，修正是对的)；探测过的也存(fixed_j 不探测)。
+            # 发散过(重新探测过)又没对准：目标多半自己在动，这次探测的 J 也不可信，不存(servo_cal.json 里原来的不动)
+            if ok or (probed and not getattr(self, '_fixed', False) and not reprobes):
                 for g in ('arm', 'ch'):
                     if J[g] is not None:
                         self.store.put(kind, g, J[g])

@@ -344,54 +344,65 @@ class ServoTests(unittest.TestCase):
 
     # ---------------- 发散判断：一次跳变不算
     def test_single_noisy_jump_is_not_divergence(self):
-        """偏差一下变大(一次测量跳了)：先再测一次，复测正常就不算发散，不丢 J、不重新探测。"""
-        rng = np.random.default_rng(34)
-        pl = SimPlant(rng, err_mm=10.0, noise_px=0.3)
-        store = JacStore(None)
-        store.put('RING', 'arm', pl.A)
-        n = [0]
-        real = pl.measure
+        """偏差一下变大(一次测量跳了)：先再测一次，复测正常就不算发散，不丢 J、不重新探测(以前会丢掉 J 重新探测)。"""
+        for seed in range(10):
+            rng = np.random.default_rng(40 + seed)
+            pl = SimPlant(rng, err_mm=3.0, noise_px=0.3)
+            store = JacStore(None)
+            store.put('RING', 'arm', pl.A)
+            n = [0]
+            real = pl.measure
 
-        def measure():
-            n[0] += 1
-            p = real()
-            if n[0] == 2:                                          # 第二次测量跳了 30 像素
-                p = (p[0] + 30.0, p[1])
-            return p
-        logged = []
-        sv = VisualServo(pl, store=store, log=logged.append, sleep=FakeClock().sleep, clock=FakeClock())
-        res = sv.run('RING', measure, pl.scale, 1.0, allow_chassis=False, max_iter=8)
-        text = '\n'.join(logged)
-        self.assertTrue(res.ok, text)
-        self.assertFalse(res.probed, text)
-        self.assertIn('再测一次', text)
-        self.assertNotIn('J 可能不对', text)
-        self.assertIsNotNone(store.get('RING', 'arm'))
+            def measure():
+                n[0] += 1
+                p = real()
+                if n[0] == 2:                                      # 第二次测量跳了 40 像素(就这一次)
+                    p = (p[0] + 40.0, p[1])
+                return p
+            logged = []
+            sv = VisualServo(pl, store=store, log=logged.append, sleep=FakeClock().sleep, clock=FakeClock())
+            res = sv.run('RING', measure, pl.scale, 1.0, allow_chassis=False, max_iter=8)
+            text = '\n'.join(logged)
+            self.assertTrue(res.ok, text)
+            self.assertFalse(res.probed, text)
+            self.assertIn('再测一次', text)
+            self.assertNotIn('J 可能不对', text)
+            self.assertIsNotNone(store.get('RING', 'arm'))
 
-    def test_divergence_never_deletes_the_stored_jacobian_file(self):
-        """真的发散(目标自己一直在跑)：这次运行里不用这组 J(内存里停用)，但 servo_cal.json 里存的不删。"""
+    def test_divergence_never_overwrites_the_stored_jacobian_file(self):
+        """目标自己挪走了两次(真的发散，对准失败)：servo_cal.json 里原来的 J 不删、也不被这次乱测的 J 换掉；
+        这次运行里先不用它(内存里停用)，重新测好的 J 放回来就照常用。"""
         import os
         import tempfile
-        path = os.path.join(tempfile.mkdtemp(), 'cal.json')
-        rng = np.random.default_rng(35)
-        pl = SimPlant(rng, err_mm=6.0, noise_px=0.2)
-        store = JacStore(path)
-        store.put('RING', 'arm', pl.A)
-        store.save()
-        k = [0]
-        real = pl.measure
+        failed = 0
+        for seed in range(10):
+            path = os.path.join(tempfile.mkdtemp(), 'cal.json')
+            rng = np.random.default_rng(seed)
+            pl = SimPlant(rng, err_mm=4.0, noise_px=0.2)
+            store = JacStore(path)
+            store.put('RING', 'arm', pl.A)
+            store.save()
+            n = [0]
+            real = pl.measure
 
-        def running_away():
-            k[0] += 1
-            pl.p = pl.p * 1.8 + 3.0                                 # 每测一次目标就跑远一大截
-            return real()
-        sv = VisualServo(pl, store=store, log=lambda m: None, sleep=FakeClock().sleep, clock=FakeClock())
-        res = sv.run('RING', running_away, pl.scale, 1.0, allow_chassis=False, max_iter=10)
-        self.assertFalse(res.ok)
-        self.assertIsNone(store.get('RING', 'arm'))                # 这次运行里不用了
-        self.assertTrue(np.allclose(JacStore(path).get('RING', 'arm'), pl.A))   # 文件里的还在
-        store.put('RING', 'arm', pl.A)                             # 重新测好的 J 放回来就照常用
-        self.assertIsNotNone(store.get('RING', 'arm'))
+            def jumpy():
+                n[0] += 1
+                p = np.array(real(), float)
+                if n[0] >= 2:
+                    p += (40.0, 0.0)                               # 目标突然挪走了(之后一直在那儿)
+                if n[0] >= 14:
+                    p += (0.0, 60.0)                               # 又挪走一次
+                return tuple(p)
+            sv = VisualServo(pl, store=store, log=lambda m: None, sleep=FakeClock().sleep, clock=FakeClock())
+            res = sv.run('RING', jumpy, pl.scale, 0.5, allow_chassis=False, max_iter=12)
+            if not res.ok:
+                failed += 1
+                self.assertIn('发散', res.reason)
+                self.assertIsNone(store.get('RING', 'arm'))        # 这次运行里不用了
+                self.assertTrue(np.allclose(JacStore(path).get('RING', 'arm'), pl.A), seed)   # 文件里的还是原来的
+                store.put('RING', 'arm', pl.A)                     # 重新测好的 J 放回来就照常用
+                self.assertIsNotNone(store.get('RING', 'arm'))
+        self.assertGreaterEqual(failed, 1)
 
     # ---------------- 手臂能偏的范围 / 横移 / 超时
     def test_arm_range_is_respected(self):
@@ -422,6 +433,23 @@ class ServoTests(unittest.TestCase):
                          chassis_s_range=(-20.0, 20.0), arm_range={'id2': (0.0, 0.0)})   # 伸缩一点也动不了
             ok += res.ok
             self.assertGreater(pl.ch_moves, 0)
+        self.assertGreaterEqual(ok, 18)
+
+    def test_wheels_step_rounded_to_zero_uses_the_arm(self):
+        """先动车轮：这一步四舍五入成 0mm(车轮只能按整毫米挪)时改用手臂，不当成"手臂到头、底盘也不动"失败。"""
+        rng = np.random.default_rng(39)
+        ok = 0
+        for _ in range(20):
+            pl = SimPlant(rng, err_mm=2.0, noise_px=0.1)
+            t = pl.B[:, 1] / np.linalg.norm(pl.B[:, 1])
+            pl.p = t * 2.0 * pl.scale                               # 偏差全在沿圆环那一排(车轮前后挪的方向)
+            store = JacStore(None)
+            store.put('RING', 'arm', pl.A)
+            store.put('RING', 'ch', pl.B)
+            res = make_servo(pl, store=store, cfg=dict(gain_ch=0.2, wheels_min_mm=1.0)).run(
+                'RING', pl.measure, pl.scale, 0.8, allow_chassis=True, chassis_axes='F', wheels_first=True, max_iter=6)
+            ok += res.ok
+            self.assertNotIn('行程极限', res.reason or '')
         self.assertGreaterEqual(ok, 18)
 
     def test_probing_time_does_not_count_against_the_timeout(self):
