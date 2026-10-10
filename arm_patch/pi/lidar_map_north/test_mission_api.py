@@ -357,6 +357,13 @@ class QrSearchTests(unittest.TestCase):
         self.assertIn('读到了(扫码器对着 1260 左右)', text)
         self.assertEqual(w.screen['t0'], '156+123+')
 
+    def test_fixed_code_skips_scanning(self):
+        """(10-11 用户)qr_fixed_code：不扫码、不前后挪，直接用手动给的任务码。"""
+        w, h, text = self.run_qr(None, cfg={'qr_fixed_code': '231+312+123+132'})
+        self.assertEqual(h.plan.code, '231+312+123+132', text)
+        self.assertIn('不扫二维码', text)
+        self.assertEqual(f_moves(w), [])
+
     def test_search_ignores_obstacles_by_default(self):
         """(10-11 用户)障碍物只用来规划路线：默认找码时不管它，照样挪过去。"""
         w, h, text = self.run_qr((-140.0, -100.0), obstacles=[(2110.0, 1560.0, 25.0)])

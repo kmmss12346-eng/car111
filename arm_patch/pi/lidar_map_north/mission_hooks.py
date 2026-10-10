@@ -88,6 +88,7 @@ DEFAULTS = dict(
     raw_wheels_first=False,             # (10-10 用户：原料区只动爪子)True = 原料区对准先动车轮(沿车头方向前后小步慢慢挪，每次最多 wheels_step_mm、wheels_rpm 转/分)，
                                         #   差不到 wheels_min_mm 再动手臂；车轮不横移(不会压进原料区)。要先做过 vcal RAW 颜色号(不加 arm)，
                                         #   存了车轮和画面的对应关系才有用，没有就只动手臂。False = 只动手臂(以前的做法)
+    qr_fixed_code=None,                 # (10-11 用户)手动给任务码，例如 "652+312+526+231"：不扫二维码，到 QR 点直接用它(屏上照样显示)；null = 正常扫码
     raw_track_s=150.0,                  # (10-11 用户：一定要夹起来)等要抓的物料转过来、停在爪子下面最多等多久(秒)；150 = 一直等到 time_limit_s。以前 30
     raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
@@ -329,6 +330,9 @@ class MissionHooks:
         t_start = self.now()
         self._items_t = 0.0
         try:
+            if role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and str(self.cfg.get('qr_fixed_code') or '').strip():
+                self.log(f'    用配置里手动给的任务码 {self.cfg.get("qr_fixed_code")}(路线里没有 QR 点也行)')
+                self._use_code(str(self.cfg.get('qr_fixed_code')).strip())
             if (role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and not self.disabled
                     and self.cfg.get('qr_retry_at_stops', True)):
                 self._qr_again()                    # QR 点没读到码：STM32 可能在路上读到了，再问一次
@@ -873,6 +877,12 @@ class MissionHooks:
         """读任务码：先原地查 qr_first_wait_s 秒(路上可能已经读到了)；没读到就沿车道前后挪着找(_qr_search)，最后回到停车点。
         qr_search=false：原地最多等 qr_timeout_s 秒(以前的做法)。"""
         cfg = self.cfg
+        fixed = str(cfg.get('qr_fixed_code') or '').strip()
+        if fixed:
+            self.log(f'    不扫二维码：用配置里手动给的任务码 qr_fixed_code = {fixed}')
+            if self._use_code(fixed):
+                return
+            self.log('    ★ 手动给的任务码格式不对(要像 652+312+526+231)：改成正常扫码')
         self._ui('stage', 'QR SCAN')
         search = bool(cfg.get('qr_search', True))
         code = self._qr_poll(float(cfg.get('qr_first_wait_s', 0.6)) if search else float(cfg['qr_timeout_s']))
