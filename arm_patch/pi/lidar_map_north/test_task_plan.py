@@ -65,6 +65,25 @@ class StatsTests(unittest.TestCase):
         s.grab(True); s.grab(False); s.place(True)
         self.assertEqual((s.grab_text(), s.place_text()), ('GRAB 1/2', 'PLACE 1/1'))
 
+    def test_final_counts_show_only_the_successful_ones(self):
+        """回到启停区：只显示做成的个数(赛规要"正确的数量")，不写成分数。"""
+        s = Stats()
+        for ok in (True, True, False):
+            s.grab(ok)
+        for ok in (True, False, True, True):
+            s.place(ok)
+        self.assertEqual((s.final_grab_text(), s.final_place_text()), ('GRAB 2', 'PLACE 3'))
+
+
+class ScreenCodeTests(unittest.TestCase):
+    def test_code_lines_keep_the_plus(self):
+        """屏上任务码分两行：第一行带上两组之间的 +，两行合起来就是完整的任务码。"""
+        p = parse_code('156+123+516+231')
+        self.assertEqual(p.screen_code(), ('156+123+', '516+231'))
+        self.assertEqual(''.join(p.screen_code()), p.code)
+        self.assertEqual(p.screen_code(plus=False), ('156+123', '516+231'))
+        self.assertTrue(all(len(l) <= 8 for l in p.screen_code()))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)

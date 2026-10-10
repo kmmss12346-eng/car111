@@ -527,8 +527,8 @@ class MissionHooks:
         cfg = self.cfg
         # 偏保守：取回了却去不成暂存区，白花时间，物料还从算了分的地方拿走了
         fixed = (2 * float(cfg.get('stop_finish_s', 3.0)) + float(cfg.get('next_leg_s', 12.0)) + self._base_s('TEMP')
-                 + float(self.home_eta_s) + float(cfg.get('home_margin_s', 12.0)) + 8.0)
-        per = 1.25 * (self._item_s('pick') + self._item_s('place'))
+                 + float(self.home_eta_s) + float(cfg.get('home_margin_s', 12.0)) + 4.0)
+        per = 1.15 * (self._item_s('pick') + self._item_s('place'))
         left = float(cfg.get('round_s', 180.0)) - self.elapsed()
         k = int(max(0.0, min(float(n), (left - fixed) / max(per, 1.0))))
         if k < n:

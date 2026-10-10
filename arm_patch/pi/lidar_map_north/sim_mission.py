@@ -1398,6 +1398,117 @@ class ZoneFlowTests(unittest.TestCase):
         self.assertEqual(w.collisions, 0, text)
         self.assertIn('号槽里还有没放出去的', text)
 
+    def test_wheels_first_option(self):
+        """wheels_first(mtest … wheels)：沿圆环那一排先让车轮小步慢慢挪——照样全放对，工位里不横移，
+        车轮每次最多 wheels_step_mm、用 wheels_rpm 的速度。"""
+        steps = []
+        for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0),
+                                          cfg=dict(wheels_first=True, wheels_step_mm=15.0, wheels_rpm=60, wheels_min_mm=4.0),
+                                          stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
+            self._assert_all_good(w, h, text, seed, batches=1)
+            self.assertEqual([m for m in w.moves if m[2] in ('ROUGH', 'TEMP') and m[0] == 'S'], [], text)
+            wheel = [(m, sp) for m, sp in zip(w.moves, w.move_speeds) if sp == 60]
+            self.assertTrue(all(m[0] == 'F' and abs(m[1]) <= 15 and m[2] in ('ROUGH', 'TEMP') for m, _sp in wheel), wheel)
+            steps += wheel
+        self.assertTrue(steps, '一次都没先动车轮')
+
+    def test_servo_timeouts_use_the_sim_clock(self):
+        """视觉闭环用模拟的时钟算超时(以前用真的时钟，模拟里永远不超时)：超时设得很短就会超时。"""
+        (seed, w, h, text), = self._run([1], dict(cam_deg=90.0), cfg=dict(servo=dict(timeout_s=0.2)),
+                                        stops=('QR', 'RAW', 'ROUGH', 'START1'))
+        self.assertIn('超时', text)
+        self.assertAlmostEqual(h.servo.clock(), w.t)
+
+
+class TiltTests(unittest.TestCase):
+    """车身和圆环那一排不平行(车停斜了几度)：看三个环时量出角度，挪到每个环以后离圆环远/近多少提前补到手臂上。
+    任务码第一批去 1、3、2 号环：1 号环离看圆环的地方 150mm，3 号环离 1 号 300mm(斜 5° 时远近差 13mm / 26mm)。"""
+    CODE = '156+132+516+231'
+
+    def _run(self, tilt, pre, seeds=range(3)):
+        from visual_servo import JacStore
+        out = []
+        for seed in seeds:
+            w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0, tilt=tilt)
+            st = JacStore(None)
+            st.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))     # 做过 vcal RING(手臂的 J 知道)
+            lines, cur, first = [], [None], {}
+
+            def log(m, lines=lines, cur=cur):
+                lines.append(m)
+                if m.startswith('  ▶') and ' 放 ' in m and '到环' in m:
+                    cur[0] = (m.split('▶ ')[1].split(' ')[0], int(m.split('到环')[1][0]))
+            orig = w.vision.ring_error
+
+            def ring_error(n=None, max_px=None, w=w, cur=cur, first=first, orig=orig):
+                if cur[0] is not None and cur[0] not in first:   # 每次放置对准时第一次测量：那一刻离圆环远/近差多少(真实的)
+                    c = w.claw()
+                    k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
+                    first[cur[0]] = abs(float((w.ring_center(k) - c)[0]))
+                return orig(n, max_px)
+            w.vision.ring_error = ring_error
+            cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', tilt_precorrect=pre,
+                       ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
+            self.assertEqual(h.stats.place_ok, 6, '\n'.join(lines))
+            out.append((w, h, '\n'.join(lines), first))
+        return out
+
+    def test_precorrection_makes_the_first_error_small(self):
+        """斜 5°(粗加工区)/-4°(暂存区)：到 1、3 号环第一次测量时离圆环远近只差几毫米；不提前补时差十几、二十几毫米。"""
+        tilt = {'ROUGH': 5.0, 'TEMP': -4.0}
+        on = [f for _w, _h, _t, f in self._run(tilt, True)]
+        off = [f for _w, _h, _t, f in self._run(tilt, False)]
+        pick = lambda fs: [e for f in fs for (z, r), e in f.items() if r in (1, 3)]
+        print(f'\n  [车身斜 5°/-4°] 1、3 号环第一次测量时远近差：提前补 最大 {max(pick(on)):.1f}mm，不补 平均 {np.mean(pick(off)):.1f}mm')
+        self.assertLess(max(pick(on)), 4.0, on)
+        self.assertGreater(np.mean(pick(off)), 9.0, off)
+
+    def test_warns_at_three_degrees_and_logs_the_angle(self):
+        for _w, _h, text, _f in self._run({'ROUGH': 5.0, 'TEMP': -4.0}, True, seeds=[0]):
+            self.assertIn('★ 车身和圆环那一排斜了 +', text)
+            self.assertIn('★ 车身和圆环那一排斜了 -', text)
+            self.assertIn('把车摆正', text)
+        for _w, _h, text, _f in self._run({'ROUGH': 1.0, 'TEMP': -1.5}, True, seeds=[0, 1]):
+            self.assertNotIn('斜了', text)
+            self.assertGreaterEqual(text.count('车身和圆环那一排的夹角'), 2, text)     # 每个工位都报角度
+
+    def test_refined_direction_is_stored_for_the_next_zone(self):
+        """第一次换环时量准的"底盘前进方向"存下来：到暂存区直接用，不再显示"可能差 1° 左右"。"""
+        (w, h, text, _f), = self._run({'ROUGH': 5.0, 'TEMP': -4.0}, True, seeds=[1])
+        self.assertIsNotNone(h.store.extra('RING', 'ch_f_ref'))
+        temp = text[text.index('TEMP'):]
+        self.assertNotIn('可能差 1° 左右', temp[:temp.index('▶')])
+
+
+class NavFlowTests(unittest.TestCase):
+    """和新的导航一起跑(模拟)：prepare、按 START 计时、每个停车点告诉钩子回家要多久、开往下一个停车点前问来不来得及。"""
+
+    def test_first_batch_fits_in_the_round_with_fast_params(self):
+        """提速参数 + vcal 做过：第一批 QR→原料→粗加工→暂存→回家 在 3 分钟内(路上每段按 10 秒)；时间不够的就不做，一定按时回家。"""
+        from visual_servo import JacStore
+        for seed in range(3):
+            w = SimWorld(seed=seed, code=MissionSimTests.CODE, params=FAST_PARAMS, cam_deg=90.0)
+            st = JacStore(None)
+            st.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
+            st.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+            lines = []
+            cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='',
+                       ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
+                             sleep=w.advance, store=st)
+            nav = dict(leg_s=10.0, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})
+            done = run_mission(w, h, log=lines.append, nav=nav)
+            text = '\n'.join(lines)
+            self.assertLessEqual(w.t, 180.0, text)
+            self.assertEqual(done[-1], 'START1')
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
+            self.assertGreaterEqual(h.stats.place_ok, 3, text)
+            self.assertEqual(w.parked, 1)
+            print(f'\n  [提速参数 + 导航 seed {seed}] 去了 {"→".join(done)}；用时 {w.t:.0f} 秒；抓 {h.stats.grab_ok}、放 {h.stats.place_ok}')
+
 
 def _demo(fast, batches=2, extra=None):
     params = dict(FAST_PARAMS) if fast else {}
