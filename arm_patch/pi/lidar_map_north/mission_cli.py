@@ -416,6 +416,8 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     h.act.reset_disp()                  # 车是手放到这个工位的：底盘位移从 0 算，前面学到的停车误差也清掉
                 h.learn = {'S': 0.0, 'F': 0.0}
                 h.nogo, h.ring_rev = nogo, rev
+                if h.cfg.get('mtest_hold_heading', True) and hasattr(h, 'hold_heading'):
+                    h.hold_heading()                    # 车是手搬过来的：现在的车头方向就是要保持的方向
                 _zone_preflight(h, what, batch, force, log)
             if force and h.plan is not None and what in ('ROUGH', 'TEMP'):
                 for it in h.plan.items(batch):
@@ -511,20 +513,30 @@ def _zone_preflight(h, zone, batch, force, log):
     items = h.plan.items(batch)
     offs = h.cfg['ring_offset_mm'].get(zone) or {}
     sign = -1.0 if h.ring_rev else 1.0
-    log(f'== {zone} 第{batch}批' + ('(nogo：只对准，不取不放)' if h.nogo else '') + '：车要停在 2 号环正对手臂的位置 ==')
+    log(f'== {zone} 第{batch}批' + ('(nogo：只对准，不取不放)' if h.nogo else '') + '：车要停在 2 号环正对手臂的位置，车身和圆环那一排平行 ==')
+    survey = h.cfg.get('ring_survey', True)
     for it in items:
+        if survey:
+            log(f'   {it.slot}号槽 {it.color_name} -> 环{it.ring}')
+            continue
         off = sign * float(offs.get(str(it.ring), 0.0))
         where = '不挪' if abs(off) < 1 else f'底盘{"前进" if off > 0 else "后退"} {abs(off):.0f}mm'
         log(f'   {it.slot}号槽 {it.color_name} -> 环{it.ring}({where})')
+    if survey:
+        order = (h.cfg.get('ring_order') or {}).get(zone, 'lr')
+        lr = (str(order).lower() != 'rl') != bool(h.ring_rev)
+        log('   先看清三个圆环(摄像头画面里从左到右是 ' + ('1 2 3' if lr else '3 2 1') + ')，再按看到的位置前后挪过去；'
+            + ('不横移' if not h.cfg.get('chassis_strafe', False) else '允许横移') + '，离圆环远近靠手臂伸缩补')
     if not force and not h.nogo:
-        missing = [it for it in items if it.slot not in h.in_tray]
+        from mission_hooks import same_item
+        missing = [it for it in items if not same_item(h.in_tray.get(it.slot), it)]
         if missing:
             log('   ★ 转盘里没有记录这些物料：' + '、'.join(f'{it.slot}号槽{it.color_name}' for it in missing) +
                 '(没跑过 mtest RAW 的话加 force，并且按上面手放进转盘)')
     if 'RING' not in (cal.get('claw_px') or {}):
         log('   ★ 还没做 vclaw RING：放的位置按估计的爪子点，可能偏几毫米')
     covered = zone == 'ROUGH' or batch == 2                 # 取回 / 码垛：圆环白心被物料盖住
-    if covered and hasattr(h.vision, 'has_pick') and not h.vision.has_pick():
+    if covered and hasattr(h.vision, 'has_pick') and not h.vision.has_pick() and h.cfg.get('learn_pick', False):
         if zone == 'ROUGH':
             log('   取回时按物料对准要用的 PICK 点还没量：' +
                 ('这次是 nogo，不放物料，量不了' if h.nogo else '第一个物料放下后会自动量一次(多几秒，量好存下来以后不用再量)'))
@@ -773,6 +785,7 @@ def _vcal(h, kind, color, chassis, log):
         if chassis:
             Jc = h.servo._probe(measure, 'ch')
             h.store.put(kind, 'ch', Jc)
+            h.store.set_synth(kind, False)              # 横移、前进都实测过了
             ps = np.linalg.norm(Jc, axis=0)
             log(f'  底盘：横移 1mm 画面移动 {ps[0]:.3f} 像素；前进 1mm 画面移动 {ps[1]:.3f} 像素')
             meas = float(ps.mean())

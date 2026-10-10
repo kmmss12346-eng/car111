@@ -16,6 +16,7 @@ claw_px.PICK：圆环上方观察时，物料正好在爪子下面，它顶面�
 粗加工区第一次放下物料以后自动量一次存起来；取回、码垛时圆环白心被物料盖住，就直接把物料顶面对到这个点。
 """
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -568,8 +569,9 @@ class Vision:
         lo, hi = (20.0, 1e9) if any_size else self._ring_rmax_range()
         return [r for r in rings if len(r) < 4 or lo <= r[3] <= hi]
 
-    def ring_px(self, n=None, expect=None, any_size=False):
+    def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
         """离 expect(默认=爪子像素)最近的那个圆环的中心像素，多帧稳健平均；看不到返回 None。
+        max_px：最近的那个也离 expect 超过这么多像素，就当没看到(不去追旁边那个圆环)。
         self.last_ring_rmax = 这几帧里那个圆环最外圈半径(像素)的中值。"""
         n = int(n or self.cfg['frames'])
         ex = expect or self.claw('RING')
@@ -579,6 +581,8 @@ class Vision:
             if fr is not None:
                 rings = self._rings_in_frame(fr, any_size)
                 best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2) if rings else None
+                if best is not None and max_px and math.hypot(best[0] - ex[0], best[1] - ex[1]) > float(max_px):
+                    best = None
                 self._publish(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
                 if best is not None:
                     pts.append((best[0], best[1]))
@@ -680,9 +684,41 @@ class Vision:
             return None
         return sum(votes) * 2 > len(votes) if len(votes) > 1 else votes[0]
 
-    def ring_error(self, n=None):
-        """圆环中心偏差像素 = 圆环中心 - 爪子(RING)。看不到返回 None。"""
-        p = self.ring_px(n)
+    def ring_list(self, n=None):
+        """这几帧里认到的所有圆环(不挑离爪子点近的)：[(u, v, 最外圈半径), ...]，按 u(画面从左到右)排。
+        一个圆环要在一半以上的帧里认到才算；大小和大多数差得多的(不是圆环)去掉。"""
+        n = int(n or self.cfg['frames'])
+        tracks, nf = [], 0
+        for fr in self._frames(n):
+            if fr is None:
+                continue
+            nf += 1
+            rings = self._rings_in_frame(fr)
+            self._publish(fr, 'RING', None, rings=rings)
+            for r in rings:
+                u, v = float(r[0]), float(r[1])
+                rm = float(r[3]) if len(r) >= 4 else float(r[2])
+                for t in tracks:
+                    if math.hypot(t[0][0] - u, t[0][1] - v) < max(10.0, 0.3 * rm):
+                        t.append((u, v, rm))
+                        break
+                else:
+                    tracks.append([(u, v, rm)])
+        out = []
+        need = nf // 2 + 1                                   # 一半以上的帧里认到(只拍了 1 帧就是那 1 帧)
+        for t in tracks:
+            if len(t) >= need:
+                k = len(t) // 2
+                out.append((sorted(q[0] for q in t)[k], sorted(q[1] for q in t)[k], sorted(q[2] for q in t)[k]))
+        if out:
+            med = sorted(r[2] for r in out)[len(out) // 2]
+            out = [r for r in out if 0.75 * med <= r[2] <= 1.33 * med]
+        out.sort(key=lambda r: r[0])
+        return out
+
+    def ring_error(self, n=None, max_px=None):
+        """圆环中心偏差像素 = 圆环中心 - 爪子(RING)。看不到返回 None。max_px 见 ring_px。"""
+        p = self.ring_px(n, max_px=max_px)
         if p is None:
             return None
         cu, cv_ = self.claw('RING')

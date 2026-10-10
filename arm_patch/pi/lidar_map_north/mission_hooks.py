@@ -56,14 +56,23 @@ DEFAULTS = dict(
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
-    chassis_fine_rpm=60,
+    chassis_fine_rpm=100,               # 视觉微调时底盘前后挪的速度(转/分)
+    # 粗加工区 / 暂存区：
+    ring_survey=True,                   # 到工位先用摄像头一次看清三个圆环，算出到 1、2、3 号环底盘各要前后挪多少，直接开过去(不靠估计的 150mm)
+    ring_order=dict(ROUGH='lr', TEMP='lr'),   # 摄像头画面里 1、2、3 号环的排列：'lr' = 从左到右是 1 2 3；'rl' = 从左到右是 3 2 1
+    ring_spacing_mm=150.0,              # 相邻两个圆环中心的距离(毫米)：用来从画面里算每毫米多少像素
+    chassis_strafe=False,               # 工位里对准时底盘能不能横移。False = 只沿圆环那一排前后挪，车不会横着压进工位；离得远近靠手臂伸缩补
+    ring_fix_max_mm=60.0,               # 对准一个圆环时，底盘最多再为对准前后挪这么多毫米(超过就停下：多半认错了环)
+    ring_move_min_mm=15.0,              # 到下一个圆环要挪的距离小于这个就不动底盘(手臂够得着)
+    drop_retract=False,                 # 放下物料后要不要缩回伸缩舵机。False = 只抬起来，接着去下一个环，这个工位做完再收臂(省时间)
+    mtest_hold_heading=True,            # mtest 开始时把"现在的车头方向"记为要保持的方向(车是手搬过来的，不然底盘一动就往开机时的方向转)
     # 圆环相对停车点、沿车头方向的位置(毫米，正=在车头前方)。车头朝向见 map_config 的 stops：
     #   ROUGH 车头朝东，圆环板 3-2-1 从西到东 -> 1 号在前方 +150
     #   TEMP  车头朝南，板转了 90°           -> 1 号在后方 -150(如果实际相反，把正负号对调)
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': -150.0, '2': 0.0, '3': 150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
-    learn_pick=True,                    # 还没量过 claw_px.PICK 时，放下第一个物料后回到对准姿态量一次(多花几秒，只做一次)
+    learn_pick=False,                   # True = 还没量过 claw_px.PICK 时，放下第一个物料后回去再拍一张量一次(要多花几秒)；默认不量，取回按圆环对准
     stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
@@ -93,6 +102,13 @@ def vision_cfg(cfg):
     vc.setdefault('detector', 'circle')
     vc['matdet'] = cfg.get('matdet') or {}
     return vc
+
+
+def same_item(a, b):
+    """两个 Item 是不是同一个物料(重新 mcode / 扫码以后 Item 对象换了新的，按批次、序号、颜色、圆环比)。"""
+    if a is None or b is None:
+        return False
+    return a is b or (a.batch, a.index, a.color, a.ring) == (b.batch, b.index, b.color, b.ring)
 
 
 def _first(p, measure):
@@ -135,6 +151,8 @@ class MissionHooks:
         self.nogo = False                   # mtest ... nogo：只认圆环、对准，不取物料、不放、不夹回
         self.ring_rev = False               # mtest ... rev：这一次圆环的前后方向反过来(车头朝向和配置的相反)
         self._pick_tries = 0                # 量 claw_px.PICK 试了几次(认不到就下一个物料再试，最多 3 次)
+        self.ring_f = {}                    # (区, 圆环号) -> 这个环正对爪子时底盘的前后位移(毫米)，到工位时用摄像头看出来的(_survey)
+        self.ring_gate_px = None            # 对准时只认离爪子点这么多像素以内的圆环(不去追旁边那个)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -369,6 +387,12 @@ class MissionHooks:
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再抓取')
                 break
+            left = self.in_tray.get(item.slot)
+            if left is not None and not same_item(left, item):    # 前面没放出去的物料还在这个槽里：再放进去会砸在它上面
+                self.log(f'    ★ 转盘 {item.slot} 号槽里还有没放出去的 {left.color_name}，{item.color_name} 不夹')
+                self.stats.grab(False)
+                self._show_stats()
+                continue
             ok = False
             try:
                 ok = self._grab_item(item)
@@ -418,6 +442,7 @@ class MissionHooks:
         batch = 1 if visit <= 1 else 2
         items = self.plan.items(batch)
         placed = []
+        self._zone_start('ROUGH', items)
         for item in items:
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
@@ -425,8 +450,8 @@ class MissionHooks:
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再放置')
                 break
-            if item.slot not in self.in_tray:
-                self.log(f'    转盘 {item.slot} 号槽是空的({item.color_name} 没抓到)，不放')
+            if not same_item(self.in_tray.get(item.slot), item):
+                self.log(f'    转盘 {item.slot} 号槽里没有 {item.color_name}(没抓到)，不放')
                 continue
             if self._place_item(item, 'ROUGH', item.ring, stack=False, label=f'粗加工放{item.color_short}'):
                 placed.append(item)
@@ -438,8 +463,8 @@ class MissionHooks:
                 self.log('    ★ 时间到，不再取回(物料留在粗加工区)')
                 break
             self._pickback_item(item, 'ROUGH')
+        self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在圆环上方)，再挪底盘
         self._return_to_stop('ROUGH')
-        self._stow_quiet()
 
     def _goto_recorded(self, zone, item):
         """取回时直接回到放下那一刻的底盘位置和手臂角度(物料就在那儿)。成功回到返回 True；没有记录或不允许返回 False。
@@ -449,6 +474,8 @@ class MissionHooks:
             return False
         d = self.act.disp
         dS, dF = int(round(rec['S'] - d['S'])), int(round(rec['F'] - d['F']))
+        if not self.cfg.get('chassis_strafe', False):
+            dS = 0
         if dS or dF:
             self.log(f'    底盘回到放下时的位置：前进 {dF:+d}mm、横移 {dS:+d}mm')
             self.act.chassis_move(dS, dF)
@@ -463,13 +490,18 @@ class MissionHooks:
         if mode == 'reverse':
             return list(reversed(placed))
         if mode == 'near':
-            offs = self.cfg['ring_offset_mm'].get(zone) or {}
-            left, out, pos = list(placed), [], self.act.disp['F'] - self.learn['F']
+            def pos_of(it):                                      # 这个物料放下时底盘的前后位置
+                rec = self.pose_at.get((zone, it.slot))
+                if rec is not None:
+                    return float(rec['F'])
+                f = self.ring_f.get((zone, int(it.ring)))
+                return f if f is not None else self._ring_nominal(zone, it.ring) + self.learn['F']
+            left, out, pos = list(placed), [], self.act.disp['F']
             while left:
-                nxt = min(left, key=lambda it: abs(float(offs.get(str(it.ring), 0.0)) - pos))
+                nxt = min(left, key=lambda it: abs(pos_of(it) - pos))
                 out.append(nxt)
                 left.remove(nxt)
-                pos = float(offs.get(str(nxt.ring), 0.0))
+                pos = pos_of(nxt)
             return out
         return list(placed)
 
@@ -520,6 +552,7 @@ class MissionHooks:
         if not self._can_work():
             return
         batch = 1 if visit <= 1 else 2
+        self._zone_start('TEMP', self.plan.items(batch))
         for item in self.plan.items(batch):
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
@@ -527,8 +560,8 @@ class MissionHooks:
             if self.time_left() < 0:
                 self.log('    ★ 时间到，不再放置')
                 break
-            if item.slot not in self.in_tray:
-                self.log(f'    转盘 {item.slot} 号槽是空的({item.color_name} 不在车上)，不放')
+            if not same_item(self.in_tray.get(item.slot), item):
+                self.log(f'    转盘 {item.slot} 号槽里没有 {item.color_name}(不在车上)，不放')
                 continue
             ring, stack = item.ring, False
             if batch == 2:
@@ -545,8 +578,8 @@ class MissionHooks:
                     ring = free[0]
                     self.log(f'    {item.color_name} 找不到同色的第一批物料可叠，平放在空着的环{ring}')
             self._place_item(item, 'TEMP', ring, stack=stack, label=('码垛' if stack else '暂存放') + item.color_short)
+        self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在物料上方)，再挪底盘
         self._return_to_stop('TEMP')
-        self._stow_quiet()
 
     # ------------------------------------------------------------------ 放到圆环(核心)
     def _place_item(self, item, zone, ring, stack, label):
@@ -563,8 +596,8 @@ class MissionHooks:
             if stack:                                            # 下面那层物料盖住了白心：先认它的顶面对准
                 res, how = self._align_covered(item.color, key, label, confirm=None)
             else:
-                res, how = self.servo.run('RING', self.vision.ring_error, self.vision.scale('RING'), cfg['tol_mm'][key],
-                                          allow_chassis=True, label=label, bounds=self.vision.bounds('RING')), '圆环'
+                res, how = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm'][key],
+                                          allow_chassis=True, label=label, bounds=self.vision.bounds('RING'), **self._zone_servo_kw()), '圆环'
             if res is not None:
                 self.log('    对准结果' + (f'(按{how})' if stack else '') + f'：{res}')
                 err_mm = res.err_mm
@@ -591,7 +624,7 @@ class MissionHooks:
                 self.arm.take(item.slot)                         # 去转盘取物料
                 held = True
                 self._return_to_pose(a1, a2)                     # 回到记下的角度
-                self.arm.drop(stack)                             # 下降、松手、抬起
+                self._drop(stack)                                # 下降、松手、抬起
                 held = False
                 ok = True
         except ArmAbort:
@@ -611,6 +644,265 @@ class MissionHooks:
             self._learn_pick(item, self.pose_at[(zone, item.slot)])
         return ok
 
+    # ------------------------------------------------------------------ 粗加工区 / 暂存区：到工位先看清三个圆环
+    def hold_heading(self):
+        """车是手搬到这个工位的：把"现在的车头方向"记为 STM32 要保持的方向(HOME)。
+        不然 STM32 还按开机时(或上一次转弯后)的方向保持，底盘一前后挪就把车头往那个方向转，车身就歪了。"""
+        link = getattr(self.act, 'link', None) if self.act is not None else None
+        if link is None:
+            return False
+        try:
+            out = link.request('HOME', 3.0)
+        except Exception as ex:
+            self.log(f'    (记车头方向出错：{ex!r})')
+            return False
+        ok, reply = out[0], out[1]
+        if 'ABORT' in (reply or ''):
+            raise Abort(f'HOME -> {reply}')
+        if ok:
+            self.log('  车头方向：以现在的方向为准(底盘前后挪时保持这个方向)')
+        else:
+            self.log(f'  ★ 记车头方向失败({reply})：底盘挪动时可能会把车头转回开机时的方向')
+        return bool(ok)
+
+    def _zone_start(self, zone, items=()):
+        """到粗加工区/暂存区：刷新 STM32 参数(可能刚 set 过)，看清三个圆环(算出到每个环底盘要挪多少)。
+        没有要放的物料、或者时间到了，就不看(省时间)。"""
+        self.ring_f = {}
+        self.ring_gate_px = None
+        try:
+            self.arm.params(refresh=True)
+        except ArmAbort as ex:
+            raise Abort(str(ex))
+        except Exception:
+            pass
+        if not self.cfg.get('ring_survey', True) or not hasattr(self.vision, 'ring_list'):
+            return
+        if self.time_left() < 0 or (items and not any(same_item(self.in_tray.get(it.slot), it) for it in items)):
+            return
+        try:
+            self._survey(zone)
+        except ArmAbort as ex:
+            raise Abort(str(ex))
+        except (ArmError, VisionError) as ex:
+            self.ring_f = {}
+            self.log(f'    ★ 看圆环出错：{ex}；按配置里的圆环间距走')
+
+    def _jac_f(self, rings0, fresh=False):
+        """底盘往前走 1mm，圆环在画面里移动多少像素(2 维向量)。返回 (jf, 这次是不是现测的)；测不出来 jf 是 None。
+        以前测过(servo_cal.json)就直接用(fresh=True 不用)；没有就现测：往前挪 20mm 再看一眼、再退回来(只前后动，不横移)。
+        rings0 = 挪之前看到的圆环(ring_list)。挪 20mm 画面只动几十像素，两个圆环之间隔着两百多像素：
+        取挪动前后离得最近的一对，就是同一个环(不会认成旁边那个)。"""
+        import numpy as np
+        J = self.store.get('RING', 'ch') if (self.store is not None and not fresh) else None
+        if J is not None:
+            jf = np.asarray(J, float)[:, 1]
+            if float(np.hypot(*jf)) >= 0.2:
+                return jf, False
+        if not rings0:
+            return None, True
+        step = 20
+        self.log(f'    第一次在圆环这里：底盘前进 {step}mm 再退回来，看画面怎么动(以后不用再测)')
+        self.act.chassis_move(0, step)
+        try:
+            self.sleep(0.3)
+            rings1 = self.vision.ring_list()
+        finally:
+            self.act.chassis_move(0, -step)
+        if not rings1:
+            return None, True
+        a = np.array([[r[0], r[1]] for r in rings0], float)
+        b = np.array([[r[0], r[1]] for r in rings1], float)
+        pairs = [(float(np.hypot(*(qb - qa))), qb - qa) for qa in a for qb in b]
+        _dmin, d0 = min(pairs, key=lambda t: t[0])
+        same = [d for _dist, d in pairs if np.hypot(*(d - d0)) <= 8.0]   # 其他环挪得一样的也算上，取平均
+        jf = np.mean(same, axis=0) / float(step)
+        if float(np.hypot(*jf)) < 0.2:
+            return None, True
+        if self.store is not None:
+            self.store.put('RING', 'ch', [[-jf[1], jf[0]], [jf[0], jf[1]]])     # S 那一列用不到(不横移)，补一个和 F 垂直的
+            self.store.set_synth('RING', True)                                # 记下"横移那一列是补的"：真要横移时重新测
+            self.store.save()
+        return jf, True
+
+    def _survey(self, zone):
+        """手臂摆到圆环上方(空爪)，一次看清画面里的圆环，按排列认出 1、2、3 号，算出每个环正对爪子时底盘的前后位置(self.ring_f)。
+        画面里看到三个：直接认；两个：哪一头能看到却没有环，那一头就是这一排的尽头(圆环上放着物料时不这样认，可能只是没认出来)；
+        两个隔了两个间距：中间那个没认出来，补上；一个、或者认不准：当作离爪子近的是 2 号(车停在 2 号环前面)。
+        看到的圆环间距和"底盘走的距离"对不上(认错了/漏了)：这次不按看到的走，按配置里的间距走。
+        顺便用圆环间距算出每毫米多少像素(没做 vclaw RING 时用它)。"""
+        import numpy as np
+        v, cfg = self.vision, self.cfg
+        self.arm.obs('RING', open_claw=True)
+        rings = v.ring_list()
+        if not rings:
+            self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
+            return
+        jf, measured = self._jac_f(rings)
+        if jf is None:
+            self.log('    ★ 测不出底盘前后挪和画面的关系：按配置里的圆环间距走')
+            return
+        cu, cv_ = v.claw('RING')
+        claw = np.array([cu, cv_], float)
+        pts = np.array([[r[0], r[1]] for r in rings], float)
+        sp_mm = float(cfg.get('ring_spacing_mm') or 150.0)
+        # 这一排圆环在画面里的方向：看到两个以上用它们自己连线的方向，否则用底盘前后的方向
+        if len(pts) >= 2:
+            axis = np.linalg.svd(pts - pts.mean(axis=0))[2][0]
+        else:
+            axis = jf / np.hypot(*jf)
+        if abs(axis[0]) >= abs(axis[1]):
+            axis = axis if axis[0] > 0 else -axis                # "从左到右"
+        else:
+            axis = axis if axis[1] > 0 else -axis                # 竖着排的："从上到下"
+        pts = pts[np.argsort(pts @ axis)]
+        if len(pts) > 3:                                         # 多看到了(别的工位的环？)：取爪子点附近连着的三个
+            proj = pts @ axis
+            mid = int(np.argmin(np.abs(proj - float(claw @ axis))))
+            lo = min(max(mid - 1, 0), len(pts) - 3)
+            pts = pts[lo:lo + 3]
+
+        def jf_px():                                             # 按"底盘走 1mm 画面动多少"算，相邻两个环在画面里隔多少像素
+            return abs(float(jf @ axis)) * sp_mm
+
+        if len(pts) >= 2:
+            gaps = np.diff(pts @ axis)
+            sp_px = float(np.median(gaps))
+            ratio = sp_px / max(jf_px(), 1e-9)
+            if not measured and not (0.6 <= ratio <= 1.6 or (len(pts) == 2 and 1.7 <= ratio <= 2.3)):
+                self.log(f'    存着的"底盘前后挪 1mm 画面动多少"({np.hypot(*jf):.2f} 像素)和圆环间距({sp_px / sp_mm:.2f} 像素/mm)对不上，重新测')
+                jf2, _m = self._jac_f(rings, fresh=True)
+                if jf2 is not None:
+                    jf = jf2
+                    ratio = sp_px / max(jf_px(), 1e-9)
+            if len(pts) == 2 and 1.7 <= ratio <= 2.3:
+                pts = np.array([pts[0], (pts[0] + pts[1]) / 2.0, pts[1]])     # 隔了两个间距：中间那个没认出来(比如被盖住)，补上
+                sp_px /= 2.0
+                ratio /= 2.0
+                self.log('    中间那个圆环没认出来，按两边的位置补上')
+            if len(pts) == 3 and max(gaps) > 1.3 * min(gaps):
+                self.log(f'    ★ 看到的三个圆环间距不一样({gaps[0]:.0f}、{gaps[1]:.0f} 像素)，可能认错了：这次按配置里的间距走')
+                return
+            if not 0.7 <= ratio <= 1.4:
+                self.log(f'    ★ 看到的圆环间距({sp_px:.0f} 像素)和按底盘走的距离算的({jf_px():.0f} 像素)对不上：'
+                         '可能漏认/认错了圆环，或者底盘走的距离不准(FPPM)。这次按配置里的间距走')
+                return
+        else:
+            sp_px = jf_px()
+        h_img, w_img = self._frame_size()
+        rmax = float(np.median([r[2] for r in rings]))
+
+        def inside(q):
+            return rmax <= q[0] <= w_img - rmax and rmax <= q[1] <= h_img - rmax
+
+        step = axis * sp_px
+        n = len(pts)
+        covered = any(st for (z, _k), st in self.on_ring.items() if z == zone)   # 圆环上已经放着物料(白心被盖住，可能认不全)
+        dist = np.hypot(pts[:, 0] - cu, pts[:, 1] - cv_)
+        guess = False
+        if n == 3:
+            first = 0                                            # pts[0] 是排在最前面(左/上)的那个
+        elif n == 2:
+            before, after = inside(pts[0] - step), inside(pts[1] + step)
+            if before and not after and not covered:
+                first = 0                                        # 前面那头看得到却没有环：pts[0] 就是这一排的第一个
+            elif after and not before and not covered:
+                first = 1                                        # 后面那头看得到却没有环：pts[1] 是最后一个，pts[0] 是中间那个
+            else:
+                first = 1 if int(np.argmin(dist)) == 0 else 0    # 认不准：当作离爪子点近的那个是中间(2 号)
+                guess = True
+        else:
+            first = 1                                            # 只看到一个：当作中间那个(2 号)
+            guess = True
+        if guess and float(np.min(dist)) > 0.3 * sp_px:
+            self.log('    ★ 只看到' + ('两个' if n == 2 else '一个') + '圆环、又离爪子挺远，认不准哪个是 2 号：按离爪子近的那个算。'
+                     '车要停在 2 号环正对爪子的地方(画面里能同时看到三个环)')
+        pos = [pts[0] + (k - first) * step for k in range(3)]    # 这一排三个位置(看不到的按间距推)
+        lr = str((cfg.get('ring_order') or {}).get(zone, 'lr')).lower() != 'rl'
+        if self.ring_rev:
+            lr = not lr
+        ids = (1, 2, 3) if lr else (3, 2, 1)
+        n2 = float(jf @ jf)
+        many = n >= 2
+        if many:
+            # 看到两个以上：沿这一排每毫米多少像素按圆环间距算(比底盘挪 20mm 测出来的准)，底盘往哪边挪画面往哪边动看 jf
+            m = (1.0 if float(jf @ axis) > 0 else -1.0) * sp_px / sp_mm
+            cosf = abs(float(jf @ axis)) / max(float(np.hypot(*jf)), 1e-9)
+            if cosf < 0.97:                                      # 底盘前后挪时圆环不是顺着这一排动：车身和这一排不平行
+                self.log(f'    ★ 车身和圆环那一排好像不平行(差约 {math.degrees(math.acos(min(1.0, cosf))):.0f}°)：'
+                         '挪到别的环时离圆环会越来越远/近，靠手臂伸缩补；差得多就把车摆正再来')
+        parts = []
+        for k, q in zip(ids, pos):
+            off = np.asarray(q, float) - claw
+            if many:
+                f = -float(off @ axis) / m                       # 底盘前后挪多少，这个环到爪子点
+                side = off - axis * float(off @ axis)            # 垂直于这一排的偏差(像素)：靠手臂伸缩补
+            else:
+                f = -float(jf @ off) / n2
+                side = off + jf * f
+            parts.append((k, f, float(np.hypot(*side))))
+        far = max(abs(f) for _k, f, _s in parts)
+        if far > 2.6 * sp_mm:
+            self.log(f'    ★ 算出来要挪 {far:.0f}mm 才到圆环，不对劲(认错了？)：这次按配置里的间距走')
+            return
+        d = self.act.disp
+        for k, f, _side in parts:
+            self.ring_f[(zone, k)] = d['F'] + f
+        scale = sp_px / sp_mm
+        vc = getattr(v, 'cfg', None)
+        if isinstance(vc, dict) and not vc.get('ring_rmax_cal') and many:
+            vc.setdefault('px_per_mm', {})['RING'] = scale       # 没做 vclaw RING：按圆环间距算的比例换算毫米
+        self.ring_gate_px = 0.45 * sp_px
+        seen = '、'.join(str(ids[i]) for i in range(3) if any(np.hypot(*(pos[i] - p)) < 0.3 * sp_px for p in pts))
+        self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素：' +
+                 '  '.join(f'环{k} ' + ('不用挪' if abs(f) < 1 else ('前进' if f > 0 else '后退') + f' {abs(f):.0f}mm') +
+                           f'(横向差 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))
+        worst = max(side for _k, _f, side in parts) / scale
+        if worst > 40.0:
+            self.log(f'    ★ 车离圆环那一排的远近差了约 {worst:.0f}mm：手臂伸缩可能补不过来，车停得再正一点')
+        if n2 > 0 and many:
+            ratio = (float(np.hypot(*jf)) / scale)
+            if not 0.75 <= ratio <= 1.33:
+                self.log(f'    ★ 按底盘走的距离算是每毫米 {np.hypot(*jf):.2f} 像素，按圆环间距 {sp_mm:g}mm 算是 {scale:.2f}：'
+                         '底盘前后走的距离不准(FPPM)，或者圆环间距不是这么多(mission_cfg.ring_spacing_mm)')
+
+    def _frame_size(self):
+        cam = (getattr(self.vision, 'cfg', None) or {}).get('camera') or {}
+        return float(cam.get('height', 480)), float(cam.get('width', 640))
+
+    def _ring_measure(self):
+        """对准圆环用的测量：只认离爪子点 ring_gate_px 以内的圆环(看清过三个环以后才有)，不去追旁边那个。"""
+        gate = self.ring_gate_px
+        if gate:
+            return lambda: self.vision.ring_error(max_px=gate)
+        return self.vision.ring_error
+
+    def _zone_servo_kw(self):
+        """工位里对准的底盘限制：不横移(只前后挪)、为对准最多挪 ring_fix_max_mm。"""
+        cfg = self.cfg
+        kw = {}
+        if not cfg.get('chassis_strafe', False):
+            kw['chassis_axes'] = 'F'
+        if cfg.get('ring_fix_max_mm'):
+            kw['chassis_fix_max_mm'] = float(cfg['ring_fix_max_mm'])
+        return kw
+
+    def _drop(self, stack):
+        """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。"""
+        if self.cfg.get('drop_retract', False):
+            self.arm.drop(stack)
+            return
+        P = self.arm.params() or {}
+        try:
+            z = float(P['ZSTK' if stack else 'ZPLC'])
+            zhi = float(P['ZHI'])
+        except (KeyError, TypeError, ValueError):
+            self.arm.drop(stack)
+            return
+        self.arm.lift(z)
+        self.arm.claw(True)
+        self.arm.lift(zhi)
+
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
     def _align_covered(self, color, key, label, confirm):
         """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
@@ -624,17 +916,18 @@ class MissionHooks:
             if e is not None:
                 self._seed_pick_jac()
                 res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color)), v.scale('PICK'), tol, allow_chassis=True,
-                                     label=label, bounds=v.bounds('PICK'), confirm=confirm)
+                                     label=label, bounds=v.bounds('PICK'), confirm=confirm, **self._zone_servo_kw())
                 if res.ok or res.err_mm <= acc:
                     return res, '物料'
                 self.log(f'    按物料没对准({res.reason})，改认圆环')
             else:
                 self.log('    认不到圆环上的物料，改认圆环')
-        e = v.ring_error()
+        measure = self._ring_measure()
+        e = measure()
         if e is None:
             return None, None
-        return self.servo.run('RING', _first(e, v.ring_error), v.scale('RING'), tol, allow_chassis=True, label=label,
-                              bounds=v.bounds('RING'), confirm=confirm), '圆环'
+        return self.servo.run('RING', _first(e, measure), v.scale('RING'), tol, allow_chassis=True, label=label,
+                              bounds=v.bounds('RING'), confirm=confirm, **self._zone_servo_kw()), '圆环'
 
     def _seed_pick_jac(self):
         """PICK(物料顶面)还没有自己的 J：用圆环的 J 按两个高度的像素/毫米之比换算一份，省得再小幅动几下探测。"""
@@ -651,6 +944,8 @@ class MissionHooks:
             J = st.get('RING', g)
             if st.get('PICK', g) is None and J is not None:
                 st.put('PICK', g, J * k)
+                if g == 'ch':
+                    st.set_synth('PICK', st.synth('RING'))
 
     def _want_pick(self, item):
         v = self.vision
@@ -757,16 +1052,48 @@ class MissionHooks:
             self.arm.ap(a1, a2)
 
     # ------------------------------------------------------------------ 底盘沿车头方向在圆环间挪动
+    def _ring1_dir(self, zone):
+        """1 号环在 2 号环的哪一边(沿车头)：+1 = 前方，-1 = 后方；不知道返回 None。
+        按存着的"底盘前进时画面往哪边动"(servo_cal.json 里 RING 的底盘 J)和 ring_order(画面里 1 号在左/上还是右/下)推，
+        和 _survey 认环的办法一致(没看清圆环、按名义位置走时也不会前后弄反)。"""
+        import numpy as np
+        J = self.store.get('RING', 'ch') if self.store is not None else None
+        if J is None:
+            return None
+        jf = np.asarray(J, float)[:, 1]
+        s = float(jf[0] if abs(jf[0]) >= abs(jf[1]) else jf[1])
+        if abs(s) < 0.1:
+            return None
+        lr = str((self.cfg.get('ring_order') or {}).get(zone, 'lr')).lower() != 'rl'
+        if self.ring_rev:
+            lr = not lr
+        d = 1.0 if s > 0 else -1.0                               # 前进时圆环往右(下)移：左(上)边的环要往前开才到爪子下面
+        return d if lr else -d
+
     def _ring_nominal(self, zone, ring):
+        """圆环相对停车点(2 号环)沿车头的名义位置(毫米，正 = 前方)。方向能推出来就按 ring_order(_ring1_dir)，不然按 ring_offset_mm。"""
+        d = self._ring1_dir(zone)
+        if d is not None:
+            return (2 - int(ring)) * float(self.cfg.get('ring_spacing_mm') or 150.0) * d
         offs = self.cfg['ring_offset_mm'].get(zone) or {}
         v = float(offs.get(str(ring), 0.0))
         return -v if self.ring_rev else v
 
     def _goto_ring(self, zone, ring):
-        """底盘挪到这个圆环旁边：目标位置 = 圆环的名义位置 + 前面圆环对准时学到的停车误差；按累计位移算差多少。"""
+        """底盘沿圆环那一排前后挪到这个圆环正对爪子的位置。
+        到工位时摄像头看清过三个环(_survey)：按看到的位置直接开过去；没看清：圆环的名义位置 + 前面圆环对准时学到的停车误差。
+        工位里不横移(chassis_strafe=False)：离圆环远一点近一点由手臂伸缩补。"""
         d = self.act.disp
+        f = self.ring_f.get((zone, int(ring)))
+        if f is not None:
+            dF = int(round(f - d['F']))
+            if abs(dF) < float(self.cfg.get('ring_move_min_mm') or 0.0):
+                return                                           # 很近：手臂够得着，底盘不动
+            self.log(f'    底盘挪到环{ring}：' + ('前进' if dF > 0 else '后退') + f' {abs(dF)}mm')
+            self.act.chassis_move(0, dF)
+            return
         dF = int(round(self._ring_nominal(zone, ring) + self.learn['F'] - d['F']))
-        dS = int(round(self.learn['S'] - d['S']))
+        dS = int(round(self.learn['S'] - d['S'])) if self.cfg.get('chassis_strafe', False) else 0
         if dF == 0 and dS == 0:
             return
         self.log(f'    底盘挪到环{ring}：前进 {dF:+d}mm' + (f'、横移 {dS:+d}mm' if dS else ''))

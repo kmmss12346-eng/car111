@@ -34,8 +34,8 @@ DEFAULTS = dict(
     gain_ch=0.8,                # 底盘
     settle_arm_s=0.20,          # 手臂动完等多久再拍(摄像头在手臂上，要等它不抖)
     settle_ch_s=0.35,           # 底盘动完等多久
-    arm_limit_deg=dict(id2=150.0, id1=12.0),    # 手臂相对开始对准时的姿态，最多再偏多少度
-    step_limit_deg=dict(id2=45.0, id1=4.0),     # 手臂每次最多动多少度
+    arm_limit_deg=dict(id2=250.0, id1=12.0),    # 手臂相对开始对准时的姿态，最多再偏多少度(ID2 约 0.175mm/度：250° ≈ 伸缩 ±44mm，车离圆环远一点近一点都靠它补)
+    step_limit_deg=dict(id2=90.0, id1=4.0),     # 手臂每次最多动多少度
     min_step_deg=dict(id2=0.35, id1=0.35),      # 舵机比这小的一步动不了(STM32 的到位误差 ATOL=0.3°)：小于它的一步要么放大到它，要么不动
     chassis_step_max_mm=60.0,   # 底盘每次最多动多少毫米
     chassis_min_mm=6.0,         # 偏差小于这个就不动底盘(底盘只能到几毫米精度)
@@ -46,10 +46,13 @@ DEFAULTS = dict(
     probe_max_scale=6.0,
     diverge_ratio=1.4,          # 这次误差比上次大这么多倍就认为发散
     confirm=True,               # 误差够小时再测一次确认
+    near_avg=2.0,               # 偏差比容差大、但在容差的这么多倍以内：先再测一次取平均再决定动不动(剩下的偏差和测量噪声差不多大，不去追噪声)
     broyden_min_px=6.0,         # 预计移动超过这么多像素才用来在线修正 J
     broyden_gain=0.5,
     broyden_max_rel=0.5,        # 实际移动和预计差太多(比如原料盘自己在转)就不拿来修正 J
     max_cond=40.0,              # J 的条件数超过这个说明两个轴在画面里几乎平行，没法解
+    chassis_axes='SF',          # 底盘能动哪几个方向：'SF' = 横移和前后；'F' = 只前后(粗加工区/暂存区：车不横着挪，不会压进工位)
+    chassis_fix_max_mm=None,    # 一次对准里底盘最多累计挪多少毫米，超过就停下(多半是认错了目标)；None = 不限
 )
 
 
@@ -115,6 +118,24 @@ class JacStore:
         if kind in self.data and group in self.data[kind]:
             del self.data[kind][group]
             self.dirty = True
+        if group == 'ch':
+            self.set_synth(kind, False)
+
+    def synth(self, kind):
+        """这个 kind 的底盘 J 只测过前后(F)，横移(S)那一列是补出来的：要横移时得重新测。"""
+        return bool((self.data.get(kind) or {}).get('ch_s_synth'))
+
+    def set_synth(self, kind, flag):
+        d = self.data.get(kind)
+        if flag:
+            if d is None:
+                d = self.data.setdefault(kind, {})
+            if not d.get('ch_s_synth'):
+                d['ch_s_synth'] = True
+                self.dirty = True
+        elif d is not None and 'ch_s_synth' in d:
+            del d['ch_s_synth']
+            self.dirty = True
 
     def save(self):
         if not self.path or not self.dirty:
@@ -147,6 +168,8 @@ class VisualServo:
         self.sleep = sleep
         self.clock = clock
         self.dev = np.zeros(2)          # 手臂 [ID2, ID1] 相对开始对准时的偏移(度)
+        self._axes = None               # 这一次对准底盘能动的方向(run 里设，结束清掉)
+        self._ch_synth = False          # 现在的底盘 J 的横移那一列是不是补出来的(只测过前后)
 
     # ------------------------------------------------------------------ 测量
     def _measure(self, measure, tries=3):
@@ -198,8 +221,25 @@ class VisualServo:
         self.sleep(self.cfg['settle_arm_s'])
         return applied, sat
 
+    def _f_only(self):
+        return str(getattr(self, '_axes', None) or self.cfg.get('chassis_axes') or 'SF').upper() == 'F'
+
+    def _ch_cmd(self, Jc, p):
+        """底盘这一步怎么动 (S, F)。只许前后动时：只用 J 的 F 那一列，按最小二乘算前后挪多少(横向的偏差留给手臂)。"""
+        c = self.cfg
+        if self._f_only():
+            jf = np.asarray(Jc, float)[:, 1]
+            n2 = float(jf @ jf)
+            if n2 < 1e-12:
+                return 0.0, 0.0
+            return 0.0, float(-c['gain_ch'] * float(jf @ p) / n2)
+        sf = -c['gain_ch'] * np.linalg.solve(Jc, p)
+        return float(sf[0]), float(sf[1])
+
     def _apply_chassis(self, s_mm, f_mm):
         c = self.cfg
+        if self._f_only():
+            s_mm = 0.0                                   # 不横移
         s_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], s_mm))
         f_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], f_mm))
         s_mm, f_mm = float(round(s_mm)), float(round(f_mm))      # STM32 的 S/F 只收整数毫米
@@ -229,7 +269,8 @@ class VisualServo:
         shrink = min_px / c['probe_min_px']
         J = np.zeros((2, 2))
         names = ('ID2', 'ID1') if group == 'arm' else ('S', 'F')
-        for axis in (0, 1):
+        f_only = group != 'arm' and self._f_only()
+        for axis in ((1,) if f_only else (0, 1)):
             if group == 'arm':
                 key = 'id2' if axis == 0 else 'id1'
                 step = c['probe_start_deg'][key] * shrink
@@ -284,6 +325,10 @@ class VisualServo:
                                  '检查摄像头有没有拍到目标、手臂/底盘是否真的动了')
             J[:, axis] = dp / moved
             last = cur
+        if f_only:
+            J[:, 0] = (-J[1, 1], J[0, 1])                 # 不横移：S 那一列用不到，按"和 F 垂直、一样大"补上(只为了 J 能求逆)
+        if group != 'arm':
+            self._ch_synth = f_only
         cond = float(np.linalg.cond(J))
         if not np.isfinite(cond) or cond > c['max_cond']:
             raise ServoError(f'探测失败：{names[0]} 和 {names[1]} 在画面里的移动方向几乎平行(条件数 {cond:.0f})')
@@ -296,6 +341,23 @@ class VisualServo:
         c = self.cfg
         if not allow_chassis or e < c['chassis_min_mm']:
             return 'arm'
+        if self._f_only() and J['ch'] is not None:
+            jf = np.asarray(J['ch'], float)[:, 1]
+            along = e * abs(float(jf @ p)) / max(_norm(jf) * _norm(p), 1e-9)   # 偏差里沿着"底盘前后"方向的那一段(毫米)
+            if along < c['chassis_min_mm']:
+                return 'arm'                             # 主要是横向的偏差：底盘不能横移，只能靠手臂伸缩
+            if along > c['arm_cover_mm']:
+                return 'ch'                              # 沿着圆环那一排差得多：底盘前后挪
+            if J['arm'] is not None:                     # 差得不多：沿这一排动的那个舵机够得着就用手臂(底盘尽量少动)
+                Ja = np.asarray(J['arm'], float)
+                want = -c['gain_arm'] * np.linalg.solve(Ja, p)
+                got, _sat = self._clip_arm(want)
+                ju = jf / max(_norm(jf), 1e-9)
+                ia = int(np.argmax([abs(float(Ja[:, i] @ ju)) / max(_norm(Ja[:, i]), 1e-9) for i in (0, 1)]))
+                # 只看沿这一排的那个舵机(一般是 ID1)够不够得着：横向(ID2 伸缩)够不着，底盘前后挪也帮不上
+                sat = abs(want[ia]) > 1e-9 and abs(want[ia] - got[ia]) > 0.3 * abs(want[ia])
+                return 'ch' if sat else 'arm'
+            return 'arm'
         if e > c['arm_cover_mm']:
             return 'ch'
         if J['arm'] is not None:
@@ -305,7 +367,17 @@ class VisualServo:
         return 'arm'
 
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
-            bounds=None, confirm=None):
+            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None):
+        """对准(见 _run)。chassis_axes 只管这一次：结束后恢复成配置里的(vcal 之类单独探测时不受影响)。"""
+        self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
+        try:
+            return self._run(kind, measure, scale_px_per_mm, tol_mm, allow_chassis, max_iter, timeout_s, label, bounds, confirm,
+                             chassis_fix_max_mm)
+        finally:
+            self._axes = None
+
+    def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
+             bounds=None, confirm=None, chassis_fix_max_mm=None):
         """对准。measure() 返回 (du, dv) = 目标像素 - 爪子像素；看不到返回 None。返回 Result。
 
         kind          'RAW'(原料盘上的物料) 或 'RING'(地上的圆环)；J 按它分开存
@@ -314,14 +386,22 @@ class VisualServo:
         allow_chassis 偏差大、手臂够不着时允许动底盘
         bounds        画面范围换算成 p 的上下限 ((u 下限, v 下限), (u 上限, v 上限))，用来在目标靠近画面边缘时缩小探测步长
         confirm       达标后是否再测一次确认；None=用配置里的 confirm。对精度要求不高的(夹原料、取回)可以关掉省时间
+        chassis_axes  这次底盘能动的方向('SF' / 'F')；None = 用配置里的
+        chassis_fix_max_mm  这次对准底盘最多累计挪多少毫米；None = 用配置里的
         """
         c = self.cfg
+        fix_max = chassis_fix_max_mm if chassis_fix_max_mm is not None else c.get('chassis_fix_max_mm')
+        ch_moved = [0.0]                # 这次对准底盘累计挪了多少毫米
         max_iter = int(max_iter or c['max_iter'])
         timeout = float(timeout_s or c['timeout_s'])
         do_confirm = c['confirm'] if confirm is None else bool(confirm)
         t0 = self.clock()
         self.dev = np.zeros(2)
         J = {g: self.store.get(kind, g) for g in ('arm', 'ch')}
+        self._ch_synth = J['ch'] is not None and self.store.synth(kind)
+        if self._ch_synth and allow_chassis and not self._f_only():
+            J['ch'] = None                  # 存着的底盘 J 只测过前后，这次要横移：重新探测
+            self._ch_synth = False
         used_ch = False
         probed = False
         hist = []
@@ -335,6 +415,7 @@ class VisualServo:
         p = np.zeros(2)
         e = float('inf')
         fresh = [False]                 # p 是不是最后一次动作以后测的(动了以后没测到 = 不知道现在偏多少)
+        avg = [False]                   # 这个位置已经测过两次取了平均
         stalls = 0
 
         def meas():
@@ -344,12 +425,18 @@ class VisualServo:
 
         def moved():
             fresh[0] = False
+            avg[0] = False
+
+        def over_budget():
+            return fix_max is not None and ch_moved[0] >= float(fix_max)
 
         def finish(ok, reason=''):
             if ok or probed:
                 for g in ('arm', 'ch'):
                     if J[g] is not None:
                         self.store.put(kind, g, J[g])
+                if J['ch'] is not None:
+                    self.store.set_synth(kind, self._ch_synth)
                 self.store.save()
             # 动了以后没测到：不能拿动之前的偏差当结果(会按一个没人测过的位置去夹)
             return Result(ok, e if (ok or fresh[0]) else float('inf'), moves, p, reason, self.clock() - t0, hist, used_ch, probed)
@@ -363,6 +450,16 @@ class VisualServo:
                 e = _norm(p) / scale_px_per_mm
                 hist.append(e)
                 self.log(f'  {tag} 偏差 {e:.2f}mm  (像素 {p[0]:+.1f},{p[1]:+.1f})')
+
+                near = float(c.get('near_avg') or 0.0)
+                if tol_mm < e <= near * tol_mm and fresh[0] and not avg[0]:
+                    avg[0] = True                            # 离目标很近：再测一次取平均，免得按一次测量的噪声去动
+                    p = (p + meas()) / 2.0
+                    e = _norm(p) / scale_px_per_mm
+                    self.log(f'  {tag} 再测一次取平均 {e:.2f}mm')
+                    if e <= tol_mm:
+                        self.log(f'  {tag} 对准完成')
+                        return finish(True)                  # 两次的平均已经在容差内(相当于复测过了)
 
                 if e <= tol_mm:
                     if do_confirm and not confirmed:
@@ -416,10 +513,13 @@ class VisualServo:
                     moved()
                     applied, sat = self._apply_arm(du)
                 else:
-                    sf = -c['gain_ch'] * np.linalg.solve(J['ch'], p)
+                    if over_budget():
+                        return finish(False, f'底盘已经为对准挪了 {ch_moved[0]:.0f}mm 还差 {e:.2f}mm，停下(多半认错了目标，或者车停得太偏)')
+                    sf = self._ch_cmd(J['ch'], p)
                     moved()
-                    applied = self._apply_chassis(float(sf[0]), float(sf[1]))
+                    applied = self._apply_chassis(sf[0], sf[1])
                     used_ch = True
+                    ch_moved[0] += _norm(applied)
                 if _norm(applied) < 1e-9:
                     fresh[0] = True                          # 回读说一点没动：上次测的偏差还是现在的
                 else:
@@ -440,10 +540,13 @@ class VisualServo:
                             p = meas()
                             prev_e = None
                             continue
-                        sf = -c['gain_ch'] * np.linalg.solve(J['ch'], p)
+                        if over_budget():
+                            return finish(False, f'底盘已经为对准挪了 {ch_moved[0]:.0f}mm 还差 {e:.2f}mm，停下(多半认错了目标，或者车停得太偏)')
+                        sf = self._ch_cmd(J['ch'], p)
                         moved()
-                        applied = self._apply_chassis(float(sf[0]), float(sf[1]))
+                        applied = self._apply_chassis(sf[0], sf[1])
                         used_ch = True
+                        ch_moved[0] += _norm(applied)
                         group = 'ch'
                     if _norm(applied) < 1e-9:
                         fresh[0] = True
@@ -460,7 +563,11 @@ class VisualServo:
                 # 方向对、只是大小差几倍(J 的比例不对，比如观察高度改过)也修；方向不对的(原料盘在转)不修
                 if _norm(pred) >= c['broyden_min_px'] and (_norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred)
                                                             or (cosang >= 0.9 and 0.3 <= ratio <= 3.0)):
-                    J[group] = J[group] + c['broyden_gain'] * np.outer(dp - pred, applied) / float(applied @ applied)
+                    # 按"每个轴让画面动了多少像素"分摊修正量：ID2 每度只动零点几像素、ID1 每度动好几像素，
+                    # 直接按角度分摊的话，测量噪声几乎全算到 ID2 那一列上，几次以后 ID2 那一列就错了(来回晃、越晃越大)
+                    sc = np.maximum(np.linalg.norm(J[group], axis=0), 1e-6)
+                    x = applied * sc
+                    J[group] = J[group] + c['broyden_gain'] * np.outer(dp - pred, x * sc) / float(x @ x)
                 p = p_new
         except ServoError as ex:
             return finish(False, str(ex))

@@ -285,15 +285,16 @@ class CliTests(unittest.TestCase):
         vis, w = self.h.vision, self.w
         orig = vis.ring_error
 
-        def ring_error(n=None):
+        def ring_error(n=None, max_px=None):
             c = w.claw()
             k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
-            return None if w.rings.get((w.zone, k)) else orig(n)
+            return None if w.rings.get((w.zone, k)) else orig(n, max_px=max_px)
         vis.ring_error = ring_error
 
     def test_pickback_aligns_on_the_material(self):
         """取回时白心被物料盖住、认不出圆环：第一个物料放下后自动量 PICK 点，取回时直接认物料对准，全都夹回来。"""
         self._zone_setup('ROUGH', '234+123+342+213')           # 黄、蓝、绿(没有黑色)
+        self.h.cfg['learn_pick'] = True                       # 这个功能默认关了(要多拍一张)，这里测它
         self._hide_covered_rings()
         self.assertFalse(self.h.vision.has_pick())
         self.run_cli('mtest', 'mtest ROUGH 1 force')
@@ -311,6 +312,7 @@ class CliTests(unittest.TestCase):
     def test_black_material_uses_the_ring_seen_when_placing(self):
         """黑色物料在黑环上认不出来(不按物料对)：按放物料时认到的圆环对准取回。"""
         self._zone_setup('ROUGH')                              # 红、黑、浅蓝
+        self.h.cfg['learn_pick'] = True                       # 这个功能默认关了(要多拍一张)，这里测它
         self.run_cli('mtest', 'mtest ROUGH 1 force')
         text = '\n'.join(self.lines)
         self.assertEqual(text.count('对准结果(按物料)'), 2, text)
@@ -320,6 +322,7 @@ class CliTests(unittest.TestCase):
     def test_pickback_blind_when_nothing_is_visible(self):
         """物料、圆环都认不到：按放下时记下的位置直接夹(不会卡住、不会报错停下)。"""
         self._zone_setup('ROUGH')
+        self.h.cfg['learn_pick'] = True                       # 这个功能默认关了(要多拍一张)，这里测它
         self._hide_covered_rings()
         self.h.vision.hide_pick = (1, 2, 3, 4, 5, 6)
         self.run_cli('mtest', 'mtest ROUGH 1 force')
@@ -341,6 +344,7 @@ class CliTests(unittest.TestCase):
     def test_temp_stacking_aligns_on_the_lower_material(self):
         """暂存区第二批码垛：下面那层盖住了白心，按物料顶面对准(黑色认圆环外圈)，叠在同色物料上。"""
         self._zone_setup('TEMP')
+        self.h.cfg['learn_pick'] = True                       # 这个功能默认关了(要多拍一张)，这里测它
         self.run_cli('mtest', 'mtest TEMP 1 force')
         self.assertTrue(self.h.vision.has_pick(), '\n'.join(self.lines))     # 第一批放下时量好了
         for it in self.h.plan.items(2):                        # 第二批手放进转盘
@@ -394,16 +398,45 @@ class CliTests(unittest.TestCase):
         orig = self.w.link.move
         self.w.link.move = lambda cmd, val, speed=None: (moves.append((cmd, val)), orig(cmd, val, speed))[1]
         self.run_cli('mtest', 'mtest TEMP 1 force nogo')
-        first = next(v for c, v in moves if c == 'F')
+        first = next(v for c, v in moves if c == 'F' and abs(v) > 40)          # 跳过第一次测"底盘挪 20mm 画面怎么动"
         self.h.act.disp = {'S': 40.0, 'F': -70.0}
         self.h.learn = {'S': 12.0, 'F': 9.0}
         moves.clear()
         self.run_cli('mtest', 'mtest TEMP 1 force nogo rev')
-        first_rev = next(v for c, v in moves if c == 'F')
-        self.assertEqual(first, -first_rev, (first, first_rev))
-        self.assertEqual(abs(first), 150, moves)
+        first_rev = next(v for c, v in moves if c == 'F' and abs(v) > 40)
+        self.assertLess(abs(first + first_rev), 12, (first, first_rev))       # 方向反过来
+        self.assertLess(abs(abs(first) - 150), 12, moves)
+        self.assertEqual([m for m in moves if m[0] == 'S'], [], moves)        # 工位里不横移
         with self.assertRaises(ValueError):
             mission_cli.handle_cli('mtest', ['mtest', 'TEMP', '1', 'xyz'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+
+    def test_mtest_zone_holds_heading_surveys_and_does_not_retract(self):
+        """mtest ROUGH/TEMP：先把现在的车头方向记为要保持的方向(HOME)，再看清三个圆环；放完不缩回(不发 DROP)；不横移。"""
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        text = '\n'.join(self.lines)
+        self.assertEqual(self.w.homed, 1, text)
+        self.assertIn('车头方向：以现在的方向为准', text)
+        self.assertIn('个圆环(认出', text)
+        self.assertIn('不横移', text)
+        self.assertFalse([r for r in self.w.requests if r.startswith('DROP')], text)
+        self.assertEqual([m for m in self.w.moves if m[0] == 'S'], [], text)
+        self.assertEqual(len(self.w.placed), 3, text)
+        self.assertNotIn('PICK 点还没量', text)                   # 默认不回去拍物料，就不提 PICK 点
+
+    def test_mcode_again_keeps_what_is_in_the_tray(self):
+        """mtest RAW 以后又输了一次 mcode(同一个码)：转盘里的物料还认得，mtest ROUGH 照常放。"""
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.w.arrive('RAW', 1)
+        self.run_cli('mtest', 'mtest RAW 1')
+        self.assertEqual(self.h.stats.grab_ok, 3)
+        self.run_cli('mcode', 'mcode 156+123+516+231')
+        self.w.arrive('ROUGH', 1)
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest ROUGH 1')
+        text = '\n'.join(self.lines)
+        self.assertEqual(self.h.stats.place_ok, 3, text)
+        self.assertNotIn('槽里没有', text)
 
     def test_mcode_lists_slots(self):
         self.run_cli('mcode', 'mcode 156+123+516+231')
@@ -555,12 +588,16 @@ class ConfigScriptTests(unittest.TestCase):
         path = os.path.join(d, 'cfg.json')
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'px_per_mm': {'RAW': 4.36, 'RING': 2.96}, 'tol_mm': {'RAW': 3.0},
-                                       'accept_mm': {'RAW': 5.0}}}, f)
+                                       'accept_mm': {'RAW': 5.0}, 'learn_pick': True, 'chassis_fine_rpm': 80}}, f)
         apply_mission_config.main([path])
         mc = load(path)['mission_cfg']
         self.assertEqual(mc['px_per_mm']['RAW'], 1.97)              # 没改过的旧默认值 -> 新默认值
         self.assertEqual(mc['tol_mm']['RAW'], 2.0)
         self.assertEqual(mc['accept_mm']['RAW'], 5.0)               # 用户自己改过的不动
+        self.assertIs(mc['learn_pick'], False)                      # 10-10 改了默认值：放完不回去拍照
+        self.assertEqual(mc['chassis_fine_rpm'], 80)                # 用户自己改过的不动
+        self.assertEqual(mc['ring_order'], {'ROUGH': 'lr', 'TEMP': 'lr'})   # 新加的项补上
+        self.assertIs(mc['chassis_strafe'], False)
 
     def test_missing_file(self):
         self.assertEqual(apply_mission_config.main(['/nonexistent/x.json']), 1)

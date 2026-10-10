@@ -18,8 +18,10 @@ NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调�
         'time_limit_s=超过这个时间不再做夹放，留时间回家。详见 README_mission.md')
 
 
-# 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的
-OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0), ('accept_mm', 'RAW'): (6.0, 4.0)}
+# 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的。(None, 键) = mission_cfg 下面直接的键
+OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0), ('accept_mm', 'RAW'): (6.0, 4.0),
+                (None, 'learn_pick'): (True, False),          # 10-10：放完不再回去拍物料(慢)，取回认圆环外圈
+                (None, 'chassis_fine_rpm'): (60, 100)}        # 10-10：视觉微调时底盘快一点
 
 
 def main(argv):
@@ -33,9 +35,13 @@ def main(argv):
     old = cfg.get('mission_cfg') or {}
     new = deep_merge(DEFAULTS, old)          # DEFAULTS 打底，已有的值覆盖它(不会改你已经设的)
     for (sec, k), (was, now) in OLD_DEFAULTS.items():     # 以前的默认值、没改过的：换成新的默认值
-        if (old.get(sec) or {}).get(k) == was:
-            new[sec][k] = now
-            print(f'  {sec}.{k}：旧的默认值 {was} -> 新的默认值 {now}')
+        cur = old.get(k, None) if sec is None else (old.get(sec) or {}).get(k)
+        if cur is not None and type(cur) is type(was) and cur == was:
+            if sec is None:
+                new[k] = now
+            else:
+                new[sec][k] = now
+            print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {was} -> 新的默认值 {now}')
     if disable:
         new['enabled'] = False
     elif 'enabled' not in old:
