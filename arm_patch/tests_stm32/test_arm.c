@@ -1,4 +1,5 @@
-/* arm.c 的主机回归测试：用假的 HAL / 舵机 / 升降，检查指令解析、动作顺序、保护、急停、扫码。
+/* arm.c 的主机回归测试：用假的 HAL / 舵机 / 升降，检查指令解析、动作顺序、保护、急停、扫码、串口屏触摸选区。
+ * hwt101.c 整个包含进来(串口中断回调在那里)，触摸帧、出错重启都走真的回调。
  * 运行：bash run.sh      (有断言失败会返回非 0) */
 #include "arm.h"
 #include <stdio.h>
@@ -6,17 +7,28 @@
 #include <stdlib.h>
 #include <math.h>
 
-UART_HandleTypeDef huart2, huart3, huart5;
+UART_HandleTypeDef huart1, huart2, huart3, huart5;
 TIM_HandleTypeDef htim2;
+USART_TypeDef fake_usart[6];
 volatile uint8_t car_abort = 0;
+void HAL_NVIC_SetPriority(int irqn, uint32_t pre, uint32_t sub) { (void)irqn; (void)pre; (void)sub; }
+void HAL_NVIC_EnableIRQ(int irqn) { (void)irqn; }
+void Link_RxCplt(void) { }
+void Link_RxRestart(void) { }
+#include "../Core/Src/hwt101.c"
 
 static uint32_t now = 0;
 static int abort_at = -1;
 static float ang[3] = {0, 323.0f, -862.0f};
 static char ev[8192];                 /* 事件记录：每个动作追加一小段文字，测试里用 strstr / 下标比较顺序 */
 static char pi[4096];                 /* STM32 发给树莓派的文字 */
-static char scr[1024];                /* 发给串口屏的文字 */
+static char scr[8192];                /* 发给串口屏的文字(每条后面加 |) */
 static uint8_t *rxp = 0;
+static uint8_t *scrp = 0;             /* USART2(屏)接收缓冲 */
+static int scr_armed = 0;             /* 1 = USART2 正在等下一个字节(HAL_UART_Receive_IT 开着)；收到一个字节或出错就变 0，要重新开 */
+static int scr_starts = 0;            /* HAL_UART_Receive_IT(&huart2) 调了几次 */
+static int scr_rxfail = 0;            /* 1 = 假装 USART2 接收开不起来 */
+static int scr_lost = 0;              /* 没开接收时屏发来、丢掉的字节数 */
 static int fails = 0, checks = 0;
 
 #define EV(...) do { char t_[96]; snprintf(t_, sizeof t_, __VA_ARGS__); strncat(ev, t_, sizeof ev - strlen(ev) - 1); } while (0)
@@ -28,10 +40,15 @@ void Delay_Report(uint32_t ms) { HAL_Delay(ms); }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) {
     (void)t;
     if (h == &huart3 && strncmp((char *)b, "YAW100", 6) != 0) strncat(pi, (char *)b, (size_t)n < sizeof pi - strlen(pi) - 1 ? (size_t)n : sizeof pi - strlen(pi) - 1);
-    if (h == &huart2 && b[0] != 0xFF) { strncat(scr, (char *)b, (size_t)n); strcat(scr, "|"); }
+    if (h == &huart2 && b[0] != 0xFF) { size_t room = sizeof scr - strlen(scr) - 2; strncat(scr, (char *)b, (size_t)n < room ? (size_t)n : room); strcat(scr, "|"); }
     return 0;
 }
-int HAL_UART_Receive_IT(UART_HandleTypeDef *h, uint8_t *b, uint16_t n) { (void)n; if (h == &huart5) rxp = b; return 0; }
+int HAL_UART_Receive_IT(UART_HandleTypeDef *h, uint8_t *b, uint16_t n) {
+    (void)n;
+    if (h == &huart5) rxp = b;
+    if (h == &huart2) { scr_starts++; if (scr_rxfail) return 1; scrp = b; scr_armed = 1; }
+    return 0;
+}
 int HAL_UART_Init(UART_HandleTypeDef *h) { (void)h; return 0; }
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *h, uint32_t c) { (void)h; EV("pwm%u;", c); return 0; }
 void tim_set(uint32_t ch, uint32_t v) { (void)ch; (void)v; }
@@ -113,13 +130,42 @@ static int at(const char *needle) { const char *p = strstr(ev, needle); return p
 static int has(const char *s) { return strstr(ev, s) != 0; }
 static int last(const char *needle) { int r = -1; const char *p = ev; while ((p = strstr(p, needle)) != 0) { r = (int)(p - ev); p++; } return r; }
 static int pis(const char *s) { return strstr(pi, s) != 0; }
+static int scrs(const char *s) { return strstr(scr, s) != 0; }
+/* 屏发来字节：和真的串口一样，开着接收(HAL_UART_Receive_IT)才收得到，收到一个以后要回调里重新开 */
+static void scr_in(const uint8_t *f, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (!scr_armed) { scr_lost++; continue; }
+        scr_armed = 0; *scrp = f[i]; HAL_UART_RxCpltCallback(&huart2);
+    }
+}
+/* 触摸帧：67 XH XL YH YL 事件 FF FF FF(事件 1 = 按下，0 = 松开)。
+ * 按下之前先过 touch_gap 毫秒(默认 600，比换页后的保护时间 0.5 秒长：人正常地看一眼再按) */
+static uint32_t touch_gap = 600;
+static void touch(int x, int y, int ev) {
+    uint8_t f[9];
+    if (ev == 1) now += touch_gap;
+    f[0] = 0x67; f[1] = (uint8_t)(x >> 8); f[2] = (uint8_t)x; f[3] = (uint8_t)(y >> 8); f[4] = (uint8_t)y; f[5] = (uint8_t)ev;
+    f[6] = f[7] = f[8] = 0xFF;
+    scr_in(f, 9);
+}
+static void tap(int x, int y) { touch(x, y, 1); touch(x, y, 0); Arm_Poll(); }   /* 按下、松开在同一点，再让主循环跑一次 */
+static int zone_is(const char *want) { pi[0] = 0; run("ZONE?"); return strstr(pi, want) != 0; }
+/* 扫码模块发来字节(走 hwt101.c 里真的串口回调) */
+static void qr_feed(const char *s) { for (; *s; s++) { *rxp = (uint8_t)*s; HAL_UART_RxCpltCallback(&huart5); now += 1; } }
 
 int main(void) {
     int i;
+    huart1.Instance = USART1; huart2.Instance = USART2; huart3.Instance = USART3; huart5.Instance = UART5;
     flash_blank();
     Arm_Init();
     CHECK(has("pwm3;") && has("pwm2;"), "Arm_Init 启动了夹爪/转盘 PWM");
-    CHECK(strstr(scr, "cls 0") && strstr(scr, "\"READY\""), "画模式开机清屏并显示 READY");
+    CHECK(scr_armed && scr_starts == 1, "开机打开 USART2 接收(收屏的触摸)");
+    CHECK(scrs("sendxy=1|cls 0|") && scrs("xstr 0,0,240,48,0,65535,0,1,1,1,\"START ZONE 1 OR 2\"")
+          && scrs("xstr 0,52,236,268,1,65535,31,1,1,1,\"1\"") && scrs("xstr 244,52,236,268,1,65535,63488,1,1,1,\"2\"") && !scrs("READY"),
+          "开机显示选区页：先发 sendxy=1、清屏，左边大按钮 1(蓝)、右边大按钮 2(红)，不写 READY");
+    clear();
+    CHECK(run("ZONE?") == 1 && pis("ZONE 0 0"), "开机还没选区：ZONE 0 0");
 
     /* ---- 保护 ---- */
     clear();
@@ -127,7 +173,7 @@ int main(void) {
     CHECK(run("OBS RAW O") == -1, "ARMOK=0 时 OBS 拒绝");
     Arm_Param_Set("ARMOK", 1);
     clear();
-    CHECK(run("LIFT?") == 1 && pis("LIFT 1 60"), "开机从最低点自动升到 60mm");
+    CHECK(run("LIFT?") == 1 && pis("LIFT 1 60") && pis("BOOT=NOCAL"), "开机没标定：当作 60mm，LIFT? 回 BOOT=NOCAL");
     clear();
     CHECK(run("LIFT 100") == 1 && has("L+3200;"), "开机不用 LIFT ZERO：从 60 走到 100 = 往上 40mm(3200 脉冲)");
     clear();
@@ -276,6 +322,9 @@ int main(void) {
     CHECK(has("stop5;"), "急停时停升降");
     clear();
     CHECK(run("OBS RAW") == -1 && pis("ERR NOZERO"), "急停打断升降后要求重新回零");
+    clear();
+    CHECK(run("PARK") == -1 && pis("ERR NOZERO") && !has("L+") && !has("L-") && !has("S1:") && !has("S2:"),
+          "升降位置不知道(急停打断过)：PARK 什么都不动，回 ERR NOZERO");
     run("LIFT ZERO");
 
     /* ---- 升降限幅 ---- */
@@ -284,6 +333,201 @@ int main(void) {
     run("LIFT 999");
     CHECK(has("L+8400;"), "LIFT 999 被限制在最高点 105mm(8400 脉冲)");
     run("LIFT 0");
+
+    /* ---- PARK：收臂 + 升降停到 60mm(下次开机认高度最稳) ---- */
+    Arm_Param_Set("ZHI", 100);
+    away(); clear();
+    CHECK(run("PARK") == 1 && has("L+8000;") && has("S1:323.0@90;") && has("S2:-862.0@90;") && has("L-3200;")
+          && at("L+8000;") < at("S1:") && at("L+8000;") < at("S2:") && at("S1:") < at("L-3200;") && at("S2:") < at("L-3200;"),
+          "PARK(ARMOK=1)：先升到 ZHI，再像 STOW 那样收臂(A1H、A2R)，最后降到 60mm");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0"), "PARK 以后升降在 60mm");
+    Arm_Param_Set("ARMOK", 0);
+    run("LIFT 0"); away(); clear();
+    CHECK(run("PARK") == 1 && has("L+4800;") && !has("L+8000") && !has("S1:") && !has("S2:") && !has("M1:") && !has("M2:") && !has("H1") && !has("H2"),
+          "PARK(ARMOK=0，姿态还没标定)：舵机不动，只把升降走到 60mm");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0"), "ARMOK=0 的 PARK 以后升降也在 60mm");
+    Arm_Param_Set("ARMOK", 1);
+    run("LIFT 0"); clear();
+    abort_at = (int)now + 500;
+    i = run("PARK");
+    abort_at = -1;
+    CHECK(i == 1 && has("stop5;") && !has("S1:"), "PARK 途中急停：升降马上停，不再往下做(main.c 回 ERR ABORT)");
+    run("LIFT ZERO");
+    Arm_Param_Set("ZHI", 0);
+    run("LIFT 0");
+
+    /* ---- 选启停区：屏上触摸(USART2 收 67 帧)、ZONE 指令 ---- */
+    clear(); Arm_Init();                            /* 重新开机：选区页 */
+    CHECK(zone_is("ZONE 0 0"), "开机：ZONE 0 0");
+    clear(); tap(100, 200);
+    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,0,320,80,1,65535,0,1,1,1,\"ZONE 1\"")
+          && scrs("xstr 336,8,136,64,0,65535,33808,1,1,1,\"BACK\"") && scrs("xstr 0,128,480,192,1,0,2016,1,1,1,\"START\"")
+          && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"\"") && !scrs("sendxy"),
+          "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页(ZONE 1、状态行、大 START、小 BACK)");
+    clear(); tap(400, 30);
+    CHECK(zone_is("ZONE 0 0") && scrs("START ZONE 1 OR 2"), "准备页按 BACK：回选区页，选的区清掉");
+    clear(); touch(100, 200, 1); touch(400, 200, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "在按钮 1 按下、滑到按钮 2 松开：不算");
+    touch(100, 200, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "只有松开、没有按下：不算");
+    tap(240, 200); tap(100, 20); tap(600, 200);
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "按在两个按钮中间的缝上、标题行、屏外的坐标：都不算");
+    clear(); tap(470, 315);
+    CHECK(zone_is("ZONE 2 0") && scrs("\"ZONE 2\""), "按右边按钮：选 2 区");
+    clear(); touch(240, 250, 1); Arm_Poll();
+    CHECK(zone_is("ZONE 2 0") && scr[0] == 0, "START 只按下、还没松开：不算");
+    touch(20, 310, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,1,0,65504,1,1,1,\"GO\"") && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"GO\"")
+          && scrs("xstr 336,8,136,64,0,0,0,1,1,1,\"\"") && !scrs("cls"),
+          "在 START 里按下、松开：s=1，START 换成 GO、状态行 GO、BACK 擦掉(不整页重画)");
+    clear(); tap(400, 30); tap(240, 250); tap(100, 200);
+    CHECK(zone_is("ZONE 2 1") && scr[0] == 0, "按了 START 以后不再收触摸(BACK、START、别处都不算)");
+    clear();
+    CHECK(run("ZONE ASK") == 1 && zone_is("ZONE 0 0") && scrs("sendxy=1|cls 0|") && scrs("START ZONE 1 OR 2"),
+          "ZONE ASK：发 sendxy=1、重画选区页，清掉选的区和 START");
+    clear();
+    CHECK(run("ZONE 1") == 1 && zone_is("ZONE 1 0") && scrs("sendxy=1|cls 0|") && scrs("\"ZONE 1\"") && scrs("\"START\""),
+          "ZONE 1：和在屏上按 1 一样，画准备页");
+    tap(240, 250);
+    CHECK(zone_is("ZONE 1 1"), "ZONE 1 以后屏上按 START：s=1");
+    /* 换页以后 0.5 秒内按下的不算：选区时手指抖一下/连按两下，不会顺手按到 START(START 就在按钮 1、2 的下半部分) */
+    run("ZONE ASK");
+    touch_gap = 50; tap(100, 250);
+    CHECK(zone_is("ZONE 0 0"), "ZONE ASK 刚画完 50ms 就按：不算");
+    touch_gap = 600; tap(100, 250);
+    CHECK(zone_is("ZONE 1 0"), "过了保护时间再按：选 1 区");
+    touch_gap = 100; tap(100, 250); touch_gap = 300; tap(100, 250);
+    CHECK(zone_is("ZONE 1 0"), "选好区以后 0.1 秒、0.3 秒又在同一个地方按了两下(手指抖)：都不算 START");
+    touch_gap = 50; touch(100, 250, 1); touch_gap = 600; touch(100, 250, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 1 0"), "保护时间内按下、过了保护时间才松开：也不算");
+    touch_gap = 600; tap(100, 250);
+    CHECK(zone_is("ZONE 1 1"), "正常再按一次 START：s=1");
+    CHECK(run("ZONE 2") == 1 && zone_is("ZONE 2 0"), "ZONE 2：START 清掉(s=0)");
+    touch(240, 250, 1); run("ZONE 2"); touch(240, 250, 0); Arm_Poll();
+    CHECK(zone_is("ZONE 2 0"), "按下 START 以后页面重画了(换页)，再松开不算(按下的那一下属于上一页)");
+    clear();
+    CHECK(run("ZONE MSG SCAN 1/2") == 1 && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"SCAN 1/2\"") && !scrs("cls"),
+          "ZONE MSG：只写准备页的状态行(黄字)");
+    clear(); run("ZONE MSG  a\"bcdefghijklmnopqrstuvwxyz");
+    CHECK(scrs(",\"abcdefghijklmnopqrst\""), "ZONE MSG：去掉双引号和前面多的空格，最多 20 个字");
+    clear(); run("ZONE MSG");
+    CHECK(scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"\""), "ZONE MSG 不带字：清空状态行");
+    run("ZONE MSG PLAN OK"); clear(); tap(400, 30);
+    CHECK(scrs("START ZONE 1 OR 2") && scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "BACK 回选区页：状态行清空(在右上角)");
+    clear(); run("ZONE MSG SCAN");
+    CHECK(scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"SCAN\""), "选区页的状态行在右上角");
+    clear();
+    CHECK(run("ZONE LOCK") == 1 && scrs("cls 0|") && !scrs("xstr") && zone_is("ZONE 0 0"), "ZONE LOCK：清屏回到比赛布局");
+    clear(); tap(100, 200); tap(400, 300);
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "ZONE LOCK 以后屏上按什么都不算");
+    clear(); run("ZONE MSG X");
+    CHECK(scr[0] == 0, "比赛布局时 ZONE MSG 只记下，不画(不盖掉比赛的字)");
+    run("ZONE 2"); tap(240, 250); run("ZONE LOCK");
+    CHECK(zone_is("ZONE 2 1"), "ZONE LOCK 以后 ZONE? 还查得到选的区和 START");
+    clear();
+    CHECK(run("ZONE 3") == -1 && pis("ERR ARG") && run("ZONE") == -1 && run("ZONE ASK X") == -1 && run("ZONE FOO") == -1 && run("ZONE 1 2") == -1,
+          "ZONE 参数不对：ERR ARG");
+    /* 坏帧、半帧 */
+    run("ZONE ASK");
+    {
+        static const uint8_t half[] = { 0x67, 0x00, 0x64, 0x00, 0xC8, 0x01, 0xFF, 0xFF };          /* 少一个 FF */
+        static const uint8_t comp[] = { 0x65, 0x00, 0x01, 0x01, 0xFF, 0xFF, 0xFF };              /* 控件事件帧(不是坐标) */
+        static const uint8_t err[]  = { 0x1A, 0xFF, 0xFF, 0xFF };                                /* 屏回的错误码 */
+        static const uint8_t lng[]  = { 0x67, 0x00, 0x64, 0x00, 0xC8, 0x01, 0x00, 0xFF, 0xFF, 0xFF };   /* 长了一个字节 */
+        static const uint8_t ff4[]  = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        scr_in(half, (int)sizeof half); touch(100, 200, 0); Arm_Poll();
+        CHECK(zone_is("ZONE 0 0"), "半帧(少一个 FF)：和后面的帧拼起来长度不对，一起丢掉");
+        scr_in(comp, (int)sizeof comp); scr_in(err, (int)sizeof err); scr_in(lng, (int)sizeof lng); touch(100, 200, 0); Arm_Poll();
+        CHECK(zone_is("ZONE 0 0"), "控件事件帧、错误码、长度不对的帧：都不当成触摸");
+        scr_in(ff4, (int)sizeof ff4); tap(100, 200);
+        CHECK(zone_is("ZONE 1 0"), "多余的 FF 以后：下一帧照样认得出(重新对上帧)");
+    }
+    {
+        static const uint8_t sleepf[] = { 0x68, 0x01, 0xC0, 0x00, 0x96, 0x01, 0xFF, 0xFF, 0xFF };   /* 屏睡眠时的触摸帧 68，x=448 y=150 */
+        static const uint8_t sleepr[] = { 0x68, 0x01, 0xC0, 0x00, 0x96, 0x00, 0xFF, 0xFF, 0xFF };
+        run("ZONE ASK"); now += 600;
+        scr_in(sleepf, 9); scr_in(sleepr, 9); Arm_Poll();
+        CHECK(zone_is("ZONE 2 0"), "屏睡眠时的 68 帧也认(x=448 在右半边 = 2 区)");
+    }
+    /* USART2 出错：一定要重新开始接收 */
+    run("ZONE ASK");
+    {
+        static const uint8_t part[] = { 0x67, 0x00, 0x64, 0x00 };
+        int s0;
+        scr_in(part, 4);
+        s0 = scr_starts;
+        scr_armed = 0;                              /* 溢出：HAL 停了接收，再调错误回调 */
+        HAL_UART_ErrorCallback(&huart2);
+        CHECK(scr_starts == s0 + 1 && scr_armed, "USART2 出错后错误回调里重新开始接收(不然以后再也按不动)");
+        tap(100, 200);
+        CHECK(zone_is("ZONE 1 0"), "出错时收了一半的帧丢掉，接着按照样能选");
+        s0 = scr_lost;
+        scr_armed = 0; touch(400, 200, 1);          /* 没开接收时来的字节收不到(假串口和真的一样) */
+        CHECK(scr_lost == s0 + 9, "假串口：没开接收时收不到");
+        HAL_UART_ErrorCallback(&huart2);
+    }
+    /* 屏重新上电(发来 88 FF FF FF)：sendxy 忘了、画面也没了 */
+    {
+        static const uint8_t boot[] = { 0x88, 0xFF, 0xFF, 0xFF };
+        run("ZONE 1"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("sendxy=1|cls 0|") && scrs("\"ZONE 1\"") && scrs("\"START\"") && zone_is("ZONE 1 0"), "屏重新上电：再发 sendxy=1，整页重画(选的区不变)");
+        run("ZONE LOCK"); run("QR CLR"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scr[0] == 0, "比赛布局时屏重新上电(还没读到码)：不画选区页，什么都不写");
+        qr_feed("321+654+987+123\r\n"); Arm_Poll(); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("\"321+654+\"") && scrs("\"987+123\"") && !scrs("START") && pi[0] == 0,
+              "比赛布局时屏重新上电：把任务码重新写上(赛规要一直显示)，不再发给树莓派");
+        run("QR CLR");
+    }
+    /* 旧的树莓派程序不发 ZONE LOCK：写 SCR 时自动回到比赛布局 */
+    run("ZONE ASK"); clear();
+    CHECK(run("SCR t1 QR SCAN") == 1 && scrs("cls 0|xstr 292,82,188,38,0,65535,0,0,1,1,\"QR SCAN\""),
+          "选区页还在显示时写 SCR：先清屏回到比赛布局，再写字");
+    clear(); tap(100, 200);
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "SCR 自动回到比赛布局以后，触摸也关了");
+    clear(); run("SCR t1 QR OK");
+    CHECK(!scrs("cls"), "已经是比赛布局：SCR 不清屏");
+    /* 选区页还在显示时扫到码：告诉树莓派，不写屏(不盖掉按钮) */
+    run("ZONE ASK"); clear();
+    qr_feed("999+888+777+666\r\n"); Arm_Poll();
+    CHECK(pis("QR 999+888+777+666") && !scrs("999+888"), "选区页还在显示时扫到码：发给树莓派，但不写屏(不盖掉按钮)");
+    run("QR CLR"); run("ZONE LOCK");
+    /* USART2 接收开不起来：和以前一样显示 READY，终端里照样能选区 */
+    scr_rxfail = 1; clear(); Arm_Init(); scr_rxfail = 0;
+    CHECK(scrs("cls 0|") && scrs("\"READY\"") && !scrs("START ZONE") && !scrs("sendxy"), "收不到触摸(USART2 接收开不起来)：开机和以前一样清屏、显示 READY");
+    scr_rxfail = 1;
+    CHECK(zone_is("ZONE 0 0") && run("ZONE 2") == 1 && zone_is("ZONE 2 0"), "收不到触摸时终端里 ZONE 2 照样能选");
+    scr_rxfail = 0;
+    CHECK(run("ZONE ASK") == 1 && scr_armed, "开机没开起来的接收：ZONE ASK 时再试一次");
+    tap(100, 200);
+    CHECK(zone_is("ZONE 1 0"), "再试开起来以后屏上能选");
+    clear(); Arm_Init(); run("ZONE LOCK");          /* 恢复：接收开着，比赛布局 */
+
+    /* ---- 二维码在中断里锁存：长指令阻塞(主循环不跑 Arm_Poll)时扫到的码不丢 ---- */
+    run("QR CLR"); clear();
+    qr_feed("xx156+123+516+231\r\n");
+    for (i = 0; i < 300; i++) qr_feed("x");          /* 后面一直来字节(缓冲满了好几次) */
+    CHECK(run("QR?") == 1 && pis("QR 156+123+516+231"), "Arm_Poll 没跑时扫到的码在中断里已经锁存：后面的字节挤满缓冲也不丢，QR? 读得到");
+    clear(); Arm_Poll();
+    CHECK(!pis("QR ") && scrs("\"156+123+\"") && scrs("\"516+231\""), "主循环再写屏(t0 带 +)；QR? 已经回过这个码了，不再主动发一遍");
+    run("QR CLR"); clear();
+    qr_feed("156+123+516+231\r\n"); Arm_Poll();
+    CHECK(pis("QR 156+123+516+231") && scrs("\"156+123+\""), "没被 QR? 取走的新码：主循环写屏、主动告诉树莓派");
+    clear(); Arm_Poll(); qr_feed("156+123+516+231\r\n"); Arm_Poll();
+    CHECK(pi[0] == 0 && scr[0] == 0, "同一个码再扫到：不重复发、不重写屏");
+    run("QR CLR"); clear();
+    for (i = 0; i < 6; i++) qr_feed("452+321+254+312");   /* 不发换行的模块连着发(中间没有停 60 毫秒) */
+    CHECK(run("QR?") == 1 && pis("QR 452+321+254+312"), "不发换行、连着发：缓冲满了清空前也在中断里找一遍");
+    run("QR CLR"); clear();
+    qr_feed("111+222+333+444\r\n");
+    run("QR CLR"); Arm_Poll(); run("QR?");
+    CHECK(pis("QR NONE") && !scrs("111+222"), "QR CLR 把中断里锁存了还没取走的码也清掉");
+    clear(); qr_feed("12+345+678+90+1\r\n"); qr_feed("123+456+789+01\r\n"); Arm_Poll(); run("QR?");
+    CHECK(pis("QR NONE"), "格式不对的行(组的位数不对)不锁存");
 
     /* ---- 二维码(画模式：屏工程里不用放控件) ---- */
     clear();
@@ -294,10 +538,12 @@ int main(void) {
         for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
         Arm_Poll();
     }
-    CHECK(strstr(scr, "xstr 0,0,288,80,1,65535,0,1,1,1,\"777+111\"") && strstr(scr, "xstr 0,80,288,80,1,65535,0,1,1,1,\"222+333\""),
-          "画模式：任务码用大字(字库1)画在左上两行");
+    CHECK(strstr(scr, "xstr 0,0,322,80,1,65535,0,1,1,1,\"777+111+\"") && strstr(scr, "xstr 0,80,288,80,1,65535,0,1,1,1,\"222+333\""),
+          "画模式：任务码用大字(字库1)画在左上两行，组之间的 + 都在(t0 = 777+111+ 共 8 个大字 320 像素，框 322 宽)");
     clear(); run("SCR t1 RAW 1/3");
-    CHECK(strstr(scr, "xstr 292,2,188,38,0,65535,0,0,1,1,\"RAW 1/3\""), "画模式：t1 小字画在右上");
+    CHECK(strstr(scr, "xstr 292,82,188,38,0,65535,0,0,1,1,\"RAW 1/3\""), "画模式：t1 阶段小字画在 t7 右边(188 宽，长的阶段文字放得下)");
+    clear(); run("SCR t5 B1 R1 G2 B3");
+    CHECK(strstr(scr, "xstr 326,2,154,38,0,65535,0,0,1,1,\"B1 R1 G2 B3\""), "画模式：t5 第一批小字画在右上(t0 右边)");
     clear(); run("SCR t9 X");
     CHECK(scr[0] == 0, "画模式：表里没有的名字不发");
     Arm_Param_Set("SCRMODE", 0);                    /* 下面测"写控件"模式 */
@@ -311,7 +557,7 @@ int main(void) {
         for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
         Arm_Poll();
     }
-    CHECK(pis("QR 452+321+254+312") && strstr(scr, "t0.txt=\"452+321\"") && strstr(scr, "t7.txt=\"254+312\""), "扫到任务码：发给树莓派并分两行显示到串口屏 t0、t7");
+    CHECK(pis("QR 452+321+254+312") && strstr(scr, "t0.txt=\"452+321+\"") && strstr(scr, "t7.txt=\"254+312\""), "扫到任务码：发给树莓派并分两行显示到串口屏 t0(带 +)、t7");
     clear();
     {
         const char *again = "452+321+254+312\r\n";
@@ -327,7 +573,7 @@ int main(void) {
         for (p = other; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
         Arm_Poll();
     }
-    CHECK(pis("QR 111+222+333+123") && strstr(scr, "t0.txt=\"111+222\""), "换了一个码：重新发、重新显示");
+    CHECK(pis("QR 111+222+333+123") && strstr(scr, "t0.txt=\"111+222+\""), "换了一个码：重新发、重新显示");
     clear(); {
         const char *back = "452+321+254+312\r\n"; const char *p;
         for (p = back; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
@@ -355,6 +601,8 @@ int main(void) {
     clear(); run("SCMD page 1");
     CHECK(strstr(scr, "page 1"), "SCMD");
     CHECK(run("SCR") == 0 && run("SCR t1") == -1, "SCR 参数检查");
+    run("ZONE 1"); clear();
+    CHECK(run("ZONE LOCK") == 1 && scrs("page 0|") && !scrs("cls"), "写控件模式：ZONE LOCK 重新载入 page 0(控件都回来)");
 
     /* ---- 升降编码器：标定、开机自动找高度 ---- */
     run("LIFT 60"); phys_mm = 60.0;                      /* 让"程序以为的高度"和真实高度一致 */
@@ -367,6 +615,8 @@ int main(void) {
     phys_mm = 47.3;                                       /* 关机时被人推到 47.3mm */
     Arm_Init();
     CHECK((pis("LIFTBOOT 47.3") || pis("LIFTBOOT 47.29")) && has("L+1016;") && fabs(phys_mm - 60.0) < 0.05, "开机：编码器算出在 47.3mm，往上走 12.7mm 到正好 60");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0") && pis("BOOT=POS"), "开机用编码器、以 Flash 里记的上次位置为中心找到的：LIFT? 回 BOOT=POS");
     clear();
     phys_mm = 75.6;
     Arm_Init();
@@ -387,6 +637,8 @@ int main(void) {
     enc_ok = 0; clear(); phys_mm = 52.0;
     Arm_Init();
     CHECK(pis("LIFTBOOT NOENC") && !has("L+") && !has("L-"), "读不到编码器：不动，当作在 60");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0") && pis("BOOT=NOENC"), "读不到编码器：LIFT? 回 BOOT=NOENC(高度是假设的)");
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
     enc_ok = 1; enc_frozen = 1; enc31_zero = 1; pos36_off = 0.0; clear();
     { double save = phys_mm; phys_mm = 0.0; run("LIFT 0"); phys_mm = 0.0; (void)save; }
@@ -416,6 +668,8 @@ int main(void) {
     flash_blank();
     clear(); Arm_Init();
     CHECK(pis("LIFTBOOT NOCAL") && !has("L+") && !has("L-"), "没标定：开机不动，当作在 60");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0") && pis("BOOT=NOCAL"), "没标定：LIFT? 回 BOOT=NOCAL(高度是假设的)");
     run("LIFT 60");
 
     /* ---- 记住上次停下的位置：断电时停在哪都行 ---- */
@@ -443,6 +697,15 @@ int main(void) {
     run("LIFT 30"); clear(); Arm_Init();
     CHECK(pis("LIFTBOOT 30.0") && fabs(phys_mm - 60.0) < 0.05, "擦完以后照样记位置");
     run("LIFT 60");
+    /* Flash 里只有标定、没有位置记录：在 60 上下找 */
+    for (i = 64; i < 256; i++) fake_flash[i] = 0xFFFFFFFFu;   /* 位置记录从 0x100 字节(第 64 个字)开始 */
+    phys_mm = 70.0; clear(); Arm_Init();
+    CHECK((pis("LIFTBOOT 70.0") || pis("LIFTBOOT 69.99")) && pis("last 60.0") && fabs(phys_mm - 60.0) < 0.05, "没有位置记录：在 60 上下找到 70，走回 60");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 60.0") && pis("BOOT=ENC"), "没有位置记录、编码器找到的：LIFT? 回 BOOT=ENC");
+    clear(); run("LIFT ZERO"); run("LIFT?");
+    CHECK(pis("LIFT 1 0.0") && pis("BOOT=ENC"), "BOOT= 只说开机时怎么认的，之后 LIFT ZERO 也不变");
+    run("LIFT 60"); phys_mm = 60.0;
 
     /* ---- GET/SET 用的接口 ---- */
     clear();
