@@ -479,6 +479,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     h.act.reset_disp()                  # 车是手放到原料区的：底盘位移从 0 算(不会按上一个工位剩下的位移开回去)
                 h._raw_seek_F = 0.0                     # 车是手放的：上次挪着找到的位置不算
                 h._raw_seek_S = 0.0
+                h._raw_pose = None                      # 车是手放的：上次记下的夹取姿态不算
                 if h.cfg.get('mtest_hold_heading', True) and hasattr(h, 'hold_heading'):
                     h.hold_heading()
             if what in ('ROUGH', 'TEMP'):

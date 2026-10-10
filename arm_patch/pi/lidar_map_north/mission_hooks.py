@@ -104,6 +104,7 @@ DEFAULTS = dict(
                                         #   (不横移，不压线)，下一次停下再夹；记住这个位置，同一轮第二批到原料区直接挪到这里
     raw_seek_steps_mm=[40, 20, 10, 5],  # (10-11 用户)原料盘停下时扫不到/够不着要夹的物料：车往原料盘那边(车的右边)挪 4cm，再不行挪 2cm、1cm、0.5cm，一次比一次少
     raw_seek_dir='right',               # 往哪边挪：'right' = 车的右边(原料盘那边，横移)；'left'；'forward' / 'back' = 沿车头前后
+    raw_keep_pose=True,                 # (10-11 用户)原料区第一次对准夹到以后，后面的物料都从这个姿态开始等、对准(物料每次停在同一个地方)
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停。
@@ -304,6 +305,7 @@ class MissionHooks:
         self._ret_bias = [0.0, 0.0]
         self._raw_seek_F = 0.0              # 原料区：车离停车点挪了多少(前后 F、横移 S)时够得着物料(挪着找到的，第二批直接用)
         self._raw_seek_S = 0.0
+        self._raw_pose = None               # 原料区第一次夹到时对准好的 (ID1, ID2)：后面的物料直接从这里开始
         self._seek = None         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
@@ -1194,6 +1196,7 @@ class MissionHooks:
             got = None
             try:
                 self.arm.obs('RAW', open_claw=True)
+                self._raw_goto_pose()
                 t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + float(cfg['time_limit_s']))
                 got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
             except (ArmError, VisionError) as ex:
@@ -1214,6 +1217,22 @@ class MissionHooks:
         self._stow_quiet()
 
     # ------------------------------------------------------------------ 原料区：车轮前后挪到够得着物料的地方
+    def _raw_remember_pose(self):
+        """原料区对准好、马上下爪：记下这时的 ID1、ID2(只记第一次)。后面的物料都停在差不多同一个地方，直接从这个姿态开始。"""
+        if not self.cfg.get('raw_keep_pose', True) or self._raw_pose is not None:
+            return
+        ang = getattr(self.arm, 'angle', None) or {}
+        a1, a2 = ang.get(1), ang.get(2)                          # 对准最后一下 AP 回报的角度(不再发 A? 去读：下爪要快，原料盘停的时间有限)
+        if a1 is not None and a2 is not None:
+            self._raw_pose = (float(a1), float(a2))
+            self.log(f'    记下这次夹的位置(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：后面的物料都从这里开始等')
+
+    def _raw_goto_pose(self):
+        """OBS RAW 以后：第一次夹到的姿态记下了就转过去(在看原料盘的高度上小幅转)。"""
+        if not self.cfg.get('raw_keep_pose', True) or self._raw_pose is None:
+            return
+        self.arm.ap(self._raw_pose[0], self._raw_pose[1])
+
     def _raw_seek_begin(self):
         self._seek = {'last': None, 'jf': None, 'stop': None, 'told': False}
         J = self.store.get('RAW', 'ch') if self.store is not None else None
@@ -1276,6 +1295,7 @@ class MissionHooks:
         self._ui('stage', f'RAW GRAB {item.index + 1}/3 {item.color_short}')
         self._raw_recenter()                        # 上一个物料对准时底盘挪过的话先挪回(够得着物料的)位置，免得这个物料出了视野
         self.arm.obs('RAW', open_claw=True)
+        self._raw_goto_pose()
         md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
         if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(item.color) and not self._warned_vmask:
             self._warned_vmask = True
@@ -1307,6 +1327,7 @@ class MissionHooks:
                 self.log('    (原料区对准只动手臂、车轮不动：物料停在手臂够不着的地方就跳过。车要停得让物料停下时在爪子附近)')
             self._recover(f'没对准({res.reason})，不夹，免得夹偏')
             return False
+        self._raw_remember_pose()
         self.arm.grab_here(item.slot)
         return True
 
@@ -1616,6 +1637,8 @@ class MissionHooks:
             self.log(f'    nogo：对准了(偏差 {err:.1f}mm)，不夹。看看爪子是不是在物料正上方')
             return True
         self.log(f'    下爪(偏差 {err:.1f}mm' + ('' if res.ok else '，停的时间到了，按现在的位置夹') + ')')
+        if mode != 'nogo':
+            self._raw_remember_pose()
         if mode == 'lift':
             P = self.arm.params() or {}
             self.arm.do(f'LIFT {float(P["ZGRAB"]):g}')

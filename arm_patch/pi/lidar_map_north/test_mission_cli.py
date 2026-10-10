@@ -225,6 +225,19 @@ class CliTests(unittest.TestCase):
             self.assertLess(abs(self.h.act.disp['S']), 1.0)                              # 挪回停车点了
             self.assertGreaterEqual(abs(self.h._raw_seek_S), 40.0)
 
+    def test_raw_keeps_the_first_grab_pose(self):
+        """原料区第一次对准夹到以后记下手臂姿态，后面的物料 OBS RAW 以后直接转到这个姿态再等。"""
+        self._plate_world(seed=7)
+        self.run_cli('mtest', 'mtest RAW 1 force any')
+        text = '\n'.join(self.lines)
+        self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)
+        self.assertEqual(text.count('记下这次夹的位置'), 1, text)
+        self.assertIsNotNone(self.h._raw_pose)
+        req = self.w.requests
+        a1, a2 = self.h._raw_pose
+        i = [k for k, r in enumerate(req) if r.startswith('OBS RAW')][-1]
+        self.assertEqual(req[i + 1], f'AP {a1:.3f} {a2:.3f}', req[i:i + 3])
+
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
         self._plate_world(seed=7)
