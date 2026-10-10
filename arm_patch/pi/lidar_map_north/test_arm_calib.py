@@ -140,6 +140,8 @@ FULL = [
     '2 -760', '',                      # 圆环：ID2 直接到 -760(负数大于 200 = 直接转到)
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
+    'c', '1 +0.5', '2 -10', '',        # PL1：第一层放置补偿 ID1 +0.5、ID2 -10
+    's',                               # PL2 跳过
     's',                               # ZOBRNG 跳过
     '+20', '',                         # A1H 323 -> 343
     'y',                               # 打开 ARMOK
@@ -164,6 +166,10 @@ class WizardTests(unittest.TestCase):
             self.assertAlmostEqual(self.stm.P[k], v, places=3, msg='STM32 ' + k)
         self.assertNotIn('TT3', saved)
         self.assertNotIn('ZOBRAW', saved)
+        self.assertEqual(saved['PL1'], (0.5, -10))                        # 放置补偿存进 place_adj.json
+        self.assertNotIn('PL2', saved)
+        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
+        self.assertEqual(adj, {'RING': [0.5, -10]})
         sp = load(self.cfg)['stm32_params']
         for k, v in want.items():
             self.assertAlmostEqual(sp[k], v, places=3, msg='配置 ' + k)

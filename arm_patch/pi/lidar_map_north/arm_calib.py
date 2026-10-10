@@ -112,6 +112,13 @@ STEPS = [
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
          text='在已经放好的物料上面再放一个时的高度，一般 = ZPLC + 物料高度(60mm)。\n'
               '可以在圆环里放一个物料，夹着第二个物料往下降到刚好叠上去。'),
+    dict(key='PL1', kind='place', adj='RING', z='ZPLC', title='第一层(平放)的放置位置', setup='place',
+         text='车别动(和"地上圆环上方的姿态"那一步同一个位置)，圆环上空着。输入 c 让爪子夹住一个物料，\n'
+              '它会停在离地约 8mm 的地方。用 1 +0.5 / 1 -0.5(沿圆环那一排)、2 +10 / 2 -10(离圆环远/近)把物料挪到圆环正中，回车保存。\n'
+              '存的是"夹着物料放准时，手臂比圆环上方的姿态多转了多少"，以后每次平放都按它补(弥补爪子夹物料的偏差)。不需要就输入 s 跳过。'),
+    dict(key='PL2', kind='place', adj='STACK', z='ZSTK', title='第二层(码垛)的放置位置', setup='place',
+         text='车别动。圆环里先放好一个物料当下面那层；输入 c 夹住第二个物料，它会停在下面那个物料上方约 8mm。\n'
+              '用 1 ± / 2 ± 把它挪到下面那个物料的正上方，回车保存。以后每次码垛都按它补。不需要就输入 s 跳过。'),
     dict(key='ZOBRNG', kind='lift', title='摄像头看圆环的高度 ZOBRNG', setup='ring_obs', optional=True,
          text='摄像头对准地上圆环时手臂停的高度。已经用 vcal 标定过的话输入 s 跳过。'),
     dict(key='A1H', kind='servo', sid=1, title='收起待命的姿态(ID1)', setup='stow',
@@ -119,9 +126,11 @@ STEPS = [
               '这一步只调 ID1(ID2 用转盘上方那一步的角度)。'),
 ]
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
+PLACE_HOVER_MM = 8.0          # 第一层/第二层放置位置那两步：物料停在离地(离下面那个物料)这么高
+PLACE_ADJ_FILE = 'place_adj.json'   # 和 mission_cfg.place_adj_file 一样(run_live 里 pcal 也写这个文件)
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
-CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring', 'PL1': 'ring', 'PL2': 'ring'}
 VIEW_LOG = '/tmp/vlive_wizard.log'
 
 
@@ -333,6 +342,11 @@ class Wizard:
             self.pose(P['A1G'], P['A2E'])
         elif kind in ('ring', 'ring_down', 'ring_obs'):
             self.pose(P['A1P'], P['A2P'])
+        elif kind == 'place':
+            adj = self._place_adj_now(st)
+            self.pose(P['A1P'] + adj[0], P['A2P'] + adj[1])     # 从上次存的位置开始(没存过就是圆环上方的姿态)
+            self.claw_to(P['CLWO'])
+            self.lift_to(P[st['z']] + PLACE_HOVER_MM)
         elif kind == 'stow':
             self.pose(P['A1H'], P['A2R'])
         if kind in ('raw_obs', 'ring_obs'):
@@ -345,6 +359,10 @@ class Wizard:
         if k == 'pose':
             n1, n2 = st['key']
             return f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   (原来 {n1}={P[n1]:g} {n2}={P[n2]:g})'
+        if k == 'place':
+            d1, d2 = self.cur[1] - P['A1P'], self.cur[2] - P['A2P']
+            o = self._place_adj_now(st)
+            return f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   比圆环上方的姿态多转 ID1 {d1:+.2f}° ID2 {d2:+.2f}°   (原来存的 {o[0]:+.2f} {o[1]:+.2f})'
         if k == 'servo':
             return f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   (原来 {st["key"]}={P[st["key"]]:g})'
         if k == 'claw':
@@ -428,6 +446,17 @@ class Wizard:
             pass
         self.out(f'  (摄像头画面关了{("：" + why) if why else ""}。输入 v 再打开)')
 
+    def _place_adj_path(self):
+        return (self.cfg_path.parent if self.cfg_path is not None else ROOT) / PLACE_ADJ_FILE
+
+    def _place_adj_now(self, st):
+        try:
+            d = json.loads(self._place_adj_path().read_text(encoding='utf-8'))
+            v = d.get(st['adj']) or [0.0, 0.0]
+            return float(v[0]), float(v[1])
+        except Exception:
+            return 0.0, 0.0
+
     def _read_servos(self):
         self.cur = {1: self.angle(1), 2: self.angle(2)}
 
@@ -451,7 +480,7 @@ class Wizard:
             self.z = P['ZHI']
         self.cur = {1: None, 2: None}
         self._q_warned = False
-        if k in ('pose', 'servo'):
+        if k in ('pose', 'servo', 'place'):
             self._read_servos()
         if k == 'claw':
             self.claw_to(P[st['key']])
@@ -598,6 +627,21 @@ class Wizard:
         elif k == 'servo':
             self._read_servos()
             self.save({st['key']: self.cur[st['sid']]})
+        elif k == 'place':
+            self._read_servos()
+            d1, d2 = self.cur[1] - self.P['A1P'], self.cur[2] - self.P['A2P']
+            path = self._place_adj_path()
+            try:
+                d = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            except Exception:
+                d = {}
+            d[st['adj']] = [round(d1, 2), round(d2, 2)]
+            path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
+            self.saved[st['key']] = (round(d1, 2), round(d2, 2))
+            self.out(f'  已保存：{st["title"]}补偿 ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path.name})')
+            self.lift_to(self.P[st['z']])                  # 放下去、松开、抬起来
+            self.claw_to(self.P['CLWO'])
+            self.lift_to(self.P['ZHI'])
         if self.released:
             self._read_servos()
             self.pose(self.cur[1], self.cur[2])     # 用手摆的：让舵机重新出力，停在摆好的位置
@@ -627,7 +671,7 @@ class Wizard:
             self.out(f'  !! 收臂失败：{e}')
         if self.saved:
             self.out('')
-            self.out('这次保存的参数：' + '  '.join(f'{k}={v:g}' for k, v in self.saved.items()))
+            self.out('这次保存的参数：' + '  '.join(f'{k}=' + ('/'.join(f'{x:g}' for x in v) if isinstance(v, tuple) else f'{v:g}') for k, v in self.saved.items()))
             if self.cfg_path is not None:
                 self.out(f'已写进 {self.cfg_path}(原文件备份为 .json.bak)，以后 map_merge_live 启动会自动发给 STM32。')
             self.out('回到正常使用：bash run_live.sh')
