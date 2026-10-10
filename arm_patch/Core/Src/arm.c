@@ -1414,6 +1414,24 @@ static volatile uint32_t qr_nbytes = 0;
 static volatile uint16_t qr_nerr = 0;
 static char              qr_last[QR_BUF];
 static volatile uint8_t  qr_last_len = 0;
+/* 扫到码以后关掉扫码模块(不再一直扫、一直响)，开跑(QR CLR)时再打开。
+ * 用 GM65 的串口指令：先读 0x0000 区(工作模式在最低两位：10 = 连续扫，01 = 等指令才扫)，只改这两位再写回去；
+ * 只写模块的内存不存 flash：模块断电重启就回到原来的连续扫。全程不阻塞主循环(Arm_Poll 里一步步走) */
+#define QRC_IDLE   0
+#define QRC_READ   1
+#define QRC_WRITE  2
+#define QRC_ON     2u                      /* 连续扫 */
+#define QRC_OFF    1u                      /* 等指令才扫(相当于关掉：不扫、不响、不亮) */
+static uint8_t           qrc_state = QRC_IDLE;
+static uint8_t           qrc_want = QRC_ON;
+static uint8_t           qrc_tries = 0;
+static uint32_t          qrc_t = 0;
+static volatile uint8_t  qrc_cap = 0;      /* 1 = 中断里把收到的字节也存进 qrc_rsp(等模块的回复) */
+static volatile uint8_t  qrc_n = 0;
+static uint8_t           qrc_rsp[32];
+static uint8_t           qr_auto_off = 1;  /* 1 = 扫到任务码就自动关(QR AUTO 0 / 1 改) */
+static int8_t            qr_scan = -1;     /* 扫码模块现在：1 开着 0 关了 -1 不知道(还没设成功过) */
+static uint8_t           qrc_fail = 0;     /* 上一次开/关模块没收到回复 */
 
 /* 在 s 里找 "ddd+ddd+ddd+ddd" 这种 15 个字符的格式，找到就复制到 out。前后有多余字符也没关系 */
 static int QR_Match(const char *s, int len, char *out)
@@ -1463,6 +1481,10 @@ void Arm_QR_RxCplt(void)
     char ch = (char)qr_rx;
 
     qr_nbytes++;
+    if (qrc_cap && qrc_n < sizeof(qrc_rsp))
+    {
+        qrc_rsp[qrc_n++] = (uint8_t)ch;           /* 等模块回复时也存一份(回复是二进制，下面照常当文字处理也没关系) */
+    }
     if (ch == '\r' || ch == '\n')
     {
         if (qr_len > 0)
@@ -1495,6 +1517,99 @@ void Arm_QR_RxRestart(void)
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
 }
 
+/* ---- 开/关扫码模块(GM65 串口指令) ---- */
+static void QRC_Send(uint8_t type, uint8_t data)
+{
+    uint8_t f[9];
+
+    f[0] = 0x7E; f[1] = 0x00; f[2] = type; f[3] = 0x01;   /* 7E 00 类型 长度1 */
+    f[4] = 0x00; f[5] = 0x00;                              /* 地址 0x0000(工作模式等) */
+    f[6] = data;                                           /* 读：读几个字节；写：写的值 */
+    f[7] = 0xAB; f[8] = 0xCD;                              /* AB CD = 不校验 */
+    __disable_irq();
+    qrc_n = 0;
+    qrc_cap = 1;
+    __enable_irq();
+    HAL_UART_Transmit(&huart5, f, 9, 30);
+    qrc_t = HAL_GetTick();
+}
+
+/* 模块的回复 02 00 00 01 数据 校验2：找到就取出数据字节 */
+static int QRC_Reply(uint8_t *d)
+{
+    int i, n = qrc_n;
+
+    for (i = 0; i + 5 <= n; i++)
+    {
+        if (qrc_rsp[i] == 0x02 && qrc_rsp[i + 1] == 0x00 && qrc_rsp[i + 2] == 0x00 && qrc_rsp[i + 3] == 0x01)
+        {
+            *d = qrc_rsp[i + 4];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void QRC_Start(uint8_t want, uint8_t tries)
+{
+    qrc_want = want;
+    qrc_tries = tries;
+    qrc_state = QRC_READ;
+    QRC_Send(0x07, 0x01);                                  /* 读 0x0000 区 1 个字节 */
+}
+
+static void QRC_Done(int ok)
+{
+    qrc_cap = 0;
+    qrc_state = QRC_IDLE;
+    qrc_fail = ok ? 0 : 1;
+    if (ok)
+    {
+        qr_scan = (qrc_want == QRC_ON) ? 1 : 0;
+    }
+}
+
+/* 主循环里一步步走：读 -> 只改最低两位 -> 写；300ms 没回复就重试 */
+static void QRC_Poll(void)
+{
+    uint8_t d, nb;
+
+    if (qrc_state == QRC_IDLE)
+    {
+        return;
+    }
+    if (QRC_Reply(&d))
+    {
+        if (qrc_state == QRC_READ)
+        {
+            nb = (uint8_t)((d & 0xFCu) | qrc_want);
+            if (nb == d)
+            {
+                QRC_Done(1);                               /* 本来就是要的模式 */
+                return;
+            }
+            qrc_state = QRC_WRITE;
+            QRC_Send(0x08, nb);
+            return;
+        }
+        QRC_Done(1);                                       /* 写好了(回 02 00 00 01 00 33 31) */
+        return;
+    }
+    if (HAL_GetTick() - qrc_t > 300u)
+    {
+        if (qrc_tries > 1)
+        {
+            qrc_tries--;
+            qrc_state = QRC_READ;
+            QRC_Send(0x07, 0x01);
+        }
+        else
+        {
+            QRC_Done(0);
+        }
+    }
+}
+
 /* 主循环里：收到一个合格的任务码。扫码模块在连续模式下会反复发同一个码：
  * 同一个码只处理一次，免得一直重写串口屏、占用主循环 */
 static void QR_Accept(const char *c)
@@ -1505,6 +1620,10 @@ static void QR_Accept(const char *c)
         qr_valid = 1;
         qr_show = 1;
         qr_said = 0;
+        if (qr_auto_off)
+        {
+            QRC_Start(QRC_OFF, 3);                 /* 扫到了：关掉扫码模块，不再一直扫、一直响 */
+        }
     }
 }
 
@@ -1570,6 +1689,7 @@ void Arm_Poll(void)
 
     /* 二维码：收到回车/换行的，中断里已经认好、锁存了 */
     QR_Fetch();
+    QRC_Poll();
     /* 不发换行的模块：60 毫秒没有新字节，就把收到的拿去解析 */
     if (qr_len != 0 && (HAL_GetTick() - qr_tick) > 60u)
     {
@@ -1624,6 +1744,7 @@ void Arm_Init(void)
     qr_len = 0;
     qr_new = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
+    QRC_Start(QRC_ON, 10);                         /* 单片机复位、扫码模块没断电时它可能还关着：打开(模块刚上电没回话就每 0.3 秒再试，最多 3 秒) */
     /* 收屏发回来的触摸坐标(选启停区)。USART2 的中断在 hal_msp.c 里也已经打开(main.c 里把优先级降到 3) */
     scr_n = 0;
     scr_ff = 0;
@@ -2057,6 +2178,28 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         qr_valid = 0;
         qr_code[0] = 0;
         qr_show = 0;
+        QRC_Start(QRC_ON, 3);                      /* 开跑前清码：扫码模块重新打开(上一轮扫到以后关掉了) */
+        return 1;
+    }
+    /* QR ON / QR OFF：手动开/关扫码模块；QR AUTO 0|1：扫到码以后要不要自动关；QR SCAN?：现在开着还是关了 */
+    if (strcmp(v, "QR") == 0 && n == 2 && (strcmp(t[1], "ON") == 0 || strcmp(t[1], "OFF") == 0))
+    {
+        QRC_Start(strcmp(t[1], "ON") == 0 ? QRC_ON : QRC_OFF, 3);
+        return 1;
+    }
+    if (strcmp(v, "QR") == 0 && n == 3 && strcmp(t[1], "AUTO") == 0 && (strcmp(t[2], "0") == 0 || strcmp(t[2], "1") == 0))
+    {
+        qr_auto_off = (uint8_t)(t[2][0] - '0');
+        return 1;
+    }
+    if (strcmp(v, "QR") == 0 && n == 2 && strcmp(t[1], "SCAN?") == 0)
+    {
+        char m[48];
+
+        snprintf(m, sizeof(m), "QRSCAN %s auto=%u%s%s\r\n",
+                 qr_scan == 1 ? "ON" : (qr_scan == 0 ? "OFF" : "UNKNOWN"), (unsigned)qr_auto_off,
+                 qrc_state != QRC_IDLE ? " busy" : "", qrc_fail ? " noreply" : "");
+        Say(m);
         return 1;
     }
 

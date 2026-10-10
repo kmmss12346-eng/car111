@@ -37,8 +37,10 @@ static int fails = 0, checks = 0;
 uint32_t HAL_GetTick(void) { return now; }
 void HAL_Delay(uint32_t ms) { now += ms; if (abort_at >= 0 && (int)now >= abort_at) car_abort = 1; }
 void Delay_Report(uint32_t ms) { HAL_Delay(ms); }
+static char qrtx[2048];                /* 发给扫码模块(UART5)的字节，十六进制 "7E 00 07 ..." 每条后面加 | */
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) {
     (void)t;
+    if (h == &huart5) { uint16_t k; for (k = 0; k < n && strlen(qrtx) < sizeof qrtx - 8; k++) { char x[4]; snprintf(x, sizeof x, k ? " %02X" : "%02X", b[k]); strcat(qrtx, x); } strcat(qrtx, "|"); }
     if (h == &huart3 && strncmp((char *)b, "YAW100", 6) != 0) strncat(pi, (char *)b, (size_t)n < sizeof pi - strlen(pi) - 1 ? (size_t)n : sizeof pi - strlen(pi) - 1);
     if (h == &huart2 && b[0] != 0xFF) { size_t room = sizeof scr - strlen(scr) - 2; strncat(scr, (char *)b, (size_t)n < room ? (size_t)n : room); strcat(scr, "|"); }
     return 0;
@@ -616,6 +618,55 @@ int main(void) {
     clear();
     { const char *nt = "111+222+333+123"; const char *p; for (p = nt; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; } now += 100; Arm_Poll(); }
     CHECK(pis("QR 111+222+333+123"), "没有换行的模块：60ms 没新字节也算收完");
+
+    /* ---- 扫到码以后关掉扫码模块(GM65 串口指令)，QR CLR 时再打开 ---- */
+    {
+        static const uint8_t r_on[] = {0x02, 0x00, 0x00, 0x01, 0xD6, 0x12, 0x34};    /* 读 0x0000 的回复：D6 = 连续扫(最低两位 10) */
+        static const uint8_t r_off[] = {0x02, 0x00, 0x00, 0x01, 0xD5, 0x56, 0x78};   /* D5 = 等指令才扫(01) */
+        static const uint8_t ack[] = {0x02, 0x00, 0x00, 0x01, 0x00, 0x33, 0x31};     /* 写成功 */
+#define QRB(a) do { size_t k_; for (k_ = 0; k_ < sizeof(a); k_++) { *rxp = (a)[k_]; Arm_QR_RxCplt(); now += 1; } } while (0)
+        const char *code = "452+321+254+312\r\n", *p;
+        run("QR CLR"); now += 1000; Arm_Poll();                               /* 前面的开/关都超时放弃，从干净的状态开始 */
+        now += 1000; Arm_Poll();
+        clear(); qrtx[0] = 0;
+        for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
+        Arm_Poll();
+        CHECK(pis("QR 452+321+254+312"), "扫到码照样发给树莓派");
+        CHECK(strstr(qrtx, "7E 00 07 01 00 00 01 AB CD|") != 0, "扫到码：先读扫码模块 0x0000 区(工作模式)");
+        qrtx[0] = 0; QRB(r_on); Arm_Poll();
+        CHECK(strcmp(qrtx, "7E 00 08 01 00 00 D5 AB CD|") == 0, "只改最低两位写回去：D6 -> D5(等指令才扫 = 关掉，不再一直响)");
+        qrtx[0] = 0; QRB(ack); Arm_Poll(); run("QR SCAN?");
+        CHECK(pis("QRSCAN OFF auto=1") && qrtx[0] == 0, "写成功：QR SCAN? 回 OFF");
+        clear(); run("QR?");
+        CHECK(pis("QR 452+321+254+312"), "关掉以后码还在，QR? 照样读得到");
+        for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
+        qrtx[0] = 0; Arm_Poll();
+        CHECK(qrtx[0] == 0, "同一个码再来一次：不再发关闭指令");
+        clear(); qrtx[0] = 0; run("QR CLR");
+        CHECK(strstr(qrtx, "7E 00 07 01 00 00 01 AB CD|") != 0, "QR CLR(开跑前清码)：重新打开扫码模块，先读");
+        qrtx[0] = 0; QRB(r_off); Arm_Poll();
+        CHECK(strcmp(qrtx, "7E 00 08 01 00 00 D6 AB CD|") == 0, "D5 -> D6(连续扫)");
+        QRB(ack); Arm_Poll(); clear(); run("QR SCAN?");
+        CHECK(pis("QRSCAN ON"), "打开了：QR SCAN? 回 ON");
+        /* 本来就是要的模式：只读不写 */
+        qrtx[0] = 0; run("QR ON"); QRB(r_on); Arm_Poll();
+        CHECK(strcmp(qrtx, "7E 00 07 01 00 00 01 AB CD|") == 0, "本来就开着：只读、不写");
+        /* 模块不回话：每 0.3 秒重试，3 次都没回就放弃，记下 noreply，主循环不卡 */
+        qrtx[0] = 0; run("QR OFF");
+        for (i = 0; i < 6; i++) { now += 310; Arm_Poll(); }
+        clear(); run("QR SCAN?");
+        CHECK(pis("noreply") && !pis("busy"), "扫码模块不回话：重试后放弃，QR SCAN? 带 noreply");
+        CHECK(strstr(qrtx, "7E 00 07 01 00 00 01 AB CD|7E 00 07 01 00 00 01 AB CD|7E 00 07 01 00 00 01 AB CD|") != 0
+              && strstr(qrtx, "7E 00 08") == 0, "不回话：读了 3 次，没写");
+        /* QR AUTO 0：扫到码不关 */
+        run("QR AUTO 0"); run("QR CLR"); now += 2000; Arm_Poll();
+        qrtx[0] = 0;
+        for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
+        Arm_Poll();
+        CHECK(qrtx[0] == 0, "QR AUTO 0：扫到码不关扫码模块");
+        run("QR AUTO 1"); run("QR CLR"); now += 2000; Arm_Poll();
+#undef QRB
+    }
 
     /* ---- 串口屏 ---- */
     clear();
