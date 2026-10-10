@@ -644,11 +644,11 @@ def run_bg(fn, tick=None, aborted=None, poll=0.1, sleep=time.sleep):
     return box.get('r')
 
 
-def leg_time(motion, seq, a, b):
-    """seq[a:b] 里的指令预计要多少秒。"""
+def leg_time(motion, seq, a, b, turn_extra=0.0):
+    """seq[a:b] 里的指令预计要多少秒。turn_extra：每次转弯另外加的秒数(紧的转弯前要停下来雷达定位)。"""
     if motion is None:
         return 0.0
-    return sum(motion.time_of(c, v) for _, c, v in seq[a:b] if c)
+    return sum(motion.time_of(c, v) + (turn_extra if c == 'R' else 0.0) for _, c, v in seq[a:b] if c)
 
 
 def home_route_legs(cfg, obstacles, start_pose, names):
@@ -905,6 +905,8 @@ class _Drive:
         self.min_travel = float(g('reloc_min_travel_mm', 0))
         self.yaw_real0 = (start or {}).get('yaw_real')
         self.leg_cuts = []                      # 这一段里因为离边线/区域太近少走的方向(世界坐标单位向量)
+        self.n_fix = [0, 0, 0]                  # 雷达定位：次数、没成功的次数；按定位修正的小动作条数
+        self.turn_extra = float(g('turn_extra_s', 0.8))
 
     # ------------------------------------------------------------ 工具
     def _recut(self):
@@ -1007,6 +1009,8 @@ class _Drive:
             self._command(cmd, val)
             self.k += 1
         self.log(f'  路线行驶共用 {time.monotonic()-self.t_start:.1f} 秒（其中指令执行 {self.t_move:.1f} 秒）')
+        if self.n_fix[0]:
+            self.log(f'  路上雷达定位 {self.n_fix[0]} 次(没成功 {self.n_fix[1]} 次)，按定位修正 {self.n_fix[2]} 条小动作')
 
     def _command(self, cmd, val):
         if cmd == 'R':
@@ -1038,6 +1042,12 @@ class _Drive:
         self.nav.moved(cmd, v)
         self.nav.ref = ref_next
 
+    def _count(self, meas):
+        self.n_fix[0] += 1
+        if not (meas or {}).get('ok'):
+            self.n_fix[1] += 1
+        return meas
+
     def _uncert(self):
         """上次雷达定位以后，按推算的位置可能差多少(mm)：approach_guard_travel_frac × 走过的距离。"""
         return float(self.cfg.get('approach_guard_travel_frac', 0.015)) * self.travel
@@ -1060,7 +1070,7 @@ class _Drive:
         if best >= u:
             return
         self.log(f'    (要原地转 {want:+.0f}°：按推算的位置转，车角离{what}只有 {best:.0f}mm，可能已经差了 {self._uncert():.0f}mm：先雷达定位)')
-        meas = _reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4)))   # 路线中间：少拍几帧，快
+        meas = self._count(_reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4))))   # 路线中间：少拍几帧，快
         if not meas.get('ok'):
             self.log(f"    ◆ 转弯前雷达定位没成功：{meas.get('why')}。照推算的转。")
             return
@@ -1079,6 +1089,7 @@ class _Drive:
             v2 = clamp_move(self.cfg, obs, self.nav.real(), c, int(round(v)), need)
             if abs(v2) >= STOP_MIN_MM:
                 self._send(c, v2, self.fine, '(转弯前定位修正)')
+                self.n_fix[2] += 1
                 self.nav.moved(c, v2)
 
     def _after_turn(self):
@@ -1098,7 +1109,7 @@ class _Drive:
                 break
         if nxt is None or abs(nxt[1]) < float(g('reloc_split_mm', 1200)) or self.travel < max(self.min_travel, 1.0):
             return
-        meas = _reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4)))   # 路线中间：少拍几帧，快
+        meas = self._count(_reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4))))   # 路线中间：少拍几帧，快
         if not meas.get('ok'):
             self.log(f"    ◆ 转弯后雷达定位没成功：{meas.get('why')}。照推算的走。")
             return
@@ -1123,6 +1134,7 @@ class _Drive:
             v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
             if abs(v2) >= STOP_MIN_MM:
                 self._send(c, v2, self.fine, '(转弯后定位修正)')
+                self.n_fix[2] += 1
                 self.nav.moved(c, v2)
 
     def _approach_cut(self, cmd, want):
@@ -1219,13 +1231,15 @@ class _Drive:
                     raise Abort(f'{stop} 扫到新障碍物后规划不出剩下的路线：{res.get("reason")}，车停在这里')
                 self._splice(res['legs'], '已换成新路线')
             meas = (res or {}).get('reloc')
+            if meas is not None:
+                self._count(meas)
             self.log(f'    站点扫描用时 {time.monotonic()-t_s:.1f} 秒')
         elif self.reloc_on and (self.reloc_stops is None or up in self.reloc_stops or
                                 any(up.startswith(s) for s in self.reloc_stops)):
             if self.travel < self.min_travel and not up.startswith('PREHOME'):
                 self.log(f'    (上次定位以后才走了 {self.travel:.0f}mm，不到 reloc_min_travel_mm={self.min_travel:.0f}，这里不定位)')
             else:
-                meas = _reloc(self.ctx, self.nav.real(), self.reloc_frames)
+                meas = self._count(_reloc(self.ctx, self.nav.real(), self.reloc_frames))
         if meas is not None:
             if meas.get('ok'):
                 self.travel = 0.0
@@ -1304,6 +1318,7 @@ class _Drive:
             if abs(v) < STOP_MIN_MM:
                 continue
             self._send(c, v, self.fine, '(定位修正)' if ok else '(补到停车点)')
+            self.n_fix[2] += 1
             self.nav.moved(c, v)
 
     # ------------------------------------------------------------ 时间
@@ -1319,8 +1334,8 @@ class _Drive:
         fin = float(self.cfg.get('home_finish_s', 10.0))
         legs = self._home_legs(name, goal)
         if legs and self.motion is not None:
-            return sum(self.motion.time_of(c, v) for L in legs for c, v in L['cmds']) + fin
-        return leg_time(self.motion, self.seq, from_k + 1, len(self.seq)) + fin
+            return sum(self.motion.time_of(c, v) + (self.turn_extra if c == 'R' else 0.0) for L in legs for c, v in L['cmds']) + fin
+        return leg_time(self.motion, self.seq, from_k + 1, len(self.seq), self.turn_extra) + fin
 
     def _time_check(self, stop, goal):
         h = self.hooks
@@ -1338,7 +1353,7 @@ class _Drive:
         nrole = _role(nname)
         if nrole is None or nrole == 'START':
             return
-        est_leg = leg_time(self.motion, self.seq, self.k + 1, nxt) + float(self.cfg.get('stop_overhead_s', 3.0))
+        est_leg = leg_time(self.motion, self.seq, self.k + 1, nxt, self.turn_extra) + float(self.cfg.get('stop_overhead_s', 3.0))
         ngoal = _marker_goal(self.seq, nxt, self.stops)
         est_home = self._home_time(nname, ngoal, nxt)
         try:
