@@ -104,7 +104,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sorted(c for c in self.w.tray.values() if c), [1, 5, 6])
 
     def test_mtest_raw_out_of_reach_is_skipped_not_chased(self):
-        """raw_seek 关掉时(以前的做法)：物料停在手臂够不着的地方就跳过，不开车去追。默认开着时见 test_raw_plate_too_far_wheels_seek_until_reachable。"""
+        """raw_seek 关掉时(以前的做法)：物料停在手臂够不着的地方就跳过，不开车去追。开着时见 test_raw_plate_too_far_wheels_seek_until_reachable。"""
         moves = self._raw_setup()
         self.h.cfg['raw_seek'] = False
         self.w.raw_items[0]['pos'] = self.w.raw_items[0]['pos'] * 0 + (0.0, 60.0)
@@ -216,6 +216,7 @@ class CliTests(unittest.TestCase):
         """物料每次都停在离车远 70mm(原料盘那边)的地方，手臂够不着：车往右(原料盘那边)挪 4cm、2cm、1cm……(一次比一次少)，够得着就夹；做完挪回停车点。"""
         for off in (70.0,):
             self._plate_world(seed=7, plate_off_mm=off)
+            self.h.cfg['raw_seek'] = True                                  # 默认关(10-11 用户：原料区车不动)；开着时的做法
             self.run_cli('mtest', 'mtest RAW 1 force any')
             text = '\n'.join(self.lines)
             self.assertEqual((self.h.stats.grab_ok, self.h.stats.grab_total), (3, 3), text)

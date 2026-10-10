@@ -42,7 +42,8 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 (None, 'zone_gain'): (1.0, 0.85),
                 (None, 'survey_frames'): (3, None),
                 ('place_shift_mm', 'F'): (-20.0, 0.0),
-                (None, 'raw_wheels_first'): (True, False)}    # 10-10：原料区只动爪子(上一版默认先动车轮)          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
+                (None, 'raw_wheels_first'): (True, False),
+                (None, 'raw_seek'): (True, False)}            # 10-11：原料区到了停车点车不动，只动爪子    # 10-10：原料区只动爪子(上一版默认先动车轮)          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
 
 
 def main(argv):
