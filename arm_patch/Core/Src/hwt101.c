@@ -153,6 +153,8 @@ extern void Link_RxCplt(void);
 extern void Link_RxRestart(void);
 extern void Arm_QR_RxCplt(void);
 extern void Arm_QR_RxRestart(void);
+extern void Arm_Scr_RxCplt(void);
+extern void Arm_Scr_RxRestart(void);
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -168,6 +170,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     else if (huart->Instance == UART5)
     {
         Arm_QR_RxCplt();
+    }
+    else if (huart->Instance == USART2)
+    {
+        Arm_Scr_RxCplt();                   /* 串口屏发回来的触摸坐标 */
     }
 }
 
@@ -185,5 +191,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     else if (huart->Instance == UART5)
     {
         Arm_QR_RxRestart();
+    }
+    else if (huart->Instance == USART2)
+    {
+        Arm_Scr_RxRestart();                /* 一定要重新开始接收：不然出一次溢出错误以后，屏上再也按不动 */
     }
 }

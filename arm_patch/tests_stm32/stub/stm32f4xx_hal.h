@@ -2,7 +2,17 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
-typedef struct { struct { uint32_t BaudRate; } Init; } UART_HandleTypeDef;
+typedef struct { int dummy; } USART_TypeDef;
+typedef struct { USART_TypeDef *Instance; struct { uint32_t BaudRate; } Init; } UART_HandleTypeDef;
+/* 串口编号(hwt101.c 的串口回调按它分)：测试里是一个假数组里的地址 */
+extern USART_TypeDef fake_usart[6];
+#define USART1 (&fake_usart[0])
+#define USART2 (&fake_usart[1])
+#define USART3 (&fake_usart[2])
+#define UART5  (&fake_usart[4])
+#define USART1_IRQn 37
+void HAL_NVIC_SetPriority(int irqn, uint32_t pre, uint32_t sub);
+void HAL_NVIC_EnableIRQ(int irqn);
 typedef struct { int dummy; } TIM_HandleTypeDef;
 #define TIM_CHANNEL_2 2
 #define TIM_CHANNEL_3 3

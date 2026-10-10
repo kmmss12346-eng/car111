@@ -8,7 +8,9 @@
  *   LIFT ZERO                              把"现在的高度"记为 0 (升降最低点)
  *   LIFT HOME                              让 ID5 驱动器自己回零(需先在驱动器里配好回零方式)
  *   LIFT <mm>                              升降到离零点(最低点)往上 mm 毫米(只能在 ZERO/HOME 之后)
- *   LIFT?                                  回 "LIFT <是否已回零> <当前mm>"
+ *   LIFT?                                  回 "LIFT <是否已回零> <当前mm> BOOT=<开机怎么认的高度>"
+ *                                          BOOT=ENC / POS：编码器找准的(POS = 以 Flash 里记的上次停下的位置为中心找的)；
+ *                                          BOOT=NOCAL / NOENC：没标定 / 读不到编码器，开机时直接当作在 60mm(可能不准)
  *
  *  ID1 / ID2 两个舵机的精确控制，用于摄像头闭环对准(哪个管伸缩看参数 AEXT，默认 ID2 伸缩、ID1 旋转)
  *   A? <1|2>                               读角度，回 "ANG <id> <度>"
@@ -33,6 +35,8 @@
  *   TAKE <n>                               从转盘 n 号位取出物料，夹着停在转盘上方
  *   DROP [S]                               手臂已经对准：下降、松开、抬起、伸缩舵机缩回(S=码垛，放在已有物料上)
  *   STOW                                   收臂待命(升到最高、缩回)
+ *   PARK                                   停车待机：像 STOW 那样收臂，再把升降降到 60mm(下次开机认高度最稳)。
+ *                                          ARMOK=0 时只降升降；升降位置不知道时回 ERR NOZERO
  *
  *  不用摄像头的完整流程(调试、应急)
  *   GRAB <n>        = OBS RAW O  + GRAB <n> H
@@ -40,15 +44,24 @@
  *   PLACE <n> [S]   = TAKE <n> + OBS RING + DROP [S]
  *
  *  二维码 / 串口屏
- *   QR?                                    回 "QR <任务码>" 或 "QR NONE"
+ *   QR?                                    回 "QR <任务码>" 或 "QR NONE"(车在走的时候扫到的码也记着：中断里就认好、存下来)
  *   QR CLR                                 清掉已读到的任务码
  *   SCR <控件名> <文字>                    往串口屏某个文本控件写字，例如 SCR t0 452+321+254+312
+ *                                          (选区页还在显示时，先自动回到比赛布局、关掉触摸，和 ZONE LOCK 一样)
  *   SCMD <淘晶驰指令>                      直接发一条串口屏指令，例如 SCMD page 1
+ *
+ *  选启停区(屏上触摸。开机屏上就是选区页：左边大按钮 1、右边大按钮 2；选好进准备页：ZONE n、状态行、START、BACK)
+ *   ZONE?                                  回 "ZONE <区> <s>"：区 = 选了几区(0 = 还没选)，s = 1 表示选区以后按过 START
+ *   ZONE ASK                               画选区页，清掉选的区和 START，打开触摸
+ *   ZONE 1 | ZONE 2                        直接选区(和在屏上按一样)，画准备页，START 清掉
+ *   ZONE MSG <文字>                        写选区页/准备页的状态行(只要 ASCII，最多 20 个字)
+ *   ZONE LOCK                              关掉触摸，清屏回到比赛布局(选的区和 START 还记着，ZONE? 照样能查)
  *
  * 另外 SET / GET 可以改/看机械臂参数(名字见 arm.c 的 tun 表)。
  * 夹爪、转盘、两个舵机的姿态、升降各个高度，用树莓派上的 arm_calib.py 一步一步标定最方便。
  *
- * STM32 -> 树莓派 额外会主动发：QR <任务码>   (扫码模块读到合格的任务码时发一次；同时自动把任务码分两行写到串口屏的 t0 和 t7)
+ * STM32 -> 树莓派 额外会主动发：QR <任务码>   (扫码模块读到合格的任务码时发一次；同时自动把任务码分两行写到串口屏的 t0 和 t7：
+ *                                            t0 = 前两组带后面的 +，如 452+321+；t7 = 后两组，如 254+312)
  */
 #ifndef __ARM_H
 #define __ARM_H
@@ -58,7 +71,7 @@
 #define SERVO_FINE_DEG  4.5f   /* 离目标这么近的小动作(摄像头微调，一步最多 4°)：转慢一点、查得勤一点，到了马上停，停得准 */
 
 void Arm_Init(void);                 /* 开机调用一次：启动夹爪/转盘 PWM，开始接收二维码 */
-void Arm_Poll(void);                 /* 主循环里反复调用：处理扫码模块收到的数据 */
+void Arm_Poll(void);                 /* 主循环里反复调用：处理扫码模块收到的任务码、屏上的触摸 */
 
 /* 返回 0 = 这条不是机械臂的指令，请继续往下判断
  *      1 = 做完了(调用者再回 DONE)
@@ -70,6 +83,8 @@ void Arm_Param_Dump(void);
 
 void Arm_QR_RxCplt(void);            /* UART5 收到 1 字节(在串口中断回调里调用) */
 void Arm_QR_RxRestart(void);         /* UART5 出错后重新开始接收 */
+void Arm_Scr_RxCplt(void);           /* USART2 收到串口屏 1 字节(触摸坐标；在串口中断回调里调用) */
+void Arm_Scr_RxRestart(void);        /* USART2 出错后重新开始接收 */
 
 void Screen_Text(const char *obj, const char *text);
 

@@ -270,6 +270,12 @@ static int Wait_Ms(uint32_t ms)
 /* ================= 升降 (Emm ID5) ================= */
 static float   lift_mm    = 0.0f;
 static uint8_t lift_known = 0;
+/* 开机时升降高度是怎么认的(LIFT? 回复里的 BOOT=)：
+ *   ENC   编码器找准的(Flash 里没有上次的位置记录，在 60mm 上下找)
+ *   POS   编码器找准的(在 Flash 里记的上次停下的位置上下找)
+ *   NOCAL 没标定，直接当作在 60mm(高度可能不准)
+ *   NOENC 读不到编码器，直接当作在 60mm(高度可能不准) */
+static const char *lift_boot_how = "NOCAL";
 
 /* 下面"编码器"那一节里的函数，Lift_Goto 要先用到 */
 static void Pos_Save(float z);
@@ -701,6 +707,7 @@ static void Lift_Boot(void)
 
     lift_known = 1;
     lift_mm = LIFT_BOOT_MM;
+    lift_boot_how = "NOCAL";
     Cal_Load();
     if (!lift_cal_ok)
     {
@@ -717,6 +724,7 @@ static void Lift_Boot(void)
     {
         near_mm = LIFT_BOOT_MM;                    /* 没有记录：当作在 60 附近 */
     }
+    lift_boot_how = "NOENC";
     for (k = 0; k < 20 && !got; k++)               /* 驱动器上电要一会儿才能回复，最多等约 3 秒 */
     {
         got = Lift_EncPos(near_mm, &z, &e);
@@ -731,6 +739,7 @@ static void Lift_Boot(void)
         return;
     }
     lift_mm = z;
+    lift_boot_how = pos_last_ok ? "POS" : "ENC";
     FmtF(s1, (int)sizeof(s1), z);
     FmtF(s2, (int)sizeof(s2), near_mm);
     snprintf(m, sizeof(m), "LIFTBOOT %s (last %s) -> %ld\r\n", s1, s2, (long)LIFT_BOOT_MM);
@@ -950,35 +959,55 @@ static const char *Seq_Stow(void)
     return NULL;
 }
 
+/* 停车待机：先像 STOW 那样收臂(升到最高 -> 缩回、ID1 转到待命角度)，再把升降降到 LIFT_BOOT_MM(60mm)。
+ * 停在 60，下次开机不管有没有标定、读不读得到编码器，认出来的高度都对(见 Lift_Boot)。
+ * ARMOK=0(姿态还没标定)时不动舵机，只降升降。升降位置不知道(急停打断过)就不动，回 ERR NOZERO */
+static const char *Seq_Park(void)
+{
+    if (!lift_known)           return "ERR NOZERO";
+
+    if (g_armok > 0.5f)
+    {
+        GO(Lift_Goto(g_zhi));
+        SERVOS(g_a1h, g_a2r, 1, g_atolc, g_aspd);
+    }
+    GO(Lift_Goto(LIFT_BOOT_MM));
+    return NULL;
+}
+
 /* ================= 串口屏 ================= */
 /* 淘晶驰(TJC)串口屏，指令后面跟三个 0xFF。两种用法(参数 SCRMODE)：
  *  1(默认) 程序自己画字：用 xstr 指令把字画在固定位置。屏的工程里不用放任何控件，只要：
- *          横屏 480x320、字库 0 = 小字(约 24 像素高)、字库 1 = 大字(80 像素高，赛规字高 ≥12mm)，都只要 ASCII
+ *          横屏 480x320、字库 0 = 小字(20~24 像素高)、字库 1 = 大字(80 像素高，赛规字高 ≥12mm)，都只要 ASCII
+ *          (ASCII 字宽是字高的一半：大字一个 40 像素宽，小字一个 10~12 像素宽)
  *  0       写控件：屏的工程里要放好名叫 t0~t7 的文本控件，发 t0.txt="文字"
  * 两种用法程序里都还是用 t0~t7 这几个名字，下面这张表就是"每个名字画在屏上哪里"(480x320 横屏)：
- *   ┌──────────────┬────────┐
- *   │ t0 任务码前半 │ t1 阶段 │  大字行 0  y=0
- *   │              │ t4 提示 │
- *   ├──────────────┤ t5 一批 │
- *   │ t7 任务码后半 │ t6 二批 │  大字行 1  y=80
+ *   ┌────────────────┬──────┐
+ *   │ t0 任务码前半   │t5 一批│  大字行 0  y=0    t0 带后面的 +：156+123+ 共 8 个大字 = 320 像素宽
+ *   │ 156+123+       │t6 二批│
+ *   ├──────────────┬─┴──────┤
+ *   │ t7 任务码后半 │ t1 阶段 │  大字行 1  y=80   t7：516+231 共 7 个大字 = 280 像素宽
+ *   │ 516+231      │ t4 提示 │
  *   ├──────────────┴────────┤
  *   │ t2 抓取数              │  大字行 2  y=160
  *   ├───────────────────────┤
  *   │ t3 放置数              │  大字行 3  y=240
- *   └───────────────────────┘ */
+ *   └───────────────────────┘
+ * (以前 t0 只有 288 宽、放不下 8 个大字，右上角是 t1/t4。t1 阶段、t4 提示的字比较长(最多 18 个小字)，
+ *  所以和字短的 t5/t6(B1 R1 G2 B3，11 个小字)换了位置) */
 #define SCR_FONT_SMALL 0
 #define SCR_FONT_BIG   1
 typedef struct { const char *obj; int16_t x, y, w, h; uint8_t font; uint16_t color; } ScrBox;
 static const ScrBox scr_box[] =
 {
-    { "t0",   0,   0, 288, 80, SCR_FONT_BIG,   65535u },   /* 白 */
+    { "t0",   0,   0, 322, 80, SCR_FONT_BIG,   65535u },   /* 白 */
     { "t7",   0,  80, 288, 80, SCR_FONT_BIG,   65535u },
     { "t2",   0, 160, 480, 80, SCR_FONT_BIG,   2016u  },   /* 绿 */
     { "t3",   0, 240, 480, 80, SCR_FONT_BIG,   65504u },   /* 黄 */
-    { "t1", 292,   2, 188, 38, SCR_FONT_SMALL, 65535u },
-    { "t4", 292,  42, 188, 38, SCR_FONT_SMALL, 63488u },   /* 红 */
-    { "t5", 292,  82, 188, 38, SCR_FONT_SMALL, 65535u },
-    { "t6", 292, 122, 188, 38, SCR_FONT_SMALL, 65535u },
+    { "t5", 326,   2, 154, 38, SCR_FONT_SMALL, 65535u },
+    { "t6", 326,  42, 154, 38, SCR_FONT_SMALL, 65535u },
+    { "t1", 292,  82, 188, 38, SCR_FONT_SMALL, 65535u },
+    { "t4", 292, 122, 188, 38, SCR_FONT_SMALL, 63488u },   /* 红 */
 };
 #define SCR_BOX_N  ((int)(sizeof(scr_box) / sizeof(scr_box[0])))
 
@@ -1022,18 +1051,6 @@ void Screen_Text(const char *obj, const char *text)
     Screen_Send(buf, snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, text));
 }
 
-/* 画模式开机先清屏(黑底)，显示 READY */
-static void Screen_Boot(void)
-{
-    char buf[16];
-
-    if (g_scrmode > 0.5f)
-    {
-        Screen_Send(buf, snprintf(buf, sizeof(buf), "cls 0"));
-        Screen_Text("t1", "READY");
-    }
-}
-
 /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
 static void Screen_Raw(const char *cmd)
 {
@@ -1043,41 +1060,313 @@ static void Screen_Raw(const char *cmd)
     HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
 }
 
+/* 回到比赛布局：画模式清屏(黑底)；写控件模式重新载入 page 0(控件都回来) */
+static void Screen_Clear(void)
+{
+    char buf[16];
+
+    if (g_scrmode > 0.5f)
+    {
+        Screen_Send(buf, snprintf(buf, sizeof(buf), "cls 0"));
+    }
+    else
+    {
+        Screen_Send(buf, snprintf(buf, sizeof(buf), "page 0"));
+    }
+}
+
+/* ================= 选启停区(串口屏触摸) =================
+ * 开机屏上先显示选区页：左半边大按钮 "1"、右半边大按钮 "2"(启停区 1 / 2)。
+ * 选好进准备页：上面 "ZONE n"，中间一行状态(树莓派用 ZONE MSG 写，例如 SCAN、PLAN OK)，
+ * 下面大按钮 START，右上角小按钮 BACK(回选区页重新选)。
+ * 按 START：s=1，状态显示 GO，以后不再收触摸(只启动一次)。
+ * 树莓派用 ZONE? 查选了几区、按没按 START；开跑时发 ZONE LOCK：关掉触摸、清屏回到比赛布局。
+ * 按下和松开都在同一个按钮里才算(按下去滑到别处再松开不算)。
+ * 屏的工程不用改：发 sendxy=1 以后，屏被按下/松开时发回 67 XH XL YH YL 事件 FF FF FF(事件 01 按下、00 松开；
+ * 屏睡眠时首字节是 68)。坐标高字节最大 01，数据里不会有连续三个 FF，所以按 FF FF FF 分帧。
+ * sendxy 屏断电就忘了：开机、ZONE ASK / ZONE n、屏重新上电(发来 88 FF FF FF)时都再发一次。
+ * 中断里只认按钮(几次比较)；画页面要阻塞两三百毫秒(9600 波特率)，都在主循环 Arm_Poll / 指令里做 */
+#define ZUI_OFF     0          /* 比赛布局，不收触摸 */
+#define ZUI_PICK    1          /* 选区页 */
+#define ZUI_READY   2          /* 准备页 */
+#define ZUI_GO      3          /* 准备页，已经按了 START(不再收触摸) */
+
+#define ZBTN_1      1          /* 按钮号 1、2 正好是区号 */
+#define ZBTN_2      2
+#define ZBTN_START  3
+#define ZBTN_BACK   4
+
+/* 按钮位置(480x320 横屏)。画按钮和认触摸用同一组数 */
+#define ZP_BTN_Y    52         /* 选区页：两个大按钮从 y=52 到底 */
+#define ZP_BTN_W    236        /* 按钮 1：x 0~235；按钮 2：x 244~479(中间 8 像素的缝按了不算) */
+#define ZR_START_Y  128        /* 准备页：START 从 y=128 到底，整个宽度 */
+#define ZR_BACK_X   336        /* 准备页：BACK 画在右上角 x 336~471、y 8~71(认触摸时右上角 x≥330、y<80 都算) */
+
+#define SCR_FB      12
+static uint8_t          scr_rx;
+static uint8_t          scr_fb[SCR_FB];    /* 正在收的一帧 */
+static uint8_t          scr_n = 0;         /* 这一帧已经收了几个字节(超过 SCR_FB 的只计数不存) */
+static uint8_t          scr_ff = 0;        /* 末尾连着几个 0xFF */
+static uint8_t          scr_ok = 0;        /* 1 = USART2 接收开起来了(收得到触摸) */
+static volatile uint8_t scr_boot = 0;      /* 屏刚上电(收到 88 FF FF FF)：主循环里重画选区页 */
+static volatile uint8_t zone_ui = ZUI_OFF; /* 现在显示哪一页(中断里按它认按钮) */
+static volatile uint8_t scr_down = 0;      /* 按下时落在哪个按钮上(0 = 没落在按钮上) */
+static volatile uint8_t scr_tap = 0;       /* 按下、松开都在同一个按钮里：按钮号，主循环取走后清 0 */
+static uint8_t          zone_sel = 0;      /* 选了几区：0 = 还没选 */
+static uint8_t          zone_go = 0;       /* 1 = 上次 ZONE ASK / ZONE n / 选区以后按过 START */
+static char             zone_msg[21];      /* 状态行(ZONE MSG 写的，最多 20 个字) */
+
+/* 触摸点落在这一页的哪个按钮上(在中断里调用，只比较几次) */
+static uint8_t Zone_Hit(uint8_t ui, uint16_t x, uint16_t y)
+{
+    if (x >= 480 || y >= 320)
+    {
+        return 0;
+    }
+    if (ui == ZUI_PICK && y >= ZP_BTN_Y)
+    {
+        if (x < ZP_BTN_W)          return ZBTN_1;
+        if (x >= 480 - ZP_BTN_W)   return ZBTN_2;
+    }
+    if (ui == ZUI_READY)
+    {
+        if (y >= ZR_START_Y)                   return ZBTN_START;
+        if (x >= ZR_BACK_X - 6 && y < 80)      return ZBTN_BACK;
+    }
+    return 0;
+}
+
+/* 在中断里：一次按下(ev=01)或松开(ev=00)。松开时还在按下的那个按钮里，才记成一次触摸 */
+static void Zone_Touch(uint16_t x, uint16_t y, uint8_t ev)
+{
+    uint8_t b = Zone_Hit(zone_ui, x, y);
+
+    if (ev == 0x01)
+    {
+        scr_down = b;
+    }
+    else if (ev == 0x00)
+    {
+        if (b != 0 && b == scr_down)
+        {
+            scr_tap = b;
+        }
+        scr_down = 0;
+    }
+}
+
+/* 在串口中断里：收屏发回来的一个字节。收满一帧(末尾三个 FF)就认：触摸帧换成按钮，开机帧记下来，
+ * 别的(比如指令出错时屏回的错误码)不管 */
+void Arm_Scr_RxCplt(void)
+{
+    uint8_t c = scr_rx;
+
+    if (scr_n == 0 && c == 0xFF)
+    {
+        /* 帧不会以 FF 开头(上一帧多出来的 FF)：丢掉 */
+    }
+    else
+    {
+        if (scr_n < SCR_FB)
+        {
+            scr_fb[scr_n] = c;
+        }
+        if (scr_n < 255)
+        {
+            scr_n++;
+        }
+        scr_ff = (c == 0xFF) ? (uint8_t)(scr_ff + 1) : 0;
+        if (scr_ff >= 3)
+        {
+            if (scr_n == 9 && (scr_fb[0] == 0x67 || scr_fb[0] == 0x68))
+            {
+                Zone_Touch((uint16_t)(((uint16_t)scr_fb[1] << 8) | scr_fb[2]),
+                           (uint16_t)(((uint16_t)scr_fb[3] << 8) | scr_fb[4]), scr_fb[5]);
+            }
+            else if (scr_n == 4 && scr_fb[0] == 0x88)
+            {
+                scr_boot = 1;
+            }
+            scr_n = 0;
+            scr_ff = 0;
+        }
+    }
+    HAL_UART_Receive_IT(&huart2, &scr_rx, 1);
+}
+
+/* USART2 出错(溢出、噪声)后重新开始接收：不重新开，以后就再也收不到触摸了 */
+void Arm_Scr_RxRestart(void)
+{
+    scr_n = 0;
+    scr_ff = 0;
+    scr_down = 0;                                  /* 按下的那一帧可能丢了，这次按的不算 */
+    HAL_UART_Receive_IT(&huart2, &scr_rx, 1);
+}
+
+/* 画一块：底色 bg 铺满 (x,y,w,h)，文字居中(字库 font、字色 fg) */
+static void Zone_Box(int x, int y, int w, int h, int font, unsigned fg, unsigned bg, const char *txt)
+{
+    char buf[96];
+
+    Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,%u,1,1,1,\"%s\"", x, y, w, h, font, fg, bg, txt));
+}
+
+/* 状态行：选区页在右上角，准备页在 "ZONE n" 下面。比赛布局时只记下来，不画 */
+static void Zone_ShowMsg(void)
+{
+    if (zone_ui == ZUI_PICK)
+    {
+        Zone_Box(240, 0, 240, 48, SCR_FONT_SMALL, 65504u, 0u, zone_msg);          /* 黄字 */
+    }
+    else if (zone_ui != ZUI_OFF)
+    {
+        Zone_Box(0, 84, 480, 40, SCR_FONT_SMALL, 65504u, 0u, zone_msg);
+    }
+}
+
+/* 准备页下半部分：没按 START 时是绿色 START 和右上角 BACK；按了以后 BACK 擦掉、START 换成黄色 GO */
+static void Zone_ShowButtons(void)
+{
+    if (zone_ui == ZUI_READY)
+    {
+        Zone_Box(ZR_BACK_X, 8, 136, 64, SCR_FONT_SMALL, 65535u, 33808u, "BACK");                 /* 灰底白字 */
+        Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 0u, 2016u, "START");      /* 绿底黑字 */
+    }
+    else
+    {
+        Zone_Box(ZR_BACK_X, 8, 136, 64, SCR_FONT_SMALL, 0u, 0u, "");
+        Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 0u, 65504u, "GO");        /* 黄底黑字 */
+    }
+}
+
+/* 把现在这一页整页画出来(约 250 字节，9600 波特率要 0.25 秒)。xy=1 先发 sendxy=1(打开触摸坐标上报) */
+static void Zone_Show(uint8_t xy)
+{
+    char buf[16];
+
+    if (zone_ui == ZUI_OFF)
+    {
+        return;
+    }
+    if (xy)
+    {
+        if (!scr_ok)
+        {
+            /* 开机时 USART2 接收没开起来：再试一次 */
+            scr_n = 0;
+            scr_ff = 0;
+            scr_ok = (HAL_UART_Receive_IT(&huart2, &scr_rx, 1) == HAL_OK) ? 1 : 0;
+        }
+        Screen_Send(buf, snprintf(buf, sizeof(buf), "sendxy=1"));
+    }
+    Screen_Send(buf, snprintf(buf, sizeof(buf), "cls 0"));
+    if (zone_ui == ZUI_PICK)
+    {
+        Zone_Box(0, 0, 240, 48, SCR_FONT_SMALL, 65535u, 0u, "START ZONE 1 OR 2");
+        Zone_Box(0, ZP_BTN_Y, ZP_BTN_W, 320 - ZP_BTN_Y, SCR_FONT_BIG, 65535u, 31u, "1");                  /* 蓝底 */
+        Zone_Box(480 - ZP_BTN_W, ZP_BTN_Y, ZP_BTN_W, 320 - ZP_BTN_Y, SCR_FONT_BIG, 65535u, 63488u, "2");  /* 红底 */
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "ZONE %d", (int)zone_sel);
+        Zone_Box(0, 0, 320, 80, SCR_FONT_BIG, 65535u, 0u, buf);
+        Zone_ShowButtons();
+    }
+    Zone_ShowMsg();
+}
+
+/* 换页：先换状态再画。关中断把还没处理的按下/触摸清掉，免得上一页的按钮算到这一页上。
+ * 选区页、准备页的状态行清空；GO 页状态行是 "GO" */
+static void Zone_Page(uint8_t ui, uint8_t sel, uint8_t xy)
+{
+    __disable_irq();
+    zone_ui = ui;
+    scr_down = 0;
+    scr_tap = 0;
+    __enable_irq();
+    zone_sel = sel;
+    zone_go = (ui == ZUI_GO) ? 1 : 0;
+    snprintf(zone_msg, sizeof(zone_msg), "%s", (ui == ZUI_GO) ? "GO" : "");
+    Zone_Show(xy);
+}
+
+/* 主循环里处理一次触摸(中断里已经认好了按钮) */
+static void Zone_Tap(uint8_t b)
+{
+    if (zone_ui == ZUI_PICK && (b == ZBTN_1 || b == ZBTN_2))
+    {
+        Zone_Page(ZUI_READY, b, 0);                /* 选好区：进准备页 */
+    }
+    else if (zone_ui == ZUI_READY && b == ZBTN_START)
+    {
+        /* 按了 START：只改下半部分和状态行(比整页重画快一半，树莓派早一点查到 s=1) */
+        __disable_irq();
+        zone_ui = ZUI_GO;
+        scr_down = 0;
+        scr_tap = 0;
+        __enable_irq();
+        zone_go = 1;
+        snprintf(zone_msg, sizeof(zone_msg), "GO");
+        Zone_ShowButtons();
+        Zone_ShowMsg();
+    }
+    else if (zone_ui == ZUI_READY && b == ZBTN_BACK)
+    {
+        Zone_Page(ZUI_PICK, 0, 0);                 /* 回去重新选 */
+    }
+}
+
+/* 选区结束：关掉触摸，清屏回到比赛布局(和开机以前一样，只是不写 READY)。选的区、按没按 START 还记着，ZONE? 照样能查 */
+static void Zone_Lock(void)
+{
+    __disable_irq();
+    zone_ui = ZUI_OFF;
+    scr_down = 0;
+    scr_tap = 0;
+    __enable_irq();
+    Screen_Clear();
+}
+
+/* 开机：收得到触摸就显示选区页(选启停区 1 还是 2)；
+ * USART2 接收没开起来(收不到触摸)就和以前一样：画模式清屏、t1 显示 READY(终端里还能用 ZONE 1 / ZONE 2 选) */
+static void Screen_Boot(void)
+{
+    zone_sel = 0;
+    zone_go = 0;
+    zone_msg[0] = 0;
+    if (scr_ok)
+    {
+        Zone_Page(ZUI_PICK, 0, 1);
+        return;
+    }
+    __disable_irq();
+    zone_ui = ZUI_OFF;
+    scr_down = 0;
+    scr_tap = 0;
+    __enable_irq();
+    if (g_scrmode > 0.5f)
+    {
+        Screen_Clear();
+        Screen_Text("t1", "READY");
+    }
+}
+
 /* ================= 二维码 (UART5) ================= */
+/* 扫码模块(连续扫描模式)每读到一次码就发一行(码 + 回车/换行)。
+ * 中断里收到回车/换行就马上在这一行里找任务码，找到就锁存起来：F/S/R、LIFT、STOW 这些指令要阻塞好几秒，
+ * 这期间主循环不跑，以前字节只能堆在缓冲里、堆满了清掉，车边走边扫到的码会丢。
+ * 主循环(Arm_Poll)只负责写屏和告诉树莓派。不发换行的模块：60 毫秒没有新字节也算收完一条(Arm_Poll 里)；
+ * 连着发、缓冲快满时，清空前在中断里也找一遍 */
 #define QR_BUF   64
 static uint8_t           qr_rx;
 static char              qr_buf[QR_BUF];
 static volatile uint8_t  qr_len = 0;
-static volatile uint8_t  qr_end = 0;
 static volatile uint32_t qr_tick = 0;
+static char              qr_latch[16];     /* 中断里锁存的任务码 */
+static volatile uint8_t  qr_new = 0;       /* 1 = qr_latch 里有主循环还没取走的码 */
 static char              qr_code[16];
 static uint8_t           qr_valid = 0;
-
-/* 在串口中断里：把收到的字节存起来。是否收完一条，交给主循环判断 */
-void Arm_QR_RxCplt(void)
-{
-    if (qr_len < QR_BUF - 1)
-    {
-        qr_buf[qr_len++] = (char)qr_rx;
-    }
-    else
-    {
-        qr_len = 0;                                /* 太长，丢掉重来 */
-    }
-    qr_tick = HAL_GetTick();
-    if (qr_rx == '\r' || qr_rx == '\n')
-    {
-        qr_end = 1;
-    }
-    HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
-}
-
-void Arm_QR_RxRestart(void)
-{
-    qr_len = 0;
-    qr_end = 0;
-    HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
-}
+static uint8_t           qr_show = 0;      /* 1 = 新码还没写屏、还没告诉树莓派 */
 
 /* 在 s 里找 "ddd+ddd+ddd+ddd" 这种 15 个字符的格式，找到就复制到 out。前后有多余字符也没关系 */
 static int QR_Match(const char *s, int len, char *out)
@@ -1109,49 +1398,132 @@ static int QR_Match(const char *s, int len, char *out)
     return 0;
 }
 
+/* 在中断里：缓冲里这一条有任务码就锁存(最多比较几百次，几微秒) */
+static void QR_Latch(void)
+{
+    char c[16];
+
+    if (qr_len >= 15 && QR_Match(qr_buf, qr_len, c))
+    {
+        memcpy(qr_latch, c, sizeof(qr_latch));
+        qr_new = 1;
+    }
+}
+
+/* 在串口中断里：存一个字节；收到回车/换行(一条收完)就找任务码 */
+void Arm_QR_RxCplt(void)
+{
+    char ch = (char)qr_rx;
+
+    if (ch == '\r' || ch == '\n')
+    {
+        QR_Latch();
+        qr_len = 0;
+    }
+    else
+    {
+        if (qr_len >= QR_BUF - 1)
+        {
+            QR_Latch();                            /* 太长(没有换行、连着发)：清空前先找一遍 */
+            qr_len = 0;
+        }
+        qr_buf[qr_len++] = ch;
+    }
+    qr_tick = HAL_GetTick();
+    HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
+}
+
+void Arm_QR_RxRestart(void)
+{
+    qr_len = 0;
+    HAL_UART_Receive_IT(&huart5, &qr_rx, 1);
+}
+
+/* 主循环里：收到一个合格的任务码。扫码模块在连续模式下会反复发同一个码：
+ * 同一个码只处理一次，免得一直重写串口屏、占用主循环 */
+static void QR_Accept(const char *c)
+{
+    if (!qr_valid || strcmp(c, qr_code) != 0)
+    {
+        memcpy(qr_code, c, sizeof(qr_code));
+        qr_valid = 1;
+        qr_show = 1;
+    }
+}
+
+/* 主循环里：取走中断里锁存的码 */
+static void QR_Fetch(void)
+{
+    char c[16];
+
+    if (!qr_new)
+    {
+        return;
+    }
+    __disable_irq();
+    memcpy(c, qr_latch, sizeof(c));
+    qr_new = 0;
+    __enable_irq();
+    QR_Accept(c);
+}
+
 void Arm_Poll(void)
 {
     char tmp[QR_BUF];
     char newc[16];
     int n;
+    uint8_t b;
 
-    /* 收完一条(收到换行)，或者 60 毫秒没有新字节(有的模块不发换行)，就拿去解析 */
-    if (qr_len == 0)
+    /* 屏刚重新上电(忘了 sendxy、画面也没了)：选区页还在用就整页重画 */
+    if (scr_boot)
     {
-        return;
+        scr_boot = 0;
+        Zone_Show(1);
     }
-    if (!qr_end && (HAL_GetTick() - qr_tick) <= 60u)
+    /* 触摸：中断里已经认好了按钮 */
+    if (scr_tap)
     {
-        return;
+        __disable_irq();
+        b = scr_tap;
+        scr_tap = 0;
+        __enable_irq();
+        Zone_Tap(b);
     }
 
-    __disable_irq();
-    n = qr_len;
-    memcpy(tmp, qr_buf, (size_t)n);
-    qr_len = 0;
-    qr_end = 0;
-    __enable_irq();
-
-    if (QR_Match(tmp, n, newc))
+    /* 二维码：收到回车/换行的，中断里已经认好、锁存了 */
+    QR_Fetch();
+    /* 不发换行的模块：60 毫秒没有新字节，就把收到的拿去解析 */
+    if (qr_len != 0 && (HAL_GetTick() - qr_tick) > 60u)
     {
-        /* 扫码模块在连续模式下会反复发同一个码：同一个码只处理一次，免得一直重写串口屏、占用主循环 */
-        if (!qr_valid || strcmp(newc, qr_code) != 0)
+        __disable_irq();
+        n = qr_len;
+        memcpy(tmp, qr_buf, (size_t)n);
+        qr_len = 0;
+        __enable_irq();
+        if (QR_Match(tmp, n, newc))
         {
-            char m[32];
-            char h1[8];
-            char h2[8];
+            QR_Accept(newc);
+        }
+    }
+    if (qr_show)
+    {
+        char m[32];
+        char h1[12];
+        char h2[8];
 
-            memcpy(qr_code, newc, sizeof(qr_code));
-            qr_valid = 1;
-            /* 屏上显示任务码。赛规要求字高不小于 12mm，3.5 寸屏一行放不下 15 个字符，所以分两行：
-             * t0 = 前两组(如 452+321)，t7 = 后两组(如 254+312)。控件名不一样就改这里 */
-            memcpy(h1, qr_code, 7);      h1[7] = 0;
+        qr_show = 0;
+        /* 屏上显示任务码。赛规要求字高不小于 12mm，3.5 寸屏一行放不下 15 个字符，所以分两行，组之间的 + 都留着：
+         * t0 = 前两组带后面的 +(如 452+321+)，t7 = 后两组(如 254+312)。控件名不一样就改这里。
+         * 选区页还在显示时不写(会盖掉按钮)，码照样记着、照样告诉树莓派 */
+        if (zone_ui == ZUI_OFF)
+        {
+            memcpy(h1, qr_code, 8);      h1[8] = 0;
             memcpy(h2, qr_code + 8, 7);  h2[7] = 0;
             Screen_Text("t0", h1);
             Screen_Text("t7", h2);
-            snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
-            Say(m);
         }
+        snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
+        Say(m);
     }
 }
 
@@ -1173,15 +1545,20 @@ void Arm_Init(void)
     HAL_UART_Init(&huart5);
 
     qr_len = 0;
-    qr_end = 0;
+    qr_new = 0;
     HAL_UART_Receive_IT(&huart5, &qr_rx, 1);       /* UART5 的中断在 hal_msp.c 里已经打开 */
+    /* 收屏发回来的触摸坐标(选启停区)。USART2 的中断在 hal_msp.c 里也已经打开(main.c 里把优先级降到 3) */
+    scr_n = 0;
+    scr_ff = 0;
+    scr_ok = (HAL_UART_Receive_IT(&huart2, &scr_rx, 1) == HAL_OK) ? 1 : 0;
 
     Servo_SetPower((uint16_t)g_spow);
     Servo_SetComp(1, g_s1comp);
     Servo_SetComp(2, g_s2comp);
 
     HAL_Delay(300);                                /* 等屏上电启动 */
-    Screen_Boot();
+    scr_boot = 0;                                  /* 这之前屏发来的开机帧不用管：下面马上画；这之后再来说明屏又重启了，Arm_Poll 重画 */
+    Screen_Boot();                                 /* 选区页(选启停区 1 / 2) */
 
     /* 升降：0 = 最低点，往上为正，最高 100mm(LFMAX)。开机读编码器找到准确高度，自动走到 60mm(见 Lift_Boot) */
     Lift_Boot();
@@ -1305,11 +1682,11 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     /* ---- 升降 ---- */
     if (strcmp(v, "LIFT?") == 0)
     {
-        char m[40];
+        char m[48];
         char b[20];
 
         FmtF(b, (int)sizeof(b), lift_mm);
-        snprintf(m, sizeof(m), "LIFT %d %s\r\n", (int)lift_known, b);
+        snprintf(m, sizeof(m), "LIFT %d %s BOOT=%s\r\n", (int)lift_known, b, lift_boot_how);
         Say(m);
         return 1;
     }
@@ -1549,11 +1926,20 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         return 1;
     }
 
+    /* ---- 停车待机：收臂 + 升降停到 60mm(ARMOK=0 时只降升降) ---- */
+    if (strcmp(v, "PARK") == 0 && n == 1)
+    {
+        r = Seq_Park();
+        if (r)  FAIL(r);
+        return 1;
+    }
+
     /* ---- 二维码 ---- */
     if (strcmp(v, "QR?") == 0 && n == 1)
     {
         char m[32];
 
+        QR_Fetch();                                /* 中断里刚锁存、主循环还没取走的码也算 */
         if (qr_valid)  snprintf(m, sizeof(m), "QR %s\r\n", qr_code);
         else           snprintf(m, sizeof(m), "QR NONE\r\n");
         Say(m);
@@ -1561,8 +1947,54 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     }
     if (strcmp(v, "QR") == 0 && n == 2 && strcmp(t[1], "CLR") == 0)
     {
+        __disable_irq();
+        qr_new = 0;                                /* 中断里锁存了还没取走的、收了一半的，一起清掉 */
+        qr_len = 0;
+        __enable_irq();
         qr_valid = 0;
         qr_code[0] = 0;
+        qr_show = 0;
+        return 1;
+    }
+
+    /* ---- 选启停区(屏上触摸)：ZONE? / ZONE ASK / ZONE 1|2 / ZONE MSG <文字> / ZONE LOCK ---- */
+    if (strcmp(v, "ZONE?") == 0 && n == 1)
+    {
+        char m[24];
+
+        snprintf(m, sizeof(m), "ZONE %d %d\r\n", (int)zone_sel, (int)zone_go);   /* 选了几区(0=还没选)、按没按 START */
+        Say(m);
+        return 1;
+    }
+    if (strcmp(v, "ZONE") == 0)
+    {
+        if (n >= 2 && strcmp(t[1], "MSG") == 0)
+        {
+            const char *p = strstr(cmd, "MSG") + 3;
+            int k = 0;
+
+            while (*p == ' ')
+            {
+                p++;
+            }
+            while (*p != 0 && k < (int)sizeof(zone_msg) - 1)
+            {
+                if (*p >= 0x20 && *p <= 0x7E && *p != '"')   /* 字库只有 ASCII；双引号会弄坏屏的指令，去掉 */
+                {
+                    zone_msg[k++] = *p;
+                }
+                p++;
+            }
+            zone_msg[k] = 0;
+            Zone_ShowMsg();
+            return 1;
+        }
+        if (n != 2)                                FAIL("ERR ARG");
+        if (strcmp(t[1], "ASK") == 0)              Zone_Page(ZUI_PICK, 0, 1);
+        else if (strcmp(t[1], "1") == 0)           Zone_Page(ZUI_READY, 1, 1);
+        else if (strcmp(t[1], "2") == 0)           Zone_Page(ZUI_READY, 2, 1);
+        else if (strcmp(t[1], "LOCK") == 0)        Zone_Lock();
+        else                                       FAIL("ERR ARG");
         return 1;
     }
 
@@ -1598,6 +2030,10 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             p++;
         }
         txt[k] = 0;
+        if (zone_ui != ZUI_OFF)
+        {
+            Zone_Lock();                           /* 选区页还在显示(没发 ZONE LOCK 的旧树莓派程序)：先回到比赛布局再写 */
+        }
         Screen_Text(obj, txt);
         return 1;
     }
