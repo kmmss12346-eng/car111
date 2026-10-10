@@ -61,7 +61,7 @@ class SimLink:
 class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
-                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, raw_scale=None, tilt=None, ap_bias=None,
+                 park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
                  qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC'):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
@@ -127,7 +127,7 @@ class SimWorld:
         self.plate_move = float(plate_move_s)
         self.plate_t0 = 0.0
         self.plate_r = 150.0
-        self.plate_c = np.array([self.plate_r + float(plate_off_mm), 0.0])
+        self.plate_c = np.array([self.plate_r + float(plate_off_mm), float(plate_off_tan)])   # plate_off_tan：物料停的地方沿车头方向偏了多少(车停得前/后了)
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
         # 二维码：扫码器只有车停在 QR 点前后挪 qr_window=(下限, 上限) mm 以内时才看得到码(None = 一直看得到)；
         # STM32 读到一次就一直存着(qr_code)，QR CLR 才清掉；qr_latch_moving = 新程序：车在走的时候读到的也存下来；

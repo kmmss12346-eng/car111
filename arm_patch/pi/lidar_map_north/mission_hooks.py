@@ -100,6 +100,9 @@ DEFAULTS = dict(
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
     raw_any_order=True,                 # (10-11 用户：来一个夹一个)原料盘停下时哪个需要的颜色在爪子附近就夹哪个，不等指定颜色；False = 按任务码顺序 True = 不按任务码顺序：哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)。
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
+    raw_seek=True,                      # (10-11 用户：自由移动到够得着为止)原料盘停下时要夹的物料都停在手臂够不着的地方：车轮沿车头方向前后挪过去
+                                        #   (不横移，不压线)，下一次停下再夹；记住这个位置，同一轮第二批到原料区直接挪到这里
+    raw_seek_steps_mm=[40, 20, 10, 5],  # (10-11 用户)原料盘停下时扫不到/够不着要夹的物料：车往前挪 4cm，再不行挪 2cm、1cm、0.5cm，一次比一次少
     raw_claw_close_s=0.15,              # 发出"合上"到夹爪真的夹住大约要多久(秒)
     lift_init='skip',                   # 升降位置：STM32 开机读编码器自己找准高度并走到 60mm，一般不用管。'home'=让驱动器回零；'zero'/'skip'=不自动记零
     lift_park_mm=60.0,                  # 跑完回到启停区后升降停在这里：下次开机时升降必须在 60±20mm 内，编码器才能认出准确高度；None=不停。
@@ -297,7 +300,9 @@ class MissionHooks:
         self._ring_ready = False            # 手臂现在就在这个工位的圆环上方、爪子张开(刚放完/刚看完圆环)：去下一个环不用整套 OBS
         self._at_obs = False                # 手臂就在观察姿态(刚 OBS 过、还没动过)：去第一个环不用再 OBS 一遍
         self._zone_d2 = []                  # 这个工位里每次对准好时 (底盘前后位移, ID2 比 A2P 多转的度数)：车离圆环那一排的远近
-        self._ret_bias = [0.0, 0.0]         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
+        self._ret_bias = [0.0, 0.0]
+        self._raw_seek_F = 0.0              # 原料区：车停在停车点前后多少毫米时够得着物料(挪着找到的，第二批直接用)
+        self._seek = None         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -1114,6 +1119,11 @@ class MissionHooks:
     def _raw(self, visit):
         if not self._can_work():
             return
+        self._raw_seek_begin()
+        self._raw_body(visit)
+        self._raw_seek_end()
+
+    def _raw_body(self, visit):
         batch = 1 if visit <= 1 else 2
         try:
             self.arm.params(refresh=True)                         # 升降速度可能刚 set 过：算下爪提前量要用最新的
@@ -1178,7 +1188,7 @@ class MissionHooks:
                 self.log('    ★ 时间到，不再抓取')
                 break
             self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
-            self._recenter(min_mm=20.0)
+            self._raw_recenter()
             got = None
             try:
                 self.arm.obs('RAW', open_claw=True)
@@ -1201,11 +1211,62 @@ class MissionHooks:
         self._show_stats()
         self._stow_quiet()
 
+    # ------------------------------------------------------------------ 原料区：车轮前后挪到够得着物料的地方
+    def _raw_seek_begin(self):
+        self._seek = {'last': None, 'jf': None, 'stop': None, 'told': False}
+        J = self.store.get('RAW', 'ch') if self.store is not None else None
+        if J is not None and float(np.hypot(*np.asarray(J, float)[:, 1])) > 0.2:
+            self._seek['jf'] = np.asarray(J, float)[:, 1]
+        f = float(self._raw_seek_F)
+        if self.cfg.get('raw_seek', True) and self.act is not None and abs(f) >= 3:
+            self.log(f'    原料区：上次在停车点{"前面" if f > 0 else "后面"} {abs(f):.0f}mm 够得着物料，直接挪过去')
+            self.act.chassis_move(0, int(round(f)))
+
+    def _raw_seek_end(self):
+        """原料区做完：车挪回停车点(路线下一段从停车点算)。"""
+        self._seek = None
+        if self.act is None:
+            return
+        d = self.act.disp
+        if abs(d['S']) >= 1 or abs(d['F']) >= 1:
+            self._return_to_stop('RAW')
+
+    def _raw_recenter(self):
+        """挪回原料区的工作位置：停车点，或者挪着找到的够得着物料的地方(raw_seek)。"""
+        d = self.act.disp
+        tgt = float(self._raw_seek_F) if self.cfg.get('raw_seek', True) else 0.0
+        s, f = -float(d['S']), tgt - float(d['F'])
+        if math.hypot(s, f) < 20.0:
+            return
+        self.log(f'    底盘挪回原料区的工作位置：前进 {f:+.0f}mm、横移 {s:+.0f}mm')
+        self.act.chassis_move(int(round(s)), int(round(f)))
+
+    def _raw_seek(self, e, tag, stop_id):
+        """原料盘停下了，要夹的物料扫不到/手臂够不着：车往前挪一步(用户 10-11 定的：先 4cm，再 2cm、1cm、0.5cm，一次比一次少)，
+        下一次停下再看。每次停下最多挪一次，只往前挪(不横移，不压线)。挪了返回 True。"""
+        cfg, sk = self.cfg, self._seek
+        if not cfg.get('raw_seek', True) or sk is None or self.act is None or sk.get('stop') == stop_id:
+            return False
+        sk['stop'] = stop_id
+        steps = list(cfg.get('raw_seek_steps_mm') or [])
+        k = sk.setdefault('k', 0)
+        if k >= len(steps):
+            if not sk['told']:
+                sk['told'] = True
+                self.log(f'  {tag} 往前已经挪了 {self.act.disp["F"]:.0f}mm 还是扫不到/够不着：不再挪，原料区停车点要调')
+            return False
+        f = float(steps[k])
+        sk['k'] = k + 1
+        self.log(f'  {tag} 扫不到/够不着要夹的物料：车往前挪 {f:g}mm(第 {k + 1} 次)，下一次停下再看')
+        self.act.chassis_move(0, int(round(f)))
+        self._raw_seek_F = float(self.act.disp['F'])
+        return True
+
     def _grab_item(self, item):
         cfg = self.cfg
         self.log(f'  ▶ 抓第{item.batch}批 #{item.index + 1}：{item.color_name} -> 转盘 {item.slot} 号槽')
         self._ui('stage', f'RAW GRAB {item.index + 1}/3 {item.color_short}')
-        self._recenter(min_mm=20.0)                 # 上一个物料对准时底盘挪过的话先挪回停车点，免得这个物料出了视野
+        self._raw_recenter()                        # 上一个物料对准时底盘挪过的话先挪回(够得着物料的)位置，免得这个物料出了视野
         self.arm.obs('RAW', open_claw=True)
         md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
         if md is not None and hasattr(md, 'need_vmask') and md.need_vmask(item.color) and not self._warned_vmask:
@@ -1431,6 +1492,11 @@ class MissionHooks:
                             what = '、'.join(f'{x[2][2].color_name if x[2][2] is not None else x[2][0]} {x[0]:.0f}mm' for x in seen) or '一个也没看到'
                             self.log(f'  {tag} 这次停下，爪子附近没有要夹的颜色({what})：等下一次停')
                         tries = 2
+                        if self._raw_seek(None, tag, stop_id):
+                            t_arm = self.now()
+                            stream.close()
+                            stream = self._raw_stream(color)  # 车挪过：重新比画面
+                            hist, cnt, fresh = [], 0, 0
                         continue
                     d, _f, cand, e = min(near, key=lambda x: x[0])
                     if cand[2] is not None:
@@ -1442,6 +1508,11 @@ class MissionHooks:
                         said.add(('far', stop_id))
                         self.log(f'  {tag} 这次物料停在别的位置(离爪子点约 {np.linalg.norm(e) / v.scale("RAW"):.0f}mm，手臂够不着)：等它转到爪子下面')
                     tries = 2
+                    if self._raw_seek(e, tag, stop_id):
+                        t_arm = self.now()
+                        stream.close()
+                        stream = self._raw_stream(color)      # 车挪过：重新比画面
+                        hist, cnt, fresh = [], 0, 0
                     continue
                 probe = False
                 if J is None:
