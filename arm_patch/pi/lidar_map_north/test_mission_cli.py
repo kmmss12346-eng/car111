@@ -772,9 +772,11 @@ class ConfigScriptTests(unittest.TestCase):
         path = os.path.join(d, 'cfg.json')
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'px_per_mm': {'RAW': 4.36, 'RING': 2.96}, 'tol_mm': {'RAW': 3.0},
-                                       'accept_mm': {'RAW': 5.0}, 'learn_pick': True, 'chassis_fine_rpm': 80}}, f)
+                                       'accept_mm': {'RAW': 5.0}, 'learn_pick': True, 'chassis_fine_rpm': 80,
+                                       'raw_stop_s': 5.0, 'raw_frames': 2}}, f)
         apply_mission_config.main([path])
         mc = load(path)['mission_cfg']
+        self.assertEqual((mc['raw_stop_s'], mc['raw_frames']), (4.0, 1))       # 10-10 写进配置的旧默认值也升级
         self.assertEqual(mc['px_per_mm']['RAW'], 1.97)              # 没改过的旧默认值 -> 新默认值
         self.assertEqual(mc['tol_mm']['RAW'], 2.0)
         self.assertEqual(mc['accept_mm']['RAW'], 5.0)               # 用户自己改过的不动

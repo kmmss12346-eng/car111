@@ -587,6 +587,8 @@ class MissionHooks:
         cfg, v = self.cfg, self.vision
         single = len(cands) == 1
         color = cands[0][0] if single else None
+        if single and cands[0][2] is not None and label == '抓':
+            label = f'抓{cands[0][2].color_short}'           # 不按顺序抓、只剩最后一个：日志里也写上颜色
         tag = f'[{label}]'
         J = self.store.get('RAW', 'arm') if self.store is not None else None
         static_s = float(cfg.get('raw_static_s', 9.0))
