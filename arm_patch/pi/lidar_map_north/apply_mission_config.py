@@ -31,7 +31,8 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 (None, 'ring_strafe_max_mm'): ((40.0, 40), 20.0),   # 10-10：工位里横移最多 20mm(停车点离白区只有 60mm，40 太近)
                 (None, 'wheels_min_mm'): (1.5, 4.0),
                 (None, 'raw_any_order'): (False, True),       # 10-10：原料区爪子下面停的是要抓的哪个颜色就夹哪个
-                (None, 'wheels_first'): (False, True)}        # 10-10：工位对准尽量先慢慢动车轮，最后才动爪子          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
+                (None, 'wheels_first'): (False, True),        # 10-10：工位对准尽量先慢慢动车轮，最后才动爪子
+                (None, 'raw_wheels_first'): (True, False)}    # 10-10：原料区只动爪子(上一版默认先动车轮)          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
 
 
 def main(argv):

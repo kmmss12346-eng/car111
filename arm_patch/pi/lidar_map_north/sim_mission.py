@@ -792,7 +792,7 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
 
 
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False)
-LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=True, wheels_first=True)
+LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True)
 
 
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
@@ -932,7 +932,7 @@ class MissionSimTests(unittest.TestCase):
         self.assertEqual([c for c in w.tray.values() if c], [5])        # 黑色留在车上
 
     def test_live_defaults_whatever_stops_under_the_claw_and_wheels_first(self):
-        """比赛默认(10-10 用户要的)：原料区爪子下面停的是哪个就夹哪个、对准先慢慢动车轮：全抓到、全放对、不空夹。"""
+        """比赛默认(10-10 用户要的)：原料区爪子下面停的是哪个就夹哪个(只动爪子)、工位对准先慢慢动车轮：全抓到、全放对、不空夹。"""
         for seed in range(3):
             w = SimWorld(seed=300 + seed, code=self.CODE)
             h = make(w, dict(LIVE_DEFAULTS))

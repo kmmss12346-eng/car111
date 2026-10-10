@@ -932,7 +932,7 @@ class ConfigScriptTests(unittest.TestCase):
         self.assertEqual(mc['wheels_min_mm'], 4.0)
         self.assertIs(mc['wheels_first'], True)          # 10-10：先慢慢动车轮
         self.assertIs(mc['raw_any_order'], True)         # 10-10：爪子下面停的是哪个就夹哪个
-        self.assertIs(mc['raw_wheels_first'], True)
+        self.assertIs(mc['raw_wheels_first'], False)      # 10-10：原料区只动爪子
         self.assertIs(mc['zone_filter'], True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'mission_cfg': {'ring_strafe_max_mm': 30}}, f)
