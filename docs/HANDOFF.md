@@ -1,4 +1,169 @@
-# 接手说明：粗加工区 / 暂存区对准(接着 3bf4a39 做的)
+# 接手说明（最新：2026-10-10 晚，全流程整合，还没开始改代码）
+
+分支 `claude/tender-heisenberg-2t1awl`。**先读完这一节，再读 `docs/integration/spec.md`（分工和接口）和 `docs/integration/analysis_*.md`（6 份分析报告）。**
+文末"附：上一位留下的交接"是更早的工位对准交接，仍然有效。
+
+## 一、现在的状态
+
+**代码：** 和 44b740d 一样（工位对准提速的 WIP，详见文末附录）。分析时跑过一遍树莓派全套测试，231 个全过；STM32 主机测试（`bash arm_patch/tests_stm32/run.sh`）arm 105、chassis 32、servo 38，全过。
+
+**这次做了什么：**
+- 没改代码。
+- 做了全面分析，写成 6 份报告：导航执行、路线规划、STM32 底盘、屏幕/扫码/升降、整场任务、比赛规则。
+- 定好了分 5 块并行实现的分工和接口，写在 spec.md。
+- 刚开始实现，用户就叫停了。改了一半的东西没有保存。
+
+**用户的车上有、仓库里没有的模块：** `lidar_map_live.py`、`ld14p_scan.py`、`pose_fix.py`、`merge_stations.py`、`reference_correction.py`、`stm32_link.py`、`home_fix.py`，还有地图配置。
+- **不能**把它们放进更新包，也不能替换车上的版本。
+- `docs/pi_snapshot_1006/` 里有 10 月 6 日的配置，以及 `lidar_map_live.py`、`home_fix.py` 的旧副本，用来看函数签名和几何。
+- 仓库里的 `route_plan.py`、`auto_run.py`、`map_merge_live.py` 就是车上正在跑的版本，和上一个更新包 1010i 逐字节相同。
+- 分析报告里提到的 `scratchpad/...` 脚本是上一位的临时文件，**接手的人看不到**，要用就照报告的描述重写。
+
+## 二、用户这次的要求（10-10 原话整理）
+
+1. **工位放置太慢。**
+   - 用户原话："先第一次校准再第二次放太浪费时间"。
+   - 调整的幅度要小、要慢。
+   - 用户希望到了附近先慢速小幅动轮子去找，实在不行再动爪子。
+   - 注意：分析结论是 wheels_first 在模拟里更慢、失败更多（见 analysis_mission.md 第 3 节）。默认先保持关闭，再加 `mtest … wheels` 让用户上车对比；回复用户时要解释原因。
+2. **扫码读不到时，前后挪一点再读。**
+   - 扫码器装在车的**右后方**，离车后边约 20 mm、离右边约 40 mm，也就是在车中心后 125 mm、右 90 mm。
+   - 车停在 QR 点时，扫码器离码中心约 125 mm（偏 42°），而且码板位置每场随机 ±100 mm。
+3. **车不能碰到原料盘、各工位和障碍物。** 压到黄色区域或工位区，本轮结束、0 分。转弯要留出余量。
+4. **待机时升降自动停到 60 mm。** 开机自动认高度要求升降在 60 附近。
+5. **屏幕选启停区。**
+   - 屏上显示选择启停区 1 还是 2；
+   - 选完把车放好，车自己对准；
+   - 比赛开始后不能再碰电脑（不能再敲 `y`）。
+6. **回启停区要非常准。** 雷达定位效果不错，但有时还是会跑出地图（0 分）。
+7. **把所有任务连起来完整跑一次。** 启停区 1 从来没测过。
+8. **底盘更平稳。** 少抖动、动作衔接更顺；出错要有补救办法；用户没想到的也要考虑到。
+
+## 三、分析查出的重点（细节和行号在各报告里）
+
+1. **【高，已复现】回家前定位中途失败后，会接着执行原路线剩下的指令，车冲出场地。**
+   - 位置：`auto_run.py:181-186` 加 `map_merge_live.py:336-360`。
+   - 见 analysis_nav-exec.md 第 0 节。
+2. **【高】路线中途完全没有雷达修正。**
+   - `relocalize` 导入了但从没调用。
+   - 配置里有一组 v16 的键（`reloc_*`、`plan_footprint_mm`、`zone_margin_mm`、`cam_side_targets`），代码一个都不读。
+   - 蒙特卡洛估计常规误差下整场压线概率约 0.69；每个停车点加每次转弯后都用雷达修正，降到约 0。
+3. **【高，规则】`go` 以后还要在电脑上敲 `y`**（`auto_run.py:279`）。另外规划在 x86 上就要 13～15 s，加上第二次扫描，会超过"15 s 不动本轮结束"。
+4. **【高】时间到了不会提前回家。** `drive` 里没有时间检查；计时从创建 MissionHooks 时就开始了。
+5. **【高】扫码。**
+   - 开跑前从不发 `QR CLR`，可能读到上一轮的旧码；
+   - QR 停车点对不准码；
+   - 读不到就整轮不夹放。
+6. **【高】启停区 1 照现在的配置会冲出北边界。**
+   - 车头改朝西（START2 绕场地中心转 +90°：`(x,y,h)->(2400-y, x, h+90)`）就和区 2 等价，第二站动作可以原样用。
+   - START1 停车点的车头也要改成 180。
+7. **【中】`flatten` 悄悄丢掉小于 20 mm 的移动**（`auto_run.py:42`），误差会累积。ROUGH y=340、TEMP x=340、第二站都不在 25 mm 栅格上。
+8. **【中】规划余量。**
+   - 暂存区、粗加工区、转盘、场地边都没有硬余量；
+   - 黄区余量会降到 15 甚至 0；
+   - `ring_strafe_max_mm`=40 时，工位里车离白区只剩 5～20 mm。
+9. **【中】底盘抖动，来源已定位（chassis.c）。**
+   - 转弯末段在 0 和 ±8 rpm 之间来回切；
+   - 转弯刹车的减速度超过驱动器斜坡；
+   - 横移前馈从 CA 切到 CD 时跳一下；
+   - 横移航向环用硬死区、不滤波。
+   - R 只接受整数度，ALTOL 1.5°。
+10. **【中】STM32 完全不收屏发回来的数据**（USART2 没开接收）。触摸选区要改固件：`sendxy=1` 后解析 0x67 帧，不用改屏的工程。
+11. **【中】升降只有正常跑完才停 60。** abort、出错、mtest、退出程序时都不停。建议在 STM32 加 `PARK` 指令；abort 后不要自动动。
+12. **【低】其他。**
+    - 第二批在暂存区找不到同色下层时会平放（0 分，还多算放置数）；
+    - 屏上任务码缺"+"；
+    - 噪声跳变会被当成发散，把 servo_cal.json 里的 J 删掉；
+    - 车宽 260 加雷达 40 正好 300，没有余量；
+    - 转盘 x 位置也随机 ±100（RAW 停车点固定）。
+
+## 四、建议的做法
+
+按 `docs/integration/spec.md` 分 5 块做。文件归属互不重叠，可以并行；接口按 spec 的"Interface contract"来。每块要做的事，上一位写的详细任务清单如下（spec 里的各块范围是它的简版）：
+
+- **pi-nav**（auto_run.py、map_merge_live.py、新 reloc.py）
+  - 修回家重放 bug，回家每一步都按真实车身限幅，保证不出场地；
+  - 快速 ICP（reloc.py），每个停车点先重定位再修正；
+  - flatten 把余数带到下一条，不再丢；
+  - 时间不够时从当前点直接回家（预先算好回家路线）；
+  - 启停区配置切换（`zone 1|2`）；
+  - 屏幕一键启动流程：查 `ZONE?` → 选区 → 开跑前先扫第一次并预规划 → 按 START → 不再问 `y`；
+  - 车长时间不动时调用 `hooks.keepalive()`；
+  - 退出时停 60。
+- **pi-plan**（route_plan.py）
+  - 加硬余量（`zone_margin_mm`、`edge_margin_mm`），黄区余量最低到 15 为止；
+  - 规划提速 3 倍以上；
+  - 新增 `pose_clear`、`moves_clear`、`plan_leg`；
+  - 每段都精确停到停车点；
+  - 测试两个启停区。
+- **pi-mission**（mission_hooks.py 等）
+  - hooks 的接口：`prepare`、`start_clock`、`go_home_now`、`set_home_eta`、`keepalive`、`park`；
+  - 扫码前后挪着找（避开障碍物，最后回到停车点）；
+  - 时间管理；
+  - 第二批找不到同色就跳过；
+  - 屏幕显示；
+  - 发散判断；
+  - `mtest wheels/nofilt`；
+  - 车身斜 3° 以上提醒并提前补偿；
+  - `ring_strafe_max_mm` 改成 20；
+  - apply_mission_config 加上新键。
+- **stm32-chassis**（chassis.c、main.c）
+  - 转弯末段平滑；
+  - 横移前馈平滑，航向环照直行环的做法改；
+  - 精确模式：速度 ≤ PSPD（默认 70）的移动加减速更柔、航向修正阈值降到 0.5°；
+  - R 支持小数；
+  - 补主机测试。
+- **stm32-io**（arm.c、hwt101.c）
+  - 屏幕触摸；
+  - `ZONE?`、`ZONE ASK`、`ZONE 1|2`、`ZONE MSG`、`ZONE LOCK`；
+  - `PARK`；
+  - `LIFT?` 回复里加 `BOOT=`；
+  - 二维码在中断里锁存；
+  - 补主机测试。
+
+做完：
+1. 合并，全部测试跑通；
+2. 再做一轮对抗审查；
+3. 打更新包，带上 e6b5c72 和 44b740d 以后的全部改动：`树莓派/lidar_map_north/` 加 STM32 的 `Core/Src`、`Core/Inc` 文件；
+4. 给用户写中文的传输、烧录、上车测试步骤。
+
+## 五、用户的习惯（回复和交付）
+
+**回复：** 用中文，操作步骤要写详细。
+
+**树莓派：**
+- 地址 `zstu@10.109.173.12`，程序在 `/home/zstu/lidar_map_north/`。
+- 更新包放 E 盘，用 PowerShell 传：
+  ```
+  scp "E:\car111_update_XXXX.zip" zstu@10.109.173.12:/home/zstu/
+  ```
+- 然后在树莓派上（先在 run_live 里输入 `q` 退出）：
+  ```
+  cd ~
+  unzip -o car111_update_XXXX.zip
+  cp -r ~/car111_update_XXXX/树莓派/lidar_map_north/* ~/lidar_map_north/
+  cd ~/lidar_map_north
+  python3 apply_mission_config.py
+  bash run_live.sh
+  ```
+
+**STM32：**
+- Keil 工程在 `E:\CubeMXcode\car_2027 - zhengshiban`（路径不要改）。
+- 烧录步骤：
+  1. Keil 里 Rebuild（F7）；
+  2. `scp "...\MDK-ARM\car_2027\car_2027.hex" zstu@10.109.173.12:/home/zstu/`；
+  3. run_live 里先 `arm LIFT 60`，再 `q`；
+  4. `openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program /home/zstu/car_2027.hex verify reset exit"`。
+
+**提交：**
+- 先 fetch 再 merge，不 rebase、不 force，因为别的对话也往这个分支推。
+- 提交信息结尾带上 attribution 行。
+- 不写模型名。
+- 没有要求就不开 PR。
+
+---
+
+# 附：上一位留下的交接：粗加工区 / 暂存区对准(接着 3bf4a39 做的)
 
 分支 `claude/tender-heisenberg-2t1awl`。这次提交是**做到一半停下的**：
 `bash arm_patch/run_tests.sh` 在最后几处改动之后**没有完整跑过**，接手先跑一遍。
