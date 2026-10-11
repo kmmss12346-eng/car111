@@ -55,6 +55,8 @@ RAW_CAR_FIXED = True   # (10-11 用户：写死)原料区：车开到停车点�
 
 DEFAULTS = dict(
     enabled=True,
+    full_course=True,                   # (10-11 用户：车一定要跑完全程)True = 不因为时间、没任务码、没活可干提前回家，每个停车点都去；
+                                        #   时间也不限制开始新的物料(每个物料最多等 raw_track_s)。比赛要 3 分钟内回家时改 false
     time_limit_s=150.0,                 # 每轮 3 分钟；超过它就不再做夹放，留出时间让车开回启停区(一次路线最后一段大约 20~30 秒)。
                                         #   每个物料开始前还要来得及在这之前做完(按实测的每个物料用时)
     round_s=180.0,                      # 一轮多长(赛规 3 分钟)：导航告诉了回家要多久(set_home_eta)时，按它算还来不来得及
@@ -91,7 +93,7 @@ DEFAULTS = dict(
     qr_prescan_s=60.0,                  # (10-11 用户：直接扫码)开跑前这么多秒以内手拿码板对着扫码器扫到的码留着用(0 = 开跑时清掉)
     qr_fixed_code=None,
     qr_fallback_code=None,              # (10-11 用户：扫不出来也要接着做)QR 点读不到码时用的备用任务码；null = 读不到就不做夹放                 # (10-11 用户)手动给任务码，例如 "652+312+526+231"：不扫二维码，到 QR 点直接用它(屏上照样显示)；null = 正常扫码
-    raw_track_s=150.0,                  # (10-11 用户：一定要夹起来)等要抓的物料转过来、停在爪子下面最多等多久(秒)；150 = 一直等到 time_limit_s。以前 30
+    raw_track_s=40.0,                   # (10-11 用户：没夹到就接着做下一个)等要抓的物料转过来、停在爪子下面最多等多久(秒)，到了就跳过做下一个
     raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
     raw_motion_frac=0.004,              # 前后两帧画面(爪子以外)变了的地方超过这个比例 = 原料盘在转
@@ -447,6 +449,8 @@ class MissionHooks:
         role = role_of(next_role, self.cfg.get('stop_aliases')) if next_role else None
         if role == 'START':
             return False
+        if self.cfg.get('full_course', True):
+            return False                                   # (10-11 用户)跑完全程：每个停车点都去
         if self.out_of_time:
             self.log(f'  ★ 时间不够了(前面已经停止开始新的物料)：不去 {next_role}，直接回家')
             return True
@@ -599,6 +603,8 @@ class MissionHooks:
 
     def _no_time(self, kind, what, quiet=False):
         """再开始一个 kind 的物料(grab/place/pick/stack)来不来得及：来不及返回原因(并记下 out_of_time，让车回家)，来得及返回 None。"""
+        if self.cfg.get('full_course', True):
+            return None                                    # (10-11 用户)跑完全程：不按时间停
         need = self._item_s(kind)
         left = self._work_deadline() - self.now()
         if left >= need:
@@ -617,7 +623,7 @@ class MissionHooks:
         """粗加工区放完 n 个：取回几个以后还来得及开到暂存区把它们放下再回家(取回 k 个 + 暂存区放 k 个 + 路上 + 回家 + 余量)。
         来不及的就不取回：取回要时间，物料放在粗加工区已经算了分，留在那儿不吃亏，车早点回家。
         不知道回家要多久(导航没给 set_home_eta)时不判断，返回 n。"""
-        if self.home_eta_s is None or n <= 0:
+        if self.home_eta_s is None or n <= 0 or self.cfg.get('full_course', True):
             return n
         cfg = self.cfg
         # 偏保守：取回了却去不成暂存区，白花时间，物料还从算了分的地方拿走了
@@ -1228,7 +1234,7 @@ class MissionHooks:
             try:
                 self.arm.obs('RAW', open_claw=True)
                 self._raw_goto_pose()
-                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + float(cfg['time_limit_s']))
+                t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + (1e9 if cfg.get('full_course', True) else float(cfg['time_limit_s'])))
                 got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
@@ -1333,7 +1339,7 @@ class MissionHooks:
             self.log(f'    ★ 没标定爪子区域(claw_mask.png)：{item.color_name}物料挨着蓝色爪子时可能认错。赛前在 map_merge_live 里做一次 vmask')
         if hasattr(self.vision, 'material_stream'):
             t_end = min(self.now() + max(float(cfg['raw_wait_s']), float(cfg.get('raw_track_s', 30.0))),
-                        self.t0 + float(cfg['time_limit_s']))
+                        self.t0 + (1e9 if cfg.get('full_course', True) else float(cfg['time_limit_s'])))
             return self._raw_stop_grab(item.color, item.slot, 'grab', t_end, f'抓{item.color_short}')
         # 旧的视觉模块(没有一帧一帧认的功能)：等停稳，再闭环对准
         still, last = self.vision.wait_still(item.color, timeout_s=cfg['raw_wait_s'])

@@ -44,7 +44,7 @@ OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0
                 ('place_shift_mm', 'F'): (-20.0, 0.0),
                 (None, 'raw_wheels_first'): (True, False),
                 (None, 'raw_seek'): (True, False),
-                (None, 'raw_track_s'): (30.0, 150.0),
+                (None, 'raw_track_s'): ((30.0, 150.0, 150), 40.0),
                 (None, 'raw_max_iter'): (3, 1),
                 (None, 'raw_grab_max_mm'): ((5.0, 12.0, 12), 30.0)}   # 10-11：原料区修一次就夹，30mm 以内都夹         # 10-11：原料区一定要夹起来，等到时间用完为止            # 10-11：原料区到了停车点车不动，只动爪子    # 10-10：原料区只动爪子(上一版默认先动车轮)          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
 
