@@ -26,7 +26,7 @@ _KEYS = {2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6', 8: '7', 9: '8', 10: '9'
          71: '7', 72: '8', 73: '9', 75: '4', 76: '5', 77: '6', 79: '1', 80: '2', 81: '3', 82: '0', 78: '+'}
 _SHIFT_KEYS = {13: '+'}              # Shift + '=' = '+'(美式键盘布局)
 MAX_LINE_S = 1.0                     # 一整条码最多用多久"打"完才算扫码器(人手打字比这慢得多)
-_NAME_HINT = re.compile(r'scan|barcode|bar code|qr|gm65|gm6|symbol|honeywell|newland|zebra|datalogic', re.I)
+_NAME_HINT = re.compile(r'scan|barcode|bar code|qr|gm65|gm6|usbkey|symbol|honeywell|newland|zebra|datalogic', re.I)   # usbkey：10-11 车上这个扫码器叫 "USBKey Chip USBKey Module"
 
 
 def _devices():
