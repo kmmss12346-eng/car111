@@ -120,5 +120,32 @@ class ArmLinkTests(unittest.TestCase):
         self.assertIsNone(a.qr())
 
 
+
+class ProcReaderProtocolTests(unittest.TestCase):
+    def test_parent_parses_child_lines(self):
+        """(10-11)子进程写 CODE / SCANNER / LOG 行，父进程记下码、扫码器、转发日志；clear 以后同一个码再读到也算。"""
+        logs = []
+        r = qr_usb.ProcReader.__new__(qr_usb.ProcReader)
+        r.log, r._lock, r.code, r.t, r.scanner = logs.append, __import__('threading').Lock(), None, 0.0, None
+        r.handle('LOG   扫码器读到任务码：142+321+142+213\n')
+        r.handle('SCANNER /dev/input/event4\n')
+        r.handle('CODE 142+321+142+213\n')
+        self.assertEqual(r.get(), '142+321+142+213')
+        self.assertEqual(r.scanner, '/dev/input/event4')
+        self.assertEqual(logs, ['  扫码器读到任务码：142+321+142+213'])
+        r.clear()
+        self.assertIsNone(r.get())
+        r.handle('CODE 142+321+142+213\n')
+        self.assertEqual(r.get(), '142+321+142+213')
+
+    def test_syn_dropped_resets_the_line(self):
+        """内核丢了按键(SYN_DROPPED)：这一行作废，不拼出错的码。"""
+        import struct
+        rd = qr_usb.Reader(log=lambda m: None, devices=lambda: [])
+        ev = lambda typ, code, val, t=1.0: struct.pack(qr_usb._FMT, int(t), int((t % 1) * 1e6), typ, code, val)
+        rd.feed('/dev/input/event9', ev(1, 2, 1) + ev(0, 3, 0) + ev(1, 28, 1))
+        self.assertIsNone(rd.get())
+
+
 if __name__ == '__main__':
     unittest.main()

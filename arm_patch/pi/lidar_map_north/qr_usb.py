@@ -142,6 +142,9 @@ class Reader:
         for i in range(0, len(data) - _SIZE + 1, _SIZE):
             sec, usec, typ, code, value = struct.unpack(_FMT, data[i:i + _SIZE])
             t = sec + usec / 1e6
+            if typ == 0 and code == 3:                # SYN_DROPPED：内核缓冲满了丢了按键，这一行作废
+                self._buf[path] = ''
+                continue
             if typ != _EV_KEY:
                 continue
             if code in _SHIFT:
@@ -180,15 +183,103 @@ class Reader:
             self._grab(path)
 
 
+class ProcReader:
+    """(10-11)在单独的进程里读扫码器，和 Reader 一样用(get / clear / code / t / scanner)。
+    run_live 里雷达、摄像头、画图很忙，后台线程抢不到 Python 的 GIL，扫码器"打"一条码的一百来个按键事件
+    内核只缓冲 64 个，读晚了就丢键、拼不出码(手拿着单独测能读到、跑的时候读不到就是这个)。单独的进程不受影响。"""
+
+    def __init__(self, log=print):
+        import subprocess
+        import sys
+        self.log = log
+        self._lock = threading.Lock()
+        self.code = None
+        self.t = 0.0
+        self.scanner = None
+        self._p = subprocess.Popen([sys.executable, '-u', os.path.abspath(__file__), '--serve'],
+                                   stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, bufsize=1)
+        threading.Thread(target=self._pump, daemon=True).start()
+        import atexit
+        atexit.register(self.stop)
+
+    def _pump(self):
+        for line in self._p.stdout:
+            self.handle(line)
+
+    def handle(self, line):
+        line = line.rstrip('\n')
+        if line.startswith('CODE '):
+            with self._lock:
+                self.code = line[5:].strip()
+                self.t = time.monotonic()
+        elif line.startswith('SCANNER '):
+            self.scanner = line[8:].strip()
+        elif line.startswith('LOG '):
+            self.log(line[4:])
+
+    def get(self):
+        with self._lock:
+            return self.code
+
+    def clear(self):
+        with self._lock:
+            self.code = None
+
+    def start(self):
+        pass
+
+    def stop(self):
+        try:
+            self._p.terminate()
+        except Exception:
+            pass
+
+
+def _serve():
+    """子进程：读扫码器，每读到一条码就往 stdout 写一行 CODE …(同一个码反复读到也每次都写)。"""
+    r = Reader(log=lambda m: print('LOG ' + m, flush=True))
+    line0 = r._line
+    grab0 = r._grab
+
+    def line(path, text):
+        line0(path, text)
+        m = _CODE.search(text or '')
+        if m:
+            print('CODE ' + m.group(1), flush=True)
+
+    def grab(path):
+        grab0(path)
+        print('SCANNER ' + path, flush=True)
+
+    r._line = line
+    r._grab = grab
+    try:
+        r._run()
+    except KeyboardInterrupt:
+        pass
+
+
 _reader = None
 
 
 def reader(log=print):
-    """全程只开一个后台读取线程。QR_USB=0 或者没有 /dev/input 时返回 None。"""
+    """全程只开一个读扫码器的后台(默认单独的进程；QR_USB_PROC=0 用以前的线程)。QR_USB=0 或者没有 /dev/input 时返回 None。"""
     global _reader
     if os.environ.get('QR_USB', '1') == '0' or not os.path.isdir('/dev/input'):
         return None
     if _reader is None:
+        if os.environ.get('QR_USB_PROC', '1') != '0':
+            try:
+                _reader = ProcReader(log=log)
+                return _reader
+            except Exception as ex:
+                log(f'  (扫码器读取进程开不起来：{ex!r}，改用线程)')
         _reader = Reader(log=log)
         _reader.start()
     return _reader
+
+
+if __name__ == '__main__':
+    import sys as _sys
+    if '--serve' in _sys.argv:
+        _serve()
