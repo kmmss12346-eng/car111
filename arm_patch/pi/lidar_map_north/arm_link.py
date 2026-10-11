@@ -100,10 +100,14 @@ class ArmLink:
                 return m.group(1)
         return None
 
-    def qr_clear(self):
-        """清掉存的任务码(树莓派 USB 扫码器的和 STM32 的)。返回 STM32 是否回了 DONE。"""
-        if getattr(self, "usb_qr", None) is not None:
-            self.usb_qr.clear()
+    def qr_clear(self, keep_recent_s=0.0):
+        """清掉存的任务码(树莓派 USB 扫码器的和 STM32 的)。返回 STM32 是否回了 DONE。
+        keep_recent_s > 0：USB 扫码器在这么多秒以内刚读到的码留着(开跑前手拿码板扫一下就用它)。"""
+        u = getattr(self, "usb_qr", None)
+        if u is not None:
+            import time as _t
+            if not (keep_recent_s and u.get() and _t.monotonic() - float(getattr(u, 't', 0.0) or 0.0) <= float(keep_recent_s)):
+                u.clear()
         ok, _reply, _info = self.request('QR CLR', 2.0)
         return bool(ok)
 

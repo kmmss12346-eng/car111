@@ -88,6 +88,7 @@ DEFAULTS = dict(
     raw_wheels_first=False,             # (10-10 用户：原料区只动爪子)True = 原料区对准先动车轮(沿车头方向前后小步慢慢挪，每次最多 wheels_step_mm、wheels_rpm 转/分)，
                                         #   差不到 wheels_min_mm 再动手臂；车轮不横移(不会压进原料区)。要先做过 vcal RAW 颜色号(不加 arm)，
                                         #   存了车轮和画面的对应关系才有用，没有就只动手臂。False = 只动手臂(以前的做法)
+    qr_prescan_s=60.0,                  # (10-11 用户：直接扫码)开跑前这么多秒以内手拿码板对着扫码器扫到的码留着用(0 = 开跑时清掉)
     qr_fixed_code=None,                 # (10-11 用户)手动给任务码，例如 "652+312+526+231"：不扫二维码，到 QR 点直接用它(屏上照样显示)；null = 正常扫码
     raw_track_s=150.0,                  # (10-11 用户：一定要夹起来)等要抓的物料转过来、停在爪子下面最多等多久(秒)；150 = 一直等到 time_limit_s。以前 30
     raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
@@ -386,10 +387,14 @@ class MissionHooks:
                     return False
         if not self._prep.get('qr'):
             try:
-                ok = self.arm.qr_clear()
+                keep = float(self.cfg.get('qr_prescan_s', 60.0) or 0.0)
+                ok = self.arm.qr_clear(keep_recent_s=keep) if keep > 0 else self.arm.qr_clear()
                 if ok is False:
                     self.sleep(0.1)
-                    ok = self.arm.qr_clear()        # 串口偶尔一次没回话：再清一次
+                    ok = self.arm.qr_clear(keep_recent_s=keep) if keep > 0 else self.arm.qr_clear()   # 串口偶尔一次没回话：再清一次
+                u = getattr(self.arm, 'usb_qr', None)
+                if keep > 0 and u is not None and u.get():
+                    self.log(f'  开跑前扫码器刚读到任务码 {u.get()}：到 QR 点直接用它')
                 if ok is False:
                     raise ArmError('QR CLR 没有回 DONE')
                 self.arm.screen_reset()             # 屏可能刚清过(ZONE LOCK)：每个控件都重新写

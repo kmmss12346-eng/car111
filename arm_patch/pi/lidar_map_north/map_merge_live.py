@@ -590,6 +590,9 @@ def main():
         bad=link.sync_params(sp_,log=lambda m:print(m,flush=True))
         synced[0]=True
         if sp_:print(f'已把配置里的 {len(sp_)} 个运动参数发给 STM32'+(f'（{len(bad)} 个失败）' if bad else '')+'。',flush=True)
+    try:                                                # (10-11)一启动就占住 USB 扫码器：开跑前手拿码板扫一下就记下，码也不会打进终端
+        import qr_usb;qr_usb.reader(lambda m:print(m,flush=True))
+    except Exception:pass
     def make_hooks():
         if not (raw_cfg.get('mission_cfg') or {}).get('enabled',False):return None
         # 机械臂任务钩子：QR 读码、RAW 抓取、ROUGH/TEMP 放置、START 显示统计(见 mission_hooks.py)

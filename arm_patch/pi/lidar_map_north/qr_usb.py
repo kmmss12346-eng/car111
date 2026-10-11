@@ -171,8 +171,11 @@ class Reader:
         if not m:
             return
         with self._lock:
+            new = m.group(1) != self.code
             self.code = m.group(1)
             self.t = time.monotonic()
+        if new:
+            self.log(f'  扫码器读到任务码：{m.group(1)}')
         if self.scanner != path and path in self._fds:
             self._grab(path)
 
