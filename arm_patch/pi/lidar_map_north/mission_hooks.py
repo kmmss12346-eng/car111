@@ -97,9 +97,11 @@ DEFAULTS = dict(
     raw_keepalive_s=12.0,               # 等物料转过来时手臂这么多秒没动过，就轻轻摆一下 ID1(规则：机器人停止运行 15 秒、等转盘时 23 秒本轮结束)；0 = 不摆
     raw_keepalive_deg=1.0,              # 摆多少度(ID1，摆过去马上回来)
     raw_frames=2,                       # 原料区对准时每次测量用几帧(一帧最快，停下来的时间有限)
-    raw_max_iter=3,                     # 原料区对准最多修正几次(果断：差不多就下爪)
+    raw_max_iter=1,                     # (10-11 用户：不要一直校准)原料区对准最多修正几次，以前 3
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
-    raw_grab_max_mm=5.0,                # 原料盘停的时间到了就按当时的偏差下爪，只要不超过这个(爪子每边约 5mm 余量，再大会砸到物料)
+    raw_force_grab=True,                # (10-11 用户：一定要夹)修完偏差还大、越对越偏、停的时间到了：只要偏差不超过 raw_force_max_mm 照样下爪
+    raw_force_max_mm=60.0,
+    raw_grab_max_mm=30.0,               # (10-11 用户：误差 30mm 以内都可以夹)修正完按当时的偏差下爪，只要不超过这个。以前 5
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
     raw_any_order=False,                # (10-11 晚 用户：原料区要按顺序夹，不能随机夹)False = 按任务码顺序一个一个等着夹；True = 哪个需要的颜色停在爪子附近就先夹哪个(放进它自己的槽)。只想这一次不按顺序：mtest RAW 1 force any
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
@@ -1525,6 +1527,8 @@ class MissionHooks:
                         if q is not None:
                             d = math.hypot(q[0], q[1]) / v.scale('RAW')
                             far_c = self._raw_reachable(J, np.array(q, float)) if (J is not None) else ''
+                            if far_c and cfg.get('raw_force_grab', True) and d <= float(cfg.get('raw_force_max_mm', 60.0)):
+                                far_c = ''
                             seen.append((d, far_c, c, np.array(q, float)))
                     near = [x for x in seen if not x[1]]
                     if not near:
@@ -1544,6 +1548,8 @@ class MissionHooks:
                         lab = f'抓{cand[2].color_short}'
                         self.log(f'  {tag} 这次停在爪子附近的是{cand[2].color_name}：先夹它(放 {cand[1]} 号槽)')
                 far = self._raw_reachable(J, e) if (J is not None) else ''
+                if far and cfg.get('raw_force_grab', True) and np.linalg.norm(e) / v.scale('RAW') <= float(cfg.get('raw_force_max_mm', 60.0)):
+                    far = ''                                  # (10-11 用户：一定要夹)手臂转到头也去夹
                 if far:
                     if ('far', stop_id) not in said:
                         said.add(('far', stop_id))
@@ -1590,10 +1596,20 @@ class MissionHooks:
             return ''
         lim = (self.servo.cfg.get('arm_limit_deg') or {}) if self.servo is not None else {}
         out = []
+        dc = np.array(d, float)
         for i, key in enumerate(('id2', 'id1')):
             lm = 0.95 * float(lim.get(key, 250.0 if key == 'id2' else 12.0))
             if abs(d[i]) > lm:
                 out.append(f'{"ID2" if i == 0 else "ID1"} 要转 {d[i]:+.0f}°，最多 ±{lm:.0f}°')
+                dc[i] = math.copysign(lm, d[i])
+        if out and self.vision is not None:
+            # (10-11 用户：误差 30mm 以内都可以夹)手臂转到头以后剩下的偏差在 raw_grab_max_mm 以内：也算够得着，去夹
+            try:
+                rest = float(np.linalg.norm(np.asarray(e, float) + np.asarray(J, float) @ dc)) / float(self.vision.scale('RAW'))
+                if rest <= float(self.cfg.get('raw_grab_max_mm', 5.0)):
+                    return ''
+            except Exception:
+                pass
         return '，'.join(out)
 
     def _raw_wheels(self):
@@ -1626,7 +1642,10 @@ class MissionHooks:
                              allow_chassis=allow, label=label, bounds=v.bounds('RAW'), confirm=False, **kw)
         self.log(f'    对准结果：{res}')
         err = float(res.err_mm)
-        if '误差变大' in (res.reason or ''):
+        force = bool(cfg.get('raw_force_grab', True)) and math.isfinite(err) and err <= float(cfg.get('raw_force_max_mm', 60.0))
+        if force and ('误差变大' in (res.reason or '') or err > grab_max or self.now() > deadline + 0.25):
+            self.log(f'    ★ 偏差 {err:.1f}mm({res.reason or "到时间了"})：一定要夹，照样下爪')
+        elif '误差变大' in (res.reason or ''):
             self._raw_bad_j = getattr(self, '_raw_bad_j', 0) + 1
             if self._raw_bad_j == 2:
                 self.log('    ★ 连着两次越对越偏：存的原料区对应关系(J)可能不对(以前在转盘转的时候测的？)。'
@@ -1636,10 +1655,10 @@ class MissionHooks:
         if not math.isfinite(err):
             self.log(f'    ★ 对准中途看不到物料了({res.reason})：不下爪，等下一次停')
             return False
-        if err > grab_max:
+        if err > grab_max and not force:
             self.log(f'    ★ 偏差 {err:.1f}mm，超过 {grab_max:g}mm，下爪会砸到物料：不下爪，等下一次停')
             return False
-        if self.now() > deadline + 0.25:
+        if self.now() > deadline + 0.25 and not force:
             self.log('    ★ 对准超时太多，原料盘马上要转了：不下爪，等下一次停')
             return False
         if mode == 'nogo':

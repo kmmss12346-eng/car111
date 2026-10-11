@@ -793,7 +793,7 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
 
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
-              survey_frames=3)   # 这些测试写的时候工位用的是新做法；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+              survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False)   # 这些测试写的时候工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
 LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
 
 
@@ -1024,7 +1024,7 @@ class MissionSimTests(unittest.TestCase):
         w.placed.clear()
         w.rings.clear()
         w.tray = {1: None, 2: None, 3: None}
-        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None, place_shift_mm=dict(F=0.0, S=0.0))}, log=lambda m: None, vision=w.vision,
+        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None, place_shift_mm=dict(F=0.0, S=0.0), raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False)}, log=lambda m: None, vision=w.vision,
                           now=w.now, sleep=w.advance, store=h.store)
         run_mission(w, h2)
         aps_warm = sum(1 for r in w.requests[n0:] if r.startswith('AP'))
@@ -1322,6 +1322,7 @@ class ZoneFlowTests(unittest.TestCase):
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), ring_survey=False, ring_offset_mm=bad,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             lines = []
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
             h = MissionHooks({'mission_cfg': cfg}, log=lines.append, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, log=lines.append)
             self._assert_all_good(w, h, '\n'.join(lines), seed)
@@ -1533,6 +1534,7 @@ class TiltTests(unittest.TestCase):
             w.vision.ring_error = ring_error
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False, ring_precorrect=True, zone_filter=True, zone_frames=2, zone_gain=1.0,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
@@ -1581,6 +1583,7 @@ class NavFlowTests(unittest.TestCase):
             lines = []
             cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
             h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
                              sleep=w.advance, store=st)
             nav = dict(leg_s=10.0, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})
