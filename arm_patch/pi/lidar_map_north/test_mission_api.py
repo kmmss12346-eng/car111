@@ -357,6 +357,12 @@ class QrSearchTests(unittest.TestCase):
         self.assertIn('读到了(扫码器对着 1260 左右)', text)
         self.assertEqual(w.screen['t0'], '156+123+')
 
+    def test_fallback_code_when_scan_fails(self):
+        """(10-11 用户)扫不出码：用 qr_fallback_code 接着做后面的任务。"""
+        w, h, text = self.run_qr((5000.0, 5100.0), cfg={'qr_fallback_code': '231+312+123+132'})
+        self.assertEqual(h.plan.code, '231+312+123+132', text)
+        self.assertIn('备用任务码', text)
+
     def test_fixed_code_skips_scanning(self):
         """(10-11 用户)qr_fixed_code：不扫码、不前后挪，直接用手动给的任务码。"""
         w, h, text = self.run_qr(None, cfg={'qr_fixed_code': '231+312+123+132'})
