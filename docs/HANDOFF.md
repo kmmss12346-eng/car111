@@ -32,6 +32,10 @@
 - arm_calib：加 PL1/PL2 两步；ZPLC/ZSTK 升降还在高处(>40/100mm)按回车要再按一次确认（用户误存过 100）。
 - 另一个对话（10-11）：原料区停在 RAW 点只动手臂、一次修正就下爪（30mm 内下爪，最多强制 60mm）、等物料最长 raw_track_s；
   `full_course` 默认开（不看时间，整条路线跑完）；行驶时默认不理地图障碍物（只用于规划，exec_obstacles=true 恢复）。
+- 10-12 停车点旁边的障碍物（用户："障碍物离指定的点太近……跑不到 1200,2100"）：route_plan.leg 以前车身离障碍物不到
+  margin_mm(60，看不清的圆柱 +80)就把停车点改到别处(差 25~280mm)。现在只在停车点附近 `goal_relax_radius_mm`(450) 内放宽，
+  按圆柱真实半径最少留 `goal_obstacle_min_margin_mm`(10)，准确停在停车点；真车碰到才沿车头方向挪(`goal_shift_max_mm` 300)，
+  note、leg['goal_shift']、到站日志写清楚差多少（有 hooks.stop_offset(stop, 往前mm, 往左mm) 时也告诉它）。测试 test_route_goal_obstacle。
 
 ## 4. 还没做完 / 要留意
 - 用户问过"原料区下爪允许偏差 5mm 太严，改一下"，中途打断了，没定数值（现在另一个对话已改成 30mm 内下爪）。
