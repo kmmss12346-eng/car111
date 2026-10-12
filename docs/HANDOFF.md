@@ -1,3 +1,48 @@
+# 接手说明（最新：2026-10-12，先读这一节；下面"更早的交接"是历史记录，结论可能已经过时）
+
+## 0. 规矩（用户定的，必须遵守）
+- 分支 `claude/tender-heisenberg-2t1awl`，**好几个 Claude 对话同时在推**：每次先 `git fetch` + `git merge`，不要 rebase、不要 force push。
+- 回复用户用中文，步骤要详细；不要主动开 PR。
+- 提交信息结尾加用户要求的 Co-Authored-By / Claude-Session 两行；提交、文件里都不要写模型名字。
+- 交付方式：打 zip 包 `car111_update_<日期><字母>.zip`，里面是 `car111_update_XXX/树莓派/lidar_map_north/*`（只放仓库里 `arm_patch/pi/lidar_map_north` 的文件，包括 testdata/）。
+  - 包和解压出来的目录不提交：加进 `.git/info/exclude`。
+  - **车上独有、不能放进包、不能替换的模块：** lidar_map_live、ld14p_scan、pose_fix、merge_stations、reference_correction、stm32_link、home_fix、地图配置（map_config_*.json）、place_adj.json、servo_cal.json、vision_cal.json。
+  - 用户安装：`scp "E:\car111_update_XXX.zip" zstu@10.109.173.12:/home/zstu/`，然后车上
+    `cd ~; unzip -o car111_update_XXX.zip; cp -r ~/car111_update_XXX/树莓派/lidar_map_north/* ~/lidar_map_north/; cd ~/lidar_map_north; python3 apply_mission_config.py; bash run_live.sh`
+  - STM32 烧录：Core 文件拷到 Keil 工程 `E:\CubeMXcode\car_2027 - zhengshiban`，F7 编译，scp hex，run_live 里 `arm LIFT 60` 再 `q`，
+    `openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program /home/zstu/car_2027.hex verify reset exit"`；烧之前确认 `stm32f4xx_it.c` 里有 `HAL_UART_IRQHandler(&huart2)`。
+- 改默认值时：在 `apply_mission_config.py` 的 OLD_DEFAULTS 里加一条"旧默认 -> 新默认"，车上已有的旧配置才会跟着改。
+
+## 1. 测试
+- 树莓派：`cd arm_patch/pi/lidar_map_north && ls test_*.py | sed 's/.py//' | xargs python3 -m unittest sim_mission`（2026-10-11 晚是 442 个，全过；约 100 秒）。
+- STM32 主机测试：`bash arm_patch/tests_stm32/run.sh`。
+- sim_mission 里 `make()` 会套用 LEGACY（老测试写法）；测"比赛默认值"的用例单独写（如 `test_1010i_defaults_place_everything`）。
+
+## 2. 用户最近定下的做法（别再改回去）
+- **原料区按任务码顺序夹，不能随机夹**：`raw_any_order=False`（10-11 晚定的；另一个对话曾改成 True，已改回）。只这一次不按顺序：`mtest RAW 1 force any`。
+- 原料区、工位取放总体按 1010i（= 提交 8faa371）的做法：take_first / wheels_first / zone_filter / ring_precorrect / tilt_precorrect / return_bias 默认都关。
+- **启停区 1**：和区 2 上下对称，车在两个区里**都是车头朝北**摆。`auto_run.zone_pose`：(x, y, h) -> (x, 2400-y, 180-h)；
+  第二站动作换区时"前进"和"顺时针"取反（区 2：左 42、前 83、顺 60；区 1：左 42、后 83、逆 60）；PREHOME 在启停区靠场地里面那一侧。
+  （以前按"绕场地中心转 90°、区 1 车头朝西"算，用户实测扫描、规划全错。）
+- 放置补偿 `place_adj.json`（RING=第一层平放，STACK=第二层码垛，[dID1, dID2] 度）：由 `arm_calib.py` 第 PL1/PL2 步，或 run_live 里 `pcal 1/2` 量出来；任务里加在摄像头对准以后的姿态上。
+- 任务码：run_live 里直接输入 `652+312+526+231` 等于 `mcode …`；`qr` 读到码会自动设好。另一个对话加了 `qr_fixed_code` / `qr_fallback_code` / USB 扫码器独立进程读码。
+
+## 3. 最近的改动（按时间，详见 git log）
+- 工位看圆环：认 2 号环改按"沿圆环那一排"的距离；"底盘挪 40mm 测出来车身斜了"超过 12° 不信（10-10 实车日志：认错一位、退了 286mm）。测试 `test_survey_real_log_parked_at_ring2_far_from_row`。
+- arm_calib：加 PL1/PL2 两步；ZPLC/ZSTK 升降还在高处(>40/100mm)按回车要再按一次确认（用户误存过 100）。
+- 另一个对话（10-11）：原料区停在 RAW 点只动手臂、一次修正就下爪（30mm 内下爪，最多强制 60mm）、等物料最长 raw_track_s；
+  `full_course` 默认开（不看时间，整条路线跑完）；行驶时默认不理地图障碍物（只用于规划，exec_obstacles=true 恢复）。
+
+## 4. 还没做完 / 要留意
+- 用户问过"原料区下爪允许偏差 5mm 太严，改一下"，中途打断了，没定数值（现在另一个对话已改成 30mm 内下爪）。
+- 启停区 1 新算法只在模拟里跑通过，**还没上车验证**；要看用户的扫描/第二站/路线截图。
+- 用户的车上 `place_adj.json` 可能是按旧算法(相对 A1P)量的，新算法相对摄像头对准姿态：建议用户 `python3 arm_calib.py --from PL1` 重调，或 `pcal clear`。
+- 最新的包：car111_update_1011h（原料区按顺序 + 启停区 1 修正）。之后另一个对话又推了很多提交，下次打包前先合并、跑全套测试。
+
+---
+
+# 更早的交接
+
 # 接手说明（最新：2026-10-10 晚，全流程整合，还没开始改代码）
 
 分支 `claude/tender-heisenberg-2t1awl`。**先读完这一节，再读 `docs/integration/spec.md`（分工和接口）和 `docs/integration/analysis_*.md`（6 份分析报告）。**
