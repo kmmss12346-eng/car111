@@ -102,8 +102,7 @@ DEFAULTS = dict(
                                         #   差不到 wheels_min_mm 再动手臂；车轮不横移(不会压进原料区)。要先做过 vcal RAW 颜色号(不加 arm)，
                                         #   存了车轮和画面的对应关系才有用，没有就只动手臂。False = 只动手臂(以前的做法)
     qr_prescan_s=60.0,                  # (10-11 用户：直接扫码)开跑前这么多秒以内手拿码板对着扫码器扫到的码留着用(0 = 开跑时清掉)
-    qr_fixed_code=None,
-    qr_fallback_code=None,              # (10-11 用户：扫不出来也要接着做)QR 点读不到码时用的备用任务码；null = 读不到就不做夹放                 # (10-11 用户)手动给任务码，例如 "652+312+526+231"：不扫二维码，到 QR 点直接用它(屏上照样显示)；null = 正常扫码
+    qr_fixed_code=None,                 # (10-11 用户)手动给任务码，例如 "652+312+526+231"：不扫二维码，到 QR 点直接用它(屏上照样显示)；null = 正常扫码(比赛用 null)
     raw_track_s=40.0,                   # (10-11 用户：没夹到就接着做下一个)等要抓的物料转过来、停在爪子下面最多等多久(秒)，到了就跳过做下一个
     raw_stop_s=5.0,                     # 原料盘每次停多久(秒)，没看到它完整停过一次之前先按这个算(保守一点)；看到以后按实测的
     raw_still_px=6.0,                   # 这一帧物料位置和前两帧比变了不到这么多像素 = 没在动(转盘转的时候一帧要走二三十像素)
@@ -350,17 +349,9 @@ class MissionHooks:
         t_start = self.now()
         self._items_t = 0.0
         try:
-            if role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and not str(self.cfg.get('qr_fixed_code') or '').strip() \
-                    and str(self.cfg.get('qr_fallback_code') or '').strip() and self.visits.get('QR', 0) >= 1:
-                self.log(f'    QR 点没读到码：用备用任务码 {self.cfg.get("qr_fallback_code")}')
-                if self._use_code(str(self.cfg.get('qr_fallback_code')).strip()):
-                    self._plan_fallback = True
             if role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and str(self.cfg.get('qr_fixed_code') or '').strip():
                 self.log(f'    用配置里手动给的任务码 {self.cfg.get("qr_fixed_code")}(路线里没有 QR 点也行)')
                 self._use_code(str(self.cfg.get('qr_fixed_code')).strip())
-            if (role in ('RAW', 'ROUGH', 'TEMP') and getattr(self, '_plan_fallback', False) and not self.disabled
-                    and self.cfg.get('qr_retry_at_stops', True) and not getattr(self.stats, 'grab_total', 0)):
-                self._qr_again(replace=True)        # 10-12：用的是备用码、还没夹任何东西：路上读到真码就换成真码
             if (role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and not self.disabled
                     and self.cfg.get('qr_retry_at_stops', True)):
                 self._qr_again()                    # QR 点没读到码：STM32 可能在路上读到了，再问一次
@@ -926,12 +917,6 @@ class MissionHooks:
             code = self._qr_search()
         if not code:
             code = self._qr_poll(0.0)                   # 找码挪回停车点的路上可能刚读到：用备用码之前再问一次
-        fb = str(cfg.get('qr_fallback_code') or '').strip()
-        if not code and fb:
-            self.log(f'★ 没有读到二维码：用配置里的备用任务码 qr_fallback_code = {fb}，后面的任务照做(后面读到真码、还没夹东西就换成真码)')
-            if self._use_code(fb):
-                self._plan_fallback = True
-                return
         if not code:
             self.log('★ 没有读到二维码：先不做夹取/放置(路线照走，后面每个停车点再问一次 QR?)')
             self._ui('msg', 'QR FAIL')
@@ -954,21 +939,17 @@ class MissionHooks:
             self._check_abort()
             self.sleep(0.2)
 
-    def _qr_again(self, replace=False):
-        """QR 点没读到码：到后面的停车点再问一次(STM32 在路上读到的码也会存着)。replace=True：现在用的是备用码，读到不一样的真码就换掉。"""
+    def _qr_again(self):
+        """QR 点没读到码：到后面的停车点再问一次(STM32 / USB 扫码器在路上读到的码也会存着)。"""
         try:
             code = self.arm.qr()
         except ArmAbort:
             raise
         except ArmError:
             return
-        if code and replace and self.plan is not None and code == self.plan.code:
-            self._plan_fallback = False
-            return
         if code:
-            self.log(f'  ★ 到 {self._stop_name} 时读到任务码了(路上读到的)：{code}' + ('，换掉备用码' if replace else ''))
-            if self._use_code(code):
-                self._plan_fallback = False
+            self.log(f'  ★ 到 {self._stop_name} 时读到任务码了(路上读到的)：{code}')
+            self._use_code(code)
 
     def _use_code(self, code):
         try:

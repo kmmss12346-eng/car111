@@ -357,14 +357,8 @@ class QrSearchTests(unittest.TestCase):
         self.assertIn('读到了(扫码器对着 1260 左右)', text)
         self.assertEqual(w.screen['t0'], '156+123+')
 
-    def test_fallback_code_when_scan_fails(self):
-        """(10-11 用户)扫不出码：用 qr_fallback_code 接着做后面的任务。"""
-        w, h, text = self.run_qr((5000.0, 5100.0), cfg={'qr_fallback_code': '231+312+123+132'})
-        self.assertEqual(h.plan.code, '231+312+123+132', text)
-        self.assertIn('备用任务码', text)
-
-    def test_real_code_read_later_replaces_fallback(self):
-        """10-12：QR 点没读到、先用了备用码；去原料区的路上读到了真码(还没夹东西)：换成真码。"""
+    def test_no_fallback_code_real_code_read_later_is_used(self):
+        """10-12 用户：不要备用码。QR 点没读到(配置里就算还留着 qr_fallback_code 也不用)；路上读到了真码，到原料区就用真码。"""
         from sim_mission import FakeCtx
         w = SimWorld(seed=3, code=CODE, qr_window=(5000.0, 5100.0))
         h, lines = hooks(w, {'qr_fallback_code': '231+312+123+132'}, raw=RAW)
@@ -372,7 +366,8 @@ class QrSearchTests(unittest.TestCase):
         h.prepare(w.link, lines.append)
         w.arrive('QR')
         h.task('QR', w.link, lines.append)
-        self.assertEqual(h.plan.code, '231+312+123+132')
+        self.assertIsNone(h.plan)
+        self.assertFalse(any('备用' in l for l in lines))
         w.qr_code = CODE
         w.arrive('RAW', 1)
         h.task('RAW', w.link, lines.append)

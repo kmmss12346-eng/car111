@@ -75,6 +75,11 @@ def main(argv):
                 new[sec][k] = now
             print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {cur} -> 新的默认值 {now}')
     new['_migrated'] = sorted(done)
+    if new.pop('qr_fallback_code', None):                   # 10-12 用户：不要备用码(扫不到就再找，不拿别的码去夹放)
+        print('  qr_fallback_code：已删掉(不用备用任务码)')
+    new.pop('qr_fallback_code', None)
+    if str(new.get('qr_fixed_code') or '').strip():
+        print(f'  ★ 注意：qr_fixed_code = {new["qr_fixed_code"]}，比赛时不会扫二维码！要正常扫码就把它改成 null')
     if disable:
         new['enabled'] = False
     elif 'enabled' not in old:

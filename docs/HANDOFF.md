@@ -25,7 +25,7 @@
   第二站动作换区时"前进"和"顺时针"取反（区 2：左 42、前 83、顺 60；区 1：左 42、后 83、逆 60）；PREHOME 在启停区靠场地里面那一侧。
   （以前按"绕场地中心转 90°、区 1 车头朝西"算，用户实测扫描、规划全错。）
 - 放置补偿 `place_adj.json`（RING=第一层平放，STACK=第二层码垛，[dID1, dID2] 度）：由 `arm_calib.py` 第 PL1/PL2 步，或 run_live 里 `pcal 1/2` 量出来；任务里加在摄像头对准以后的姿态上。
-- 任务码：run_live 里直接输入 `652+312+526+231` 等于 `mcode …`；`qr` 读到码会自动设好。另一个对话加了 `qr_fixed_code` / `qr_fallback_code` / USB 扫码器独立进程读码。
+- 任务码：run_live 里直接输入 `652+312+526+231` 等于 `mcode …`；`qr` 读到码会自动设好。另一个对话加了 `qr_fixed_code` / USB 扫码器独立进程读码。**用户 10-12：不要备用码**(qr_fallback_code 已删，apply_mission_config 会把它从配置里删掉)。
 
 ## 3. 最近的改动（按时间，详见 git log）
 - 工位看圆环：认 2 号环改按"沿圆环那一排"的距离；"底盘挪 40mm 测出来车身斜了"超过 12° 不信（10-10 实车日志：认错一位、退了 286mm）。测试 `test_survey_real_log_parked_at_ring2_far_from_row`。
@@ -40,9 +40,9 @@
 ## 3b. 10-12 大任务(审查 + 用户 bug 合集)做完的
 - 对准改成**只动车轮**：`align_by` 默认 RAW/ROUGH/TEMP 都是 'wheels'(visual_servo.run(wheels_only=True))；'arm' = 旧做法。差 `place_anyway_mm`(10) 以内照样放/取。原料区要先 `vcal RAW 颜色号`(不加 arm)测车轮 J。
 - 停车点旁边有障碍物：只在停车点 450mm 内对那个圆柱放宽余量，最少 `goal_obstacle_min_margin_mm`(10)，照样停准；实在停不下沿车头方向挪(goal_shift_max_mm 300)并打印。
-- 扫码：qr_usb 加固(Tab 结尾、2.5 秒、半截行、无回车、打不开重试)；qr_diag.py 诊断；`qr` 命令说清楚是哪边没读到；读到真码换掉备用码。车上要装 10-11 以后的包(读码进程 + 名字认扫码器)才行。
+- 扫码：qr_usb 加固(Tab 结尾、2.5 秒、半截行、无回车、打不开重试)；qr_diag.py 诊断；`qr` 命令说清楚是哪边没读到；不用备用码(读不到就在后面停车点再问)。车上要装 10-11 以后的包(读码进程 + 名字认扫码器)才行。
 - 流程：第二次扫描失败重扫一次再用开跑前路线；预先规划记住自己的障碍物版本；full_course 时间到也接着抓第二批；OLD_DEFAULTS 每条只升级一次(`mission_cfg._migrated`)；pcal 没做完/爪子夹着东西时不许 race/go。
-- 最新的包：car111_update_1012a。
+- 最新的包：car111_update_1012b。
 
 ## 4. 还没做完 / 要留意
 - 用户问过"原料区下爪允许偏差 5mm 太严，改一下"，中途打断了，没定数值（现在另一个对话已改成 30mm 内下爪）。
