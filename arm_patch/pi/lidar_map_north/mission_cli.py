@@ -26,6 +26,7 @@ mtest TEMP <批次>          单独测暂存区放置/码垛(转盘里要有这�
                              rev = 这次圆环前后方向反过来(1 号、3 号环跑反了时用)。车是手放到工位上的，位移从 0 算
                              wheels = 这次对准先动车轮(沿圆环那一排小步慢慢挪，差不多了再动手臂；默认是先动手臂)
                              nofilt = 这次对准不用测量滤波(默认用)。两个都只管这一次，用来上车对比哪种快、准
+                             arm = 这次用手臂对准(以前的做法；默认 align_by 是只动车轮、手臂不动)。RAW 也能加
 pcal 1 [槽号]              放置补偿(第一层，平放在圆环上)：车停在暂存区/粗加工区 2 号环前(圆环上空着)。程序先空爪用摄像头对准 2 号环、记下姿态，
                              再去转盘取物料、回到这个姿态、降到离地几毫米停住。你用 arm AD 1 +0.5(沿圆环那一排)、arm AD 2 +10(离圆环远近)
                              把物料挪到圆环正中，输入 pcal save：记下补偿并放下。不想要：pcal cancel(物料放回转盘)
@@ -165,7 +166,7 @@ def release():
 # ---------------------------------------------------------------- vwatch：一边手动调手臂，一边实时看识别
 _W = {'thread': None, 'stop': None, 'what': None, 'resume': None}
 VISION_CMDS = ('vclaw', 'vcal', 'vdbg', 'gtest', 'rtest', 'mtest', 'vmask')    # 这些命令自己要用摄像头识别
-MTEST_OPTS = ('force', 'nogo', 'rev', 'any', 'wheels', 'nofilt')                 # mtest 后面能加的选项
+MTEST_OPTS = ('force', 'nogo', 'rev', 'any', 'wheels', 'nofilt', 'arm')                 # mtest 后面能加的选项
 
 
 def _watch_stop(join=True):
@@ -434,7 +435,10 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 raise ValueError('vcal RAW 要给颜色号：1红 2黄 3蓝 4绿 5黑 6浅蓝，例如 vcal RAW 1')
             color = int(parts[2])
         chassis = 'arm' not in rest
-        if kind == 'RAW' and chassis and str(h.cfg.get('raw_chassis') or 'off').upper() == 'OFF':
+        if kind == 'RAW' and chassis and hasattr(h, '_by_wheels') and h._by_wheels('RAW'):
+            chassis = 'SF'                                  # 原料区只动车轮对准：横移、前后都实测(各挪十来毫米)，测完挪回原处
+            log('(原料区只动车轮对准：车轮横移、前后各小幅挪一下测，测完挪回原处)')
+        elif kind == 'RAW' and chassis and str(h.cfg.get('raw_chassis') or 'off').upper() == 'OFF':
             if h.cfg.get('raw_wheels_first', True):
                 chassis = 'F'                               # 原料区先动车轮：只前后挪着测(不横移，不会压进原料区)，测完挪回原处
                 log('(原料区先动车轮：车轮只前后小幅挪着测，测完挪回原处)')
@@ -466,7 +470,7 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         batch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         opts = {p.lower() for p in parts[2:]}
         force, nogo, rev, anyo = 'force' in opts, 'nogo' in opts, 'rev' in opts, 'any' in opts
-        wheels, nofilt = 'wheels' in opts, 'nofilt' in opts
+        wheels, nofilt, by_arm = 'wheels' in opts, 'nofilt' in opts, 'arm' in opts
         bad = [p for p in parts[2:] if not p.isdigit() and p.lower() not in MTEST_OPTS]
         if bad:
             raise ValueError(f'看不懂 {" ".join(bad)}：mtest {what} 后面可以加 批次号、force、nogo、rev、any(原料区不按顺序抓)、'
@@ -529,7 +533,13 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     log('  (force：假定暂存区已经平放了第一批：' + '  '.join(f'环{it.ring}={it.color_name}' for it in h.plan.items(1)) + ')')
             h.raw_any_once = anyo and what == 'RAW'
             h.raw_wheels_once = wheels and what == 'RAW'
-            saved = {k_: h.cfg.get(k_) for k_ in ('wheels_first', 'zone_filter')}
+            saved = {k_: h.cfg.get(k_) for k_ in ('wheels_first', 'zone_filter', 'align_by')}
+            if by_arm and what in ('RAW', 'ROUGH', 'TEMP'):
+                ab = h.cfg.get('align_by')
+                ab = dict(ab) if isinstance(ab, dict) else {r: ab for r in ('RAW', 'ROUGH', 'TEMP')}
+                ab[what] = 'arm'
+                h.cfg['align_by'] = ab
+                log('  arm：这次用手臂对准(以前的做法)，不只动车轮')
             if wheels or nofilt:
                 if what not in ('ROUGH', 'TEMP', 'RAW'):
                     log('  (wheels / nofilt 只管原料区、粗加工区、暂存区的对准)')
@@ -541,13 +551,15 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                     h.cfg['zone_filter'] = False
                     log('  nofilt：这次对准不用测量滤波(每次都按这一次测的修)')
             t_go = h.now()
+            by_w = what in ('RAW', 'ROUGH', 'TEMP') and hasattr(h, '_by_wheels') and h._by_wheels(what)
             try:
                 h.run_role(what, batch)
             finally:
                 h.nogo, h.ring_rev, h.raw_any_once, h.raw_wheels_once = False, False, False, False
                 h.cfg.update(saved)
-            if wheels or nofilt or what in ('ROUGH', 'TEMP'):
-                how = '、'.join(n for n, on in (('先动车轮', wheels), ('不滤波', nofilt)) if on) or '默认(先动手臂、滤波)'
+            if wheels or nofilt or by_arm or what in ('ROUGH', 'TEMP'):
+                how = '、'.join(n for n, on in (('只动车轮、手臂不动', by_w), ('手臂对准', not by_w and what in ('RAW', 'ROUGH', 'TEMP')),
+                                              ('先动车轮', wheels and not by_w), ('不滤波', nofilt)) if on) or '默认'
                 log(f'  这次用时 {h.now() - t_go:.1f} 秒({how})')
             log(f'mtest {what} {batch if what in ("RAW", "ROUGH", "TEMP") else ""} 结束：{h.stats.grab_text()}  {h.stats.place_text()}')
             if what in ('ROUGH', 'TEMP'):
@@ -1001,7 +1013,15 @@ def _vcal(h, kind, color, chassis, log):
             log(f'  车轮：前进 1mm 画面移动 {pf:.3f} 像素(按 {scale_cfg:.3f} 像素/毫米应该约 {scale_cfg:.3f})' +
                 ('' if abs(pf - scale_cfg) / scale_cfg < 0.2 else '  → 相差 20% 以上：检查 px_per_mm.RAW 或底盘走的距离准不准'))
         elif chassis:
-            Jc = h.servo._probe(measure, 'ch')
+            act = h.servo.act
+            d0 = dict(act.disp) if hasattr(act, 'disp') else None
+            try:
+                Jc = h.servo._probe(measure, 'ch')
+            finally:
+                if chassis == 'SF' and d0 is not None:  # 原料区：挪回原处(不留在挪过去的地方)
+                    bs, bf = d0['S'] - float(act.disp['S']), d0['F'] - float(act.disp['F'])
+                    if abs(bs) >= 1.0 or abs(bf) >= 1.0:
+                        act.chassis_move(round(bs), round(bf))
             h.store.put(kind, 'ch', Jc)
             h.store.set_synth(kind, False)              # 横移、前进都实测过了
             if kind == 'RING' and hasattr(h.store, 'set_extra'):

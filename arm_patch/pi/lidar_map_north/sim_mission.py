@@ -62,7 +62,7 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC'):
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -142,6 +142,8 @@ class SimWorld:
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
         self.move_speeds = []                                  # 底盘每条指令的速度(转/分；None = 默认)，和 moves 一一对应
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
+        # 小幅 AP(对准时的一步)额外多花的秒数：模拟里一步只按转速算(零点几秒)，10-12 用户实车上手臂对准一步要好几秒(等舵机到位、回读……)
+        self.ap_fine_extra_s = float(ap_fine_extra_s)
         self.link = SimLink(self)
         self.vision = SimVision(self)
 
@@ -459,6 +461,8 @@ class SimWorld:
                 spd = max(spd, P['ASPD'])                       # 角度变化大：用大动作速度(和 arm.c 一致)
             b1, b2 = self.ap_bias if (big and self.ap_bias) else (0.0, 0.0)
             self._servos_to(a1_ + b1, a2_ + b2, spd, fine=True)
+            if not big:
+                self.advance(self.ap_fine_extra_s)
             ang(1)
             ang(2)
             return True, 'DONE', info
@@ -791,9 +795,11 @@ QR_STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 34
             'START1': [2250, 2250, 180], 'START2': [2250, 150, 90]}     # 用户配置里的停车点(10-06)
 
 
+ARM_ALIGN = dict(RAW='arm', ROUGH='arm', TEMP='arm')     # 手臂对准(10-12 以前的做法)；10-12 起比赛默认只动车轮(见 WheelsAlignTests)
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
-              survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False)   # 这些测试写的时候工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+              survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False,
+              align_by=ARM_ALIGN)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
 LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
 
 
@@ -1024,7 +1030,7 @@ class MissionSimTests(unittest.TestCase):
         w.placed.clear()
         w.rings.clear()
         w.tray = {1: None, 2: None, 3: None}
-        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None, place_shift_mm=dict(F=0.0, S=0.0), raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False)}, log=lambda m: None, vision=w.vision,
+        h2 = MissionHooks({'mission_cfg': dict(time_limit_s=1e9, servo_cal_file=None, place_shift_mm=dict(F=0.0, S=0.0), raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN)}, log=lambda m: None, vision=w.vision,
                           now=w.now, sleep=w.advance, store=h.store)
         run_mission(w, h2)
         aps_warm = sum(1 for r in w.requests[n0:] if r.startswith('AP'))
@@ -1322,7 +1328,7 @@ class ZoneFlowTests(unittest.TestCase):
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), ring_survey=False, ring_offset_mm=bad,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             lines = []
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg}, log=lines.append, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, log=lines.append)
             self._assert_all_good(w, h, '\n'.join(lines), seed)
@@ -1534,7 +1540,7 @@ class TiltTests(unittest.TestCase):
             w.vision.ring_error = ring_error
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False, ring_precorrect=True, zone_filter=True, zone_frames=2, zone_gain=1.0,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
@@ -1583,7 +1589,7 @@ class NavFlowTests(unittest.TestCase):
             lines = []
             cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
                              sleep=w.advance, store=st)
             nav = dict(leg_s=10.0, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})
@@ -1614,6 +1620,192 @@ class SweepOrderTests(unittest.TestCase):
         h = make(w, dict(place_order='code'))
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
         self.assertEqual([p[1] for p in w.placed], [3, 1, 2])
+
+
+WHEELS_ALIGN = dict(RAW='wheels', ROUGH='wheels', TEMP='wheels')
+ZONE_WHEELS = dict(RAW='arm', ROUGH='wheels', TEMP='wheels')
+DEFAULT_KEYS_1010I = ('raw_any_order', 'raw_wheels_first', 'wheels_first', 'take_first', 'zone_filter', 'ring_precorrect',
+                      'tilt_precorrect', 'return_bias', 'zone_frames', 'zone_gain', 'survey_frames')
+ARM_VERBS = ('AP', 'AD', 'AF', 'OBS', 'STOW', 'TAKE', 'GRAB', 'PICK', 'DROP', 'LIFT', 'CLAW', 'PARK')
+
+
+def plate_world(seed, **kw):
+    """原料盘转 3 秒停 6 秒(真车上大约这样)；画面比例和真车一样。"""
+    return SimWorld(seed=seed, code=MissionSimTests.CODE, plate_stop_s=6.0, plate_move_s=3.0, raw_scale=1.97,
+                    params=dict(ZOBRAW=100.0, ZGRAB=80.0, LFRPM=150.0, LFMRG=100.0), **kw)
+
+
+def seed_raw_wheels_j(w, h):
+    """做过 vcal RAW 颜色号(不加 arm)：原料区车轮(横移 S、前后 F)和画面的对应关系存好了。"""
+    h._ensure(w.link)
+    h.store.put('RAW', 'ch', w.scale['RAW'] * w.Rcam @ np.diag([1.0, -1.0]))
+    h.store.set_synth('RAW', False)
+
+
+class WheelsAlignTests(unittest.TestCase):
+    """10-12 用户："在对每个任务点进行任务的时候要求通过微调轮子进行对准和对齐，不要调控机械臂了，太慢了"(align_by)。
+    对准时手臂一下都不动(不发 AP/AD/AF/OBS…，ID1/ID2 角度不变)，车轮横移/前后都限着范围；对不准也尽量放(place_anyway_mm)。"""
+    CODE = MissionSimTests.CODE
+
+    def _spy(self, w, h):
+        """记下每次只动车轮对准时：发给 STM32 的手臂指令、ID1/ID2 变了多少；每个工位里车轮离停车点横移/前后最远多少。"""
+        h._ensure(w.link)
+        rec = dict(arm_cmds=[], moved=[], runs=0, s_max={}, f_max={}, res=[])
+        orig = h.servo._run_wheels
+
+        def run_w(*a, **k):
+            n0, a0 = len(w.requests), (w.a1, w.a2)
+            r = orig(*a, **k)
+            rec['runs'] += 1
+            rec['arm_cmds'] += [q for q in w.requests[n0:] if q.split()[0] in ARM_VERBS]
+            rec['moved'].append((w.a1 - a0[0], w.a2 - a0[1]))
+            rec['res'].append(r)
+            return r
+        h.servo._run_wheels = run_w
+        om = h.act.chassis_move
+
+        def cm(s, f, speed=None):
+            if speed:
+                om(s, f, speed=speed)
+            else:
+                om(s, f)
+            z = w.zone
+            rec['s_max'][z] = max(rec['s_max'].get(z, 0.0), abs(h.act.disp['S']))
+            rec['f_max'][z] = max(rec['f_max'].get(z, 0.0), abs(h.act.disp['F']))
+        h.act.chassis_move = cm
+        return rec
+
+    def _assert_arm_still(self, rec, text=''):
+        self.assertGreater(rec['runs'], 0)
+        self.assertEqual(rec['arm_cmds'], [], text[-3000:])
+        self.assertTrue(all(abs(d1) < 1e-9 and abs(d2) < 1e-9 for d1, d2 in rec['moved']), rec['moved'])
+
+    def test_zones_align_by_wheels_only_arm_never_moves(self):
+        """粗加工区/暂存区(放、取回、码垛)只动车轮：对准时手臂不动，12 个都放对(误差在 2 环以内)，横移不超过 ring_strafe_max_mm。"""
+        errs = []
+        for seed in range(4):
+            w = SimWorld(seed=seed, code=self.CODE)
+            lines = []
+            h = make(w, dict(align_by=ZONE_WHEELS), log=lines.append)
+            rec = self._spy(w, h)
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._assert_arm_still(rec, text)
+            self.assertGreaterEqual(rec['runs'], 18)                         # 9 次平放 + 3 次码垛 + 6 次取回
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-3000:])
+            self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
+            for z in ('ROUGH', 'TEMP'):
+                self.assertLessEqual(rec['s_max'].get(z, 0.0), h.cfg['ring_strafe_max_mm'], (z, rec['s_max']))
+            self.assertLess(abs(h.act.disp['S']) + abs(h.act.disp['F']), 1.0)          # 每个工位做完都挪回了停车点
+            self.assertIn('[只动车轮]', text)
+            errs += [e for (_, _, _, e, _st) in w.placed]
+        errs = np.array(errs)
+        print(f'\n  [工位只动车轮 4 组] 放置真实误差 平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
+        self.assertLess(errs.mean(), 2.0)
+        self.assertLess(errs.max(), 3.5)
+
+    def test_wheels_vs_arm_time(self):
+        """和手臂对准比用时(比赛默认的 1010i 做法，原料区都用手臂，只比工位)。
+        模拟里手臂一步只按转速算(零点几秒)、车轮一条指令按 1 秒多算：只动车轮多几秒(不超过 8%)；
+        手臂一步多花 3 秒(实车上用户说一步要好几秒)时只动车轮更快。"""
+        import mission_hooks
+        D = mission_hooks.DEFAULTS
+        out = {}
+        for extra in (0.0, 3.0):
+            for mode in ('arm', 'wheels'):
+                t = 0.0
+                for seed in range(3):
+                    w = SimWorld(seed=seed, code=self.CODE, ap_fine_extra_s=extra)
+                    cfg = {k: D[k] for k in DEFAULT_KEYS_1010I}
+                    cfg['align_by'] = dict(RAW='arm', ROUGH=mode, TEMP=mode)
+                    h = make(w, cfg)
+                    run_mission(w, h)
+                    self.assertEqual((h.stats.place_ok, w.air, w.collisions), (12, 0, 0), (extra, mode, seed))
+                    t += w.t
+                out[(extra, mode)] = t / 3.0
+        print(f'\n  [用时] 模拟原样：手臂对准 {out[(0.0, "arm")]:.0f}s，只动车轮 {out[(0.0, "wheels")]:.0f}s；'
+              f'手臂每步多 3 秒：手臂 {out[(3.0, "arm")]:.0f}s，只动车轮 {out[(3.0, "wheels")]:.0f}s(两批，不含路线行驶)')
+        self.assertLessEqual(out[(0.0, 'wheels')], 1.08 * out[(0.0, 'arm')])
+        self.assertLess(out[(3.0, 'wheels')], out[(3.0, 'arm')])
+
+    def test_raw_align_by_wheels_on_a_stop_go_plate(self):
+        """原料区只动车轮(原料盘转 3 秒停 6 秒，物料停的地方离爪子偏前/后、左/右几毫米)：手臂停在 OBS RAW 不动，3 个都夹到，
+        横移不出 raw_wheels_s_range、前后不出 ±raw_fix_max_mm，做完挪回原料区停车点。"""
+        # (原料盘一开始就停着、不知道停了多久时会马上下爪，可能正好赶上它转起来——手臂对准时也一样，见 HANDOFF；这里挑没碰上的)
+        for seed, off, tan in ((4, 0.0, 0.0), (1, 8.0, 0.0), (2, -6.0, 5.0), (3, 0.0, -8.0)):
+            w = plate_world(seed, plate_off_mm=off, plate_off_tan=tan)
+            lines = []
+            h = make(w, dict(align_by=WHEELS_ALIGN, raw_max_iter=1, raw_grab_max_mm=30.0, raw_force_grab=True), log=lines.append)
+            seed_raw_wheels_j(w, h)
+            rec = self._spy(w, h)
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self._assert_arm_still(rec, text)
+            self.assertEqual((h.stats.grab_ok, w.air), (3, 0), text[-3000:])
+            self.assertEqual(sorted(c for c in w.tray.values() if c), [1, 5, 6], text[-3000:])
+            lo, hi = h.cfg['raw_wheels_s_range']
+            self.assertLessEqual(rec['s_max'].get('RAW', 0.0), max(-lo, hi), text[-3000:])
+            self.assertLessEqual(rec['f_max'].get('RAW', 0.0), h.cfg['raw_fix_max_mm'])
+            self.assertLess(abs(h.act.disp['S']) + abs(h.act.disp['F']), 1.0)          # 挪回了原料区停车点
+
+    def test_raw_falls_back_to_the_arm_without_a_wheels_jacobian(self):
+        """align_by.RAW=wheels，但只做过 vcal RAW 颜色号 arm(只有手臂的 J)：这次按手臂对准(提醒做 vcal RAW 不加 arm)，照样夹到。"""
+        w = plate_world(5)
+        lines = []
+        h = make(w, dict(align_by=WHEELS_ALIGN), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('这次先按手臂对准', text)
+        self.assertEqual((h.stats.grab_ok, w.air), (3, 0), text[-3000:])
+
+    def test_competition_defaults_everything_by_wheels(self):
+        """比赛默认(align_by 全是 wheels、原料区修一次就夹)：原料盘一转一停，两批全夹到、全放对，对准时手臂都不动。"""
+        import mission_hooks
+        D = mission_hooks.DEFAULTS
+        self.assertEqual(D['align_by'], WHEELS_ALIGN)
+        for seed in (16, 17, 18):
+            w = plate_world(seed)
+            lines = []
+            live = {k: D[k] for k in LEGACY}                             # 不用老测试的写法，全按比赛默认
+            h = make(w, live, log=lines.append)
+            seed_raw_wheels_j(w, h)
+            rec = self._spy(w, h)
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._assert_arm_still(rec, text)
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
+
+    def _strafe_blocked(self, side_mm):
+        """车离圆环那一排远了 side_mm、又不许横移(ring_strafe_max_mm=0)：车轮修不了远近，只能前后对准。"""
+        w = SimWorld(seed=3, code=self.CODE, stop_err_mm=0.5, park_side={'ROUGH': side_mm})
+        lines = []
+        h = make(w, dict(align_by=ZONE_WHEELS, ring_strafe_max_mm=0.0), log=lines.append)
+        rec = self._spy(w, h)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        return w, h, rec, '\n'.join(lines)
+
+    def test_place_anyway_when_close_enough(self):
+        """对不到容差、但只差 place_anyway_mm(10mm)以内：照样放(物料留在车上 = 0 分)，不把物料留在车上。"""
+        w, h, rec, text = self._strafe_blocked(6.0)
+        self._assert_arm_still(rec, text)
+        self.assertEqual(rec['s_max'].get('ROUGH', 0.0), 0.0)
+        self.assertIn('照样放，不把物料留在车上', text)
+        self.assertEqual((h.stats.place_ok, h.stats.place_total), (3, 3), text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertTrue(all(4.0 < e < 8.0 for (_z, _k, _c, e, _s) in w.placed), w.placed)
+
+    def test_too_far_is_not_placed(self):
+        """差得比 place_anyway_mm 还多(会放到两个环中间、碰倒)：不放，物料留在车上，不碰倒东西。"""
+        w, h, rec, text = self._strafe_blocked(14.0)
+        self.assertEqual(h.stats.place_ok, 0, text[-3000:])
+        self.assertIn('物料留在车上', text)
+        self.assertEqual((w.loose, w.collisions), (0, 0))
+        self.assertEqual(sorted(c for c in w.tray.values() if c), [1, 5, 6])
 
 
 def _demo(fast, batches=2, extra=None):

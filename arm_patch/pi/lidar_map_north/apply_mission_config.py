@@ -16,7 +16,8 @@ from mission_hooks import DEFAULTS, deep_merge
 NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调它就能微调放置位置，1 像素≈0.34mm)；px_per_mm=每毫米多少像素；'
         'tol_mm=对准到多小算好；ring_offset_mm=圆环相对停车点沿车头方向的位置(要去现场核对圆环编号方向)；'
         'time_limit_s=超过这个时间不再做夹放，留时间回家；round_s/home_margin_s/work_item_s=按时间判断还做不做下一个物料、要不要直接回家；'
-        'qr_*=读不到码时沿车道前后挪着找；ring_strafe_max_mm=工位里车轮横移最多多少。详见 README_mission.md')
+        'qr_*=读不到码时沿车道前后挪着找；ring_strafe_max_mm=工位里车轮横移最多多少；'
+        'align_by=每个任务点只动车轮(wheels)还是手臂对准(arm)，只动车轮前先做 vcal RAW 颜色号(不加 arm)。详见 README_mission.md')
 
 
 # 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的。(None, 键) = mission_cfg 下面直接的键
