@@ -333,10 +333,22 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h._ensure_arm_only(link)
             code = h.arm.qr()
             if not code:
-                log('STM32 里的任务码：没有(还没扫到码)。把任务码纸放到扫码头前面扫一下再输入 qr；'
-                    '不扫码也行：直接输入任务码，例如 652+312+526+231(和 mcode 652+312+526+231 一样)')
+                usb = getattr(h.arm, 'usb_qr', None)
+                if usb is None:
+                    where = 'USB 扫码器的读码没有打开(QR_USB=0？)'
+                elif getattr(usb, 'scanner', None):
+                    where = f'USB 扫码器在 {usb.scanner}，还没读到码'
+                else:
+                    where = 'USB 上没认出扫码器(没插好？没权限：终端输入 id 看有没有 input 组)'
+                try:
+                    _ok, rep, info = h.arm.request('QR?', 2.0)
+                    stm = ' / '.join(info) or rep
+                except Exception as ex:
+                    stm = f'问不到({ex})'
+                log(f'任务码：没有。{where}；STM32 回复：{stm}。'
+                    '把任务码纸放到扫码头前面扫一下再输入 qr；不扫码也行：直接输入任务码，例如 652+312+526+231')
                 return
-            log(f'STM32 里的任务码：{code}')
+            log(f'读到的任务码：{code}')
             try:
                 h.plan = parse_code(code)
             except TaskError as ex:

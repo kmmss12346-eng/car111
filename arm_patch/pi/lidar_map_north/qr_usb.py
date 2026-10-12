@@ -20,12 +20,12 @@ _EVIOCGRAB = 0x40044590
 _FMT = 'llHHi'                       # struct input_event(32/64 位系统按本机 long 的长度)
 _SIZE = struct.calcsize(_FMT)
 _SHIFT = (42, 54)
-_ENTER = (28, 96)
+_ENTER = (28, 96, 15)                # 回车、小键盘回车、Tab(扫码器结尾设成 Tab 时)
 # 主键盘的数字键 KEY_1..KEY_0，小键盘数字
 _KEYS = {2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6', 8: '7', 9: '8', 10: '9', 11: '0',
          71: '7', 72: '8', 73: '9', 75: '4', 76: '5', 77: '6', 79: '1', 80: '2', 81: '3', 82: '0', 78: '+'}
 _SHIFT_KEYS = {13: '+'}              # Shift + '=' = '+'(美式键盘布局)
-MAX_LINE_S = 1.0                     # 一整条码最多用多久"打"完才算扫码器(人手打字比这慢得多)
+MAX_LINE_S = 2.5                     # 一整条码最多用多久"打"完才算扫码器(人手打字比这慢得多)
 _NAME_HINT = re.compile(r'scan|barcode|bar code|qr|gm65|gm6|usbkey|symbol|honeywell|newland|zebra|datalogic', re.I)   # usbkey：10-11 车上这个扫码器叫 "USBKey Chip USBKey Module"
 
 
@@ -60,7 +60,8 @@ class Reader:
         self._buf = {}
         self._shift = {}
         self._t0 = {}
-        self._warned = set()
+        self._warned = {}                 # 打不开的设备 -> 上次试的时间(插上的一瞬间 udev 还没改权限：过几秒再试)
+        self._last = {}                   # 每个设备上一个按键的时间
         self._stop = False
         self._th = None
 
@@ -81,17 +82,19 @@ class Reader:
     # ---------------------------------------------------------------- 后台
     def _refresh(self):
         for path, name in self._devices():
-            if path in self._fds or path in self._warned:
+            if path in self._fds or time.monotonic() - self._warned.get(path, -1e9) < 10.0:
                 continue
             try:
                 fd = self._open(path)
             except PermissionError:
-                self._warned.add(path)
-                self.log(f'  (USB 扫码器：没有权限读 {path}「{name}」。终端输入 sudo usermod -aG input $USER，重启树莓派后再试)')
+                if path not in self._warned:
+                    self.log(f'  (USB 扫码器：没有权限读 {path}「{name}」。终端输入 sudo usermod -aG input $USER，重启树莓派后再试)')
+                self._warned[path] = time.monotonic()
                 continue
             except OSError:
-                self._warned.add(path)
+                self._warned[path] = time.monotonic()
                 continue
+            self._warned.pop(path, None)
             self._fds[path] = (fd, name)
             if _NAME_HINT.search(name):
                 self._grab(path)
@@ -114,6 +117,7 @@ class Reader:
             if now - last > 2.0:                      # 插拔：每 2 秒看一次有没有新设备
                 last = now
                 self._refresh()
+            self._flush_idle()
             fds = {v[0]: k for k, v in self._fds.items()}
             if not fds:
                 time.sleep(0.5)
@@ -153,6 +157,9 @@ class Reader:
             if value != 1:                            # 只看按下
                 continue
             buf = self._buf.setdefault(path, '')
+            if buf and t - self._last.get(path, t) > 0.5:
+                buf = ''                              # 上一行没收到回车就断了(半截)：扔掉，不然这一行的计时从半截那时算
+            self._last[path] = t
             if not buf:
                 self._t0[path] = t                     # 这一行第一个键的时间
             if code in _ENTER:
@@ -168,6 +175,15 @@ class Reader:
                 elif code not in _SHIFT_KEYS:
                     buf += '?'                        # 别的键：照样占一位，免得拼出假的码
             self._buf[path] = buf
+
+    def _flush_idle(self, now=None):
+        """结尾不发回车的扫码器：一行里已经有完整的任务码、0.2 秒没有新键，就当这一行打完了。"""
+        now = time.time() if now is None else now
+        for path, buf in list(self._buf.items()):
+            if buf and _CODE.search(buf) and now - self._last.get(path, now) > 0.2 \
+                    and self._last.get(path, now) - self._t0.get(path, now) <= MAX_LINE_S:
+                self._buf[path] = ''
+                self._line(path, buf)
 
     def _line(self, path, line):
         m = _CODE.search(line or '')

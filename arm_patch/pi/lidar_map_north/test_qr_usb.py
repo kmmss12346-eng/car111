@@ -73,6 +73,40 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(r.scanner, '/dev/input/event3')
         self.assertTrue(any('USB 扫码器' in m for m in logs))
 
+    def timed(self, text, t0=0.0, dt=0.01, end=28):
+        """带时间的扫码：每个键隔 dt 秒；end = 结尾键(28 回车、15 Tab、None 不发)。返回 (数据, 最后一个键的时间)。"""
+        out, t = b'', t0
+        for ch in text:
+            if ch == '+':
+                out += ev(42, 1, t=t) + ev(13, 1, t=t) + ev(13, 0, t=t) + ev(42, 0, t=t)
+            else:
+                out += ev(KEY[ch], 1, t=t) + ev(KEY[ch], 0, t=t)
+            t += dt
+        if end is not None:
+            out += ev(end, 1, t=t) + ev(end, 0, t=t)
+        return out, t
+
+    def test_slow_scanner_tab_end_and_stale_half_line(self):
+        """10-12：慢速键盘模式(一条 1.4 秒)、结尾是 Tab、上一次留下半截没回车：都要读得到。"""
+        r, _ = self.make()
+        r.feed('/dev/input/event3', self.timed('156+123+516+231', dt=0.09)[0])
+        self.assertEqual(r.get(), '156+123+516+231')
+        r, _ = self.make()
+        r.feed('/dev/input/event3', self.timed('156+123+516+231', end=15)[0])
+        self.assertEqual(r.get(), '156+123+516+231')
+        r, _ = self.make()
+        r.feed('/dev/input/event3', self.timed('156+1', end=None)[0])           # 半截，没回车
+        r.feed('/dev/input/event3', self.timed('452+321+254+312', t0=30.0)[0])
+        self.assertEqual(r.get(), '452+321+254+312')
+
+    def test_no_enter_flushed_when_idle(self):
+        r, _ = self.make()
+        data, t = self.timed('156+123+516+231', t0=100.0, end=None)
+        r.feed('/dev/input/event3', data)
+        self.assertIsNone(r.get())
+        r._flush_idle(now=t + 0.5)
+        self.assertEqual(r.get(), '156+123+516+231')
+
     def test_human_typing_is_not_the_scanner(self):
         # 在终端里手打 mcode 156+123+516+231：打得慢，不当成扫码器，不独占键盘
         r, _ = self.make()
