@@ -144,5 +144,31 @@ class RunMissionTests(unittest.TestCase):
         self.assertTrue(any('路线全部走完' in l for l in self.logs))
 
 
+class SyncChangedTests(unittest.TestCase):
+    def test_only_changed_params_are_sent(self):
+        """(10-12 用户：启动太慢)只发和 STM32 现在不一样的参数；GET 里没有的照发；读不到全发。"""
+        import auto_run
+
+        class L:
+            def __init__(self, ps):
+                self.ps, self.sent = ps, None
+
+            def get_params(self):
+                return self.ps, 'DONE'
+
+            def sync_params(self, params, log=None):
+                self.sent = dict(params)
+                return []
+        l = L({'FPPM': 12.9, 'SCACC': 300.0})
+        auto_run.sync_changed(l, {'FPPM': 12.9, 'SCACC': 250, 'A1H': 300})
+        self.assertEqual(l.sent, {'SCACC': 250, 'A1H': 300})
+        l = L({'FPPM': 12.9})
+        auto_run.sync_changed(l, {'FPPM': 12.9})
+        self.assertIsNone(l.sent)
+        l = L(None)
+        auto_run.sync_changed(l, {'FPPM': 12.9})
+        self.assertEqual(l.sent, {'FPPM': 12.9})
+
+
 if __name__ == '__main__':
     unittest.main()

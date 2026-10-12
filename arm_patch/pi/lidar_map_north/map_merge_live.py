@@ -598,7 +598,8 @@ def main():
         """把配置里的 stm32_params 发给 STM32(STM32 断电重启后参数会回到编译进去的默认值)。每次运行程序第一次动车前自动做一次。"""
         if link is None or (synced[0] and not force):return
         sp_=raw_cfg.get('stm32_params') or {}
-        bad=link.sync_params(sp_,log=lambda m:print(m,flush=True))
+        from auto_run import sync_changed
+        bad=sync_changed(link,sp_,log=lambda m:print(m,flush=True)) if not force else link.sync_params(sp_,log=lambda m:print(m,flush=True))
         synced[0]=True
         if sp_:print(f'已把配置里的 {len(sp_)} 个运动参数发给 STM32'+(f'（{len(bad)} 个失败）' if bad else '')+'。',flush=True)
     try:                                                # (10-11)一启动就占住 USB 扫码器：开跑前手拿码板扫一下就记下，码也不会打进终端

@@ -1450,6 +1450,32 @@ def print_seq(seq, log):
             cur.append(names[c][0 if v > 0 else 1] + f'{abs(v)}mm')
 
 
+def sync_changed(link, params, log=print):
+    """(10-12 用户：启动太慢)把配置里的 STM32 参数发过去，但只发和 STM32 现在不一样的(一次 GET 读全部，比一个个 SET 快得多)。
+    读不到(或 GET 里没有这一项)就照发。返回发失败的名字列表(和 link.sync_params 一样)。"""
+    params = dict(params or {})
+    if not params:
+        return []
+    ps = None
+    try:
+        ps, _ = link.get_params()
+    except Exception:
+        ps = None
+    todo = params
+    if ps:
+        todo = {}
+        for k, v in params.items():
+            try:
+                same = k in ps and abs(float(ps[k]) - float(v)) <= max(1e-4, 1e-4 * abs(float(v)))
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                todo[k] = v
+    if not todo:
+        return []
+    return link.sync_params(todo, log=log)
+
+
 def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0.8, hooks=None, cfg=None, scanned=False):
     """first_scan=True: 完整流程(scanned=True：第一次扫描开跑前已经做好了，屏幕选区一键启动时)；False: 只按当前已规划的路线行驶。
     1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。"""
@@ -1466,34 +1492,42 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if not ok:
             raise Abort(f'STM32 没有回应 PING：{reply}（检查 USART3 接线，和 STM32 程序是不是新版）')
         log('STM32 通信正常。')
-        bad = link.sync_params(cfg.get('stm32_params'), log=log)
+        t_ph = time.monotonic()
+        bad = sync_changed(link, cfg.get('stm32_params'), log=log)
         if cfg.get('stm32_params'):
-            log(f'已把配置里的 {len(cfg["stm32_params"])} 个运动参数发给 STM32' + (f'（{len(bad)} 个失败）' if bad else ''))
+            log(f'STM32 参数已同步(只发有变化的；{time.monotonic() - t_ph:.1f} 秒)' + (f'（{len(bad)} 个失败）' if bad else ''))
         if hooks is not None and hasattr(hooks, 'prepare'):
+            t_ph = time.monotonic()
             try:
                 hooks.prepare(link, log)           # 机械臂初始化、收臂、清掉旧任务码、打开摄像头
             except Abort:
                 raise
             except Exception as e:
                 log(f'  (机械臂准备出错：{e!r}，继续)')
+            log(f'  (机械臂准备用时 {time.monotonic() - t_ph:.1f} 秒)')
         ok, reply = link.home()
         if not ok:
             raise Abort(f'STM32 不认识 HOME：{reply}（STM32 程序是不是新版）')
         if not scanned:
             log('① 第一次扫描：车保持不动……')
+            t_ph = time.monotonic()
             ctx.scan()
+            log(f'  (第一次扫描用时 {time.monotonic() - t_ph:.1f} 秒)')
         else:
             log('① 第一次扫描开跑前已经做好了。')
         rel = cfg.get('second_relative_moves', DEFAULT_SECOND_MOVES)
         log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
+        t_ph = time.monotonic()
         ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
         if not ok:
             raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
         err = parse_done(reply).get('err')
         if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
             raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
-        time.sleep(settle_s)
+        log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
+        time.sleep(float(cfg.get('second_settle_s', settle_s)) if cfg else settle_s)
         log('③ 第二次扫描：车保持不动……')
+        t_ph = time.monotonic()
         try:
             ctx.second()
         except Abort as e:
@@ -1507,8 +1541,12 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
                 if getattr(ctx, 'aborted', lambda: False)() or not (hasattr(ctx, 'second_failed') and ctx.second_failed()):
                     raise
                 log(f'  ★ 第二次扫描又失败({e2})：按推算的第二站车位，用开跑前规划好的路线接着跑')
+    if first_scan:
+        log(f'  (第二次扫描用时 {time.monotonic() - t_ph:.1f} 秒)')
     caps = firmware_caps(link, cfg)
+    t_ph = time.monotonic()
     turn_back, legs, reason = ctx.plan()
+    log(f'  (规划用时 {time.monotonic() - t_ph:.1f} 秒)')
     if reason != 'ROUTE OK' or not legs:
         raise Abort(f'没有可用路线：{reason}')
     seq = flatten(turn_back, legs)
@@ -1522,7 +1560,7 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
     else:
         print_seq(seq, log)
     if not first_scan:
-        bad = link.sync_params(cfg.get('stm32_params'), log=log)
+        bad = sync_changed(link, cfg.get('stm32_params'), log=log)
     if cfg.get('confirm_route', False) and hasattr(ctx, 'ask'):
         if not ctx.ask('确认车周围没人、场地清空后，输入 y 开始行驶；输入 n 取消。(比赛时把配置 confirm_route 关掉)'):
             raise Abort('已取消，没有发任何运动指令')
