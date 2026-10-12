@@ -217,11 +217,16 @@ class StopTests(unittest.TestCase):
         self.assertIn('黄色区', why)
 
     def test_stop_blocked_by_obstacle_parks_nearby(self):
-        legs, why, _ = rp.plan_mission(CFG, [(2100, 1420, 25)], (2100, 600, 90), ['QR'])
+        # 10-12：车头前 50mm 的圆柱(不到余量 60)不再改停别处(见 test_route_goal_obstacle)；
+        # 圆柱压在车身上(真车停不下)才沿车头方向挪到离它 goal_obstacle_min_margin_mm(10)
+        legs, why, _ = rp.plan_mission(CFG, [(2100, 1360, 25)], (2100, 600, 90), ['QR'])
         self.assertEqual(why, 'OK')
-        self.assertIn('被障碍物(2100,1420)挡住', legs[0]['note'])
+        self.assertIn('离障碍物(2100,1360)只有', legs[0]['note'])
+        self.assertIn('停不下', legs[0]['note'])
         g = legs[0]['goal']
-        self.assertTrue(rp.pose_clear(CFG, [(2100, 1420, 25)], g)[0])
+        self.assertEqual((g[0], g[2]), (2100.0, 90.0))
+        self.assertAlmostEqual(g[1], 1180.0, delta=1e-6)
+        self.assertTrue(rp.pose_clear(CFG, [(2100, 1360, 25)], g, margin_mm=10)[0])
         end = run(legs, (2100, 600, 90))[0]
         self.assertLess(math.hypot(end[0] - g[0], end[1] - g[1]), 0.6)
 

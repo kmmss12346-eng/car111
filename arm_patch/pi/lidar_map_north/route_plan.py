@@ -30,6 +30,12 @@ v17(10-10 整合)：
    不再另外发 8~15mm 的小移动。
 4. 新函数：pose_clear(某个位姿离各区域多远)、moves_clear(一串指令扫过的范围，转弯按角度一步步扫)、plan_leg(单段规划)。
 5. 停车点本身离某个区域不够余量时，这一段只在这个区域上放宽到停车点自己的距离，并在 note 里写清楚是哪个区域、差多少。
+
+10-12(用户：障碍物离指定的点太近，车就跑不到 1200,2100)：
+   以前停车点车身离障碍物不到 margin_mm(看不清的圆柱再 +80)就整个改停到最近的“按完整余量放得下”的栅格点(差 25~280mm)。
+   现在只在停车点附近(goal_relax_radius_mm)对这个障碍物放宽，按真实半径最少留 goal_obstacle_min_margin_mm(默认 10)，
+   照样准确停在停车点上(车头还是配置的方向，从哪边开进去都行)；路线其余部分照样按 margin_mm。黄色区/工位/转盘/场地边不放宽。
+   真车停在停车点上就碰到障碍物时，才沿车头方向挪到最近放得下的位置，note 和 leg['goal_shift'](往前mm, 往左mm)写清楚差多少。
 """
 import heapq
 import itertools
@@ -56,6 +62,9 @@ RAW_MARGIN_MM = 30               # 原料转盘
 EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
 START_CORRIDOR_MM = 300          # 启停区旁边这一段场地边允许贴边(开进启停区要用)
 MIN_MOVE_MM = 20                 # 比这小的前进/横移尽量不出现(执行时太短，车本身的精度就在这个量级)
+GOAL_OBS_MIN_MARGIN_MM = 10      # 停车点旁边的障碍物：真车(含雷达)离它最少留多少(按障碍物真实半径)
+GOAL_RELAX_RADIUS_MM = 450       # 停车点附近多大范围内(转轴点离停车点)可以对障碍物放宽余量
+GOAL_SHIFT_MAX_MM = 300          # 停车点真的停不下时，最多挪多远去找放得下的位置
 EPS_MM = 0.05                    # 浮点误差：差这么一点不算不够余量
 
 _BIG = 1.0e5
@@ -708,6 +717,15 @@ class Planner:
         self.fallback = False
         self.lane_fallback = False
         self._var_cache = {}
+        # 10-12：停车点旁边的障碍物(用户：障碍物离指定的点太近，车就跑不到 1200,2100)。
+        # 停车点车身离障碍物不到 margin_mm 时，不再整个改停到别处：只在停车点附近 goal_relax_radius_mm 内对它放宽，
+        # 按障碍物真实半径(看不清的圆柱多加的那一圈不算)最少留 goal_obstacle_min_margin_mm；路线其余部分照样按 margin_mm。
+        # 真车停在停车点上就碰到障碍物(不到最小余量)时，才沿停车点车头方向挪到最近放得下的位置，并写清楚差多少。
+        self.goal_min = max(0.0, min(float(cfg.get('goal_obstacle_min_margin_mm', GOAL_OBS_MIN_MARGIN_MM)), self.obs_margin))
+        self.goal_R = max(0.0, float(cfg.get('goal_relax_radius_mm', GOAL_RELAX_RADIUS_MM)))
+        self.goal_shift_max = max(0.0, float(cfg.get('goal_shift_max_mm', GOAL_SHIFT_MAX_MM)))
+        cyl = cfg.get('cylinder_diameter_mm')
+        self.obs_real_r = float(cyl) / 2 if cyl else None
 
     def _ext(self, h):
         """车头方向 h 时，车身外框(含雷达)相对车中心往 西、东、南、北 各伸出多少 mm。"""
@@ -730,6 +748,12 @@ class Planner:
     def maps(self, ox, oy, items=None):
         """栅格偏移 (ox, oy) 的表。items 给定时(放宽了某个区域)不用缓存，现算。"""
         if items is not None:
+            nf = len(self.fixed)
+            if len(items) >= nf and list(items[:nf]) == list(self.fixed):
+                # 只改了障碍物/封死的车道：固定区域的表照样用缓存，只现算后面那几项(快很多)
+                f = _fixed_maps(self.body, self.fixed, ox, oy)
+                rest = list(items[nf:])
+                return _merge_maps(f, _grid_maps(self.body, rest, ox, oy)) if rest else f
             return _grid_maps(self.body, items, ox, oy)
         key = (round(ox, 3), round(oy, 3))
         m = self._var_cache.get(key)
@@ -994,10 +1018,141 @@ class Planner:
             return None, NO_ROUTE
         return acts, 'OK'
 
+    # ---------- 停车点旁边的障碍物 ----------
+    def _real_r(self, r):
+        """障碍物真实半径：配置有 cylinder_diameter_mm 时最多按它(看不清的圆柱规划时多加的那一圈不算)。"""
+        return min(r, self.obs_real_r) if self.obs_real_r else r
+
+    def _obs_real_gap(self, it, gap):
+        return gap + (it[6] - self._real_r(it[6]))
+
+    def _goal_relax(self, items, pose, tier=1):
+        """停车点 pose 旁边的障碍物 → 放宽后的区域列表(只在停车点附近用)。
+        tier=1：只放宽停车点上不够余量的障碍物，放到停车点自己的距离(不低于 goal_obstacle_min_margin_mm)；
+        tier=2：停车点附近(真实距离不到 goal_relax_radius_mm)的障碍物都放到 goal_obstacle_min_margin_mm。
+        都按障碍物真实半径算。返回 (新列表, [(下标, 真实距离)] 停在这里就不到最小余量的, [(下标, 真实距离, 放宽到)])。"""
+        gaps = self.pose_eval(pose, items)
+        out = list(items)
+        bad, rel = [], []
+        for k, it in enumerate(items):
+            if it[1] != 'obs':
+                continue
+            g = self._obs_real_gap(it, gaps[k])
+            short = gaps[k] < it[7] - EPS_MM
+            if g < self.goal_min - EPS_MM:
+                bad.append((k, g))
+                continue
+            if tier == 1:
+                if not short:
+                    continue
+                h = min(it[7], max(self.goal_min, g - 0.5))
+            else:
+                if g >= self.goal_R and not short:
+                    continue
+                h = min(it[7], self.goal_min)
+            lst = list(it)
+            lst[6] = self._real_r(it[6]); lst[7] = h; lst[9] = min(it[9], h)
+            out[k] = tuple(lst)
+            rel.append((k, g, h))
+        return out, bad, rel
+
+    def _goal_ok(self, items, pose):
+        """停车点挪到 pose 行不行：障碍物按真实半径至少 goal_obstacle_min_margin_mm，别的区域按各自的硬余量。"""
+        gaps = self.pose_eval(pose, items)
+        for k, it in enumerate(items):
+            if it[1] == 'obs':
+                if self._obs_real_gap(it, gaps[k]) < self.goal_min - EPS_MM:
+                    return False
+            elif gaps[k] < it[7] - EPS_MM:
+                return False
+        return True
+
+    def _shift_goal(self, items, goal):
+        """停车点真车停不下(碰到障碍物)：先沿停车点车头方向(前后，任务对准的方向)找最近放得下的位置；
+        沿车头方向 goal_shift_max_mm 内都不行，再按离停车点由近到远在周围找。
+        返回 (位姿, (往前mm, 往左mm), 是否沿车头方向) 或 (None, None, False)。"""
+        x, y, yaw = goal
+        a = math.radians(yaw)
+        fx, fy = math.cos(a), math.sin(a)
+        lx, ly = -fy, fx
+        mx = self.goal_shift_max
+        d = 5.0
+        while d <= mx + EPS_MM:
+            for s in (1.0, -1.0):
+                p = (x + s*d*fx, y + s*d*fy, yaw)
+                if self._goal_ok(items, p):
+                    return p, (s*d, 0.0), True
+            d += 5.0
+        n = int(mx // 10)
+        offs = [(i*10.0, j*10.0) for i in range(-n, n+1) for j in range(-n, n+1) if j != 0 and math.hypot(i, j)*10 <= mx]
+        offs.sort(key=lambda o: (math.hypot(*o), abs(o[1])))
+        for u, v in offs:
+            p = (x + u*fx + v*lx, y + u*fy + v*ly, yaw)
+            if self._goal_ok(items, p):
+                return p, (u, v), False
+        return None, None, False
+
+    def _goal_maps(self, items, relaxed, g_items, ox, oy, gp):
+        """整段按 items 的表；停车点附近(转轴点离停车点 goal_relax_radius_mm 内)换成 g_items(障碍物放宽)的表。"""
+        Mf = self.maps(ox, oy, items if relaxed else None)
+        if g_items is None:
+            return Mf
+        Mg = self.maps(ox, oy, g_items)
+        xs = ox + np.arange(N) * STEP
+        ys = oy + np.arange(N) * STEP
+        PX, PY = np.meshgrid(xs, ys, indexing='ij')
+        near = np.hypot(PX - gp[0], PY - gp[1]) <= self.goal_R
+        return {k: np.where(near, Mg[k], Mf[k]) for k in Mf}
+
+    def _search(self, T, chk_items, start, sn, gp, gh, gyaw, rad, max_try, exact=True):
+        """在 T 上从起点 sn 规划到停车点附近的栅格点，exact=True 时差值并进移动、准确停在 gp(转轴点)。
+        返回 ((score, res, node_piv) 或 None, 原因)。"""
+        sx, sy, sh = start
+        ox, oy = sx % STEP, sy % STEP
+        cands = []
+        ci, cj = (gp[0]-ox)/STEP, (gp[1]-oy)/STEP
+        for i in range(int(math.floor(ci)) - rad + 1, int(math.floor(ci)) + rad + 1):
+            for j in range(int(math.floor(cj)) - rad + 1, int(math.floor(cj)) + rad + 1):
+                if 0 <= i < N and 0 <= j < N and T['node'][gh][i*N + j]:
+                    cands.append((math.hypot(ox + i*STEP - gp[0], oy + j*STEP - gp[1]), i, j))
+        cands.sort()
+        if not cands:
+            return None, 'no_cand'
+        best = None
+        why = NO_ROUTE
+        tried = 0
+        for dist_, gi, gj in cands:
+            if tried >= max_try:
+                break
+            gn = gi*N + gj
+            hb = self._heur(T, gn, gh)
+            tried += 1
+            if hb[sh][4][sn] == math.inf:
+                continue
+            acts = self._astar(T, sn, sh, gn, gh, hb)
+            if acts is None:
+                if self._exhausted:
+                    why = '找不到路线（按横移上限 strafe_max_mm_per_leg 走不过去）'
+                    break
+                continue
+            node_piv = (ox + gi*STEP, oy + gj*STEP)
+            target = (gp[0], gp[1]) if exact else node_piv
+            res = self._finish(chk_items, (sx, sy, yaw_of(sh)), acts, node_piv, target, gyaw)
+            if res is None:
+                continue
+            score = (0 if res['ok'] else 1, res['tiny'], res['time'])
+            if best is None or score < best[0]:
+                best = (score, res, node_piv)
+            if res['ok'] and res['tiny'] == 0:
+                break
+        return best, why
+
     # ---------- 单段：准确地从起点走到停车点 ----------
     def leg(self, start_piv, goal_pose, name):
         """start_piv: 起点转轴点 (x, y, yaw)，任意位置(不要求在栅格上)。goal_pose: 停车点车中心 (x, y, yaw)。
-        返回 (leg dict, 'OK') 或 (None, 原因)。"""
+        返回 (leg dict, 'OK') 或 (None, 原因)。
+        10-12：停车点旁边有障碍物时照样准确停在停车点上(停车点附近只对它放宽到 goal_obstacle_min_margin_mm)；
+        真车停在停车点上就碰到障碍物时，沿车头方向挪到最近放得下的位置，leg['goal_shift'] = (往前mm, 往左mm)。"""
         sh = heading_index(start_piv[2]); gh = heading_index(goal_pose[2])
         sx, sy = float(start_piv[0]), float(start_piv[1])
         ox, oy = sx % STEP, sy % STEP
@@ -1006,23 +1161,19 @@ class Planner:
             return None, '起点在场地外'
         sc = self.center_of(sx, sy, yaw_of(sh)); start_c = (sc[0], sc[1], yaw_of(sh))
         gx, gy, gyaw = float(goal_pose[0]), float(goal_pose[1]), float(goal_pose[2])
-        gp = self.pivot_of(gx, gy, gyaw)
         notes = []
         items = list(self.items)
         relaxed = False
         # 起点、停车点本身离某个区域不够硬余量：只把这个区域放宽到它自己的距离(这一段)，并写进 note
+        # (停车点离障碍物不够的，下面单独处理：只在停车点附近放宽)
         sg = self.pose_eval(start_c, items)
         gg = self.pose_eval((gx, gy, gyaw), items)
-        park = False
         for k, it in enumerate(items):
             low = None
             if sg[k] < it[7] - EPS_MM:
                 low = sg[k]
                 notes.append(f'⚠ 起点离{it[0]}只有 {sg[k]:.0f}mm(要 {it[7]:.0f}mm)，离开时按 {max(sg[k], 0):.0f}mm 放宽')
-            if gg[k] < it[7] - EPS_MM:
-                if it[1] == 'obs':
-                    park = True
-                    continue
+            if gg[k] < it[7] - EPS_MM and it[1] != 'obs':
                 if gg[k] < 0 or (it[1] == 'edge' and it[7] <= 0):
                     return None, f'停车点 {name}({gx:.0f},{gy:.0f}) 本身' + _what(it, gg[k], False).replace('车身(含雷达)', '车身(含雷达)就')
                 low = gg[k] if low is None else min(low, gg[k])
@@ -1031,75 +1182,107 @@ class Planner:
             if low is not None:
                 lst = list(it); lst[7] = min(it[7], low - 0.5); items[k] = tuple(lst)
                 relaxed = True
-        M = self.maps(ox, oy, items if relaxed else None)
-        T = self._leg_tables(M)
+        # 停车点旁边的障碍物
+        goal = (gx, gy, gyaw)
+        g1, bad, rel1 = self._goal_relax(items, goal, 1)
+        shift = None
+        if bad:
+            k, g = min(bad, key=lambda b: b[1])
+            p, off, along = self._shift_goal(items, goal)
+            if p is None:
+                return None, (f'停车点 {name}({gx:.0f},{gy:.0f}) 真车(含雷达)离{items[k][0]}只有 {g:.0f}mm'
+                              f'(最少要 {self.goal_min:.0f}mm)，周围 {self.goal_shift_max:.0f}mm 内也找不到放得下车身的位置')
+            shift = (off, along, items[k][0], g)
+            goal = p
+            g1, bad, rel1 = self._goal_relax(items, goal, 1)
+        gp = self.pivot_of(goal[0], goal[1], gyaw)
         sn = si*N + sj
-        if not T['node'][sh][sn]:
-            return None, '起点受阻：' + (self.why_blocked(start_c[0], start_c[1], sh) or '车身放不下')
-        # 终点：离准确停车点最近、车身放得下的几个栅格点(停车点被障碍物占了时，改停在最近的放得下的点)
-        cands = []
-        rad = 2 if not park else 12
-        ci, cj = (gp[0]-ox)/STEP, (gp[1]-oy)/STEP
-        for i in range(int(math.floor(ci)) - rad + 1, int(math.floor(ci)) + rad + 1):
-            for j in range(int(math.floor(cj)) - rad + 1, int(math.floor(cj)) + rad + 1):
-                if 0 <= i < N and 0 <= j < N and T['node'][gh][i*N + j]:
-                    cands.append((math.hypot(ox + i*STEP - gp[0], oy + j*STEP - gp[1]), i, j))
-        cands.sort()
-        if not cands:
-            return None, '终点受阻：' + (self.why_blocked(gx, gy, gh) or '附近没有放得下车身的位置')
-        best = None
-        why = NO_ROUTE
-        tried = 0
-        for dist_, gi, gj in cands:
-            if tried >= (4 if not park else 3):
+        start = (sx, sy, sh)
+        tiers = [(g1 if rel1 else None, g1, rel1)]
+        g2, _, rel2 = self._goal_relax(items, goal, 2)
+        if rel2 and [(k, round(h, 2)) for k, _, h in rel2] != [(k, round(h, 2)) for k, _, h in rel1]:
+            tiers.append((g2, g2, rel2))                 # 第二档：停车点附近的障碍物都放到最小余量
+        best, why, used = None, NO_ROUTE, None
+        for t, (gmap_items, chk, rel) in enumerate(tiers):
+            M = self._goal_maps(items, relaxed, gmap_items, ox, oy, gp)
+            T = self._leg_tables(M)
+            if not T['node'][sh][sn]:
+                if t == 0:
+                    return None, '起点受阻：' + (self.why_blocked(start_c[0], start_c[1], sh) or '车身放不下')
+                continue
+            r, w = self._search(T, chk if rel else items, start, sn, gp, gh, gyaw, 2, 4)
+            if r is None:
+                if w == 'no_cand':
+                    w = '终点受阻：' + (self.why_blocked(goal[0], goal[1], gh) or '附近没有放得下车身的位置')
+                why = w
+                continue
+            if best is None or r[0] < best[0]:
+                best, used = r, (t, rel)
+            if r[1]['ok']:
                 break
-            gn = gi*N + gj
-            hb = self._heur(T, gn, gh)
-            if hb[sh][4][sn] == math.inf:
-                tried += 1
-                continue
-            acts = self._astar(T, sn, sh, gn, gh, hb)
-            tried += 1
-            if acts is None:
-                if self._exhausted:
-                    why = '找不到路线（按横移上限 strafe_max_mm_per_leg 走不过去）'
-                    break
-                continue
-            node_piv = (ox + gi*STEP, oy + gj*STEP)
-            target = (gp[0], gp[1]) if not park else node_piv
-            res = self._finish(items, (sx, sy, yaw_of(sh)), acts, node_piv, target, gyaw)
-            if res is None:
-                continue
-            score = (0 if res['ok'] else 1, res['tiny'], res['time'])
-            if best is None or score < best[0]:
-                best = (score, res, park, node_piv)
-            if res['ok'] and res['tiny'] == 0:
-                break
-        if best is None:
-            return None, why
-        _, res, park, node_piv = best
+        park = None
+        if best is None or not best[1]['ok']:
+            # 最后一招(和以前一样)：停到附近按完整余量放得下的栅格点
+            M = self.maps(ox, oy, items if relaxed else None)
+            T = self._leg_tables(M)
+            r, w = self._search(T, items, start, sn, gp, gh, gyaw, 12, 3, exact=False)
+            if r is not None and r[1]['ok']:
+                best, used = r, None
+                park = r[2]
+            elif best is None:
+                if w == 'no_cand':
+                    return None, '终点受阻：' + (self.why_blocked(goal[0], goal[1], gh) or '附近没有放得下车身的位置')
+                return None, why if why != NO_ROUTE else w
+        _, res, node_piv = best
         if not res['ok']:
             return None, '规划出来的指令扫过的范围不够余量：' + res['what']
         cmds, poses = res['cmds'], res['poses']
-        if park:
-            pc = self.center_of(node_piv[0], node_piv[1], gyaw)
-            goal_c = (pc[0], pc[1], gyaw)
-            ob = [it for k, it in enumerate(self.items) if it[1] == 'obs' and gg[k] < it[7] - EPS_MM]
-            notes.append(f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f})被{ob[0][0] if ob else "障碍物"}挡住，'
-                         f'改停在 ({goal_c[0]:.0f},{goal_c[1]:.0f})，差 {math.hypot(goal_c[0]-gx, goal_c[1]-gy):.0f}mm')
-        else:
-            goal_c = (gx, gy, gyaw)
+        if park is not None:
+            pc = self.center_of(park[0], park[1], gyaw)
+            goal = (pc[0], pc[1], gyaw)
+        a = math.radians(gyaw)
+        fwd = (goal[0]-gx)*math.cos(a) + (goal[1]-gy)*math.sin(a)
+        left = -(goal[0]-gx)*math.sin(a) + (goal[1]-gy)*math.cos(a)
+        off_txt = '、'.join(t for t in ((f'往{"前" if fwd > 0 else "后"} {abs(fwd):.0f}mm' if abs(fwd) >= 0.5 else ''),
+                                        (f'往{"左" if left > 0 else "右"} {abs(left):.0f}mm' if abs(left) >= 0.5 else '')) if t)
+        if park is not None:
+            why0 = (f'真车(含雷达)离{shift[2]}只有 {shift[3]:.0f}mm' if shift else '旁边有障碍物，按放宽的余量也开不进去')
+            notes.append(f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f}){why0}，改停在 ({goal[0]:.0f},{goal[1]:.0f})'
+                         f'(比规定的点{off_txt}，差 {math.hypot(goal[0]-gx, goal[1]-gy):.0f}mm)，任务对准时要补上')
+        elif shift is not None:
+            (u, v), along, what, g = shift[0], shift[1], shift[2], shift[3]
+            how = '沿车头方向' if along else f'沿车头方向 {self.goal_shift_max:.0f}mm 内都停不下，'
+            notes.append(f'⚠ {name} 的准确停车点({gx:.0f},{gy:.0f})真车(含雷达)离{what}只有 {g:.0f}mm'
+                         f'(最少要 {self.goal_min:.0f}mm)，停不下：{how}{off_txt}，改停在 ({goal[0]:.0f},{goal[1]:.0f})'
+                         f'，任务对准时要补上这 {math.hypot(u, v):.0f}mm')
+        if used is not None and used[1] and park is None:
+            t, rel = used
+            if t == 0:
+                for k, g, h in rel:
+                    if h >= self.obs_margin - 0.5:
+                        notes.append(f'⚠ {name} 停车点旁边有{items[k][0]}(看得不清楚，规划时当成更大的圆柱)：真车(含雷达)离它 {g:.0f}mm，'
+                                     f'停车点附近按它的真实大小算、留 {h:.0f}mm，照样准确停在 ({goal[0]:.0f},{goal[1]:.0f})')
+                        continue
+                    notes.append(f'⚠ {name} 停车点旁边有{items[k][0]}：真车(含雷达)离它 {g:.0f}mm(障碍物余量 {self.obs_margin:.0f}mm)，'
+                                 f'只在停车点附近对它留 {h:.0f}mm，照样准确停在 ({goal[0]:.0f},{goal[1]:.0f})')
+            else:
+                names_ = '、'.join(items[k][0] for k, _, _ in rel)
+                notes.append(f'⚠ {name} 停车点附近的{names_}按余量 {self.obs_margin:.0f}mm 开不进去：'
+                             f'只在停车点附近对它们留 {self.goal_min:.0f}mm，照样停在 ({goal[0]:.0f},{goal[1]:.0f})')
         # 黄色区：比希望的余量近 → 提示(只有挤不过去的地方才会这样)
+        chk_items = items if used is None or not used[1] else tiers[used[0]][1]
         ym = self.yellow_margin
-        ymins = [res['mins'][k] for k, it in enumerate(items) if it[1] == 'yellow']
+        ymins = [res['mins'][k] for k, it in enumerate(chk_items) if it[1] == 'yellow']
         ygap = min(ymins) if ymins else math.inf
         if ygap < ym - 0.5:
             notes.insert(0, f'⚠ 去 {name} 这一段按离黄色区 {ym:.0f}mm 规划不出来(车道太窄或停车点离黄色区太近)，'
                             f'这一段只留了 {max(ygap, 0):.0f}mm，走这段要特别注意。')
-        real = [(res['mins'][k], it) for k, it in enumerate(items) if not (it[1] == 'edge' and it[8] <= 0)]
-        leg = dict(stop=name, start=start_c, goal=goal_c, cmds=cmds, poses=poses, note='；'.join(notes),
+        real = [(res['mins'][k], it) for k, it in enumerate(chk_items) if not (it[1] == 'edge' and it[8] <= 0)]
+        moved = math.hypot(goal[0]-gx, goal[1]-gy) >= 0.5
+        leg = dict(stop=name, start=start_c, goal=goal, cmds=cmds, poses=poses, note='；'.join(notes),
                    min_gap_mm=round(min(g for g, _ in real), 1) if real else None,
-                   yellow_mm=round(ygap, 1) if ygap < math.inf else None, time_s=round(res['time'], 2))
+                   yellow_mm=round(ygap, 1) if ygap < math.inf else None, time_s=round(res['time'], 2),
+                   stop_pose=(gx, gy, gyaw), goal_shift=(round(fwd, 1), round(left, 1)) if moved else None)
         return leg, 'OK'
 
     def _finish(self, items, start_piv, acts, node_piv, target_piv, gyaw):

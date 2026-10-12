@@ -133,7 +133,10 @@ def flatten(turn_back, legs, min_move=MIN_MOVE_MM, stop_min=STOP_MIN_MM):
                 c -= v
             rest[cmd] = c
         goal = tuple(float(v) for v in L['goal'][:3]) if L.get('goal') is not None else None
-        seq.append((L['stop'], None, dict(goal=goal, rest=rest)))        # 到达停车点的标记
+        info = dict(goal=goal, rest=rest)
+        if L.get('goal_shift'):
+            info['shift'] = tuple(float(v) for v in L['goal_shift'][:2])   # 10-12：停车点被障碍物挡住、挪了(往前mm, 往左mm)
+        seq.append((L['stop'], None, info))        # 到达停车点的标记
     return seq
 
 
@@ -1188,6 +1191,14 @@ class _Drive:
         is_pre = up.startswith('PREHOME')
         role = _role(stop)
         self.log(f'  ★ 到达 {stop}   (已用 {time.monotonic()-self.t_start:.1f} 秒)')
+        sh = info.get('shift')
+        if sh and math.hypot(sh[0], sh[1]) >= 1:
+            # 10-12：真车停在规定的点上会碰到障碍物，规划时已经挪到最近放得下的位置；任务对准时要补上
+            parts = [f'往{"前" if sh[0] > 0 else "后"} {abs(sh[0]):.0f}mm' if abs(sh[0]) >= 1 else '',
+                     f'往{"左" if sh[1] > 0 else "右"} {abs(sh[1]):.0f}mm' if abs(sh[1]) >= 1 else '']
+            self.log(f'    ⚠ {stop} 规定的停车点被障碍物挡住，这次停的位置比规定的点' + '、'.join(p for p in parts if p)
+                     + '，任务对准时要补上这段')
+            _call(self.hooks, 'stop_offset', stop, float(sh[0]), float(sh[1]))
         goal = self.nav.ref
         if is_start:
             ap = self.approach or {}
