@@ -806,6 +806,51 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mission_cli.handle_cli('mtest', ['mtest', 'TEMP', '1', 'wheel'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
 
+    def test_mtest_arm_option_uses_the_arm_this_time_only(self):
+        """(10-12)工位默认只动车轮；mtest TEMP 1 force arm：这一次用手臂对准(以前的做法)，做完恢复只动车轮。"""
+        self.h.cfg['align_by'] = dict(RAW='arm', ROUGH='wheels', TEMP='wheels')
+        self._zone_setup('TEMP')
+        self.run_cli('mtest', 'mtest TEMP 1 force arm')
+        text = '\n'.join(self.lines)
+        self.assertIn('arm：这次用手臂对准', text)
+        self.assertNotIn('[只动车轮]', text)
+        self.assertIn('手臂对准', text.split('这次用时')[-1])
+        self.assertEqual(len(self.w.placed), 3, text)
+        self.assertEqual(self.h.cfg['align_by'], dict(RAW='arm', ROUGH='wheels', TEMP='wheels'))
+        for key in [k for k in self.w.rings if k[0] == 'TEMP']:     # 圆环拿空，物料放回车上
+            self.w.rings[key] = []
+        for it in self.h.plan.items(1):
+            self.w.tray[it.slot] = it.color
+        self.lines.clear()
+        self.run_cli('mtest', 'mtest TEMP 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('[只动车轮]', text)
+        self.assertIn('只动车轮、手臂不动', text.split('这次用时')[-1])
+        self.assertEqual(len(self.w.placed), 6, text)
+        self.assertEqual((self.w.air, self.w.collisions), (0, 0), text)
+
+    def test_vcal_raw_for_wheels_probes_strafe_and_forward_and_returns(self):
+        """(10-12)原料区只动车轮：vcal RAW 颜色号 实测车轮横移、前后两列(不是补的)，测完挪回原处。"""
+        self.h.cfg['align_by'] = dict(RAW='wheels', ROUGH='wheels', TEMP='wheels')
+        self.run_cli('arm', 'arm LIFT ZERO')
+        self.w.arrive('RAW', 1)
+        for it in self.w.raw_items:
+            if it['color'] == 1:
+                it['pos'] = self.w.claw().copy()
+        self.run_cli('vcal', 'vcal RAW 1')
+        text = '\n'.join(self.lines)
+        self.assertIn('原料区只动车轮对准', text)
+        J = self.h.store.get('RAW', 'ch')
+        self.assertIsNotNone(J, text)
+        self.assertFalse(self.h.store.synth('RAW'))
+        import numpy as np
+        true = self.w.scale['RAW'] * self.w.Rcam @ np.diag([1.0, -1.0])
+        for i in (0, 1):
+            self.assertGreater(float(J[:, i] @ true[:, i]) / (np.linalg.norm(J[:, i]) * np.linalg.norm(true[:, i])), 0.95)
+        self.assertTrue(any(c == 'S' for c, _v, _z in self.w.moves))
+        self.assertEqual(sum(v for c, v, _z in self.w.moves if c == 'S'), 0)                # 挪回原处
+        self.assertEqual(sum(v for c, v, _z in self.w.moves if c == 'F'), 0)
+
     def test_park_command(self):
         """park：收臂、升降停 60(终端命令，急停以后也能做)。"""
         self.h._ensure(self.w.link)

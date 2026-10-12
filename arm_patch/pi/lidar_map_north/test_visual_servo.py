@@ -480,5 +480,127 @@ class ServoTests(unittest.TestCase):
         self.assertIsNone(JacStore(path).get('RING', 'arm'))
 
 
+class WheelsPlant(SimPlant):
+    """记下底盘每条指令(看是不是整毫米、有没有超出每步上限)；clock 给了的话每条指令按 1.1 秒算。"""
+
+    def __init__(self, rng, clock=None, **kw):
+        super().__init__(rng, **kw)
+        self.cmds = []
+        self.clock = clock
+
+    def chassis_move(self, s, f, speed=None):
+        self.cmds.append((s, f, speed))
+        if self.clock is not None:
+            self.clock.sleep(1.1 * ((s != 0) + (f != 0)))
+        super().chassis_move(s, f)
+
+
+class WheelsOnlyTests(unittest.TestCase):
+    """只动车轮(10-12 用户：每个任务点都微调车轮对准，手臂不动)。"""
+
+    def test_wheels_only_never_moves_the_arm_and_converges(self):
+        rng = np.random.default_rng(51)
+        ok_n, errs, N = 0, [], 80
+        for _ in range(N):
+            pl = WheelsPlant(rng, err_mm=rng.uniform(3, 25), ch_noise_mm=0.8)
+            store = JacStore(None)
+            store.put('RING', 'ch', pl.B * (1 + rng.normal(0, 0.05, (2, 2))))       # vcal 测过的(差几个百分点)
+            res = make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.2, wheels_only=True, timeout_s=60)
+            self.assertEqual(pl.arm_moves, 0)
+            self.assertTrue(all(float(s).is_integer() and float(f).is_integer() for s, f, _sp in pl.cmds), pl.cmds)
+            ok_n += res.ok
+            errs.append(pl.true_err_mm)
+        errs = np.array(errs)
+        print(f'\n  [只动车轮] 成功 {ok_n}/{N}，真实误差 平均 {errs.mean():.2f}mm / 95% {np.percentile(errs, 95):.2f}mm')
+        self.assertGreaterEqual(ok_n, int(0.95 * N))
+        self.assertLess(errs.mean(), 1.8)
+        self.assertLess(np.percentile(errs, 95), 3.2)
+
+    def test_tolerance_is_never_tighter_than_the_wheels_can_do(self):
+        rng = np.random.default_rng(52)
+        pl = WheelsPlant(rng, err_mm=1.7, noise_px=0.0)
+        store = JacStore(None)
+        store.put('RING', 'ch', pl.B)
+        res = make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.0, wheels_only=True)
+        self.assertTrue(res.ok)                                   # 1.7mm < wheels_only_tol_mm 2.0：不动
+        self.assertEqual(pl.cmds, [])
+
+    def test_step_clamp_and_strafe_and_travel_limits(self):
+        rng = np.random.default_rng(53)
+        for _ in range(20):
+            pl = WheelsPlant(rng, err_mm=rng.uniform(40, 80), ch_noise_mm=0.5)
+            store = JacStore(None)
+            store.put('RING', 'ch', pl.B)
+            res = make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.2, wheels_only=True, max_iter=8, timeout_s=60,
+                                            chassis_s_range=(-8.0, 12.0), chassis_fix_max_mm=25.0)
+            self.assertEqual(pl.arm_moves, 0)
+            S = np.cumsum([c[0] for c in pl.cmds]) if pl.cmds else np.zeros(1)
+            self.assertTrue(np.all(S >= -8.0) and np.all(S <= 12.0), S)
+            self.assertLessEqual(sum(abs(c[1]) for c in pl.cmds), 25.0)
+            self.assertTrue(all(abs(s) <= 30 and abs(f) <= 30 for s, f, _sp in pl.cmds), pl.cmds)   # 每步上限 30mm
+            self.assertEqual(res.disp, (float(S[-1]) if pl.cmds else 0.0, float(sum(c[1] for c in pl.cmds))))
+            if not res.ok:
+                self.assertTrue('范围' in res.reason or '挪了' in res.reason or '修正后' in res.reason, res.reason)
+
+    def test_f_range_is_cumulative(self):
+        rng = np.random.default_rng(54)
+        pl = WheelsPlant(rng, err_mm=30.0, ch_noise_mm=0.3)
+        store = JacStore(None)
+        store.put('RING', 'ch', pl.B)
+        make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.2, wheels_only=True, max_iter=6, timeout_s=60,
+                                  chassis_f_range=(-3.0, 3.0))
+        F = np.cumsum([c[1] for c in pl.cmds]) if pl.cmds else np.zeros(1)
+        self.assertTrue(np.all(np.abs(F) <= 3.0), F)
+
+    def test_synthesized_strafe_column_is_probed_once_and_saved(self):
+        rng = np.random.default_rng(55)
+        pl = WheelsPlant(rng, err_mm=10.0, ch_noise_mm=0.5)
+        store = JacStore(None)
+        jf = pl.B[:, 1]
+        store.put('RING', 'ch', np.array([[-jf[1], jf[0]], [jf[0], jf[1]]]))       # 只测过前后：横移那一列是补的
+        store.set_synth('RING', True)
+        sv = make_servo(pl, store)
+        r1 = sv.run('RING', pl.measure, pl.scale, 1.2, wheels_only=True, timeout_s=60, chassis_s_range=(-20.0, 20.0))
+        self.assertTrue(r1.probed and r1.ok, r1)
+        self.assertFalse(store.synth('RING'))
+        js, jt = store.get('RING', 'ch')[:, 0], pl.B[:, 0]
+        self.assertGreater(float(js @ jt) / (np.linalg.norm(js) * np.linalg.norm(jt)), 0.95)
+        self.assertLessEqual(max(abs(x) for x in np.cumsum([c[0] for c in pl.cmds])), 20.0)
+        ang = rng.uniform(0, 2 * math.pi)
+        pl.p = np.array([math.cos(ang), math.sin(ang)]) * 12.0 * pl.scale
+        r2 = make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.2, wheels_only=True, timeout_s=60)
+        self.assertFalse(r2.probed)
+        self.assertEqual(pl.arm_moves, 0)
+
+    def test_fixed_j_without_a_jacobian_does_not_move(self):
+        pl = WheelsPlant(np.random.default_rng(56), err_mm=10.0)
+        res = make_servo(pl).run('RAW', pl.measure, pl.scale, 3.0, wheels_only=True, fixed_j=True)
+        self.assertFalse(res.ok)
+        self.assertEqual((pl.cmds, pl.arm_moves), ([], 0))
+
+    def test_no_move_when_the_time_left_is_too_short(self):
+        clock = FakeClock()
+        pl = WheelsPlant(np.random.default_rng(57), err_mm=10.0, clock=clock)
+        store = JacStore(None)
+        store.put('RAW', 'ch', pl.B)
+        sv = VisualServo(pl, store=store, log=lambda m: None, sleep=clock.sleep, clock=clock)
+        res = sv.run('RAW', pl.measure, pl.scale, 3.0, wheels_only=True, fixed_j=True, timeout_s=1.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(pl.cmds, [])                             # 一条指令要 1.2 秒，只剩 1 秒：不挪
+        self.assertIn('超时', res.reason)
+        self.assertTrue(math.isfinite(res.err_mm))                # 没动过：测到的偏差就是现在的(按它决定夹不夹)
+
+    def test_wheels_only_off_keeps_the_old_behaviour(self):
+        """不加 wheels_only：照旧用手臂(这里不许动底盘)。"""
+        rng = np.random.default_rng(58)
+        pl = WheelsPlant(rng, err_mm=8.0)
+        store = JacStore(None)
+        store.put('RING', 'ch', pl.B)
+        res = make_servo(pl, store).run('RING', pl.measure, pl.scale, 1.0, allow_chassis=False, max_iter=8, timeout_s=60)
+        self.assertTrue(res.ok)
+        self.assertGreater(pl.arm_moves, 0)
+        self.assertEqual(pl.cmds, [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
