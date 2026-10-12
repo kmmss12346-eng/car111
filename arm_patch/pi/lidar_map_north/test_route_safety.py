@@ -6,10 +6,10 @@ import unittest
 
 import route_plan as rp
 
-# 和您 10 月 6 日的 map_config_start2_roi.json 一样(路线规划用到的那些键)；启停区1 的车头按 180(朝西)
+# 和您 10 月 6 日的 map_config_start2_roi.json 一样(路线规划用到的那些键)；启停区1 和区 2 上下对称、车头都朝北(10-12)
 STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
-         'START1': [2250, 2250, 180], 'START2': [2250, 150, 90],
-         'PREHOME2': [2250, 400, 90], 'PREHOME1': [2000, 2250, 180]}
+         'START1': [2250, 2250, 90], 'START2': [2250, 150, 90],
+         'PREHOME2': [2250, 400, 90], 'PREHOME1': [2250, 2000, 90]}
 CFG = dict(stops=STOPS, car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40,
            lidar_forward_mm=22.453557227708068, lidar_left_mm=134.7743150753031,
            margin_mm=60, strafe_cost_factor=3.0, strafe_max_mm_per_leg=300, turn_margin_mm=20,
@@ -29,8 +29,7 @@ def rot1(p):
 
 # 第二站实测停在 (2208,233)、车头转回起步方向后的规划起点；启停区1 是它转 90° 的位置
 ZONES = {2: dict(start=(2208, 233, 90), pivot=(2208, 233), home='START2', pre='PREHOME2'),
-         1: dict(start=(rot1((2208, 233, 0))[0], rot1((2208, 233, 0))[1], 180),
-                 pivot=rot1((2208, 233, 0))[:2], home='START1', pre='PREHOME1')}
+         1: dict(start=(2208, 2167, 90), pivot=(2208, 2167), home='START1', pre='PREHOME1')}
 
 
 def run(legs, start):

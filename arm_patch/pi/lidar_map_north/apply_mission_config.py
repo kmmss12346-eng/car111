@@ -59,7 +59,12 @@ def main(argv):
     cfg = json.loads(path.read_text(encoding='utf-8'))
     old = cfg.get('mission_cfg') or {}
     new = deep_merge(DEFAULTS, old)          # DEFAULTS 打底，已有的值覆盖它(不会改你已经设的)
+    done = set(old.get('_migrated') or [])                 # 10-12：每条升级只做一次(以后用户自己改回这个值，不会每次安装又被改掉)
     for (sec, k), (was, now) in OLD_DEFAULTS.items():     # 以前的默认值、没改过的：换成新的默认值
+        mid = f'{sec or ""}.{k}={now!r}'
+        if mid in done:
+            continue
+        done.add(mid)
         cur = old.get(k, None) if sec is None else (old.get(sec) or {}).get(k)
         olds = was if isinstance(was, tuple) else (was,)
         if cur is not None and any(type(cur) is type(w) and cur == w for w in olds):
@@ -68,6 +73,7 @@ def main(argv):
             else:
                 new[sec][k] = now
             print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {cur} -> 新的默认值 {now}')
+    new['_migrated'] = sorted(done)
     if disable:
         new['enabled'] = False
     elif 'enabled' not in old:

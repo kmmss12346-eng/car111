@@ -216,6 +216,7 @@ def main():
     def _plan_route(cur=None):
         if not history.views:
             state['legs'],state['path'],state['reason']=[],[],'NOT SCANNED';return
+        key0=obj_key()          # 10-12：规划用的是这一刻的扫描/障碍物；规划期间又合并了第二次扫描时，路线不能当成"已经考虑了新障碍物"
         c=state['config']
         if cur is None:cur=(c['car_x_mm'],c['car_y_mm'],c['car_yaw_deg'])
         d=float(raw_cfg.get('turn_pivot_back_mm',0))
@@ -266,7 +267,7 @@ def main():
         except ValueError as e:
             legs,why=[],str(e)
         state['legs']=legs;state['reason']='ROUTE OK' if why=='OK' else why
-        state['legs_partial']=rf is not None;state['plan_obj_key']=obj_key()
+        state['legs_partial']=rf is not None;state['plan_obj_key']=key0
         print(f'  规划用时 {time.monotonic()-t_plan:.1f} 秒',flush=True)
         pts=[state['plan_start'][:2]]
         for L in legs:pts+=[p[:2] for p in L['poses']]
@@ -439,7 +440,8 @@ def main():
     def try_reuse_preplan():
         """race：第二次扫描没看到新障碍物、第二站车位和推算的差不多，就直接用开跑前规划好的路线(不再花十几秒规划)。"""
         pp=state.get('preplan')
-        if not pp or pp.get('status')!='ok' or len(history.views)<2 or state.get('replan_from') is not None:return False
+        one=bool(state.get('second_failed'))                 # 第二次扫描失败了：只有第一次扫描，也用开跑前的路线
+        if not pp or pp.get('status')!='ok' or (len(history.views)<2 and not one) or state.get('replan_from') is not None:return False
         c=state['config'];pr=pp['pred']
         dp=math.hypot(c['car_x_mm']-pr[0],c['car_y_mm']-pr[1])
         lim=float(raw_cfg.get('preplan_reuse_mm',40))
@@ -544,6 +546,15 @@ def main():
                 time.sleep(0.1)
             return bool(state['confirm'])
         def aborted(self):return state['abort']
+        def second_failed(self):
+            """第二次扫描两次都失败：有开跑前的预先规划就把车位当成推算的第二站车位，用那条路线。返回能不能接着跑。"""
+            pp=state.get('preplan')
+            if not pp or pp.get('status')!='ok' or not pp.get('pred'):return False
+            close_stream()
+            pr=pp['pred'];c=state['config']
+            c['car_x_mm'],c['car_y_mm'],c['car_yaw_deg']=float(pr[0]),float(pr[1]),float(pr[2])
+            state['second_failed']=True;state['second_icp']=None
+            return True
         # ---- race(开跑前，在 race 线程里)
         def zone_select(self,z):self._gui(f'__zone {int(z)}')
         def gyro_yaw(self):
@@ -611,7 +622,7 @@ def main():
             if first_scan:
                 # STM32 开跑时 HOME：要保持的车头 = 出发时的车头；第二站顺时针转 cw 度以后 = 出发车头 - cw
                 state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
-                state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None   # 不用上一次的路线
+                state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None;state['second_failed']=False   # 不用上一次的路线
                 if not scanned:state['preplan']=None;state['home_routes']={}          # go：没有开跑前的预先规划
             run_mission(Ctx(),link,log=log,first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,cfg=raw_cfg,scanned=scanned)
         except Abort as e:
@@ -799,6 +810,12 @@ def main():
             if link is None:raise ValueError('没有连接 STM32（--stm-port），不能用 '+k)
             if state['auto']:raise ValueError('一键流程正在运行；输入 abort 可以中止')
             if state.get('busy'):raise ValueError('测试命令(vclaw/gtest/vcal…)还在运行，等它结束再用 '+k)
+            if k in ('go','race'):
+                try:
+                    from mission_cli import busy_reason
+                    why_=busy_reason()
+                except ImportError:why_=None
+                if why_:raise ValueError(f'不能开始 {k}：{why_}')    # 10-12：开跑后第一次张爪子会把夹着的物料掉下去
             if k=='p2':
                 sync_now()
                 print('第二站动作 ->',link.second_move(None if raw_cfg.get('second_use_p2',False) else rel,log=lambda m:print(m,flush=True)),flush=True);return

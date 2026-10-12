@@ -1483,7 +1483,19 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
             raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
         time.sleep(settle_s)
         log('③ 第二次扫描：车保持不动……')
-        ctx.second()
+        try:
+            ctx.second()
+        except Abort as e:
+            # 10-12：开跑以后雷达偶尔卡一下就整轮停在第二站，太亏：重扫一次；还不行就用开跑前(第一次扫描)规划好的路线
+            if getattr(ctx, 'aborted', lambda: False)():
+                raise
+            log(f'  ★ 第二次扫描失败({e})：再扫一次……')
+            try:
+                ctx.second()
+            except Abort as e2:
+                if getattr(ctx, 'aborted', lambda: False)() or not (hasattr(ctx, 'second_failed') and ctx.second_failed()):
+                    raise
+                log(f'  ★ 第二次扫描又失败({e2})：按推算的第二站车位，用开跑前规划好的路线接着跑')
     caps = firmware_caps(link, cfg)
     turn_back, legs, reason = ctx.plan()
     if reason != 'ROUTE OK' or not legs:

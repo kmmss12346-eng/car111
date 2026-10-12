@@ -363,6 +363,21 @@ class QrSearchTests(unittest.TestCase):
         self.assertEqual(h.plan.code, '231+312+123+132', text)
         self.assertIn('备用任务码', text)
 
+    def test_real_code_read_later_replaces_fallback(self):
+        """10-12：QR 点没读到、先用了备用码；去原料区的路上读到了真码(还没夹东西)：换成真码。"""
+        from sim_mission import FakeCtx
+        w = SimWorld(seed=3, code=CODE, qr_window=(5000.0, 5100.0))
+        h, lines = hooks(w, {'qr_fallback_code': '231+312+123+132'}, raw=RAW)
+        h.ctx = FakeCtx(None)
+        h.prepare(w.link, lines.append)
+        w.arrive('QR')
+        h.task('QR', w.link, lines.append)
+        self.assertEqual(h.plan.code, '231+312+123+132')
+        w.qr_code = CODE
+        w.arrive('RAW', 1)
+        h.task('RAW', w.link, lines.append)
+        self.assertEqual(h.plan.code, CODE, '\n'.join(lines))
+
     def test_fixed_code_skips_scanning(self):
         """(10-11 用户)qr_fixed_code：不扫码、不前后挪，直接用手动给的任务码。"""
         w, h, text = self.run_qr(None, cfg={'qr_fixed_code': '231+312+123+132'})

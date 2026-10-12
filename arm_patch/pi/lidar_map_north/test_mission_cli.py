@@ -956,6 +956,21 @@ class ConfigScriptTests(unittest.TestCase):
         self.assertEqual(mc['ring_order'], {'ROUGH': 'lr', 'TEMP': 'lr'})   # 新加的项补上
         self.assertIs(mc['chassis_strafe'], False)
 
+    def test_upgrade_runs_once(self):
+        """10-12：同一条升级只做一次。升级过以后用户自己又改回旧值(比如 raw_stop_s 4)，再装一次更新不会又被改掉。"""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'cfg.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'mission_cfg': {'raw_stop_s': 4.0}}, f)
+        apply_mission_config.main([path])
+        cfg = load(path)
+        self.assertEqual(cfg['mission_cfg']['raw_stop_s'], 5.0)
+        cfg['mission_cfg']['raw_stop_s'] = 4.0                     # 用户自己改回 4
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        apply_mission_config.main([path])
+        self.assertEqual(load(path)['mission_cfg']['raw_stop_s'], 4.0)
+
     def test_10_10_keys_and_strafe_upgrade(self):
         """10-10：ring_strafe_max_mm 旧默认 40 升级成 20(用户自己改过的不动)；新加的项(时间、扫码、斜度…)都补上，用户的值不改。"""
         d = tempfile.mkdtemp()

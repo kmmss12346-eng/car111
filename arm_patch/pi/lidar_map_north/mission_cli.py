@@ -142,6 +142,17 @@ def _hooks(link, raw_cfg, log):
     return h
 
 
+def busy_reason():
+    """测试命令留下的、开跑前必须先处理的状态(pcal 没 save/cancel、爪子里可能还夹着物料)；没有返回 None。"""
+    if _PC.get('st'):
+        return 'pcal 还没做完(爪子里夹着物料)：先输入 pcal save 或 pcal cancel'
+    h = _S.get('hooks')
+    if h is not None and (getattr(h, 'holding', None) is not None or getattr(h, 'maybe_holding', None)):
+        why = getattr(h, 'maybe_holding', None) or '爪子里夹着物料'
+        return f'{why}：先把物料拿掉，再输入 arm CLAW O(张开)和 park，然后再开始'
+    return None
+
+
 def release():
     """释放测试命令占着的摄像头和记录(go 开始前由 map_merge_live 调用，免得两个地方同时开 /dev/video0)。"""
     _watch_stop()
