@@ -142,3 +142,11 @@ code/STM32/Core/{Src,Inc}/     ← STM32 源码(arm.c chassis.c main.c hwt101.c 
 code/STM32/tests_stm32/        ← STM32 主机测试
 git_log.txt                ← 分支最近 120 条提交记录
 ```
+
+## 10. 10-14 新增（最新）
+
+- **STM32 边升边转（OVLAP=1，OVCLR=20mm）**：`arm.c` 的 `Move_Over`：先直着升 OVCLR，再一边升到 ZHI 一边转，转过一半开始往目标上方降，最后 OVCLR 直着降。用在 OBS、GRAB/PICK(夹起放进转盘)、TAKE(转到槽口上方)、DROP 后缩回；新指令 `APZ a1 a2 z`（树莓派 `ArmLink.apz`，旧固件回 ERR CMD 时自动改成 AP + LIFT）。`set OVLAP 0` 回到一步一步。
+- **工位只对准 2 号环一次（zone_reach='arm'，默认）**：车在 2 号环前对准一次(车轮)，拍一张照片，1、3 号环按示教的角度直接转手臂去放/取，不再一个一个对准；照片里 1、3 号环和示教时比偏了多少像素，按 RING 的手臂 J 换成角度补上(补车停偏、车身斜；teach_fix_max_deg 3°)。
+  - 示教命令（车停在该区 2 号环正前方）：`rteach ROUGH 2` → `arm AD 1 ±8` 转到 1 号环上方 → `rteach ROUGH 1` → 同样 `rteach ROUGH 3`；TEMP 一样。`rteach show/clear`。存在 `ring_teach.json`（**车上独有，不能覆盖**）。
+  - 没示教过就自动照旧一个环一个环对准。模拟：车身斜 ±3° 时放置误差 ≤2mm（画面看得到 3 个环时）。
+- 用户的新夹子/摄像头（摄像头中心对准夹子中心）还没装；装好后先标定（见第 7 节）再示教 rteach。

@@ -32,6 +32,9 @@ pcal 1 [槽号]              放置补偿(第一层，平放在圆环上)：车�
                              把物料挪到圆环正中，输入 pcal save：记下补偿并放下。不想要：pcal cancel(物料放回转盘)
 pcal 2 [槽号]              放置补偿(第二层，码垛)：2 号环上先放好一个第一层物料，其他和 pcal 1 一样，物料挪到下面那个物料正上方
 pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
+rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
+                             再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
+                             比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
 mtest START                单独测回家后的显示(会收臂、升降停 60)
 mtest reset                清空任务码和记录，重新开始
 park                       收臂、升降停到 60mm(下次开机编码器才认得准)；急停以后要自己输入这个
@@ -45,6 +48,7 @@ gtest <颜色号> [nogo]      夹取测试：摄像头找这个颜色的物料 �
 mot                        看 5 个电机驱动器(1~4 号轮子、5 号升降)的电压、是否使能、是否触发堵转保护——车不动时先用它
 mot en                     让 5 个驱动器解除堵转保护并使能，然后再看一次状态
 """
+import json
 import math
 import os
 import re
@@ -165,7 +169,7 @@ def release():
 
 # ---------------------------------------------------------------- vwatch：一边手动调手臂，一边实时看识别
 _W = {'thread': None, 'stop': None, 'what': None, 'resume': None}
-VISION_CMDS = ('vclaw', 'vcal', 'vdbg', 'gtest', 'rtest', 'mtest', 'vmask')    # 这些命令自己要用摄像头识别
+VISION_CMDS = ('vclaw', 'vcal', 'vdbg', 'gtest', 'rtest', 'mtest', 'vmask', 'rteach')    # 这些命令自己要用摄像头识别
 MTEST_OPTS = ('force', 'nogo', 'rev', 'any', 'wheels', 'nofilt', 'arm')                 # mtest 后面能加的选项
 
 
@@ -451,6 +455,29 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             if h.disabled:
                 raise ValueError(h.disabled)
             _vcal(h, kind, color, chassis, log)
+        return _run_async(state, log, go, vision=True)
+
+    if k == 'rteach':
+        path = h.cfg.get('ring_teach_file') or 'ring_teach.json'
+        if len(parts) >= 2 and parts[1].lower() in ('show', 'clear'):
+            from mission_hooks import load_place_adj
+            if parts[1].lower() == 'clear':
+                if os.path.exists(path):
+                    os.remove(path)
+                h.__dict__.pop('_teach_all', None)
+                log(f'已清掉示教({path})：比赛时照旧一个环一个环对准')
+            else:
+                d = load_place_adj(path)
+                log(f'示教({path})：' + (json.dumps(d, ensure_ascii=False) if d else '还没有'))
+            return None
+        if len(parts) != 3 or parts[1].upper() not in ('ROUGH', 'TEMP') or parts[2] not in ('1', '2', '3'):
+            raise ValueError('格式：rteach ROUGH 2 / rteach ROUGH 1 / rteach ROUGH 3(TEMP 一样)；rteach show / rteach clear')
+        zone, ring = parts[1].upper(), int(parts[2])
+
+        def go():
+            h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+            state['abort'] = False
+            _rteach(h, link, zone, ring, path, log)
         return _run_async(state, log, go, vision=True)
 
     if k == 'pcal':
@@ -760,6 +787,65 @@ def _zone_preflight(h, zone, batch, force, log):
     if h.store is not None and h.store.get('RING', 'arm') is None:
         log('   第一次对圆环：会先小幅动几下手臂(和底盘)，测出动作和画面的对应关系，存下来以后直接用')
     log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
+
+
+def _rteach(h, link, zone, ring, path, log):
+    """示教：只动手臂对准最近的圆环，记下角度(2 号环)或者和 2 号环差多少度(1、3 号环)，存进 ring_teach.json。"""
+    from mission_hooks import load_place_adj
+    _tools(h, link)
+    P = h.arm.params(refresh=True)
+    if P.get('ARMOK', 0) < 0.5:
+        raise ValueError('先把姿态标定好并 set ARMOK 1')
+    d = load_place_adj(path)
+    z = d.setdefault(zone, {})
+    if ring == 2:
+        log(f'① {zone} 2 号环：手臂摆到看圆环的姿态(OBS RING)')
+        h.arm.obs('RING', open_claw=True)
+    elif not z.get('p2'):
+        raise ValueError(f'先做 rteach {zone} 2(车停在 2 号环正前方)')
+    else:
+        log(f'① {zone} {ring} 号环：手臂应该已经用 arm AD 1 ±几度 大概转到 {ring} 号环上方(车别动)')
+    log('② 只动手臂对准最近的圆环……')
+    s = h.vision.scale('RING')
+    res = h.servo.run('RING', h.vision.ring_error, s, h.cfg['tol_mm']['RING'], allow_chassis=False,
+                      label=f'示教{zone}环{ring}', bounds=h.vision.bounds('RING'))
+    log(f'   对准结果：{res}')
+    if not (res.ok or res.err_mm <= h.cfg['accept_mm']['RING']):
+        raise ValueError('没对准，没保存。看看圆环在不在画面里(python3 vview.py)，手臂再转近一点重试')
+    a1, a2 = h.arm.read_angles()
+    if a1 is None or a2 is None:
+        raise ValueError('读不到手臂角度(A? 没回复)，没保存')
+    rings = []
+    try:
+        cu, cv_ = h.vision.claw('RING')
+        rings = [[round(r[0] - cu, 1), round(r[1] - cv_, 1)] for r in (h.vision.ring_list() or [])]
+    except Exception:
+        rings = []
+    if ring == 2:
+        z['p2'] = [round(a1, 2), round(a2, 2)]
+        z['seen2'] = [e for e in rings if math.hypot(e[0], e[1]) > 40.0]   # 对准 2 号环时画面里另外两个环在哪(比赛时和它比，补车停偏、车身斜)
+        for k in ('1', '3', 'e1', 'e3'):
+            z.pop(k, None)
+        log(f'③ 记下 2 号环：ID1 {a1:.2f}°、ID2 {a2:.2f}°。下一步：arm AD 1 +8(或 -8)把手臂转到 1 号环上方，再 rteach {zone} 1')
+        if len(z['seen2']) < 2:
+            log(f'   ★ 对准 2 号环时画面里只看到 {len(z["seen2"])} 个别的圆环(要 2 个)：比赛时没法拍照补车停偏/车身斜，'
+                '1、3 号环只按示教的角度走(车摆歪了会偏几毫米)。想补的话调高 ZOBRNG 让画面看得到三个环再示教')
+    else:
+        p2 = z['p2']
+        z[str(ring)] = [round(a1 - float(p2[0]), 2), round(a2 - float(p2[1]), 2)]
+        J = h.store.get('RING', 'arm') if getattr(h, 'store', None) is not None else None
+        seen = z.get('seen2') or []
+        if J is not None and seen:
+            import numpy as np
+            pred = -np.asarray(J, float) @ np.array([z[str(ring)][1], z[str(ring)][0]])   # 对准 2 号环时这个环大概在画面哪里
+            best = min(seen, key=lambda e: math.hypot(e[0] - pred[0], e[1] - pred[1]))
+            z['e' + str(ring)] = best
+        log(f'③ 记下 {ring} 号环：比 2 号环 ID1 {a1 - float(p2[0]):+.2f}°、ID2 {a2 - float(p2[1]):+.2f}°')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    h.__dict__.pop('_teach_all', None)
+    left = [r for r in ('1', '3') if r not in z]
+    log(f'   已存进 {path}。' + (f'还要示教 {"、".join(left)} 号环' if left else f'{zone} 示教完了：比赛时车只对准 2 号环一次，1、3 号环直接转过去'))
 
 
 def _rtest(h, link, arm_only, log):

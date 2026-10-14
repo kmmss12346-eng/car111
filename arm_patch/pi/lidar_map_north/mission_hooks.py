@@ -168,6 +168,9 @@ DEFAULTS = dict(
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',
+    zone_reach='arm',                   # (10-14 用户)粗加工区/暂存区：车只在 2 号环前对准一次，1、3 号环按示教(rteach)的手臂角度直接转过去放/取，不再一个一个对准；
+                                        #   没示教过(ring_teach.json 里没有这个区的 1、3 号)就照旧一个环一个环对准。'wheels' = 照旧
+    ring_teach_file='ring_teach.json',  # rteach 示教的 1、3 号环手臂姿态(相对 2 号环对准时的 ID1/ID2 角度差)
     place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
     chassis_fine_rpm=100,               # 视觉微调时底盘前后挪的速度(转/分)
     # 粗加工区 / 暂存区：
@@ -304,6 +307,8 @@ class MissionHooks:
         self.visits = {}
         self.in_tray = {}                   # 槽位 -> Item(现在转盘里有的物料)
         self.on_ring = {}                   # (区, 圆环号) -> [Item, ...](从下到上)
+        self._teach_fix = {}                # (10-14)区 -> {环号: (dID1, dID2)} 拍照补的
+        self._p2 = {}                       # (10-14)区 -> 2 号环对准时的 ID1/ID2 角度(zone_reach='arm')
         self.pose_at = {}                   # (区, 转盘槽位) -> 放下那一刻的 底盘位移 S/F 和手臂角度 a1/a2，取回时直接回到这里
         self.learn = {'S': 0.0, 'F': 0.0}   # 这个工位里前一个圆环对准时发现的停车误差(底盘位移里扣掉圆环间距后剩下的)，带到下一个圆环
         self.disabled = None                # 不为 None = 整轮不做夹放，原因在里面
@@ -1863,6 +1868,18 @@ class MissionHooks:
         acc = self._wheels_accept('PICK') if wheels else cfg['accept_mm']['PICK']
         try:
             recorded = self._goto_recorded(zone, item)
+            if recorded and self._teach(zone) is not None and self._p2.get(zone) is not None:
+                self.log('    按放下时的角度直接取(示教模式，不再对准)')
+                if self.nogo:
+                    return True
+                self._ring_ready = self._at_obs = False
+                self._apply_adj('RING')
+                self.arm.pick_here(item.slot)
+                self.in_tray[item.slot] = item
+                stack = self.on_ring.get((zone, item.ring))
+                if stack and item in stack:
+                    stack.remove(item)
+                return True
             if not recorded:
                 self._goto_ring(zone, item.ring)
                 if wheels:
@@ -2072,6 +2089,11 @@ class MissionHooks:
             self.stats.place(False)
             self._show_stats()
             return False
+        T = self._teach(zone)
+        if T is not None:
+            r = self._place_item_arm(item, zone, ring, stack, label, T)
+            if r is not None:
+                return r
         if not stack and not self.nogo and cfg.get('take_first', True) and not getattr(self, '_tf_off', False) and not wheels:
             done, ok_tf, err_tf = self._place_take_first(item, zone, ring, label)
             if not done and self.disabled:
@@ -2169,6 +2191,136 @@ class MissionHooks:
             self._learn_pick(item, self.pose_at[(zone, item.slot)])
         return ok
 
+    # ------------------------------------------------------------------ (10-14 用户)只在 2 号环前对准一次，1、3 号环按示教转手臂
+    def _teach(self, zone):
+        """zone_reach='arm' 而且示教过这个区的 1、3 号环：{环号: (dID1, dID2)}(相对 2 号环对准时的角度)；否则 None。"""
+        if str(self.cfg.get('zone_reach') or '').lower() != 'arm':
+            return None
+        if not hasattr(self, '_teach_all'):
+            self._teach_all = load_place_adj(self.cfg.get('ring_teach_file'))
+        t = (self._teach_all or {}).get(zone) or {}
+        try:
+            out = {1: (float(t['1'][0]), float(t['1'][1])), 2: (0.0, 0.0), 3: (float(t['3'][0]), float(t['3'][1]))}
+            out['e'] = {k: t.get('e' + str(k)) for k in (1, 3)}
+            return out
+        except (KeyError, TypeError, ValueError, IndexError):
+            warned = self.__dict__.setdefault('_teach_warned', set())
+            if zone not in warned:
+                warned.add(zone)
+                self.log(f'    ({zone} 还没示教 1、3 号环的手臂姿态(rteach {zone} 2/1/3)：这次照旧一个环一个环对准)')
+            return None
+
+    def _p2_align(self, zone):
+        """车在 2 号环前：对准 2 号环一次(只动车轮或按 align_by)，记下这时 ID1/ID2 的角度。对不准返回 None。"""
+        p2 = self._p2.get(zone)
+        if p2 is not None:
+            return p2
+        cfg = self.cfg
+        wheels = self._by_wheels(zone)
+        self._goto_ring(zone, 2)
+        if wheels:
+            self._obs_fixed()
+        else:
+            self._obs_ring()
+        kw = self._wheels_kw() if wheels else self._zone_servo_kw()
+        res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+                             allow_chassis=True, label=f'{zone}对准2号环', bounds=self.vision.bounds('RING'), confirm=False, **kw)
+        self.log(f'    2 号环对准结果：{res}')
+        acc = self._wheels_accept('RING') if wheels else cfg['accept_mm']['RING']
+        if res is None or not (res.ok or res.err_mm <= acc):
+            self.log('    ★ 2 号环对不准：这个区照旧一个环一个环对准')
+            return None
+        a1, a2 = self.arm.read_angles()
+        if a1 is None or a2 is None:
+            return None
+        self._p2[zone] = (a1, a2)
+        self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环按示教的角度直接转过去，车不再动')
+        self._teach_fix[zone] = self._teach_photo(zone)
+        return self._p2[zone]
+
+    def _teach_photo(self, zone):
+        """对准 2 号环以后拍一张：1、3 号环在画面里和示教时差多少像素，换成 ID1/ID2 要多转多少度(补车停偏、车身斜)。"""
+        T = self._teach(zone)
+        J = self.store.get('RING', 'arm') if self.store is not None else None
+        fix = {1: (0.0, 0.0), 3: (0.0, 0.0)}
+        if T is None or J is None or not hasattr(self.vision, 'ring_list') or not self.cfg.get('teach_photo_fix', True):
+            return fix
+        try:
+            cu, cv_ = self.vision.claw('RING')
+            seen = [(r[0] - cu, r[1] - cv_) for r in (self.vision.ring_list(n=self.cfg.get('survey_frames') or None) or [])]
+        except Exception:
+            return fix
+        lim1 = float(self.cfg.get('teach_fix_max_deg', 3.0))
+        lim2 = float(self.cfg.get('teach_fix_max_deg2', 60.0))
+        Jm = np.asarray(J, float)
+        for k in (1, 3):
+            et = T['e'].get(k)
+            if not et or not seen:
+                continue
+            ek = min(seen, key=lambda e: math.hypot(e[0] - et[0], e[1] - et[1]))
+            if math.hypot(ek[0] - et[0], ek[1] - et[1]) > float(self.cfg.get('teach_fix_max_px', 80.0)):
+                continue                                  # 差太多：多半认错了环，不补
+            try:
+                du = -np.linalg.solve(Jm, np.array([ek[0] - et[0], ek[1] - et[1]]))     # [ID2, ID1]
+            except np.linalg.LinAlgError:
+                continue
+            d2 = max(-lim2, min(lim2, float(du[0])))
+            d1 = max(-lim1, min(lim1, float(du[1])))
+            fix[k] = (d1, d2)
+            self.log(f'    环{k} 和示教时比偏了 {ek[0] - et[0]:+.0f},{ek[1] - et[1]:+.0f} 像素：多转 ID1 {d1:+.2f}°、ID2 {d2:+.1f}°')
+        return fix
+
+    def _place_item_arm(self, item, zone, ring, stack, label, T):
+        """zone_reach='arm'：按示教的角度放。返回 True/False；2 号环对不准等情况返回 None(调用的人照旧对准)。"""
+        key = 'STACK' if stack else 'RING'
+        try:
+            p2 = self._p2_align(zone)
+        except ArmAbort:
+            raise
+        except (ArmError, VisionError) as ex:
+            self.log(f'    ★ 对准 2 号环出错：{ex}：照旧一个环一个环对准')
+            return None
+        if p2 is None:
+            return None
+        d1, d2 = T[int(ring)]
+        f1, f2 = (self._teach_fix.get(zone) or {}).get(int(ring), (0.0, 0.0))
+        d1, d2 = d1 + f1, d2 + f2
+        a1, a2 = p2[0] + d1, p2[1] + d2
+        self.log(f'    环{ring}：按示教直接转过去(ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，不再对准')
+        d = self.act.disp
+        self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2)
+        if self.nogo:
+            self.arm.ap(a1, a2)
+            self.log('    (nogo：转到了，不取物料、不放)')
+            return True
+        ok, held = False, False
+        try:
+            self._ring_ready = self._at_obs = False
+            self.arm.take(item.slot)
+            held = True
+            self.holding = item
+            adj = self.place_adj(key)
+            self._return_to_pose(a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0), from_tray=True)
+            self._drop(stack)
+            held = False
+            self.holding = None
+            ok = True
+            self._ring_ready = True
+        except ArmAbort:
+            raise
+        except (ArmError, VisionError) as ex:
+            if held:
+                self._put_back(item, f'放置出错：{ex}')
+            else:
+                self._recover(f'放置出错：{ex}')
+        self.stats.place(ok)
+        if ok:
+            self.in_tray.pop(item.slot, None)
+            self.on_ring.setdefault((zone, ring), []).append(item)
+            self.placements.append((zone, ring, bool(stack), None))
+        self._show_stats()
+        return ok
+
     # ------------------------------------------------------------------ 粗加工区 / 暂存区：到工位先看清三个圆环
     def hold_heading(self):
         """车是手搬到这个工位的：把"现在的车头方向"记为 STM32 要保持的方向(HOME)。
@@ -2195,6 +2347,7 @@ class MissionHooks:
         没有要放的物料、或者时间到了，就不看(省时间)。"""
         self.ring_f = {}
         self.ring_px = {}
+        self._p2.pop(zone, None)                  # 车重新开到这个区：2 号环要重新对准
         self._zone_s_ref = None
         self.ring_gate_px = None
         self._tf_off = False

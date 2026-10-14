@@ -519,6 +519,33 @@ class CliTests(unittest.TestCase):
         self.assertTrue(all(not st for (z, k), st in self.w.rings.items() if z == 'ROUGH'))   # 全都夹回来了
         self.assertIn('现在车上转盘', text)
 
+    def test_rteach_then_rough_places_by_taught_angles(self):
+        """(10-14 用户)示教 1、3 号环以后：车只对准 2 号环一次，1、3 号环按示教的角度直接转过去放、取，不再一个一个对准。"""
+        import tempfile
+        self._zone_setup('ROUGH')
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        self.h.cfg['ring_teach_file'] = path
+        self.run_cli('rteach', 'rteach ROUGH 2')
+        w = self.w
+        t = w.ring_tan['ROUGH']
+        self.run_cli('arm', f'arm AD 1 {(t[1] - t[2]) / w.k1:.2f}')
+        self.run_cli('rteach', 'rteach ROUGH 1')
+        self.run_cli('arm', f'arm AD 1 {(t[3] - t[1]) / w.k1:.2f}')
+        self.run_cli('rteach', 'rteach ROUGH 3')
+        text = '\n'.join(self.lines)
+        self.assertIn('ROUGH 示教完了', text, text)
+        self.lines.clear()
+        self.w.requests.clear()
+        self.run_cli('mtest', 'mtest ROUGH 1 force')
+        text = '\n'.join(self.lines)
+        self.assertIn('2 号环对准了', text, text)
+        self.assertEqual(text.count('按示教直接转过去'), 3, text)
+        self.assertNotIn('照旧一个环一个环对准', text, text)
+        self.assertEqual((w.air, w.collisions), (0, 0), text)
+        placed = [p for p in w.placed if p[0] == 'ROUGH']
+        self.assertEqual(len(placed), 3, text)
+        self.assertEqual(sorted(c for c in w.tray.values() if c), sorted(it.color for it in self.h.plan.items(1)), text)
+
     def _hide_covered_rings(self):
         """模拟没量过圆环大小：圆环白心上放着物料时认不出圆环。"""
         import numpy as np
