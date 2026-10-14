@@ -106,6 +106,8 @@ static float g_para   = 1.0f;      /* PARA   1 = ID1、ID2 一起转(快)；0 = 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
 static float g_clspd  = 0.0f;      /* CLSPD  夹爪合上(夹取)的速度(微秒/秒，脉宽每秒变多少)；0 = 一下子转过去(以前的做法)。张开到夹紧约差 500 微秒：1000 = 约 0.5 秒 */
 static float g_clspo  = 800.0f;    /* CLSPO  夹爪张开(放下)的速度(微秒/秒)；0 = 一下子张开。10-10 用户定：张开 800，合上照旧一下子(CLSPD 0) */
+static float g_ovlap  = 1.0f;      /* OVLAP  1 = 升降和转动同时做(10-14 用户：夹起后边升边转、到转盘上方前边降边转)；0 = 以前的一步一步做 */
+static float g_ovclr  = 20.0f;     /* OVCLR  边升边转之前先直着升多少毫米(离开物料/转盘槽)，放下前最后直着降多少毫米 */
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
 static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
@@ -162,6 +164,8 @@ static const ArmTun tun[] =
     { "CLSPD",  &g_clspd,   0.0f,    20000.0f },
     { "CLSPO",  &g_clspo,   0.0f,    20000.0f },
     { "TTWAIT", &g_ttwait,  0.0f,    5000.0f },
+    { "OVLAP",  &g_ovlap,   0.0f,    1.0f },
+    { "OVCLR",  &g_ovclr,   0.0f,    100.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
     { "CLWO",   &g_clwo,    1700.0f, 2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
@@ -289,6 +293,100 @@ static uint32_t Lift_Time_Ms(uint32_t pulses)
 {
     float sps = g_lrpm / 60.0f * g_lspr;          /* 每秒多少脉冲 */
     return (uint32_t)((float)pulses / sps * 1000.0f) + (uint32_t)g_lmrg;
+}
+
+/* 发出去还没等完的升降(Lift_Start 发的)：目标、出发时的高度、预计到的时刻 */
+static float    lift_pend = -1.0f;
+static float    lift_from = 0.0f;
+static uint32_t lift_end  = 0;
+
+/* 只发升降指令不等(和舵机同时动用)。之后一定要调 Lift_Finish。成功返回 NULL */
+static const char *Lift_Start(float mm)
+{
+    float delta;
+    uint32_t pulses;
+    uint8_t dir_down = (g_ldir > 0.5f) ? 1 : 0;
+    uint8_t dir;
+
+    lift_pend = -1.0f;
+    if (!lift_known)
+    {
+        return "ERR NOZERO";
+    }
+    if (mm < 0.0f)     mm = 0.0f;
+    if (mm > g_lmax)   mm = g_lmax;
+    delta = mm - lift_mm;
+    if (delta > -0.05f && delta < 0.05f)
+    {
+        return NULL;
+    }
+    dir = (delta > 0.0f) ? dir_down : (uint8_t)(1 - dir_down);
+    pulses = (uint32_t)((delta > 0.0f ? delta : -delta) * g_lppm + 0.5f);
+    if (pulses == 0)
+    {
+        return NULL;
+    }
+    Emm_V5_En_Control(LIFT_ADDR, true, false);
+    HAL_Delay(5);
+    Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
+    lift_pend = mm;
+    lift_from = lift_mm;
+    lift_end  = HAL_GetTick() + Lift_Time_Ms(pulses);
+    return NULL;
+}
+
+/* 升降到了没有(不等)：到了就记下高度、返回 1 */
+static int Lift_Done_Now(void)
+{
+    if (lift_pend < 0.0f)
+    {
+        return 1;
+    }
+    if ((int32_t)(HAL_GetTick() - lift_end) >= 0)
+    {
+        lift_mm = lift_pend;
+        Pos_Save(lift_mm);
+        lift_pend = -1.0f;
+        return 1;
+    }
+    return 0;
+}
+
+/* 等 Lift_Start 发的升降走完。急停打断：停下，用编码器把高度找回来(和 Lift_Goto 一样) */
+static const char *Lift_Finish(void)
+{
+    int32_t left;
+    float mm = lift_pend;
+
+    if (mm < 0.0f)
+    {
+        return NULL;
+    }
+    left = (int32_t)(lift_end - HAL_GetTick());
+    if (left > 0 && !Wait_Ms((uint32_t)left))
+    {
+        float z;
+        uint16_t e;
+
+        lift_pend = -1.0f;
+        Emm_V5_Stop_Now(LIFT_ADDR, false);
+        lift_known = 0;
+        if (Absf(mm - lift_from) <= 36.0f)
+        {
+            HAL_Delay(50);
+            if (Lift_EncPos((mm + lift_from) / 2.0f, &z, &e))
+            {
+                lift_mm = z;
+                lift_known = 1;
+                Pos_Save(z);
+            }
+        }
+        return NULL;
+    }
+    lift_pend = -1.0f;
+    lift_mm = mm;
+    Pos_Save(mm);
+    return NULL;
 }
 
 /* 升降到离零点 mm 毫米处。成功返回 NULL；出错返回错误文字。被 '!' 打断时也返回 NULL(调用者看 car_abort) */
@@ -888,6 +986,70 @@ static int TT_WaitReady(void)
     return car_abort ? 0 : 1;
 }
 
+/* (10-14 用户)升降和转动一起做：先直着升 OVCLR(离开物料/转盘槽)，再一边升到 ZHI 一边转到 (a1, a2)；
+ * 转过一半、而且已经升到 ZHI 以后开始往 z_end + OVCLR 降(一边降一边转)，转到了再直着降到 z_end。
+ * OVLAP=0 或者 PARA=0(两个舵机一个一个转)：按以前的做法(升到 ZHI -> 转 -> 降)。 */
+static const char *Move_Over(float a1, float a2, uint8_t order, float z_end)
+{
+    float clr = g_ovclr;
+    float z_mid = z_end + clr;
+    float zc;
+    float a;
+    uint32_t t1 = 0, t2 = 0, tmax, t0;
+    uint8_t ok1 = 0, ok2 = 0, down = 0;
+    const char *e;
+
+    if (g_ovlap < 0.5f || g_para < 0.5f)
+    {
+        e = Lift_Goto(g_zhi);
+        if (e) return e;
+        if (car_abort) return NULL;
+        Servos_To(a1, a2, order, g_atolc, g_aspd);
+        if (car_abort) return NULL;
+        return Lift_Goto(z_end);
+    }
+    if (z_mid > g_zhi)  z_mid = g_zhi;
+    zc = lift_mm + clr;                            /* 先直着升一小段 */
+    if (zc > g_zhi)  zc = g_zhi;
+    if (zc > lift_mm + 0.05f)
+    {
+        e = Lift_Goto(zc);
+        if (e) return e;
+        if (car_abort) return NULL;
+    }
+    e = Lift_Start(g_zhi);                         /* 一边升一边转 */
+    if (e) return e;
+    if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= g_atolc)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, g_aspd);
+    if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= g_atolc)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, g_aspd);
+    tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
+    t0 = HAL_GetTick();
+    while (!(ok1 && ok2) && (HAL_GetTick() - t0) < tmax && !car_abort)
+    {
+        HAL_Delay(15);
+        if (!ok1 && Servo_ReadAngle(1, &a) && Servo_Arrived(1, a, g_atolc))  { ok1 = 1; Servo_Hold(1, a); }
+        if (!ok2 && Servo_ReadAngle(2, &a) && Servo_Arrived(2, a, g_atolc))  { ok2 = 1; Servo_Hold(2, a); }
+        /* 升到顶了、转过一半了：开始往目标上方降(一边降一边转) */
+        if (!down && Lift_Done_Now() && (HAL_GetTick() - t0) * 2u >= tmax - SERVO_EXTRA_MS && z_mid < lift_mm - 0.05f)
+        {
+            down = 1;
+            e = Lift_Start(z_mid);
+            if (e) return e;
+        }
+    }
+    if (car_abort)
+    {
+        if (!ok1 && Servo_ReadAngle(1, &a))  Servo_Hold(1, a);
+        if (!ok2 && Servo_ReadAngle(2, &a))  Servo_Hold(2, a);
+        return Lift_Finish();                      /* 停下升降、找回高度 */
+    }
+    if (!ok1)  Servo_StopIfStuck(1, a1);
+    if (!ok2)  Servo_StopIfStuck(2, a2);
+    e = Lift_Finish();
+    if (e) return e;
+    if (car_abort) return NULL;
+    return Lift_Goto(z_end);                       /* 最后一段直着降(或升) */
+}
+
 /* ================= 夹取 / 放置流程 ================= */
 #define GO(expr)        do { const char *e_ = (expr); if (e_) return e_; if (car_abort) return NULL; } while (0)
 #define WAIT(ms)        do { if (!Wait_Ms((uint32_t)(ms))) return NULL; } while (0)
@@ -913,9 +1075,7 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     if (e) return e;
 
     if (open_claw)  Claw_O();
-    GO(Lift_Goto(g_zhi));
-    SERVOS(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, g_atolc, g_aspd);
-    GO(Lift_Goto(ring ? g_zobrng : g_zobraw));
+    GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
     return NULL;
 }
 
@@ -931,9 +1091,7 @@ static const char *Seq_PickHere(uint8_t slot, float z)
     Claw_O();                                      /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
     GO(Lift_Goto(z));                              /* 下降 */
     Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
-    GO(Lift_Goto(g_zhi));                          /* 抬起 */
-    SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);      /* 缩回，转到转盘上方 */
-    GO(Lift_Goto(g_zdrop));                        /* 下降 */
+    GO(Move_Over(g_a1d, g_a2r, 1, g_zdrop));       /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
     Claw_O();      WAIT(g_clwait);                 /* 松开：物料落进转盘 */
     GO(Lift_Goto(g_zhi));
@@ -949,8 +1107,7 @@ static const char *Seq_Take(uint8_t slot)
 
     TT_Go(slot);
     Claw_O();
-    GO(Lift_Goto(g_zhi));
-    SERVOS(g_a1d, g_a2r, 1, g_atolc, g_aspd);
+    GO(Move_Over(g_a1d, g_a2r, 1, (g_ovlap > 0.5f) ? g_zdrop + g_ovclr : g_zhi));   /* 转到转盘上方(OVLAP=1：停在槽口上面一点) */
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
     Claw_C();      WAIT(g_clwait);                 /* 夹起 */
@@ -968,6 +1125,16 @@ static const char *Seq_Drop(uint8_t stack)
 
     GO(Lift_Goto(stack ? g_zstk : g_zplc));
     Claw_O();      WAIT(g_clwait);
+    if (g_ovlap > 0.5f && g_para > 0.5f)
+    {
+        /* (10-14 用户)放下以后先直着升 OVCLR，再一边升到 ZHI 一边缩回伸缩舵机(另一个保持现在的角度，不转) */
+        float c1 = 0.0f, c2 = 0.0f;
+        if (Servo_ReadAngle(1, &c1) && Servo_ReadAngle(2, &c2))
+        {
+            GO(Move_Over(Ext_Id() == 2 ? c1 : g_a1h, Ext_Id() == 2 ? g_a2r : c2, 1, g_zhi));
+            return NULL;
+        }
+    }
     GO(Lift_Goto(g_zhi));
     if (Ext_Id() == 2)                             /* 只把伸缩舵机缩回，不转 */
     {

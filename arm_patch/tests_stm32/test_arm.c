@@ -174,6 +174,7 @@ int main(void) {
     CHECK(run("GRAB 1") == -1 && pis("ERR NOCAL"), "ARMOK=0 时拒绝");
     CHECK(run("OBS RAW O") == -1, "ARMOK=0 时 OBS 拒绝");
     Arm_Param_Set("ARMOK", 1);
+    Arm_Param_Set("OVLAP", 0);                         /* 下面老的测试按"一步一步做"写的；边升边转的单独测(文件末尾) */
     clear();
     CHECK(run("LIFT?") == 1 && pis("LIFT 1 60") && pis("BOOT=NOCAL"), "开机没标定：当作 60mm，LIFT? 回 BOOT=NOCAL");
     clear();
@@ -666,6 +667,32 @@ int main(void) {
         CHECK(qrtx[0] == 0, "QR AUTO 0：扫到码不关扫码模块");
         run("QR AUTO 1"); run("QR CLR"); now += 2000; Arm_Poll();
 #undef QRB
+    }
+
+    /* ---- 10-14 边升边转(OVLAP=1)：先直着升 OVCLR，再一边升到 ZHI 一边转，转过一半开始往目标上方降，最后直着降 ---- */
+    {
+        int c_, up1, sw, last_dn;
+        const char *q;
+        Arm_Param_Set("OVLAP", 1); Arm_Param_Set("OVCLR", 20);
+        Arm_Param_Set("ZHI", 100); Arm_Param_Set("ZOBRAW", 100); Arm_Param_Set("ZGRAB", 20); Arm_Param_Set("ZDROP", 60);
+        Arm_Param_Set("A1D", 350);                 /* 转盘姿态和原料盘姿态不一样，ID1 才会转 */
+        run("OBS RAW O"); clear();
+        CHECK(run("GRAB 2 H") == 1, "OVLAP：GRAB 2 H");
+        c_ = at("C;"); up1 = at("L+1600;"); sw = at("S1:");
+        CHECK(c_ >= 0 && c_ < up1 && up1 < sw && at("L+4800;") < sw, "OVLAP：夹紧以后先直着升 20mm，再一边升到 ZHI 一边转(升降指令先发出去，舵机同时转)");
+        q = strstr(ev + (sw > 0 ? sw : 0), "L-");
+        last_dn = q ? (int)(q - ev) : -1;
+        q = strstr(ev + (c_ > 0 ? c_ : 0), "O;");
+        CHECK(last_dn > sw && q && (int)(q - ev) > last_dn, "OVLAP：转到转盘上方降下去以后才松爪");
+        clear(); CHECK(run("TAKE 1") == 1, "OVLAP：TAKE 1");
+        q = strstr(ev, "L-1600;");
+        CHECK(q && strstr(q + 1, "L-1600;") && at("C;") > (int)(strstr(q + 1, "L-1600;") - ev), "OVLAP：TAKE 先降到槽口上方 20mm，转盘到位后再直着降 20mm 夹");
+        clear(); run("OBS RING"); clear();
+        CHECK(run("DROP") == 1, "OVLAP：DROP");
+        q = strstr(ev, "O;");
+        CHECK(q && strstr(q, "L+1600;") && has("M2:") == 0, "OVLAP：放下松爪后先直着升 20mm，再边升边缩回");
+        Arm_Param_Set("OVLAP", 0); Arm_Param_Set("A1D", 323);
+        Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60);
     }
 
     /* ---- 串口屏 ---- */
