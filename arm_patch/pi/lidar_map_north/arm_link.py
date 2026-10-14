@@ -17,7 +17,7 @@ class ArmAbort(ArmError):
 
 # 每类指令最多等多久(秒)。机械臂整套动作(夹取/放置)比较长
 _TIMEOUTS = (
-    ('GRAB', 60.0), ('PICK', 60.0), ('PLACE', 70.0), ('TAKE', 40.0), ('DROP', 30.0), ('OBS', 40.0), ('STOW', 40.0),
+    ('APZ', 30.0), ('GRAB', 60.0), ('PICK', 60.0), ('PLACE', 70.0), ('TAKE', 40.0), ('DROP', 30.0), ('OBS', 40.0), ('STOW', 40.0),
     ('LIFT', 25.0), ('AP', 15.0), ('AD', 10.0), ('AF', 10.0), ('A?', 4.0), ('CLAW', 5.0), ('TT', 5.0),
     ('SCR', 2.0), ('SCMD', 2.0), ('QR', 2.0), ('SET', 2.0), ('GET', 4.0),
     ('PARK', 40.0), ('ZONE', 3.0), ('ZONE?', 2.0),
@@ -229,6 +229,20 @@ class ArmLink:
                     raise ArmError(f'A? {i} 失败：{reply}')
                 time.sleep(0.05 + 0.05 * k)
         return self.angle[1], self.angle[2]
+
+    def apz(self, a1, a2, z):
+        """(10-14)转到 (a1, a2) 并停在高度 z：新 STM32 程序(APZ)边升边转、边转边降；旧程序(ERR CMD)改成 AP + LIFT。"""
+        if not getattr(self, '_no_apz', False):
+            self.angle[1] = None
+            self.angle[2] = None
+            ok, reply, info = self.request(f'APZ {a1:.3f} {a2:.3f} {float(z):.1f}')
+            if ok:
+                return
+            if 'CMD' not in str(reply):
+                raise ArmError(f'APZ 失败：{reply}')
+            self._no_apz = True
+        self.ap(a1, a2)
+        self.lift(z)
 
     def ap(self, a1, a2):
         """ID1、ID2 一起转到指定角度，回读实际角度(没回读到就是 None = 不知道，不能当成"没动")。"""

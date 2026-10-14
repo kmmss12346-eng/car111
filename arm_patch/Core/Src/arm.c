@@ -2195,6 +2195,21 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         return 1;
     }
 
+    /* ---- APZ a1 a2 z：转到 (a1, a2) 并停在高度 z；OVLAP=1 时边升边转、边转边降(10-14) ---- */
+    if (strcmp(v, "APZ") == 0 && n == 4)
+    {
+        float z;
+
+        if (!ParseF(t[1], &f) || !ParseF(t[2], &g) || !ParseF(t[3], &z))  FAIL("ERR ARG");
+        r = Seq_Ready();
+        if (r)  FAIL(r);
+        r = Move_Over(f, g, 2, z);
+        if (r)  FAIL(r);
+        SayAngle(1);
+        SayAngle(2);
+        return 1;
+    }
+
     /* ---- 观察姿态：OBS RAW|RING [O]  (O = 同时张开夹爪) ---- */
     if (strcmp(v, "OBS") == 0 && (n == 2 || n == 3))
     {

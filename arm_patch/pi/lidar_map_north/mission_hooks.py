@@ -1985,8 +1985,7 @@ class MissionHooks:
             a2 = min(env[1], max(env[0], float(P['A2P']) + (d2 or 0.0)))
             a1 = float(P['A1P']) + (d1 or 0.0)
             self.log(f'    先取了物料，带着它到圆环上方对准(ID2 {a2 - float(P["A2P"]):+.0f}°)，对准一次就放下')
-            self.arm.ap(a1, a2)                                  # 搬运高度转过去
-            self.arm.lift(float(P['ZOBRNG']))                    # 降到看圆环的高度(物料底面离地 clear mm)
+            self.arm.apz(a1, a2, float(P['ZOBRNG']))             # 转过去、降到看圆环的高度(新程序边转边降)
             self._a1_hint, self._a2_hint = a1, a2
             kw = self._zone_servo_kw()
             kw['max_iter'] = int(cfg.get('take_first_iter') or 4)
@@ -2920,9 +2919,26 @@ class MissionHooks:
         learn = bool(self.cfg.get('return_bias', True)) and from_tray
         bias = self._ret_bias if learn else [0.0, 0.0]
         c1, c2 = a1 - bias[0], a2 - bias[1]                      # 前几次转回来总是多转/少转多少，这次提前补上
+        zr = None
+        if from_tray and self.cfg.get('return_lower', True):
+            try:
+                zr = float((self.arm.params() or {}).get('ZOBRNG'))       # (10-14)从转盘转回来时边转边降到看圆环的高度，再放
+            except (TypeError, ValueError):
+                zr = None
+            except ArmAbort:
+                raise
+            except Exception:
+                zr = None
         if abs(pre[0]) > 1e-6 or abs(pre[1]) > 1e-6:
-            self.arm.ap(c1 + pre[0], c2 + pre[1])                # 先从反方向靠近，再回来，消除齿轮间隙
-        self.arm.ap(c1, c2)
+            if zr is not None:
+                self.arm.apz(c1 + pre[0], c2 + pre[1], zr)
+                zr = None
+            else:
+                self.arm.ap(c1 + pre[0], c2 + pre[1])            # 先从反方向靠近，再回来，消除齿轮间隙
+        if zr is not None:
+            self.arm.apz(c1, c2, zr)
+        else:
+            self.arm.ap(c1, c2)
         tol = float(self.cfg.get('return_tol_deg') or 0.4)
         try:
             tol = max(tol, float((self.arm.params() or {}).get('ATOL', 0.0)) + 0.05)   # 比 ATOL 还小的差舵机不会再动

@@ -691,6 +691,8 @@ int main(void) {
         CHECK(run("DROP") == 1, "OVLAP：DROP");
         q = strstr(ev, "O;");
         CHECK(q && strstr(q, "L+1600;") && has("M2:") == 0, "OVLAP：放下松爪后先直着升 20mm，再边升边缩回");
+        clear(); CHECK(run("APZ 340 -862 80") == 1 && has("S1:340.0") && at("L-") > at("S1:"), "APZ：转到 (340,-862) 并降到 80mm");
+        CHECK(run("APZ 340 -862") != 1, "APZ 少参数：不执行");
         Arm_Param_Set("OVLAP", 0); Arm_Param_Set("A1D", 323);
         Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60);
     }
