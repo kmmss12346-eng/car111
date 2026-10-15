@@ -37,6 +37,9 @@ pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
                              再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
                              比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
+rteach RAW <停靠位> <颜色号> (10-16)原料区停靠位示教：车停在原料区停车点、原料盘停着，这个停靠位上是这个颜色的物料。记下它在画面里的位置；
+                             手臂够得着就对准、记下角度。3 个停靠位都示教(够不着的也要，用来认颜色在哪个位)。比赛时看一次就推算以后每次停下的颜色，
+                             手臂提前到够得着的停靠位等，一停就下爪
 mtest START                单独测回家后的显示(会收臂、升降停 60)
 mtest reset                清空任务码和记录，重新开始
 park                       收臂、升降停到 60mm(下次开机编码器才认得准)；急停以后要自己输入这个
@@ -471,13 +474,27 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 if os.path.exists(path):
                     os.remove(path)
                 h.__dict__.pop('_teach_all', None)
+                h.__dict__.pop('_raw_slots_cache', None)
                 log(f'已清掉示教({path})：比赛时照旧一个环一个环对准')
             else:
                 d = load_place_adj(path)
                 log(f'示教({path})：' + (json.dumps(d, ensure_ascii=False) if d else '还没有'))
             return None
+        if len(parts) == 4 and parts[1].upper() == 'RAW' and parts[2] in ('1', '2', '3') and parts[3] in ('1', '2', '3', '4', '5', '6'):
+            n_, col_ = int(parts[2]), int(parts[3])
+
+            def go_raw():
+                h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+                state['abort'] = False
+                _tools(h, link)
+                P_ = h.arm.params(refresh=True)
+                if P_.get('ARMOK', 0) < 0.5:
+                    raise ValueError('先把姿态标定好并 set ARMOK 1')
+                log(f'示教原料区 {n_} 号停靠位(原料盘要停着，{n_} 号位上是颜色 {col_} 的物料)……')
+                h.raw_teach_slot(n_, col_, path)
+            return _run_async(state, log, go_raw, vision=True)
         if len(parts) != 3 or parts[1].upper() not in ('ROUGH', 'TEMP') or parts[2] not in ('1', '2', '3'):
-            raise ValueError('格式：rteach ROUGH 2 / rteach ROUGH 1 / rteach ROUGH 3(TEMP 一样)；rteach show / rteach clear')
+            raise ValueError('格式：rteach ROUGH 2 / rteach ROUGH 1 / rteach ROUGH 3(TEMP 一样)；rteach RAW 停靠位(1~3) 颜色号；rteach show / rteach clear')
         zone, ring = parts[1].upper(), int(parts[2])
 
         def go():
