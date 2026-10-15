@@ -105,6 +105,10 @@ def explain_mot(lines):
                       '用下面的"抬起车轮测试"判断)。')
     elif silent:
         advice.append('这几个没回复：' + '、'.join(MOT_NAMES[i] for i in silent) + '。检查它们的电源线、串口线，以及驱动器里设的地址(要分别是 1~4)。')
+    if 5 in st and st[5] is None and len(silent) < 4:
+        advice.append('5号(升降)没回复，轮子有回复：STM32 这边是好的，问题在升降驱动器或它那根串口线。'
+                      '看升降驱动器菜单里 ID_Addr 是不是 5，UartBaud、Checksum、P_Serial 和轮子的驱动器一样不一样；'
+                      '设置都对就把它的串口线和一个轮子的对调试试(线坏了，换过线的轮子会没回复)。')
     if any(d and d['prot'] == '1' for d in st.values()):
         advice.append('有驱动器触发了堵转保护：输入 mot en 解除(或把电机电源关掉再开)。触发保护说明之前电机转不动：'
                       '电池电压低、车太重、轮子被卡住、或者加速度太大。')
