@@ -150,3 +150,17 @@ git_log.txt                ← 分支最近 120 条提交记录
   - 示教命令（车停在该区 2 号环正前方）：`rteach ROUGH 2` → `arm AD 1 ±8` 转到 1 号环上方 → `rteach ROUGH 1` → 同样 `rteach ROUGH 3`；TEMP 一样。`rteach show/clear`。存在 `ring_teach.json`（**车上独有，不能覆盖**）。
   - 没示教过就自动照旧一个环一个环对准。模拟：车身斜 ±3° 时放置误差 ≤2mm（画面看得到 3 个环时）。
 - 用户的新夹子/摄像头（摄像头中心对准夹子中心）还没装；装好后先标定（见第 7 节）再示教 rteach。
+
+## 11. 10-15 现在的状态（下一个接手的先看这里）
+
+- **最新部署包：car111_update_1014b**（含 1014a）。代码 = 本分支 HEAD。全部在电脑上模拟跑通，**还没上车验证**。
+- **用户接下来要在车上做（等他发结果再改代码）**：
+  1. 装 1014b（STM32 烧 arm.c、树莓派装包、`python3 apply_mission_config.py`）；
+  2. 新夹子/摄像头装好后重新标定（第 7 节顺序）；
+  3. 示教 `rteach ROUGH 2/1/3`、`rteach TEMP 2/1/3`（第 10 节）；
+  4. 架空 `mtest ROUGH 1 force`、`mtest TEMP 1 force`；
+  5. 跑一次全程并留日志：`bash run_live.sh 2>&1 | tee ~/run_$(date +%m%d_%H%M).log`，连同 `map_captures` 最新文件发来——用来修"雷达定位经常失败"（第 8 节）。
+- **夹爪速度（10-10 另一个对话加的，已在 arm.c 里）**：`CLSPD` = 合上(夹取)速度，默认 0 = 一下子合上；`CLSPO` = 张开(放下)速度，默认 800（微秒/秒，越小越慢）。用户定的：**夹取照原来一下子，张开 800**。用户车上配置里可能存过 `CLSPD=800`，要 `set CLSPD 0`。`arm_calib.py` 里有这两步（`--from CLSPD`）。旧固件 `set CLSPO` 会回 ERR NAME = 没烧新 arm.c。
+- 夹爪大小：`CLWO`(张开，用户车上 2350)/`CLWC`(合上，用户改成过 1920)；用户车上张开值 > 合上值（数大=张得大）。
+- 用户输入习惯：在 run_live 里一次只输一条、等回复再输下一条（连着打会粘成一行回 ERR CMD）。
+- 对话记录：`docs/对话记录/`；更早的过程在 `docs/HANDOFF.md`。
