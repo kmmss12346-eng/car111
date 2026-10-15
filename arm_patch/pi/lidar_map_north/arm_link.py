@@ -20,12 +20,12 @@ _TIMEOUTS = (
     ('APZ', 30.0), ('GRAB', 60.0), ('PICK', 60.0), ('PLACE', 70.0), ('TAKE', 40.0), ('DROP', 30.0), ('OBS', 40.0), ('STOW', 40.0),
     ('LIFT', 25.0), ('AP', 15.0), ('AD', 10.0), ('AF', 10.0), ('A?', 4.0), ('CLAW', 5.0), ('TT', 5.0),
     ('SCR', 2.0), ('SCMD', 2.0), ('QR', 2.0), ('SET', 2.0), ('GET', 4.0),
-    ('PARK', 40.0), ('ZONE', 3.0), ('ZONE?', 2.0),
+    ('PARK', 40.0), ('STBY', 40.0), ('ZONE', 3.0), ('ZONE?', 2.0),
 )
 
 
 # 这些指令会动 ID1/ID2 但不回报角度，执行后缓存的角度就过期了
-_MOVING = ('OBS', 'GRAB', 'PICK', 'PLACE', 'TAKE', 'DROP', 'STOW', 'PARK')
+_MOVING = ('OBS', 'GRAB', 'PICK', 'PLACE', 'TAKE', 'DROP', 'STOW', 'PARK', 'STBY')
 
 
 def _timeout_for(text):

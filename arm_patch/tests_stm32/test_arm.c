@@ -728,6 +728,24 @@ int main(void) {
     CHECK((pis("LIFTBOOT 75.6") || pis("LIFTBOOT 75.59")) && has("L-1248;") && fabs(phys_mm - 60.0) < 0.05, "开机：在 75.6mm，往下走 15.6mm 到 60");
     clear();
     CHECK(run("LIFT ENC?") == 1 && (pis("Z=60.0") || pis("Z=59.99")) && pis("NOW=60.0"), "LIFT ENC? 算出的高度和程序记的一致");
+    /* 10-15 待机姿态：STBY SAVE 记下现在的高度/手臂/夹爪，存进 Flash；开机、PARK 都回到这里；STBY CLR 恢复原样 */
+    clear(); run("STBY?");
+    CHECK(pis("STBY NONE"), "没存过待机姿态：STBY? 回 STBY NONE");
+    run("LIFT 80"); ang[1] = 250.0f; ang[2] = -600.0f; run("CLAW 1300");
+    clear();
+    CHECK(run("STBY SAVE") == 1 && pis("STBY Z=80.0") && pis("A1=250.0") && pis("A2=-600.0") && pis("CLAW=1300")
+          && fake_flash[0] == 0x4C465432u && fake_flash[16] == 0x53544259u, "STBY SAVE：记下 80mm、ID1 250、ID2 -600、夹爪 1300，存进 Flash(升降标定还在)");
+    away(); phys_mm = 83.0; clear();
+    Arm_Init();
+    CHECK(fabs(phys_mm - 80.0) < 0.05 && has("S1:250.0") && has("S2:-600.0") && has("claw1300;")
+          && at("S1:250.0") < at("claw1300;"), "开机：编码器找准高度后自动回到待机姿态(手臂、夹爪、升降 80mm)，不再停 60");
+    away(); run("LIFT 40"); clear();
+    CHECK(run("PARK") == 1 && fabs(phys_mm - 80.0) < 0.05 && has("S1:250.0") && has("claw1300;"), "PARK：存了待机姿态就回到它");
+    clear();
+    CHECK(run("STBY CLR") == 1 && fake_flash[16] != 0x53544259u && fake_flash[0] == 0x4C465432u, "STBY CLR：删掉待机姿态，升降标定还在");
+    clear(); phys_mm = 75.6;
+    Arm_Init();
+    CHECK(fabs(phys_mm - 60.0) < 0.05 && !has("claw1300;"), "删掉以后开机照旧停 60");
     /* 编码器一圈是 16384 的驱动器、方向也反过来 */
     enc_cpr = 16384.0; enc_cpm = -409.6; enc_off = 3000.0; phys_mm = 30.0;
     run("LIFT 30"); phys_mm = 30.0;

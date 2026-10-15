@@ -543,6 +543,46 @@ static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
     return 1;
 }
 
+/* 待机姿态(10-15 用户：上电、PARK 都回到自己定的高度/手臂角度/夹爪)。STBY SAVE 把现在的样子记下来，
+ * 和升降标定放在同一个扇区(标定后面 0x40 字节处，6 个字)，Cal_Save 擦扇区时一起写回去 */
+#define SB_ADDR        (ARM_CAL_ADDR + 0x40u)
+#define SB_MAGIC       0x53544259u        /* "STBY" */
+static uint8_t  sb_ok   = 0;
+static float    sb_z    = 0.0f;
+static float    sb_a1   = 0.0f;
+static float    sb_a2   = 0.0f;
+static uint32_t sb_claw = 0;
+
+static void Sb_Load(void)
+{
+    const volatile uint32_t *f = (const volatile uint32_t *)SB_ADDR;
+    uint32_t w[6];
+    float z, a1, a2;
+    int i;
+
+    for (i = 0; i < 6; i++)
+    {
+        w[i] = f[i];
+    }
+    sb_ok = 0;
+    if (w[0] != SB_MAGIC || w[5] != (w[0] ^ w[1] ^ w[2] ^ w[3] ^ w[4] ^ 0x5A5A5A5Au))
+    {
+        return;
+    }
+    memcpy(&z, &w[1], 4);
+    memcpy(&a1, &w[2], 4);
+    memcpy(&a2, &w[3], 4);
+    if (!(z >= 0.0f && z <= 500.0f && w[4] >= 500u && w[4] <= 3000u))
+    {
+        return;
+    }
+    sb_z = z;
+    sb_a1 = a1;
+    sb_a2 = a2;
+    sb_claw = w[4];
+    sb_ok = 1;
+}
+
 static void Cal_Load(void)
 {
     const volatile uint32_t *f = (const volatile uint32_t *)ARM_CAL_ADDR;
@@ -550,6 +590,7 @@ static void Cal_Load(void)
     float e0, c, cpr;
     int i;
 
+    Sb_Load();
     for (i = 0; i < 6; i++)
     {
         w[i] = f[i];
@@ -605,6 +646,23 @@ static int Cal_Save(void)
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, ARM_CAL_ADDR + 4u * (uint32_t)i, w[i]) != HAL_OK)
         {
             ok = 0;
+        }
+    }
+    if (ok && sb_ok)                               /* 待机姿态也在这个扇区：一起写回去 */
+    {
+        uint32_t s[6];
+        s[0] = SB_MAGIC;
+        memcpy(&s[1], &sb_z, 4);
+        memcpy(&s[2], &sb_a1, 4);
+        memcpy(&s[3], &sb_a2, 4);
+        s[4] = sb_claw;
+        s[5] = s[0] ^ s[1] ^ s[2] ^ s[3] ^ s[4] ^ 0x5A5A5A5Au;
+        for (i = 0; ok && i < 6; i++)
+        {
+            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, SB_ADDR + 4u * (uint32_t)i, s[i]) != HAL_OK)
+            {
+                ok = 0;
+            }
         }
     }
     HAL_FLASH_Lock();
@@ -850,7 +908,10 @@ static void Lift_Boot(void)
     {
         Cal_Save();
     }
-    Lift_Goto(LIFT_BOOT_MM);
+    if (!sb_ok)                                    /* 存了待机姿态：Arm_Init 里整个回到待机姿态，这里先不动 */
+    {
+        Lift_Goto(LIFT_BOOT_MM);
+    }
 }
 
 /* ================= ID1 / ID2 ================= */
@@ -1162,9 +1223,23 @@ static const char *Seq_Stow(void)
 /* 停车待机：先像 STOW 那样收臂(升到最高 -> 缩回、ID1 转到待命角度)，再把升降降到 LIFT_BOOT_MM(60mm)。
  * 停在 60，下次开机不管有没有标定、读不读得到编码器，认出来的高度都对(见 Lift_Boot)。
  * ARMOK=0(姿态还没标定)时不动舵机，只降升降。升降位置不知道(急停打断过)就不动，回 ERR NOZERO */
+/* 回到待机姿态(STBY SAVE 存的)：升到最高 -> 手臂转到待机角度 -> 夹爪 -> 升降到待机高度 */
+static const char *Seq_Standby(void)
+{
+    if (!lift_known)           return "ERR NOZERO";
+    if (!sb_ok)                return "ERR NOSTBY";
+
+    GO(Lift_Goto(g_zhi));
+    SERVOS(sb_a1, sb_a2, 1, g_atolc, g_aspd);
+    Claw_Move(sb_claw);
+    GO(Lift_Goto(sb_z));
+    return NULL;
+}
+
 static const char *Seq_Park(void)
 {
     if (!lift_known)           return "ERR NOZERO";
+    if (sb_ok)                 return Seq_Standby();   /* 存了待机姿态就回到它 */
 
     if (g_armok > 0.5f)
     {
@@ -1927,6 +2002,10 @@ void Arm_Init(void)
 
     /* 升降：0 = 最低点，往上为正，最高 100mm(LFMAX)。开机读编码器找到准确高度，自动走到 60mm(见 Lift_Boot) */
     Lift_Boot();
+    if (sb_ok && (strcmp(lift_boot_how, "ENC") == 0 || strcmp(lift_boot_how, "POS") == 0))
+    {
+        Seq_Standby();                             /* 编码器找准了高度才自动动；没标定/读不到编码器就不动 */
+    }
 }
 
 /* ================= 树莓派指令 ================= */
@@ -2306,11 +2385,63 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         return 1;
     }
 
-    /* ---- 停车待机：收臂 + 升降停到 60mm(ARMOK=0 时只降升降) ---- */
+    /* ---- 停车待机：存了待机姿态(STBY SAVE)就回到它；没存：收臂 + 升降停到 60mm(ARMOK=0 时只降升降) ---- */
     if (strcmp(v, "PARK") == 0 && n == 1)
     {
         r = Seq_Park();
         if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- 待机姿态：STBY = 回到待机姿态；STBY SAVE = 把现在的高度/手臂角度/夹爪记成待机姿态(存 Flash，上电自动回到这里)；
+     *      STBY? = 看存的是什么；STBY CLR = 不用了(开机照旧停 60mm、PARK 照旧) ---- */
+    if (strcmp(v, "STBY") == 0 && n == 1)
+    {
+        r = Seq_Standby();
+        if (r)  FAIL(r);
+        return 1;
+    }
+    if (strcmp(v, "STBY?") == 0 && n == 1)
+    {
+        char m[96];
+        char b1[20];
+        char b2[20];
+        char b3[20];
+
+        if (!sb_ok)
+        {
+            Say("STBY NONE\r\n");
+            return 1;
+        }
+        FmtF(b1, (int)sizeof(b1), sb_z);
+        FmtF(b2, (int)sizeof(b2), sb_a1);
+        FmtF(b3, (int)sizeof(b3), sb_a2);
+        snprintf(m, sizeof(m), "STBY Z=%s A1=%s A2=%s CLAW=%lu\r\n", b1, b2, b3, (unsigned long)sb_claw);
+        Say(m);
+        return 1;
+    }
+    if (strcmp(v, "STBY") == 0 && n == 2 && strcmp(t[1], "SAVE") == 0)
+    {
+        float a1, a2;
+
+        if (!lift_known)                              FAIL("ERR NOZERO");
+        if (!lift_cal_ok)                             FAIL("ERR NOCAL");      /* 升降没标定：开机认不准高度，存了也不敢动 */
+        if (!Servo_ReadAngle(1, &a1) || !Servo_ReadAngle(2, &a2))  FAIL("ERR READ");
+        sb_z = lift_mm;
+        sb_a1 = a1;
+        sb_a2 = a2;
+        sb_claw = claw_now;
+        sb_ok = 1;
+        if (!Cal_Save())                              FAIL("ERR FLASH");
+        Pos_Save(lift_mm);                         /* 擦扇区把位置记录也擦了：马上记一条，下次开机从这里找 */
+        if (!sb_ok)                                   FAIL("ERR FLASH");
+        return Arm_Command("STBY?", err, errlen);
+    }
+    if (strcmp(v, "STBY") == 0 && n == 2 && strcmp(t[1], "CLR") == 0)
+    {
+        sb_ok = 0;
+        if (lift_cal_ok && !Cal_Save())               FAIL("ERR FLASH");
+        if (lift_cal_ok)  Pos_Save(lift_mm);
         return 1;
     }
 
