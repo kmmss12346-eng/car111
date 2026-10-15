@@ -117,6 +117,13 @@ DEFAULTS = dict(
     raw_force_max_mm=60.0,
     raw_grab_max_mm=30.0,               # (10-11 用户：误差 30mm 以内都可以夹)修正完按当时的偏差下爪，只要不超过这个。以前 5
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
+    raw_follow=True,                    # (10-16 用户)原料区"跟随抓取"：手臂停在看得到整个原料盘的高度(ZOBRAW)，挑一个要夹的颜色，原料盘转的时候
+                                        #   手臂跟着它转(ID1/ID2，用 vcal RAW 颜色号 arm 测的 J)，原料盘一停马上下爪；不按任务码顺序，哪个先跟上先夹哪个。
+                                        #   要有手臂的 J(没有就照旧等物料停到爪子附近)。False = 以前的做法
+    raw_follow_limit_deg=dict(id1=25.0, id2=250.0),   # 跟随时手臂相对 OBS RAW 姿态最多转多少度(超出就换一个够得着的物料跟；ID2 还受 STM32 里的限位)
+    raw_follow_deadband_mm=3.0,         # 物料离爪子点不到这么多毫米就不动手臂(省得来回抖)
+    raw_follow_lead_s=0.35,             # 原料盘在转时往前多跟这么多秒(物料的速度 × 这个；手臂转过去要时间)
+    raw_follow_gain=0.9,                # 跟随时每次修正偏差的多少
     raw_any_order=False,                # (10-11 晚 用户：原料区要按顺序夹，不能随机夹)False = 按任务码顺序一个一个等着夹；True = 哪个需要的颜色停在爪子附近就先夹哪个(放进它自己的槽)。只想这一次不按顺序：mtest RAW 1 force any
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_seek=False,                     # (10-11 早 用户：到了原料区停车点车就不动，只动爪子对准夹)True = 原料盘停下时要夹的物料都停在手臂够不着的地方：车挪过去
@@ -1185,6 +1192,9 @@ class MissionHooks:
             pass
         # 10-10 用户定的(写死，配置改不了)：原料区来一个夹一个——爪子下面停的是要抓的哪个颜色就夹哪个，放进它自己的槽
         # (_raw_in_order 只给以前按顺序写的模拟测试用)
+        if self._raw_follow_on():
+            self._raw_any(self.plan.items(batch), follow=True)
+            return
         if ((self.cfg.get('raw_any_order') and not getattr(self, '_raw_in_order', False)) or getattr(self, 'raw_any_once', False)) \
                 and hasattr(self.vision, 'material_stream'):
             self._raw_any(self.plan.items(batch))
@@ -1215,8 +1225,21 @@ class MissionHooks:
             self._show_stats()
         self._stow_quiet()
 
-    def _raw_any(self, items):
-        """不按任务码顺序抓：每次原料盘停下，要抓的几个颜色里哪个停在爪子附近、够得着，就先夹哪个，放进它自己的槽。"""
+    def _raw_follow_on(self):
+        """原料区这次用"跟随抓取"吗：raw_follow 开着、有手臂和画面的对应关系(vcal RAW 颜色号 arm)、看得到每帧几个颜色。"""
+        if not self.cfg.get('raw_follow') or not hasattr(self.vision, 'material_errors'):
+            return False
+        if self.store is None or self.store.get('RAW', 'arm') is None:
+            if not getattr(self, '_raw_follow_said', False):
+                self._raw_follow_said = True
+                self.log('    ★ 原料区要跟随抓取(raw_follow)，但还没有手臂和画面的对应关系：这次照旧等物料停到爪子附近。'
+                         '原料盘停转、物料放在爪子下面，做一次 vcal RAW 颜色号 arm 就能跟随了')
+            return False
+        return True
+
+    def _raw_any(self, items, follow=False):
+        """不按任务码顺序抓：每次原料盘停下，要抓的几个颜色里哪个停在爪子附近、够得着，就先夹哪个，放进它自己的槽。
+        follow=True：原料盘转的时候手臂就跟着一个要夹的物料走，停下马上夹(_raw_follow_pick)。"""
         cfg = self.cfg
         todo = []
         for item in items:
@@ -1226,7 +1249,8 @@ class MissionHooks:
                 self.stats.grab(False)
                 continue
             todo.append(item)
-        self.log('  原料区：不按任务码顺序，哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)：'
+        self.log(('  原料区(跟随抓取)：手臂跟着要夹的物料转，原料盘一停就夹，哪个先跟上先夹哪个(放进它自己的槽)：' if follow else
+                  '  原料区：不按任务码顺序，哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)：')
                  + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
         md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
         if md is not None and hasattr(md, 'need_vmask') and any(md.need_vmask(it.color) for it in todo) and not self._warned_vmask:
@@ -1240,16 +1264,24 @@ class MissionHooks:
                 self.log('    ★ 时间到，不再抓取')
                 break
             self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
-            wheels = self._raw_wheels_on()
+            wheels = (not follow) and self._raw_wheels_on()
             if not wheels:
                 self._raw_recenter()                        # 只动车轮时不挪回：物料每次停在同一个地方，留在上次对准的位置(横移/前后都限着范围)
             got = None
             try:
                 self.arm.obs('RAW', open_claw=True)
-                if not wheels:
+                if not wheels and not follow:
                     self._raw_goto_pose()
                 t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + (1e9 if cfg.get('full_course', True) else float(cfg['time_limit_s'])))
-                got = self._raw_stop_pick([(it.color, it.slot, it) for it in todo], 'grab', t_end, '抓')
+                cands = [(it.color, it.slot, it) for it in todo]
+                if follow:
+                    self._raw_follow_now = True
+                    try:
+                        got = self._raw_follow_pick(cands, 'grab', t_end, '抓')
+                    finally:
+                        self._raw_follow_now = False
+                else:
+                    got = self._raw_stop_pick(cands, 'grab', t_end, '抓')
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
@@ -1635,9 +1667,244 @@ class MissionHooks:
         finally:
             stream.close()
 
+    def _raw_follow_pick(self, cands, mode, t_end, label):
+        """(10-16 用户)跟随抓取。cands = [(颜色, 槽位, 物料), ...]。手臂在 OBS RAW 的高度(看得到整个原料盘)：
+          - 先把要夹的几个颜色都认一遍，挑一个手臂够得着(相对 OBS RAW 姿态不超过 raw_follow_limit_deg)、离爪子最近的跟着；
+            跟上以后每帧只认这一个颜色(快)
+          - 每帧算物料自己动了多少：画面里的位置变化减掉手臂这一下转动造成的(按 J 算)，所以手臂边跟边看也分得清原料盘转没转
+          - 在转：手臂转到物料上方，往前多跟一点(物料速度 × raw_follow_lead_s)
+          - 停了(手臂没动的两帧之间物料也没动)：手臂已经在它上方，修一两下就下爪(_raw_follow_grab)
+          - 这一次停下剩的时间不够、没夹成：接着跟，等下一次停
+        返回夹到的那一项，没有返回 None。"""
+        cfg, v = self.cfg, self.vision
+        tag = f'[{label}]'
+        J = np.asarray(self.store.get('RAW', 'arm'), float)
+        try:
+            Jinv = np.linalg.inv(J)
+        except np.linalg.LinAlgError:
+            return self._raw_stop_pick(cands, mode, t_end, label)
+        try:
+            home = self.arm.read_angles()                     # OBS RAW 的姿态：跟随的范围以它为中心
+        except ArmAbort:
+            raise
+        except ArmError:
+            home = (None, None)
+        if home[0] is None or home[1] is None:
+            return self._raw_stop_pick(cands, mode, t_end, label)
+        home = (float(home[0]), float(home[1]))
+        cur = [home[0], home[1]]                              # 现在的 ID1、ID2(最后一次发的)
+        sc = float(v.scale('RAW'))
+        lim = dict(id1=25.0, id2=250.0)
+        lim.update(cfg.get('raw_follow_limit_deg') or {})
+        still_px = float(cfg.get('raw_still_px', 6.0))
+        dead_px = float(cfg.get('raw_follow_deadband_mm', 3.0)) * sc
+        lead_s = float(cfg.get('raw_follow_lead_s', 0.35))
+        gain = float(cfg.get('raw_follow_gain', 0.9))
+        keep_s = float(cfg.get('raw_keepalive_s', 12.0) or 0.0)
+        T = self._raw_close_delay(mode)
+        colors = [c[0] for c in cands]
+        by_color = {c[0]: c for c in cands}
+
+        def need(e):
+            """偏差 e(像素)要转到的绝对角度 (ID1, ID2)，和超出跟随范围多少(0 = 够得着)。"""
+            d = -Jinv @ np.asarray(e, float)                  # [ID2, ID1] 度
+            a1, a2 = cur[0] + float(d[1]), cur[1] + float(d[0])
+            over = max(0.0, abs(a1 - home[0]) - float(lim['id1'])) + max(0.0, abs(a2 - home[1]) - float(lim['id2'])) / 10.0
+            return a1, a2, over
+
+        def clampa(a1, a2):
+            a1 = min(home[0] + float(lim['id1']), max(home[0] - float(lim['id1']), a1))
+            a2 = min(home[1] + float(lim['id2']), max(home[1] - float(lim['id2']), a2))
+            return a1, a2
+
+        def go(a1, a2):
+            if os.environ.get('FOLLOW_DBG'):
+                self.log(f'      dbg AP {cur[0]:.1f},{cur[1]:.1f} -> {a1:.1f},{a2:.1f}')
+            self.arm.ap(a1, a2)
+            cur[0], cur[1] = a1, a2
+
+        target = None                                         # 正在跟的颜色
+        prev = None                                           # 上一帧 (时刻, 偏差, 那时的 ID1/ID2)
+        state = None                                          # 原料盘 'move' / 'stop'
+        t_move0 = t_stop0 = None
+        stop_seen = False
+        t_still = None                                        # 这次看到它停着的第一帧(没看到它停下的那一刻时，按这时才停下算)
+        skip_stop = False                                     # 这一次停下已经试过/来不及：等它再转起来
+        t_arm = self.now()
+        said = set()
+        self.log(f'    跟随抓取：手臂跟着要夹的物料转(相对现在的姿态 ID1 ±{float(lim["id1"]):g}°、ID2 ±{float(lim["id2"]):g}°)，'
+                 f'原料盘一停马上下爪(下爪到夹住约 {T:.2f} 秒)')
+        while True:
+            self._check_abort()
+            now = self.now()
+            if now > t_end:
+                self.log(f'  {tag} ★ 跟了 {float(cfg.get("raw_track_s", 30.0)):.0f} 秒没夹到，跳过')
+                return None
+            if keep_s > 0 and now - t_arm > keep_s:
+                d = float(cfg.get('raw_keepalive_deg', 1.0))
+                self.log(f'  {tag} 手臂 {now - t_arm:.0f} 秒没动了：轻轻摆一下(规则：机器人停止运行 15 秒本轮结束)')
+                self.arm.ap(cur[0] + d, cur[1])
+                self.arm.ap(cur[0], cur[1])
+                t_arm = self.now()
+                prev = None
+            t = self.now()
+            errs = v.material_errors([target] if target is not None else colors)
+            vis = {c: np.asarray(q, float) for c, q in errs.items() if q is not None}
+            if target is not None and target not in vis:
+                if ('lost', target) not in said:
+                    said.add(('lost', target))
+                    self.log(f'  {tag} 跟着的物料看不到了：换一个')
+                target, prev = None, None
+                continue
+            if target is None:
+                best = None
+                for c, e in vis.items():
+                    _a1, _a2, over = need(e)
+                    k = (over > 0.0, over, float(np.linalg.norm(e)))
+                    if best is None or k < best[0]:
+                        best = (k, c)
+                if best is None or best[0][0]:
+                    if 'none' not in said:
+                        said.add('none')
+                        self.log(f'  {tag} 画面里还没有够得着的要夹的物料：等它转过来')
+                    if best is not None:                      # 够不着的：手臂先往它那边转到范围边上等着
+                        a1, a2 = clampa(*need(vis[best[1]])[:2])
+                        if abs(a1 - cur[0]) > 0.5 or abs(a2 - cur[1]) > 2.0:
+                            go(a1, a2)
+                            t_arm = self.now()
+                    prev = None
+                    continue
+                target, prev = best[1], None
+                it = by_color[target][2]
+                self.log(f'  {tag} 跟着{it.color_name if it is not None else target}(离爪子点 {np.linalg.norm(vis[target]) / sc:.0f}mm)')
+            e = vis[target]
+            moving, vel, arm_moved = None, np.zeros(2), False
+            if prev is not None:
+                dt = max(1e-3, t - prev[0])
+                dA = np.array([cur[1] - prev[2][1], cur[0] - prev[2][0]])    # 两帧之间手臂转了多少 [ID2, ID1]
+                arm_moved = float(np.abs(dA).max()) > 1e-6
+                motion = (e - prev[1]) - J @ dA               # 物料自己(原料盘)动了多少像素
+                thr = still_px * (2.0 if arm_moved else 1.0)
+                moving = float(np.linalg.norm(motion)) > thr
+                vel = motion / dt
+            prev = (t, e, (cur[0], cur[1]))
+            if moving is not None and not (moving is False and arm_moved):
+                want = 'move' if moving else 'stop'
+                if want != state:
+                    if state == 'stop' and want == 'move':
+                        t_move0 = t
+                        if t_stop0 is not None and stop_seen:
+                            self.raw_stops.append(t_move0 - t_stop0)
+                        skip_stop = False
+                    elif want == 'stop':
+                        if state == 'move':
+                            t_stop0, stop_seen = t - 0.15, True
+                            self.raw_cycle['t_stop'] = t_stop0
+                            if t_move0 is not None:
+                                self.raw_moves.append(t_stop0 - t_move0)
+                            self.log(f'  {tag} 原料盘停了，物料离爪子点 {np.linalg.norm(e) / sc:.1f}mm')
+                        else:
+                            t_stop0, stop_seen = self._raw_predict_stop_start(t), False
+                        t_still = t
+                    state = want
+            if moving is False and arm_moved:
+                continue                                      # 好像停了，但手臂刚动过：手臂不动再拍一帧确认
+            if moving is None or moving:
+                ee = e + (lead_s * vel if moving else 0.0)
+                a1, a2, over = need(ee)
+                if over > 0.0:
+                    a1, a2 = clampa(a1, a2)                   # 跟到范围边上(转出范围以后再换一个)
+                a1 = cur[0] + gain * (a1 - cur[0])
+                a2 = cur[1] + gain * (a2 - cur[1])
+                if float(np.linalg.norm(ee)) > dead_px and (abs(a1 - cur[0]) > 0.15 or abs(a2 - cur[1]) > 0.5):
+                    go(a1, a2)
+                    t_arm = self.now()
+                if need(e)[2] > 0.0 and moving and float(np.linalg.norm(e)) / sc > 30.0 and need(e + vel)[2] > need(e)[2]:
+                    target, prev = None, None                 # 正在转出手臂够得着的范围：换一个
+                continue
+            # ---- 停着(手臂没动的两帧之间物料也没动)
+            if skip_stop:
+                continue
+            if need(e)[2] > 0.0 and float(np.linalg.norm(e)) / sc > float(cfg.get('raw_grab_max_mm', 30.0)):
+                self.log(f'  {tag} 停在手臂够不着的地方(离爪子点 {np.linalg.norm(e) / sc:.0f}mm)：等下一次停')
+                target, skip_stop = None, True
+                continue
+            stop_len = self._raw_stop_len()
+            left = None if t_stop0 is None else t_stop0 + stop_len - self.now()
+            if left is not None and left < T + 0.15:
+                self.log(f'  {tag} 这一次停下只剩 {max(0.0, left):.1f} 秒，来不及：接着跟，等下一次停')
+                skip_stop = True
+                continue
+            guess = left is None
+            if guess:                                         # 没看到它停下的那一刻：按看到它停着时才停下算(果断先试)
+                left = max(T + 0.95, (t_still if t_still is not None else self.now()) + stop_len - self.now())
+            deadline = self.now() + left - T - 0.15
+            cand = by_color[target]
+            self.log(f'  {tag} 手臂已经在物料上方(离爪子点 {np.linalg.norm(e) / sc:.1f}mm)：修一下就下爪'
+                     + ('(没看到它什么时候停下的，按刚停下算)' if guess else f'(这次停下大约还剩 {left:.1f} 秒)'))
+            r = self._raw_follow_grab(cand, mode, e, deadline, J, need, clampa, go, cur)
+            if r:
+                return cand
+            skip_stop = True
+            t_arm = self.now()
+            prev = None
+            if r is None:
+                target = None                                 # 看不到了：重新挑
+
+    def _raw_follow_grab(self, cand, mode, e, deadline, J, need, clampa, go, cur):
+        """跟随抓取：原料盘停了、手臂已经在物料上方。按 J 一下修到位(最多 raw_follow_fix 次，每次修完拍一帧看看)，
+        到容差(raw_tol_mm)或到必须下爪的时刻就下爪(偏差不超过 raw_grab_max_mm；raw_force_grab 时不超过 raw_force_max_mm 也夹)。
+        修的时候发现物料自己在动(原料盘又转了)就不夹。返回 True 夹了 / False 没夹 / None 看不到了。"""
+        cfg, v = self.cfg, self.vision
+        sc = float(v.scale('RAW'))
+        color, slot = cand[0], cand[1]
+        tol_px = float(cfg.get('raw_tol_mm') or cfg['tol_mm']['RAW']) * sc
+        still_px = float(cfg.get('raw_still_px', 6.0))
+        for _i in range(int(cfg.get('raw_follow_fix', 3))):
+            if float(np.linalg.norm(e)) <= tol_px or self.now() > deadline:
+                break
+            a1, a2, _over = need(e)
+            a1, a2 = clampa(a1, a2)
+            before = np.asarray(e, float)
+            c0 = (cur[0], cur[1])
+            go(a1, a2)
+            q = v.material_errors([color]).get(color)
+            if q is None:
+                self.log('    ★ 修的时候看不到物料了：不下爪')
+                return None
+            e = np.asarray(q, float)
+            dA = np.array([cur[1] - c0[1], cur[0] - c0[0]])
+            if True:
+                if float(np.linalg.norm((e - before) - J @ dA)) > 3.0 * still_px + 0.15 * float(np.linalg.norm(J @ dA)):
+                    self.log('    ★ 修的时候物料自己在动(原料盘又转了)：不下爪，接着跟')
+                    return False
+        err = float(np.linalg.norm(e)) / sc
+        grab_max = float(cfg.get('raw_grab_max_mm', 5.0))
+        force = bool(cfg.get('raw_force_grab', True)) and err <= float(cfg.get('raw_force_max_mm', 60.0))
+        if err > grab_max and not force:
+            self.log(f'    ★ 偏差 {err:.1f}mm，超过 {grab_max:g}mm，下爪会砸到物料：不下爪，等下一次停')
+            return False
+        if self.now() > deadline + 0.25 and not force:
+            self.log('    ★ 修得太久，原料盘马上要转了：不下爪，等下一次停')
+            return False
+        if mode == 'nogo':
+            self.log(f'    nogo：对准了(偏差 {err:.1f}mm)，不夹')
+            return True
+        self.log(f'    下爪(偏差 {err:.1f}mm)')
+        if mode == 'lift':
+            P = self.arm.params() or {}
+            self.arm.do(f'LIFT {float(P["ZGRAB"]):g}')
+            self.arm.do('CLAW C')
+            self.arm.do(f'LIFT {float(P["ZHI"]):g}')
+            return True
+        self.arm.grab_here(slot)
+        return True
+
     def _raw_wheels_on(self):
         """原料区这次只动车轮对准吗：align_by.RAW='wheels'，而且有车轮和画面的对应关系(vcal RAW 颜色号 不加 arm 测的)。
         只有手臂的(以前 vcal RAW 颜色号 arm 测的)、没有车轮的：这次还是按手臂对准(原料盘一停一转时现测车轮会测错)，提醒一次。"""
+        if getattr(self, '_raw_follow_now', False):
+            return False                                      # 跟随抓取：只动手臂
         if not self._by_wheels('RAW'):
             return False
         st = self.store

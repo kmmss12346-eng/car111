@@ -799,7 +799,7 @@ ARM_ALIGN = dict(RAW='arm', ROUGH='arm', TEMP='arm')     # 手臂对准(10-12 �
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
               survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False,
-              align_by=ARM_ALIGN)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+              align_by=ARM_ALIGN, raw_follow=False)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
 LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
 
 
@@ -1640,6 +1640,59 @@ def seed_raw_wheels_j(w, h):
     h._ensure(w.link)
     h.store.put('RAW', 'ch', w.scale['RAW'] * w.Rcam @ np.diag([1.0, -1.0]))
     h.store.set_synth('RAW', False)
+
+
+class RawFollowTests(unittest.TestCase):
+    """10-16 用户：原料区跟随抓取——原料盘转的时候手臂就跟着要夹的物料走，停下马上夹；不按任务码顺序。"""
+
+    def _run(self, seed, cfg=None, arm_j=True, **kw):
+        w = plate_world(seed, **kw)
+        lines = []
+        h = make(w, dict(dict(raw_follow=True), **(cfg or {})), log=lines.append)
+        h._ensure(w.link)
+        if arm_j:
+            h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        return w, h, '\n'.join(lines)
+
+    def test_follow_grabs_when_the_plate_stops_off_the_claw(self):
+        """物料停的地方离爪子点 40mm(以前等它停到爪子附近，一个也夹不到)：手臂跟过去，三个都夹到、都放对槽。"""
+        for seed in (1, 2, 4):
+            w, h, text = self._run(seed, plate_off_tan=40.0)
+            self.assertIn('跟随抓取', text)
+            self.assertIn('原料盘停了', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+            w2, h2, text2 = self._run(seed, dict(raw_follow=False, raw_any_order=True), plate_off_tan=40.0)
+            self.assertNotIn('跟随抓取', text2)
+            self.assertLess(h2.stats.grab_ok, 3)                 # 以前的做法：停偏了就等不到
+
+    def test_follow_stays_inside_its_range(self):
+        """跟随时 ID1/ID2 不超出 OBS RAW 姿态 ± raw_follow_limit_deg。"""
+        w = plate_world(2, plate_off_tan=-35.0, plate_off_mm=25.0)
+        h = make(w, dict(raw_follow=True, raw_follow_limit_deg=dict(id1=20.0, id2=200.0)))
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        P = w.params
+        aps = []
+        orig = w.link.request
+
+        def req(text, *a, **k):
+            if text.startswith('AP ') and w.zone == 'RAW':
+                aps.append(tuple(float(x) for x in text.split()[1:3]))
+            return orig(text, *a, **k)
+        w.link.request = req
+        run_mission(w, h, stops=('QR', 'RAW'))
+        self.assertTrue(aps)
+        self.assertLessEqual(max(abs(a1 - P['A1G']) for a1, _ in aps), 20.0 + 1.5)    # 摆一下(keepalive)最多多 1°
+        self.assertLessEqual(max(abs(a2 - P['A2E']) for _, a2 in aps), 200.0 + 0.5)
+        self.assertGreaterEqual(h.stats.grab_ok - w.air, 2)
+
+    def test_without_an_arm_jacobian_it_waits_as_before(self):
+        """没做过 vcal RAW 颜色号 arm：提醒一次，照旧等物料停到爪子附近再夹。"""
+        w, h, text = self._run(1, arm_j=False)
+        self.assertIn('还没有手臂和画面的对应关系', text)
+        self.assertNotIn('跟随抓取：', text)
 
 
 class WheelsAlignTests(unittest.TestCase):
