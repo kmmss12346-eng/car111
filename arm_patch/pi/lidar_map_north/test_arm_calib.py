@@ -12,7 +12,7 @@ from arm_calib import Wizard, CalError, STEPS, STEP_KEYS
 RANGES = dict(LFMAX=(10, 105), ZHI=(0, 400), ZGRAB=(0, 400), ZDROP=(0, 400), ZPLC=(0, 400), ZSTK=(0, 400),
               ZOBRAW=(0, 400), ZOBRNG=(0, 400), A1G=(232, 417.6), A1D=(232, 417.6), A1H=(232, 417.6),
               A1P=(232, 417.6), A2E=(-1220, -503.5), A2R=(-1220, -503.5), A2P=(-1220, -503.5),
-              CLWO=(1700, 2910), CLWC=(1700, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
+              CLWO=(500, 2910), CLWC=(500, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
               AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100))
 DEFAULTS = dict(LFMAX=100, ZHI=100, ZGRAB=20, ZDROP=60, ZPLC=0, ZSTK=60, ZOBRAW=100, ZOBRNG=100,
                 A1G=323, A1D=323, A1H=323, A1P=323, A2E=-862, A2R=-862, A2P=-862,

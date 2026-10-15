@@ -46,7 +46,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 # 夹爪、转盘脉宽的限位(和 main.c 里 CLAW_MIN_US/CLAW_MAX_US、TURNTABLE_MIN_US/TURNTABLE_MAX_US 一样)
-CLAW_RANGE = (1700, 2910)
+CLAW_RANGE = (500, 2910)
 TT_RANGE = (500, 2608)
 MATERIAL_MM = 60.0            # 物料高度：码垛高度 ZSTK 默认 = ZPLC + 这个
 

@@ -79,7 +79,7 @@ def wait_qr(link, timeout):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', default='/dev/serial0')
-    ap.add_argument('--close', type=int, default=None, help='夹紧的脉宽(微秒，1700~2910，越大越紧)，不给就用 CLAW C(2910)')
+    ap.add_argument('--close', type=int, default=None, help='夹紧的脉宽(微秒，500~2910，越大越紧)，不给就用 CLAW C(2910)')
     ap.add_argument('--noqr', action='store_true')
     ap.add_argument('--wait', type=float, default=60.0, help='最多等二维码多少秒')
     a = ap.parse_args()

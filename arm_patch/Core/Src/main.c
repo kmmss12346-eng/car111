@@ -903,7 +903,7 @@ void Link_Poll(void)
 
 #define CLAW_OPEN_US        2090u
 #define CLAW_CLOSE_US       2910u
-#define CLAW_MIN_US         1700u
+#define CLAW_MIN_US         500u     /* 10-15 用户重装夹爪：要用到 1300 左右，下限放宽到舵机常用的 500 */
 #define CLAW_MAX_US         2910u
 #define TURNTABLE_SLOT1_US  2608u
 #define TURNTABLE_STEP_US   900u

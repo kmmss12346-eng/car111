@@ -168,8 +168,8 @@ static const ArmTun tun[] =
     { "OVCLR",  &g_ovclr,   0.0f,    100.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
-    { "CLWO",   &g_clwo,    1700.0f, 2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
-    { "CLWC",   &g_clwc,    1700.0f, 2910.0f },
+    { "CLWO",   &g_clwo,    500.0f,  2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
+    { "CLWC",   &g_clwc,    500.0f,  2910.0f },
     { "TT1",    &g_tt1,     500.0f,  2608.0f },  /* 范围 = main.c 里转盘的限位 TURNTABLE_MIN_US ~ TURNTABLE_MAX_US */
     { "TT2",    &g_tt2,     500.0f,  2608.0f },
     { "TT3",    &g_tt3,     500.0f,  2608.0f },
