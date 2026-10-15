@@ -2426,7 +2426,16 @@ int Arm_Command(const char *cmd, char *err, int errlen)
 
         if (!lift_known)                              FAIL("ERR NOZERO");
         if (!lift_cal_ok)                             FAIL("ERR NOCAL");      /* 升降没标定：开机认不准高度，存了也不敢动 */
-        if (!Servo_ReadAngle(1, &a1) || !Servo_ReadAngle(2, &a2))  FAIL("ERR READ");
+        {
+            int k, g1 = 0, g2 = 0;
+            for (k = 0; k < 3 && !(g1 && g2); k++)    /* 总线偶尔读不到：各多试两次 */
+            {
+                if (!g1)  g1 = Servo_ReadAngle(1, &a1);
+                if (!g2)  g2 = Servo_ReadAngle(2, &a2);
+            }
+            if (!g1)  FAIL("ERR READ1");
+            if (!g2)  FAIL("ERR READ2");
+        }
         sb_z = lift_mm;
         sb_a1 = a1;
         sb_a2 = a2;
