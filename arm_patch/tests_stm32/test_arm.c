@@ -74,7 +74,7 @@ int Servo_WriteParam(uint8_t id, const char *name, long v) {
     if (v < 0 || v > 65535) return 2;
     return v == 4242 ? -1 : 1;
 }
-static float clampa(uint8_t id, float a) { float lo = id == 1 ? 44.0f : -1220.0f, hi = id == 1 ? 440.0f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
+static float clampa(uint8_t id, float a) { float lo = id == 1 ? 232.0f : -1220.0f, hi = id == 1 ? 440.0f : -503.5f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
     float d; *a = clampa(id, *a); fgoal[id] = *a; d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
@@ -232,7 +232,7 @@ int main(void) {
     CHECK(run("DROP S") == 1 && has("L+3200;"), "DROP S 下降到 ZSTK(40mm=3200 脉冲)");
 
     /* ---- PLACE = TAKE + OBS RING + DROP ---- */
-    Arm_Param_Set("A1P", 200);                     /* 圆环姿态和转盘姿态不一样，ID1 才会转 */
+    Arm_Param_Set("A1P", 350);                     /* 圆环姿态和转盘姿态不一样，ID1 才会转 */
     away(); clear();
     CHECK(run("PLACE 1") == 1 && at("C;") >= 0 && at("C;") < last("S1:") && last("S1:") < last("O;"), "PLACE：先取(夹紧)，再转到圆环上方，再放(松开)");
     Arm_Param_Set("A1P", 323);
@@ -675,7 +675,7 @@ int main(void) {
         const char *q;
         Arm_Param_Set("OVLAP", 1); Arm_Param_Set("OVCLR", 20);
         Arm_Param_Set("ZHI", 100); Arm_Param_Set("ZOBRAW", 100); Arm_Param_Set("ZGRAB", 20); Arm_Param_Set("ZDROP", 60);
-        Arm_Param_Set("A1D", 200);                 /* 转盘姿态和原料盘姿态不一样，ID1 才会转 */
+        Arm_Param_Set("A1D", 350);                 /* 转盘姿态和原料盘姿态不一样，ID1 才会转 */
         run("OBS RAW O"); clear();
         CHECK(run("GRAB 2 H") == 1, "OVLAP：GRAB 2 H");
         c_ = at("C;"); up1 = at("L+1600;"); sw = at("S1:");
