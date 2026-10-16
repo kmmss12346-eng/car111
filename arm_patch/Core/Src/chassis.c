@@ -1840,3 +1840,94 @@ void Car_Motor_Enable(void)
         HAL_Delay(3);
     }
 }
+
+
+/* ================= (10-16 用户)连续速度：树莓派一边看一边慢慢挪车(原料区找原料盘中心) =================
+ * "V s f"：横移 s、前进 f(毫米/秒，左/前为正)，发了马上回 DONE，车一直按这个速度走，直到下一条 V；
+ * 超过 VEL_TIMEOUT_MS 没收到新的 V(树莓派卡住/断线)或者急停(!)就自动停车。
+ * "V?"：回 "VD 横移 前进"，从开机起 V 一共走了多少毫米(按发给电机的速度算；步进电机闭环，不会丢步)。
+ * 不纠车头(速度很慢、距离很短)。 */
+#define VEL_TIMEOUT_MS   400u
+#define VEL_MAX_MMPS     60.0f
+static uint8_t  vel_on = 0;
+static float    vel_s_rpm = 0.0f;     /* 现在发给电机的(取整以后的)转速：横移那一份 */
+static float    vel_f_rpm = 0.0f;     /* 前进那一份 */
+static uint32_t vel_t = 0;            /* 上次累计位移的时刻 */
+static uint32_t vel_cmd_t = 0;        /* 上次收到 V 的时刻 */
+static float    vel_ds = 0.0f;        /* 累计横移(mm) */
+static float    vel_df = 0.0f;        /* 累计前进(mm) */
+
+static void Vel_Integrate(uint32_t now)
+{
+    if (vel_on)
+    {
+        float dt = (float)(now - vel_t) / 1000.0f;
+        float ps = (vel_s_rpm >= 0.0f) ? g_lppm : g_rppm;
+        float pf = (vel_f_rpm >= 0.0f) ? g_fppm : g_bppm;
+
+        vel_ds += vel_s_rpm * PULSES_PER_REV / 60.0f / ps * dt;
+        vel_df += vel_f_rpm * PULSES_PER_REV / 60.0f / pf * dt;
+    }
+    vel_t = now;
+}
+
+void Car_Vel(float s_mmps, float f_mmps)
+{
+    uint32_t now = HAL_GetTick();
+    float ps, pf, rs, rf;
+    float w[4];
+
+    Vel_Integrate(now);
+    vel_cmd_t = now;
+    if (s_mmps > VEL_MAX_MMPS)  s_mmps = VEL_MAX_MMPS;
+    if (s_mmps < -VEL_MAX_MMPS) s_mmps = -VEL_MAX_MMPS;
+    if (f_mmps > VEL_MAX_MMPS)  f_mmps = VEL_MAX_MMPS;
+    if (f_mmps < -VEL_MAX_MMPS) f_mmps = -VEL_MAX_MMPS;
+    ps = (s_mmps >= 0.0f) ? g_lppm : g_rppm;
+    pf = (f_mmps >= 0.0f) ? g_fppm : g_bppm;
+    rs = s_mmps * ps * 60.0f / PULSES_PER_REV;
+    rf = f_mmps * pf * 60.0f / PULSES_PER_REV;
+    rs = (float)(int)((rs >= 0.0f) ? (rs + 0.5f) : (rs - 0.5f));    /* 电机按整数 转/分 走：按取整后的算位移 */
+    rf = (float)(int)((rf >= 0.0f) ? (rf + 0.5f) : (rf - 0.5f));
+    if (rs == 0.0f && rf == 0.0f)
+    {
+        if (vel_on)
+        {
+            w[0] = w[1] = w[2] = w[3] = 0.0f;
+            Wheels_Vel(w);
+            Stop_Quick();
+        }
+        vel_on = 0;
+        vel_s_rpm = vel_f_rpm = 0.0f;
+        return;
+    }
+    /* 左移时 ID1、ID4 往前，ID2、ID3 往后(和 Car_Strafe_Closed 一致)；前进 4 个轮子都往前 */
+    w[0] = rf + rs;
+    w[1] = rf - rs;
+    w[2] = rf - rs;
+    w[3] = rf + rs;
+    Wheels_Vel(w);
+    vel_s_rpm = rs;
+    vel_f_rpm = rf;
+    vel_on = 1;
+}
+
+void Car_Vel_Poll(void)
+{
+    if (vel_on && (car_abort || (HAL_GetTick() - vel_cmd_t) > VEL_TIMEOUT_MS))
+    {
+        Car_Vel(0.0f, 0.0f);
+    }
+}
+
+void Car_Vel_Read(float *s_mm, float *f_mm)
+{
+    Vel_Integrate(HAL_GetTick());
+    *s_mm = vel_ds;
+    *f_mm = vel_df;
+}
+
+uint8_t Car_Vel_On(void)
+{
+    return vel_on;
+}

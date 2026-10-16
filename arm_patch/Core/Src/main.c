@@ -217,6 +217,7 @@ while (1)
     static uint32_t last_send = 0;
 
     Link_Poll();                   /* 有指令就执行，执行完回 DONE 或 ERR */
+    Car_Vel_Poll();                /* (10-16)按 V 走的时候：树莓派 400ms 没发新指令/急停就停车 */
 #if ARM_MODULES_ON
     Arm_Poll();                    /* 处理扫码模块收到的任务码 */
 #endif
@@ -720,6 +721,10 @@ void Link_Poll(void)
     car_abort = 0;                                 /* 清掉上一条留下的急停标志 */
     car_stalled = 0;
     t0 = HAL_GetTick();
+    if (Car_Vel_On() && cmd[0] != 'V')
+    {
+        Car_Vel(0.0f, 0.0f);                         /* (10-16)别的指令来了：先停下 V 的连续走 */
+    }
 
     if (strcmp(cmd, "PING") == 0)
     {
@@ -768,6 +773,30 @@ void Link_Poll(void)
         return;
     }
 
+    /* (10-16)连续速度："V 横移 前进"(mm/s，左/前为正)，马上回 DONE，车一直按这个速度走，400ms 没新的 V 自动停；
+     * "V?" 回 "VD 横移 前进"(V 一共走了多少 mm) */
+    if (cmd[0] == 'V' && cmd[1] == '?' && cmd[2] == 0)
+    {
+        float vs, vf;
+        char m[48];
+        Car_Vel_Read(&vs, &vf);
+        snprintf(m, sizeof(m), "VD %ld %ld\r\nDONE\r\n", (long)(vs * 10.0f), (long)(vf * 10.0f));
+        Link_Reply(m);
+        return;
+    }
+    if (cmd[0] == 'V' && cmd[1] == ' ')
+    {
+        char *e1;
+        char *e2;
+        float vs = (float)strtod(&cmd[2], &e1);
+        float vf;
+        if (e1 == &cmd[2] || *e1 != ' ')             { Link_Reply("ERR ARG\r\n"); return; }
+        vf = (float)strtod(e1 + 1, &e2);
+        if (e2 == e1 + 1 || *e2 != 0)                { Link_Reply("ERR ARG\r\n"); return; }
+        Car_Vel(vs, vf);
+        Link_Reply("DONE\r\n");
+        return;
+    }
     /* 在线改参数："SET 名字 数值" */
     if (cmd[0] == 'S' && cmd[1] == 'E' && cmd[2] == 'T' && cmd[3] == ' ')
     {

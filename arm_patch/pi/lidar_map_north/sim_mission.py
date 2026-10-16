@@ -141,6 +141,9 @@ class SimWorld:
         self.park_cmd = bool(park_cmd)                         # STM32 认识 PARK(新程序)
         self.apn_fw = bool(apn_fw)                             # (10-16)STM32 认识 APN(只发目标不等，跟随用)
         self.trk = None                                        # APN 发的目标 [a1, a2, 转速1, 转速2]：时间往前走时舵机跟着转
+        self.vel = None                                        # (10-16)V 发的底盘速度 [横移 mm/s, 前进 mm/s, 发的时刻]：400ms 没新的就停
+        self.vel_fw = True                                     # STM32 认识 V
+        self.vel_sum = [0.0, 0.0]                              # V 一共走了多少(V? 回的)
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
@@ -153,6 +156,15 @@ class SimWorld:
 
     # ------------------------------------------------------------------ 时间
     def advance(self, s):
+        vl = self.__dict__.get('vel')
+        if vl and s > 0:                                   # 底盘按 V 的速度走(超过 400ms 没新的 V 就停)
+            dt = max(0.0, min(s, vl[2] + 0.4 - self.t))
+            self.off_s += vl[0] * dt
+            self.off_f += vl[1] * dt * self.f_gain
+            self.vel_sum[0] += vl[0] * dt
+            self.vel_sum[1] += vl[1] * dt
+            if self.t + s > vl[2] + 0.4:
+                self.vel = None
         tr = self.__dict__.get('trk')
         if tr and s > 0:                                   # APN 发过目标：舵机按转速一直往那边转
             for i, tg, sp in ((1, tr[0], tr[2]), (2, tr[1], tr[3])):
@@ -341,6 +353,7 @@ class SimWorld:
 
     # ------------------------------------------------------------------ 底盘
     def move(self, cmd, val, speed=None):
+        self.vel = None
         self.advance(1.0 + abs(val) / 150.0)
         self.moves.append((cmd, val, self.zone))
         self.move_speeds.append(speed)
@@ -377,6 +390,18 @@ class SimWorld:
         parts = text.split()
         verb = parts[0] if parts else ''
         info = []
+        if verb == 'V' or verb == 'V?':
+            if not self.vel_fw:
+                return False, 'ERR CMD', info
+            self.advance(0.01)
+            if verb == 'V?':
+                info.append(f'VD {int(round(self.vel_sum[0] * 10))} {int(round(self.vel_sum[1] * 10))}')
+                return True, 'DONE', info
+            vs, vf = float(parts[1]), float(parts[2])
+            vs, vf = max(-60.0, min(60.0, vs)), max(-60.0, min(60.0, vf))
+            self.vel = None if (vs == 0.0 and vf == 0.0) else [vs, vf, self.t]
+            return True, 'DONE', info
+        self.vel = None                                        # 别的指令：STM32 先停下 V 的连续走
         if verb not in _KEEP_TRK:
             self.trk = None                                    # 别的转动指令接管舵机：APN 的目标作废
         self.advance(DUR.get(verb.rstrip('?'), 0.0) if verb != 'A?' else DUR['A'])
@@ -1727,7 +1752,8 @@ class RawFollowTests(unittest.TestCase):
             h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
             run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
             text = '\n'.join(lines)
-            self.assertIn('车轮慢慢挪', text)
+            self.assertIn('车轮边走边对准', text)                           # 连续顺滑地走(V)，不是挪一下停一下
+            self.assertFalse([m for m in w.moves[:-2] if m[2] == 'RAW'], w.moves)   # 只有最后挪回停车点用 S/F
             self.assertIn('认出了 3 个停靠位', text)
             self.assertNotIn('跟着', text)                                     # 没有一直跟着物料走
             ds = [float(x.split('原料盘中心离爪子点 ')[1].split('mm')[0]) for x in lines if '原料盘中心离爪子点' in x]
@@ -1747,7 +1773,7 @@ class RawFollowTests(unittest.TestCase):
         seed_raw_wheels_j(w2, h2)
         run_mission(w2, h2, stops=('QR', 'RAW'), log=lines2.append)
         text2 = '\n'.join(lines2)
-        self.assertNotIn('各挪 15mm 测一下', text2)
+        self.assertNotIn('边走边看圆心怎么动', text2)
         self.assertEqual(h2.stats.grab_ok - w2.air, 3, text2[-3000:])
 
     def test_center_with_only_two_in_view(self):
@@ -1769,15 +1795,28 @@ class RawFollowTests(unittest.TestCase):
         h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
         h._ensure(w.link)
         h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
-        real = h._raw_plate_center
-        h._raw_plate_center = lambda wait: real(wait) if h.act.disp['S'] <= -39.0 or getattr(h, '_raw_slots_rt', None) else None
+        real = h._raw_center_frame
+        h._raw_center_frame = lambda *a: real(*a) if w.off_s <= -19.0 else (None, None, 1)   # 往右走过 19mm 才看得到
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
         text = '\n'.join(lines)
-        self.assertIn('车轮挪着找(第 1 处', text)
-        self.assertIn('车轮挪着找(第 2 处', text)
+        self.assertIn('车轮边走边找', text)
         self.assertIn('认出了 3 个停靠位', text)
         self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
         self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+
+    def test_center_old_firmware_steps(self):
+        """STM32 是旧程序(不认 V)：改回一步一步挪，照样对准、夹到。"""
+        w = self._center_world(2)
+        w.vel_fw = False
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('不认 V 指令', text)
+        self.assertIn('车轮慢慢挪', text)
+        self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
 
     def test_center_falls_back_to_follow(self):
         """认不出原料盘中心(看的颜色画面里没有)：改用跟随抓取，照样夹。"""
@@ -1791,7 +1830,7 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('认不出原料盘中心', text)
         self.assertIn('一帧里最多看到', text)                                # 说清楚看到了几个
         self.assertIn('跟随抓取', text)
-        self.assertIn('车轮挪着找', text)                                    # 先挪着找过
+        self.assertIn('车轮边走边找', text)                                  # 先边走边找过
         self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)               # 找不到：挪回停车点
 
     def test_follow_stays_inside_its_range(self):

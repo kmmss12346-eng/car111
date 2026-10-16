@@ -311,6 +311,31 @@ class ArmActuators:
             return None                                   # 没读回来，按指令的量算
         return (a2_1 - a2_0, a1_1 - a1_0)
 
+    def vel(self, s_mmps, f_mmps):
+        """(10-16)底盘按速度一直走：横移 s_mmps、前进 f_mmps(毫米/秒，左/前为正)，发了马上返回(STM32 回 DONE)，
+        400ms 没发新的就自己停。返回 True；STM32 是旧程序(不认 V)返回 False(以后不再试)。位移不记进 disp：用 vel_read 算。"""
+        if getattr(self, '_no_vel', False):
+            return False
+        ok, reply, _info = self.link.request(f'V {float(s_mmps):.1f} {float(f_mmps):.1f}', 1.0, collect=True)
+        reply = reply or ''
+        if 'ABORT' in reply:
+            raise ArmAbort(f'V -> {reply}')
+        if not ok:
+            if 'CMD' in reply or 'ARG' in reply:
+                self._no_vel = True
+                return False
+            raise ArmError(f'底盘 V 失败：{reply}')
+        return True
+
+    def vel_read(self):
+        """V 一共走了多少 (横移, 前进) 毫米(STM32 按发给电机的速度算)；读不到返回 None。"""
+        ok, reply, info = self.link.request('V?', 1.0, collect=True)
+        for line in info or []:
+            m = re.match(r'VD (-?\d+) (-?\d+)', line)
+            if m:
+                return int(m.group(1)) / 10.0, int(m.group(2)) / 10.0
+        return None
+
     def chassis_move(self, s_mm, f_mm, speed=None):
         """底盘横移 s_mm(向左为正)、前进 f_mm(向前为正)，一条一条发，等 DONE。speed = 这次的速度(转/分)；None = 小距离用 fine_speed。"""
         for cmd, v in (('S', s_mm), ('F', f_mm)):

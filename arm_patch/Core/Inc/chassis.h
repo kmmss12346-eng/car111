@@ -25,6 +25,10 @@ void Car_Strafe_Closed(uint16_t speed, float distance_mm);     /* 闭环横移�
 void Car_Strafe_Calib(uint16_t speed, float distance_mm);      /* 横移校准：不纠偏左移再右移，串口打印 CAL 并立刻生效 */
 void Car_Move_Align(char kind, uint16_t speed, float distance_mm);
 void Car_Home(void);                              /* 现在的车头方向 = 要保持的方向 */
+void Car_Vel(float s_mmps, float f_mmps);         /* (10-16)V：按速度一直走(mm/s)，400ms 没新指令自动停 */
+void Car_Vel_Poll(void);                          /* 主循环里调用：超时/急停就停车 */
+void Car_Vel_Read(float *s_mm, float *f_mm);      /* V?：V 一共走了多少 mm */
+uint8_t Car_Vel_On(void);                         /* 现在是不是在按 V 走 */
 
 int  Car_Param_Set(const char *name, float v);    /* 0=没有这个名字 1=成功 2=超出范围 */
 void Car_Param_Dump(void);                        /* 串口打印全部参数 */

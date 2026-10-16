@@ -649,6 +649,53 @@ static void test_params(void)
 }
 #endif
 
+#ifndef CHASSIS_V12A
+/* (10-16)V：按速度一直走，马上返回；400ms 没新的 V / 急停就停；V? 的累计位移和实际走的差不多 */
+static void test_vel(void)
+{
+    float ds, df, s0, f0;
+    uint32_t t0;
+    printf("== V：连续速度(原料区边看边慢慢挪车)\n");
+    reset_car();
+    Car_Vel_Read(&s0, &f0);
+    t0 = now_ms;
+    Car_Vel(0.0f, 20.0f);                              /* 前进 20mm/s */
+    CHECK(now_ms - t0 < 50, "V 应该马上返回(用了 %u ms)", (unsigned)(now_ms - t0));
+    CHECK(Car_Vel_On(), "V 以后应该在走");
+    while (now_ms - t0 < 1000) { HAL_Delay(50); Car_Vel(0.0f, 20.0f); Car_Vel_Poll(); }   /* 树莓派一直在发 */
+    Car_Vel(0.0f, 0.0f);
+    HAL_Delay(300);
+    Car_Vel_Read(&ds, &df);
+    CHECK(fabs(px - 20.0) < 5.0, "V 0 20 走 1 秒应该前进约 20mm，实际 %.1f", px);
+    CHECK(fabs((df - f0) - px) < 3.0 && fabs(ds - s0) < 0.5, "V? 记的前进 %.1f 和实际 %.1f 差太多(横移记了 %.1f)", df - f0, px, ds - s0);
+    CHECK(!Car_Vel_On(), "V 0 0 应该停下");
+    /* 横移(左) */
+    reset_car();
+    Car_Vel_Read(&s0, &f0);
+    t0 = now_ms;
+    while (now_ms - t0 < 1000) { Car_Vel(15.0f, 0.0f); HAL_Delay(50); Car_Vel_Poll(); }
+    Car_Vel(0.0f, 0.0f);
+    HAL_Delay(300);
+    Car_Vel_Read(&ds, &df);
+    CHECK(fabs(py - 15.0) < 5.0, "V 15 0 走 1 秒应该左移约 15mm，实际 %.1f", py);
+    CHECK(fabs((ds - s0) - py) < 3.0, "V? 记的横移 %.1f 和实际 %.1f 差太多", ds - s0, py);
+    /* 树莓派不发了：400ms 后自己停 */
+    reset_car();
+    Car_Vel(0.0f, 20.0f);
+    t0 = now_ms;
+    while (now_ms - t0 < 1000) { HAL_Delay(10); Car_Vel_Poll(); }
+    CHECK(!Car_Vel_On(), "400ms 没收到新的 V 应该自己停");
+    CHECK(px < 12.0, "超时停车：最多走 0.4 秒多一点(约 8mm)，实际 %.1f", px);
+    /* 急停 */
+    reset_car();
+    Car_Vel(0.0f, 20.0f);
+    car_abort = 1;
+    Car_Vel_Poll();
+    CHECK(!Car_Vel_On(), "急停(!)应该马上停");
+    car_abort = 0;
+}
+#endif
+
 int main(void)
 {
     uint32_t t;
@@ -766,6 +813,7 @@ int main(void)
 
     test_abort();
 #ifndef CHASSIS_V12A
+    test_vel();
     test_precision();
     test_parse();
     test_params();
