@@ -554,6 +554,42 @@ class Vision:
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
         return out
 
+    def plate_scan(self, colors):
+        """(10-16 用户：照抄开源方案)同一帧里：原料盘(转盘)外圆 + 这几个颜色的物料。
+        返回 (外圆 dict(c=(x, y), r=半径, stable=是否连续几帧稳定, rms=拟合残差) 或 None, {颜色: 偏差像素 或 None})。
+        外圆用 turntable_detector.py(开源方案原样)：粗 Hough 找大圆 -> 沿径向采样边缘精修；锁定以后每帧只做局部精修(快)。
+        参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。"""
+        det = self._material_det()
+        fr = self._frame()
+        out = {}
+        cu, cv_ = self.claw('RAW')
+        for c in colors:
+            p = det(fr, int(c)) if fr is not None else None
+            out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        plate = None
+        if fr is not None and self.cfg.get('turntable_on', True):
+            tt = getattr(self, '_tt', None)
+            if tt is None:
+                import turntable_detector as T
+                doc = T.build_default_turntable_detector_document()
+                doc['coarse_search'].update(image_scale=0.29, minimum_radius_px=200.0, maximum_radius_px=420.0,
+                                            canny_threshold=24.0, accumulator_threshold=26.0)
+                doc['refinement'].update(radial_search_half_width_px=53.0, minimum_visible_arc_deg=90.0, maximum_fit_rms_px=6.6,
+                                         local_recheck_rms_above_px=1.6)
+                doc['stability'].update(window_frames=3, maximum_center_jitter_px=10.0)
+                for k, v in (self.cfg.get('turntable') or {}).items():
+                    if isinstance(v, dict) and k in doc:
+                        doc[k].update(v)
+                tt = self._tt = T.TurntableDetector(T.turntable_config_from_document(doc))
+            try:
+                r = tt.detect(fr)
+            except Exception:
+                r = None
+            if r is not None and r.detected:
+                plate = dict(c=(float(r.center_x_px), float(r.center_y_px)), r=float(r.radius_px), stable=bool(r.stable),
+                             rms=float(r.fit_rms_px))
+        return plate, out
+
     def material_error(self, color_id, n=None):
         """物料偏差像素 = 物料 - 爪子(RAW)。看不到返回 None。"""
         p = self.material_px(color_id, n)

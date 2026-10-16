@@ -704,6 +704,19 @@ class SimVision:
         c = self.claw(kind)
         return (float(e[0]) + self.TRUE_CLAW[0] - c[0], float(e[1]) + self.TRUE_CLAW[1] - c[1])
 
+    outer_on = True                     # (10-16)假摄像头也能认原料盘外圆(plate_scan)；False = 只能靠物料位置算圆心
+
+    def plate_scan(self, colors):
+        """和真的 Vision.plate_scan 一样：同一帧里的原料盘外圆 + 物料。原料盘外圆很大，总看得到一段弧。"""
+        w = self.w
+        pc = None
+        if self.outer_on and w.zone == 'RAW' and w.plate_stop:
+            e = w.scale['RAW'] * (w._cam() @ (w.plate_c - w.claw())) + w.rng.normal(0, 1.5, 2)
+            o = self._off('RAW', e)
+            cl = self.claw('RAW')
+            pc = dict(c=(cl[0] + o[0], cl[1] + o[1]), r=w.scale['RAW'] * (w.plate_r + 60.0), stable=True, rms=1.0)
+        return pc, self.material_errors(colors)
+
     def material_error(self, color_id, n=None):
         w = self.w
         items = [it for it in w.raw_items if it['color'] == int(color_id)]
@@ -855,7 +868,8 @@ LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, t
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
               survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False,
               align_by=ARM_ALIGN, raw_follow=False, raw_center=False)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
-LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
+LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True,
+                     raw_center=False)   # 这些整场模拟的原料盘是以前的样子(爪子停在物料旁边)，不对准原料盘中心；对准中心的见 RawFollowTests
 
 
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
@@ -1383,7 +1397,7 @@ class ZoneFlowTests(unittest.TestCase):
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), ring_survey=False, ring_offset_mm=bad,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
             lines = []
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN, raw_center=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg}, log=lines.append, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, log=lines.append)
             self._assert_all_good(w, h, '\n'.join(lines), seed)
@@ -1595,7 +1609,7 @@ class TiltTests(unittest.TestCase):
             w.vision.ring_error = ring_error
             cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0), tilt_precorrect=pre, take_first=False, ring_precorrect=True, zone_filter=True, zone_frames=2, zone_gain=1.0,
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN, raw_center=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg}, log=log, vision=w.vision, now=w.now, sleep=w.advance, store=st)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=log)
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
@@ -1644,7 +1658,7 @@ class NavFlowTests(unittest.TestCase):
             lines = []
             cfg = dict(time_limit_s=170.0, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),
                        ring_order={z: w.ring_order(z) for z in ('ROUGH', 'TEMP')})
-            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
+            cfg = dict(dict(raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False, align_by=ARM_ALIGN, raw_center=False), **cfg)      # 原料区按以前的做法(修 3 次、5mm 以内才夹)；手臂对准
             h = MissionHooks({'mission_cfg': cfg, 'stops': QR_STOPS}, log=lines.append, vision=w.vision, now=w.now,
                              sleep=w.advance, store=st)
             nav = dict(leg_s=10.0, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})
@@ -1779,6 +1793,7 @@ class RawFollowTests(unittest.TestCase):
     def test_center_with_only_two_in_view(self):
         """原料盘大(半径 100mm)：画面里常常只看得到相邻两个物料，按"三个隔 120°"算圆心，照样对准中心、按停靠位夹到三个。"""
         w = plate_world(2, plate_r=100.0, plate_off_mm=-100.0 + 15.0, plate_off_tan=-12.0)
+        w.vision.outer_on = False                                          # 只靠物料位置算圆心
         lines = []
         h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
         h._ensure(w.link)
@@ -1818,11 +1833,45 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('车轮慢慢挪', text)
         self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
 
+    def test_center_fail_no_follow_by_default(self):
+        """(10-16 用户)默认认不出原料盘中心就不抓，不改用跟随抓取(手臂不乱晃)；车挪回停车点。"""
+        w = self._center_world(1)
+        lines = []
+        w.vision.outer_on = False                                          # 外圆也认不出(只能靠物料，而看的颜色画面里没有)
+        h = make(w, dict(raw_follow=True, raw_center=True, raw_center_colors=[2], raw_center_wait_s=2.0), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('不改用跟随抓取', text)
+        self.assertNotIn('跟随抓取：手臂跟着', text)
+        self.assertEqual(h.stats.grab_ok, 0)
+        self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+
+    def test_center_bad_stored_wheel_j(self):
+        """存着的车轮对应关系方向是反的(以前测错了)：越走越偏就重新测，照样对准、夹到。"""
+        w = self._center_world(2)
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        seed_raw_wheels_j(w, h)
+        h.store.put('RAW', 'ch', -np.asarray(h.store.get('RAW', 'ch'), float))     # 反过来
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('越走越偏', text)
+        self.assertIn('帧/秒', text)
+        ds = [float(x.split('原料盘中心离爪子点 ')[1].split('mm')[0]) for x in lines if '原料盘中心离爪子点' in x]
+        self.assertLess(ds[-1], 4.0, text)
+        self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
+
     def test_center_falls_back_to_follow(self):
         """认不出原料盘中心(看的颜色画面里没有)：改用跟随抓取，照样夹。"""
         w = self._center_world(1)
         lines = []
-        h = make(w, dict(raw_follow=True, raw_center=True, raw_center_colors=[2], raw_center_wait_s=2.0), log=lines.append)
+        w.vision.outer_on = False                                          # 外圆也认不出(只能靠物料，而看的颜色画面里没有)
+        h = make(w, dict(raw_follow=True, raw_center=True, raw_center_colors=[2], raw_center_wait_s=2.0,
+                         raw_center_fallback='follow'), log=lines.append)
         h._ensure(w.link)
         h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
