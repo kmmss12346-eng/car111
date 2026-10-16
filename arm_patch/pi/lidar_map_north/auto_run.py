@@ -1222,10 +1222,15 @@ class _Drive:
                 self.final_leg = True
         if self.hooks is not None and hasattr(self.hooks, 'adjust'):
             self.hooks.adjust(stop, self.link, self.log)        # 以后接摄像头：看地面标记
+        skip = False
+        if not is_pre and not is_start and role is not None and not self.homing:
+            skip = self._step(f'到达 {stop}，下一步做这一站的任务', allow_skip=True) == 'skip'
         if is_pre:
             pass                                                # PREHOME 只是回家前定位用的点，没有任务
         elif self.homing and not is_start and role is not None:
             self.log(f'    时间不够，{stop} 不做任务，直接往回走')
+        elif skip:
+            self.log(f'    (分段调试)跳过 {stop} 的任务')
         elif self.hooks is not None and hasattr(self.hooks, 'task'):
             self.hooks.task(stop, self.link, self.log)
         elif self.stop_wait > 0:
@@ -1236,7 +1241,27 @@ class _Drive:
                     raise Abort('收到 abort，已停止发送')
                 time.sleep(0.05)
         if not is_start:
+            if not is_pre and role is not None:
+                self._step(f'{stop} 做完了，下一步开往下一站')
             self._time_check(stop, goal)
+
+    def _step(self, text, allow_skip=False):
+        """(10-16 用户)分段调试(go step)：停下等终端输入 n 继续 / skip 跳过这一站的任务。等的时间不算进比赛用时。
+        不是分段调试返回 'next'。"""
+        fn = getattr(self.ctx, 'step_pause', None)
+        if fn is None:
+            return 'next'
+        t0 = time.monotonic()
+        ans = fn(text, allow_skip) or 'next'
+        dt = time.monotonic() - t0
+        if dt > 0.5:
+            self.t_start += dt                                  # 等命令的时间不算用时(不然会以为时间不够、提前回家)
+            if self.hooks is not None and hasattr(self.hooks, 't0'):
+                try:
+                    self.hooks.t0 += dt
+                except TypeError:
+                    pass
+        return ans
 
     def _measure(self, stop):
         """停车点上雷达定位。QR 这类要再扫一次障碍物的停车点，直接用那次扫描的帧定位。"""

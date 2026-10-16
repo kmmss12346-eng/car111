@@ -546,6 +546,17 @@ def main():
                 time.sleep(0.1)
             return bool(state['confirm'])
         def aborted(self):return state['abort']
+        def step_pause(self,text,allow_skip=False):
+            """(10-16)分段调试(go step)：停下等终端输入 n(继续) / skip(跳过这一站的任务) / abort。不是 go step 直接返回。"""
+            if not state.get('step_mode'):return 'next'
+            state['step_ans']=None;state['step_wait']=True
+            print(f'⏸ 分段调试：{text}。输入 n 继续'+('，skip 跳过这一站的任务' if allow_skip else '')+'，abort 停止',flush=True)
+            try:
+                while state.get('step_ans') is None:
+                    if state['abort']:raise Abort('收到 abort，已停止')
+                    time.sleep(0.1)
+                return state['step_ans']
+            finally:state['step_wait']=False
         def second_failed(self):
             """第二次扫描两次都失败：有开跑前的预先规划就把车位当成推算的第二站车位，用那条路线。返回能不能接着跑。"""
             pp=state.get('preplan')
@@ -665,6 +676,12 @@ def main():
         parts=line.strip().split();k=parts[0].lower() if parts else 'scan'
         if len(parts)==1 and re.fullmatch(r'\d{3}(\+\d{3}){3}',parts[0]):
             parts=['mcode',parts[0]];k='mcode'      # 直接输入任务码(例如 652+312+526+231) = mcode 任务码
+        # ---- (10-16)分段调试：行驶线程停在某一站等命令
+        if k in ('n','next','skip') and state.get('step_wait'):
+            state['step_ans']='skip' if k=='skip' else 'next'
+            return
+        if k in ('next','skip'):
+            print('现在没有在等分段调试的命令(go step 开始分段调试)',flush=True);return
         # ---- 行驶/比赛线程让界面线程做的事
         if k.startswith('__'):
             try:
@@ -824,6 +841,8 @@ def main():
                 # 1010 比赛：屏上选启停区 -> 车放好自动扫描、预先规划 -> 屏上按 START 开跑(开跑后不再碰电脑)
                 state['abort']=False;state['aborted']=False;state['confirm']=None;state['auto']=True
                 threading.Thread(target=race_thread,daemon=True).start();return
+            state['step_mode']=k in ('go','drive') and len(parts)>1 and parts[1].lower()=='step'
+            if state['step_mode']:print('分段调试：每到一站先停下等你输入 n 才做任务，做完再等 n 才开往下一站(skip = 跳过这一站的任务)',flush=True)
             if k=='go' and history.views:raise ValueError('go 要从头开始：先 reset 清空历史，并把车放回起点')
             if k=='go':
                 # 上一次跑完 reset 以后 state['config'] 还是第二站/站点扫描的车位：第一次扫描要按本区的起点车位算

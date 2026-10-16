@@ -144,6 +144,36 @@ class RunMissionTests(unittest.TestCase):
         self.assertTrue(any('路线全部走完' in l for l in self.logs))
 
 
+class StepModeTests(unittest.TestCase):
+    """10-16 用户：分段调试(go step)——到一站先等 n 才做任务(skip 跳过)，做完再等 n 才开往下一站。"""
+
+    def _run(self, answers):
+        asked, done = [], []
+
+        class Ctx(FakeCtx):
+            def step_pause(self, text, allow_skip=False):
+                asked.append((text, allow_skip))
+                return answers.pop(0) if answers else 'next'
+
+        class Hooks:
+            def task(self, stop, link, log):
+                done.append(stop)
+        auto_run.run_mission(Ctx(), FakeLink(), log=lambda m: None, stop_wait=0.0, settle_s=0.0, hooks=Hooks(), cfg={})
+        return asked, done
+
+    def test_waits_before_and_after_the_task(self):
+        asked, done = self._run(['next', 'next'])
+        self.assertEqual(done, ['QR'])
+        self.assertEqual([a[1] for a in asked], [True, False])
+        self.assertIn('到达 QR', asked[0][0])
+        self.assertIn('开往下一站', asked[1][0])
+
+    def test_skip_does_not_do_the_task(self):
+        asked, done = self._run(['skip'])
+        self.assertEqual(done, [])
+        self.assertEqual(len(asked), 2)
+
+
 class SyncChangedTests(unittest.TestCase):
     def test_only_changed_params_are_sent(self):
         """(10-12 用户：启动太慢)只发和 STM32 现在不一样的参数；GET 里没有的照发；读不到全发。"""
