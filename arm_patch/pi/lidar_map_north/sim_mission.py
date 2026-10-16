@@ -1750,6 +1750,18 @@ class RawFollowTests(unittest.TestCase):
         self.assertNotIn('各挪 15mm 测一下', text2)
         self.assertEqual(h2.stats.grab_ok - w2.air, 3, text2[-3000:])
 
+    def test_center_with_only_two_in_view(self):
+        """原料盘大(半径 100mm)：画面里常常只看得到相邻两个物料，按"三个隔 120°"算圆心，照样对准中心、按停靠位夹到三个。"""
+        w = plate_world(2, plate_r=100.0, plate_off_mm=-100.0 + 15.0, plate_off_tan=-12.0)
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('认出了 3 个停靠位', text)
+        self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
     def test_center_falls_back_to_follow(self):
         """认不出原料盘中心(看的颜色画面里没有)：改用跟随抓取，照样夹。"""
         w = self._center_world(1)
@@ -1760,6 +1772,7 @@ class RawFollowTests(unittest.TestCase):
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
         text = '\n'.join(lines)
         self.assertIn('认不出原料盘中心', text)
+        self.assertIn('一帧里最多看到', text)                                # 说清楚看到了几个
         self.assertIn('跟随抓取', text)
         self.assertGreaterEqual(h.stats.grab_ok - w.air, 1, text[-3000:])
 

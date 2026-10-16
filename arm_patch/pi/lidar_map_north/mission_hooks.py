@@ -41,7 +41,7 @@ import time
 import numpy as np
 
 from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
-from task_plan import parse_code, TaskError, role_of, Stats
+from task_plan import parse_code, TaskError, role_of, Stats, COLOR_NAMES
 from visual_servo import VisualServo, JacStore
 from vision import Vision, VisionError, apply_vision_cal, load_vision_cal
 
@@ -1968,31 +1968,61 @@ class MissionHooks:
             return None
         return c, r
 
+    @staticmethod
+    def _center_from_pair(p1, p2, near):
+        """原料盘上三个物料隔 120°：画面里只看到相邻两个时，圆心在它们连线的垂直平分线上、离连线中点 半径/2 的地方
+        (半径 = 两点距离/√3)。两边各有一个解，取离 near(爪子点，标定时就在原料盘中心上方)近的。返回 (圆心, 半径)。"""
+        p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+        d = p2 - p1
+        L = float(np.linalg.norm(d))
+        if L < 1e-6:
+            return None
+        r = L / math.sqrt(3.0)
+        n = np.array([-d[1], d[0]]) / L
+        mid = (p1 + p2) / 2.0
+        c1, c2 = mid + n * r / 2.0, mid - n * r / 2.0
+        c = c1 if float(np.linalg.norm(c1 - near)) <= float(np.linalg.norm(c2 - near)) else c2
+        return c, r
+
     def _raw_plate_center(self, max_s):
-        """看原料盘上的物料(raw_center_colors 里的颜色，转着也行)，算原料盘中心在画面里的位置：返回 (圆心像素, 半径像素)，认不出返回 None。
-        一帧里看到 3 个以上物料：这一帧就能算一个圆心；看到的少：攒几帧的点一起拟合(物料转的时候在同一个圆上)。取几次的中位数。"""
+        """看原料盘上的物料(这一批的三个颜色，转着也行)，算原料盘中心在画面里的位置：返回 (圆心像素, 半径像素)，认不出返回 None。
+        一帧里看到 3 个物料：直接算外接圆；只看到相邻 2 个：按"三个物料隔 120°"算；只看到 1 个：攒它转过的一段弧拟合。取几次的中位数。"""
         v, cfg = self.vision, self.cfg
         colors = self._raw_center_colors()
         claw = np.array(v.claw('RAW'), float)
         sc = float(v.scale('RAW'))
-        cs, rs, pts = [], [], []
+        cs3, cs2, pts = [], [], []
+        most, seen_cols, frames = 0, set(), 0
+        ok_r = (10.0 * sc, 250.0 * sc)
         t_lim = self.now() + float(max_s)
         while self.now() < t_lim:
             self._check_abort()
             errs = v.material_errors(colors)
+            frames += 1
             P = [claw + np.asarray(q, float) for q in errs.values() if q is not None]
+            seen_cols.update(k for k, q in errs.items() if q is not None)
+            most = max(most, len(P))
             pts.extend(P)
-            got = self._fit_circle(P) if len(P) >= 3 else None
-            if got is not None and 10.0 * sc <= got[1] <= 250.0 * sc:
-                cs.append(got[0])
-                rs.append(got[1])
-            if len(cs) >= 3:
+            got = None
+            if len(P) >= 3:
+                got = self._fit_circle(P)
+                if got is not None and ok_r[0] <= got[1] <= ok_r[1]:
+                    cs3.append(got)
+            elif len(P) == 2:
+                got = self._center_from_pair(P[0], P[1], claw)
+                if got is not None and ok_r[0] <= got[1] <= ok_r[1]:
+                    cs2.append(got)
+            if len(cs3) >= 3 or (not cs3 and len(cs2) >= 5):
                 break
-        if len(cs) >= 2:
-            return np.median(np.asarray(cs), axis=0), float(np.median(rs))
+        for cs in (cs3, cs2):
+            if len(cs) >= 2:
+                return (np.median(np.asarray([c for c, _r in cs]), axis=0), float(np.median([r for _c, r in cs])))
         got = self._fit_circle(pts[-40:]) if len(pts) >= 6 else None
-        if got is not None and 10.0 * sc <= got[1] <= 250.0 * sc:
+        if got is not None and ok_r[0] <= got[1] <= ok_r[1]:
             return got
+        names = '、'.join(COLOR_NAMES.get(int(c), str(c)) for c in sorted(seen_cols)) or '一个也没有'
+        self.log(f'    看了 {frames} 帧：一帧里最多看到 {most} 个物料(认到过的颜色：{names}；要认的：'
+                 + '、'.join(COLOR_NAMES.get(int(c), str(c)) for c in colors) + ')')
         return None
 
     def _raw_chassis_J(self, c0):
