@@ -15,5 +15,7 @@ gcc -std=gnu90 -Wall -Wextra -Wdeclaration-after-statement -Istub_ch -I../Core/I
 echo
 # main.c 里舵机那一节(从 "ID 1、ID 2 串口舵机" 到 "原来的接口")摘出来单独测
 tr -d '\r' < ../Core/Src/main.c | awk '/^\/\* ================= ID 1、ID 2 串口舵机/{f=1} /^\/\* 原来的接口：转到绝对角度/{f=0} f' > "$OUT/servo_section.c"
+# 舵机测试按以前的 ID1 限位(232~440)写的角度：只测卡住/重发这些机制，限位换成测试用的
+sed -i 's/^#define SERVO1_MIN_DEG .*/#define SERVO1_MIN_DEG 232.0f/; s/^#define SERVO1_MAX_DEG .*/#define SERVO1_MAX_DEG 440.0f/' "$OUT/servo_section.c"
 gcc -std=gnu90 -Wall -Wextra -I"$OUT" -o "$OUT/test_servo_host" test_servo.c -lm 2>&1 | grep -v "test_servo.c" || true
 "$OUT/test_servo_host" | grep -v "^  ok\|^SV "
