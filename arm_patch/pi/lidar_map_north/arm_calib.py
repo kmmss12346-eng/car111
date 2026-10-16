@@ -302,6 +302,7 @@ class Wizard:
     def pose(self, a1, a2):
         self.released = False
         self.do(f'AP {a1:g} {a2:g}')
+        self._last_pose = (float(a1), float(a2))
 
     def claw_to(self, us):
         us = int(round(max(CLAW_RANGE[0], min(CLAW_RANGE[1], us))))
@@ -608,7 +609,18 @@ class Wizard:
             return 0.0, 0.0
 
     def _read_servos(self):
-        self.cur = {1: self.angle(1), 2: self.angle(2)}
+        """读两个舵机现在的角度。读不到(总线接触不好)：按刚才发的姿态算，不让整个向导停下。"""
+        last = getattr(self, '_last_pose', None)
+        cur = {}
+        for sid in (1, 2):
+            try:
+                cur[sid] = self.angle(sid)
+            except CalError:
+                if last is None:
+                    raise
+                cur[sid] = last[sid - 1]
+                self.out(f'  (读不到 ID{sid} 的角度，按刚才转到的 {cur[sid]:g}° 算。老是读不到要查舵机的线)')
+        self.cur = cur
 
     def step(self, i):
         """返回 +1 下一步，-1 上一步。"""
