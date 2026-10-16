@@ -748,6 +748,9 @@ int main(void) {
           && at("S1:250.0") < at("claw1300;"), "开机：编码器找准高度后自动回到待机姿态(手臂、夹爪、升降 80mm)，不再停 60");
     away(); run("LIFT 40"); clear();
     CHECK(run("PARK") == 1 && fabs(phys_mm - 80.0) < 0.05 && has("S1:250.0") && has("claw1300;"), "PARK：存了待机姿态就回到它");
+    away(); run("CLAW 1500"); run("LIFT 40"); clear();
+    CHECK(run("STOW") == 1 && fabs(phys_mm - 80.0) < 0.05 && has("S1:250.0") && has("S2:-600.0") && !has("claw1300;"),
+          "STOW：存了待机姿态就收到它的手臂角度和高度(只有一个默认位置)，夹爪不动(可能夹着物料)");
     clear();
     CHECK(run("STBY CLR") == 1 && fake_flash[16] != 0x53544259u && fake_flash[0] == 0x4C465432u, "STBY CLR：删掉待机姿态，升降标定还在");
     clear(); phys_mm = 75.6;
@@ -770,6 +773,13 @@ int main(void) {
     clear(); run("LIFT?");
     CHECK(pis("LIFT 1 60.0") && pis("BOOT=NOENC"), "读不到编码器：LIFT? 回 BOOT=NOENC(高度是假设的)");
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
+    enc_ok = 1; clear(); phys_mm = 60.0; Arm_Init(); run("LIFT 85");    /* 停在 85 关电 */
+    enc_ok = 0; clear(); phys_mm = 85.0;
+    Arm_Init();
+    CHECK(pis("LIFTBOOT NOENC (assume last 85.0") && !has("L+") && !has("L-"), "读不到编码器：当作在上次停下的 85(Flash 里记的)，不是一律 60");
+    clear(); run("LIFT?");
+    CHECK(pis("LIFT 1 85.0") && pis("BOOT=NOENC"), "读不到编码器：LIFT? 回上次的 85");
+    run("LIFT 60"); phys_mm = 60.0;
     enc_ok = 1; enc_frozen = 1; enc31_zero = 1; pos36_off = 0.0; clear();
     { double save = phys_mm; phys_mm = 0.0; run("LIFT 0"); phys_mm = 0.0; (void)save; }
     flash_blank();

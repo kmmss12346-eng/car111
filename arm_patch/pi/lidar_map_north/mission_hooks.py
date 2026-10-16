@@ -222,7 +222,8 @@ DEFAULTS = dict(
 
 A2_MIN, A2_MAX = -1210.0, -300.0       # STM32 里 A2(伸缩)参数的范围(10-16 用户：-1210 ~ -300)
 
-BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60mm', 'NOENC': '读不到编码器，当成 60mm', 'POS': '按上次停的位置认的高度'}
+BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60mm', 'NOENC': '读不到编码器，当成上次停下的高度(旧程序当成 60mm)',
+             'POS': '按上次停的位置认的高度'}
 
 PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
 
@@ -801,14 +802,17 @@ class MissionHooks:
                 if known:
                     self.log(f'  升降已回零，现在 {mm:.1f}mm' + (f'(开机时{BOOT_TEXT.get(boot, boot)})' if boot else ''))
                     if boot in ('NOCAL', 'NOENC'):
-                        self.log('  ★ 开机时没用编码器认高度，当成了 60mm：升降一定要停在 60mm 再关电(跑完/退出时会自动停 60；没停就输入 park)')
+                        self.log(f'  ★ 开机时没用编码器认高度，当成了 {mm:.0f}mm(不一定对)。为了不顶坏升降，这次不自动收臂(不往上升)。\n'
+                                 f'    先看实际高度是不是 {mm:.0f}mm：是就照常用；不是就关电，把升降手动放到最低点，开机后输入 arm LIFT ZERO。'
+                                 '编码器读不到多半是升降驱动器(ID5)的插头松了')
                 elif self.cfg['lift_init'] == 'home':
                     self.arm.do('LIFT HOME')
                     self.log('  升降：驱动器回零完成')
                 else:
                     self.disabled = '升降位置不知道了(急停打断过升降？)：把升降放到最低点，输入 arm LIFT ZERO'
-                if not self.disabled and self.cfg.get('stow_at_start', True):
-                    self._stow_retry()              # 开机时两个舵机是松的：出发前先收到待机姿态(升到 ZHI，ID1=A1H、ID2=A2R)
+                if not self.disabled and self.cfg.get('stow_at_start', True) and \
+                        not (known and boot in ('NOCAL', 'NOENC') and not self.cfg.get('stow_when_lift_guessed', False)):
+                    self._stow_retry()              # 开机时两个舵机是松的：出发前先收到待机姿态(存了 STBY 就是它，否则 ID1=A1H、ID2=A2R，升到 ZHI)
                     self.log('  手臂已收到待机姿态')
         except ArmAbort as ex:
             raise Abort(str(ex))

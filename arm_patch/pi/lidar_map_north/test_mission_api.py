@@ -69,14 +69,20 @@ class PrepareTests(unittest.TestCase):
         self.assertIn('打开摄像头出错', '\n'.join(lines))
 
     def test_lift_boot_mode_is_reported(self):
-        """新程序 LIFT? 带 BOOT=：开机没用编码器认高度(NOCAL/NOENC)时提醒一定要停 60 再关电。"""
+        """新程序 LIFT? 带 BOOT=：开机没用编码器认高度(NOCAL/NOENC)时提醒高度不一定对，
+        (10-16 用户：自动收臂往上升顶坏过升降)这时不自动收臂；编码器认的照常收臂。"""
         w = SimWorld(seed=3, code=CODE, lift_boot='NOENC')
         h, lines = hooks(w)
         h.prepare(w.link, lines.append)
         text = '\n'.join(lines)
         self.assertIn('读不到编码器', text)
-        self.assertIn('一定要停在 60mm', text)
+        self.assertIn('不自动收臂', text)
+        self.assertNotIn('STOW', w.requests)
         self.assertEqual(h.arm.lift_boot, 'NOENC')
+        w = SimWorld(seed=3, code=CODE, lift_boot='ENC')
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        self.assertIn('STOW', w.requests)
 
 
 class ClockTests(unittest.TestCase):

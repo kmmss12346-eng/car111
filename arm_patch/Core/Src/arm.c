@@ -896,6 +896,15 @@ static void Lift_Boot(void)
     }
     if (!got)
     {
+        if (pos_last_ok)
+        {
+            /* (10-16)读不到编码器：当作停在 Flash 里记的上次停下的高度(比一律当 60 准：停在待机高度关电的也不会认错) */
+            lift_mm = pos_last;
+            FmtF(s2, (int)sizeof(s2), pos_last);
+            snprintf(m, sizeof(m), "LIFTBOOT NOENC (assume last %s)\r\n", s2);
+            Say(m);
+            return;
+        }
         Say("LIFTBOOT NOENC (assume 60)\r\n");
         return;
     }
@@ -1217,6 +1226,14 @@ static const char *Seq_Stow(void)
     if (e) return e;
 
     GO(Lift_Goto(g_zhi));
+    if (sb_ok)
+    {
+        /* (10-16 用户)只要一个默认位置：存了待机姿态(STBY SAVE)，收臂也回到它的手臂角度和高度。
+         * 夹爪不动(收臂时可能夹着物料，张开会掉) */
+        SERVOS(sb_a1, sb_a2, 1, g_atolc, g_aspd);
+        GO(Lift_Goto(sb_z));
+        return NULL;
+    }
     SERVOS(g_a1h, g_a2r, 1, g_atolc, g_aspd);
     return NULL;
 }
