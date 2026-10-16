@@ -64,7 +64,7 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True):
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -128,7 +128,7 @@ class SimWorld:
         self.plate_stop = float(plate_stop_s) if plate_stop_s else None
         self.plate_move = float(plate_move_s)
         self.plate_t0 = 0.0
-        self.plate_r = 150.0
+        self.plate_r = float(plate_r)                           # 原料盘上物料所在圆的半径(mm)
         self.plate_c = np.array([self.plate_r + float(plate_off_mm), float(plate_off_tan)])   # plate_off_tan：物料停的地方沿车头方向偏了多少(车停得前/后了)
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
         # 二维码：扫码器只有车停在 QR 点前后挪 qr_window=(下限, 上限) mm 以内时才看得到码(None = 一直看得到)；
@@ -829,7 +829,7 @@ ARM_ALIGN = dict(RAW='arm', ROUGH='arm', TEMP='arm')     # 手臂对准(10-12 �
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
               survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False,
-              align_by=ARM_ALIGN, raw_follow=False)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+              align_by=ARM_ALIGN, raw_follow=False, raw_center=False)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
 LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True)
 
 
@@ -1711,6 +1711,57 @@ class RawFollowTests(unittest.TestCase):
         w3, h3, text3 = self._run(1, dict(raw_follow_smooth=False), plate_off_tan=40.0)
         self.assertNotIn('平滑跟随', text3)
         self.assertFalse(any(r.startswith('APN') for r in w3.requests))
+
+    def _center_world(self, seed, dx=25.0, dy=-18.0, **kw):
+        """原料盘中心在 OBS RAW 爪子点下面偏 (dx, dy)mm(车停得偏了)，物料在半径 60mm 的圆上。"""
+        return plate_world(seed, plate_r=60.0, plate_off_mm=-60.0 + dx, plate_off_tan=dy, **kw)
+
+    def test_center_then_slots(self):
+        """(10-16 用户)到原料区：车轮慢慢挪让爪子对准原料盘中心；认出三个停靠位；每次停下直接转过去抓(不一直跟着识别)。
+        三个都夹到、放对槽；做完车挪回停车点。"""
+        for seed in (1, 2, 5):
+            w = self._center_world(seed)
+            lines = []
+            h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+            h._ensure(w.link)
+            h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('车轮慢慢挪', text)
+            self.assertIn('认出了 3 个停靠位', text)
+            self.assertNotIn('跟着', text)                                     # 没有一直跟着物料走
+            ds = [float(x.split('原料盘中心离爪子点 ')[1].split('mm')[0]) for x in lines if '原料盘中心离爪子点' in x]
+            self.assertLess(ds[-1], 4.0, text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+            self.assertIsNone(getattr(h, '_raw_slots_rt', None))
+            self.assertIsNotNone(h.store.get('RAW', 'ch'))                    # 车轮的对应关系测好存起来了
+        # 第二次来：不用再测车轮的对应关系
+        w2 = self._center_world(3)
+        lines2 = []
+        h2 = make(w2, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines2.append)
+        h2._ensure(w2.link)
+        h2.store.put('RAW', 'arm', -w2.scale['RAW'] * w2.Rcam @ np.diag([w2.k2, w2.k1]))
+        seed_raw_wheels_j(w2, h2)
+        run_mission(w2, h2, stops=('QR', 'RAW'), log=lines2.append)
+        text2 = '\n'.join(lines2)
+        self.assertNotIn('各挪 15mm 测一下', text2)
+        self.assertEqual(h2.stats.grab_ok - w2.air, 3, text2[-3000:])
+
+    def test_center_falls_back_to_follow(self):
+        """认不出原料盘中心(看的颜色画面里没有)：改用跟随抓取，照样夹。"""
+        w = self._center_world(1)
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, raw_center_colors=[2], raw_center_wait_s=2.0), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('认不出原料盘中心', text)
+        self.assertIn('跟随抓取', text)
+        self.assertGreaterEqual(h.stats.grab_ok - w.air, 1, text[-3000:])
 
     def test_follow_stays_inside_its_range(self):
         """跟随时 ID1/ID2 不超出 OBS RAW 姿态 ± raw_follow_limit_deg。"""

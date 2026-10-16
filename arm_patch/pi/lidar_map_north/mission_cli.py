@@ -744,9 +744,13 @@ def _raw_preflight(h, batch, force, log):
         f'(每个物料最多等 {float(h.cfg.get("raw_track_s", 30.0)):g} 秒)')
     if getattr(h, 'store', None) is not None and h.store.get('RAW', 'arm') is None:
         log('   ★ 还没做 vcal RAW(手臂和画面的对应关系)：原料盘转着的时候不会现测。先让原料盘停转，物料放在爪子下面，输入 vcal RAW 颜色号 arm')
-    log('   对准只动手臂，车轮不动(不会压进原料区)；物料停在手臂够不着的地方就跳过' if mode == 'OFF' else
-        (f'   对准时车轮只会前后挪，最多 {float(h.cfg.get("raw_fix_max_mm") or 40.0):g}mm，不横着挪' if mode == 'F' else
-         '   ★ raw_chassis=SF：对准时车轮前后、横着都会挪，小心压进原料区'))
+    if h.cfg.get('raw_center'):
+        log(f'   (10-16)先让车轮慢慢挪(横移最多 ±{float(h.cfg.get("raw_center_s_mm", 40.0)):g}mm、前后最多 ±{float(h.cfg.get("raw_center_f_mm", 60.0)):g}mm)，'
+            '爪子对准原料盘中心；再认出三个物料停下的位置，之后每次停下直接转过去抓。做完车挪回停车点')
+    else:
+        log('   对准只动手臂，车轮不动(不会压进原料区)；物料停在手臂够不着的地方就跳过' if mode == 'OFF' else
+          (f'   对准时车轮只会前后挪，最多 {float(h.cfg.get("raw_fix_max_mm") or 40.0):g}mm，不横着挪' if mode == 'F' else
+           '   ★ raw_chassis=SF：对准时车轮前后、横着都会挪，小心压进原料区'))
     log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
 
 
