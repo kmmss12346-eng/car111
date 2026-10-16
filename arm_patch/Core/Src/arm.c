@@ -75,7 +75,7 @@ extern void Delay_Report(uint32_t ms);
 static float g_lppm   = 80.0f;     /* LFPPM  升降：1 毫米要多少脉冲。= 每圈脉冲数(16 细分是 3200) / 皮带每圈走的毫米数 */
 static float g_lrpm   = 60.0f;     /* LFRPM  升降速度(转/分)。实测 60 稳 */
 static float g_lacc   = 0.0f;      /* LFACC  升降加速度档位 0~255(0=不加速直接到速度) */
-static float g_lmax   = 118.0f;    /* LFMAX  最高点：离零点(最低点)往上 118mm(10-16 用户从 105 改成 118)。写死：SET 也不能超过 118 */
+static float g_lmax   = 115.0f;    /* LFMAX  最高点：离零点(最低点)往上 115mm(10-16 用户：机构到 115 就顶住了，从 118 改成 115)。写死：SET 也不能超过 115 */
 static float g_ldir   = 0.0f;      /* LFDIR  升降方向：0 或 1。LIFT 数字变大时走反了就改这个 */
 static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来算要等多久 */
 static float g_lmrg   = 200.0f;    /* LFMRG  升降走完后多等多少毫秒(加减速余量) */
@@ -135,7 +135,7 @@ static const ArmTun tun[] =
     { "LFPPM",  &g_lppm,    1.0f,    500.0f },
     { "LFRPM",  &g_lrpm,    10.0f,   600.0f },
     { "LFACC",  &g_lacc,    0.0f,    255.0f },
-    { "LFMAX",  &g_lmax,    10.0f,   118.0f },   /* 最高点写死 118mm，配置里存的更大的值会被拒绝 */
+    { "LFMAX",  &g_lmax,    10.0f,   115.0f },   /* 最高点写死 115mm，配置里存的更大的值会被拒绝 */
     { "LFDIR",  &g_ldir,    0.0f,    1.0f },
     { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
     { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
