@@ -207,9 +207,9 @@ int main(void) {
     Servo_Move(1, 320, 40, 2.0f, 400);
     CHECK(fabs(cmdv[0] - 320) < 0.01 && fabs(tgt[1] - 320) < 0.01, "读不到角度：不补偿，发的就是 320");
     /* 补偿不超出限位 */
-    reset1(300); Servo_SetComp(2, 5.0f); pos[2] = tgt[2] = -600;
-    Servo_Move(2, -503.5, 40, 0.3f, 400);
-    CHECK(fabs(cmdv[0] - -503.5) < 0.01, "ID2 补偿 5°：目标在限位上，不多给(还是 -503.5)");
+    reset1(300); Servo_SetComp(2, 5.0f); pos[2] = tgt[2] = -400;
+    Servo_Move(2, -300, 40, 0.3f, 400);
+    CHECK(fabs(cmdv[0] - -300) < 0.01, "ID2 补偿 5°：目标在限位上，不多给(还是 -300)");
     Servo_SetComp(2, 0.0f);
     /* Servo_Arrived：转过一点也算到；Servo_StopIfStuck 换了目标就按距离算，不会拿错方向 */
     reset1(396); t = 300.0f; Servo_Start(1, &t, 40.0f);

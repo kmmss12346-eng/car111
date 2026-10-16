@@ -999,7 +999,7 @@ void Servo_SetComp(uint8_t id, float deg)
 #define SERVO1_MIN_DEG    44.0f    /* 10-16 用户在车上松开 ID1 用手转到两头量的：42.4° ~ 244.2°，各留一点余量 */
 #define SERVO1_MAX_DEG   244.0f
 #define SERVO2_MIN_DEG   -1210.0f   /* 10-16 用户：ID2 最低限位 -1210 */
-#define SERVO2_MAX_DEG    -503.5f
+#define SERVO2_MAX_DEG    -300.0f   /* 10-16 用户：ID2 最高限位 -300 */
 
 /* 读当前角度(多圈)。读成功返回 1，角度放进 *angle；读失败返回 0 */
 int Servo_ReadAngle(uint8_t id, float *angle)
