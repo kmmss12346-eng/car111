@@ -1762,6 +1762,23 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('认出了 3 个停靠位', text)
         self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
 
+    def test_center_search_moves_the_car(self):
+        """(10-16 用户)停车点认不出原料盘中心：车轮挪着去找(raw_center_search_mm)，找到了就对准、按停靠位抓；不是原地不动。"""
+        w = self._center_world(1)
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        real = h._raw_plate_center
+        h._raw_plate_center = lambda wait: real(wait) if h.act.disp['S'] <= -39.0 or getattr(h, '_raw_slots_rt', None) else None
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('车轮挪着找(第 1 处', text)
+        self.assertIn('车轮挪着找(第 2 处', text)
+        self.assertIn('认出了 3 个停靠位', text)
+        self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
+        self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+
     def test_center_falls_back_to_follow(self):
         """认不出原料盘中心(看的颜色画面里没有)：改用跟随抓取，照样夹。"""
         w = self._center_world(1)
@@ -1774,7 +1791,8 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('认不出原料盘中心', text)
         self.assertIn('一帧里最多看到', text)                                # 说清楚看到了几个
         self.assertIn('跟随抓取', text)
-        self.assertGreaterEqual(h.stats.grab_ok - w.air, 1, text[-3000:])
+        self.assertIn('车轮挪着找', text)                                    # 先挪着找过
+        self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)               # 找不到：挪回停车点
 
     def test_follow_stays_inside_its_range(self):
         """跟随时 ID1/ID2 不超出 OBS RAW 姿态 ± raw_follow_limit_deg。"""

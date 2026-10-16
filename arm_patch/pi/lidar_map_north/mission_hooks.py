@@ -134,6 +134,9 @@ DEFAULTS = dict(
     raw_center_f_mm=60.0,               # 对准中心时车轮前后最多离原料区停车点多远(毫米)
     raw_center_probe_mm=15.0,           # 还没有车轮和画面的对应关系时：先前后、横着各挪这么多测一下(测完存进 servo_cal.json，以后不用再测)
     raw_center_wait_s=12.0,             # 认圆心最多看多久(秒)
+    raw_center_search_mm=[[-20, 0], [-40, 0], [-40, 30], [-40, -30], [0, 30], [0, -30]],
+                                        # 停车点认不出圆心：车轮依次挪到这些位置(相对原料区停车点 [横移, 前进] mm；横移负 = 往右 = 原料盘那边)
+                                        #   每到一处看一会儿，认出圆心就停下开始对准；都认不出才放弃
     raw_center_colors=None,             # 认圆心时看哪些颜色的物料；None = 这一批任务码里的三个颜色(原料盘上放的就是它们)
     raw_center_reach_deg=dict(id1=60.0, id2=700.0),   # 停靠位离看原料盘的姿态超过这么多度就算够不着(另外还不能超出舵机限位)
     raw_center_force_mm=12.0,           # 停靠位抓取：修完偏差还超过这么多毫米就不硬夹(等下一次停)，免得砸到物料
@@ -2066,7 +2069,9 @@ class MissionHooks:
         smax, fmax = float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0))
         m = self._raw_plate_center(wait)
         if m is None:
-            self.log('    ★ 认不出原料盘中心(画面里看到的物料太少)：不对准中心')
+            m = self._raw_center_search(wait)
+        if m is None:
+            self.log('    ★ 挪了几个地方都认不出原料盘中心：不对准中心')
             return None
         c, r = m
         self.log(f'    原料盘中心离爪子点 {np.linalg.norm(c - claw) / sc:.1f}mm(原料盘半径约 {r / sc:.0f}mm)')
@@ -2095,6 +2100,29 @@ class MissionHooks:
             c, r = m
             self.log(f'    原料盘中心离爪子点 {np.linalg.norm(c - claw) / sc:.1f}mm')
         return c, r
+
+    def _raw_center_search(self, wait):
+        """停车点认不出原料盘中心：车轮依次挪到 raw_center_search_mm 里的位置去找，认出来就停在那里返回 (圆心, 半径)；
+        都认不出就挪回停车点、返回 None。"""
+        spots = self.cfg.get('raw_center_search_mm') or []
+        smax = float(self.cfg.get('raw_center_s_mm', 40.0))
+        fmax = float(self.cfg.get('raw_center_f_mm', 60.0))
+        for k, spot in enumerate(spots, 1):
+            ts = max(-smax, min(smax, float(spot[0])))
+            tf = max(-fmax, min(fmax, float(spot[1])))
+            d = self.act.disp
+            ds, df = ts - float(d['S']), tf - float(d['F'])
+            if abs(ds) < 1.0 and abs(df) < 1.0:
+                continue
+            self.log(f'    认不出原料盘中心：车轮挪着找(第 {k} 处，横移 {ts:+.0f}mm、前进 {tf:+.0f}mm)')
+            self.act.chassis_move(int(round(ds)), int(round(df)))
+            m = self._raw_plate_center(wait)
+            if m is not None:
+                return m
+        d = self.act.disp
+        if abs(float(d['S'])) >= 1.0 or abs(float(d['F'])) >= 1.0:
+            self.act.chassis_move(-int(round(float(d['S']))), -int(round(float(d['F']))))
+        return None
 
     def _raw_home(self):
         """看原料盘的姿态(OBS RAW 以后)的 ID1、ID2：读不到就用参数 A1G、A2E。"""
