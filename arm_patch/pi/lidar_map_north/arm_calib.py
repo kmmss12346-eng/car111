@@ -9,8 +9,9 @@
 然后你输入下面的东西一点点调，满意了直接回车，就保存并进入下一步：
 
     +5  -5        这一步要调的东西加/减(舵机 = 度，升降 = 毫米，夹爪/转盘 = 微秒)
-    350           直接到 350(ID2 的角度本来就是负数：2 -862 是直接转到 -862 度；
-                  正负 200 以内带符号的数才算加减)
+    350           直接到 350(不带符号的数 = 直接转到这个角度)
+    2 =-862       ID2 的角度本来就是负数：前面加 = 才是直接转到 -862 度。
+                  (10-16 起)带 + 或 - 的数一律是加减：2 -400 = ID2 再转 -400 度，不再当成"转到 -400 度"
     1 +5   2 -3   调 ID1 / ID2 舵机(摆姿态的那几步要同时调两个舵机)
     z -10         调升降(任何一步都能用)
     o   c         夹爪张开 / 夹紧
@@ -257,12 +258,22 @@ class Wizard:
             self.out(f'  > {cmd}')
         return info
 
-    def angle(self, sid):
-        for line in self.do(f'A? {sid}', quiet=True):
-            m = re.match(r'ANG (\d) (-?\d+(?:\.\d+)?)', line)
-            if m and int(m.group(1)) == sid:
-                return float(m.group(2))
-        raise CalError(f'读不到 ID{sid} 的角度')
+    def angle(self, sid, tries=3):
+        """读舵机角度。总线偶尔一次没回话(ERR READ)：歇一下再读，最多 tries 次。"""
+        last = None
+        for k in range(tries):
+            try:
+                for line in self.do(f'A? {sid}', quiet=True):
+                    m = re.match(r'ANG (\d) (-?\d+(?:\.\d+)?)', line)
+                    if m and int(m.group(1)) == sid:
+                        return float(m.group(2))
+                last = CalError(f'读不到 ID{sid} 的角度')
+            except CalError as ex:
+                if 'READ' not in str(ex):
+                    raise
+                last = ex
+            self.sleep(0.05 + 0.05 * k)
+        raise last
 
     def lift_now(self):
         for line in self.do('LIFT?', quiet=True):
@@ -282,7 +293,11 @@ class Wizard:
     def servo_to(self, sid, deg):
         self.released = False
         self.do(f'AF {sid} {deg:g}')
-        return self.angle(sid)
+        try:
+            return self.angle(sid)
+        except CalError:
+            self.out(f'  (转完读不到 ID{sid} 的角度，先当它到了 {deg:g}°)')
+            return float(deg)
 
     def pose(self, a1, a2):
         self.released = False
@@ -721,13 +736,23 @@ class Wizard:
             axis = {'claw': 'c', 'tt': 't', 'lift': 'z', 'servo': str(st.get('sid', 1))}.get(k)
             if axis is None:
                 raise CalError('这一步要说清楚调哪个：1 +5 (ID1) 或 2 -5 (ID2)，升降用 z -10')
-        v = _num(val)
+        absolute = val[:1] == '='
+        v = _num(val[1:] if absolute else val)
         if v is None or axis not in ('1', '2', 'z', 'c', 't'):
             raise CalError(f'看不懂 "{line}"。输入 h 看说明')
-        rel = val[:1] == '+' or (val[:1] == '-' and abs(v) <= 200)   # ID2 的 -862 这种是直接转到这个角度
+        # (10-16 用户：输入 2 -400 一会往前一会往后)带 + / - 的一律是加减；直接转到某个角度要写 =，例如 2 =-862
+        rel = (not absolute) and val[:1] in '+-'
         if axis in ('1', '2'):
             sid = int(axis)
-            base = self.angle(sid)
+            base = None
+            if rel:
+                try:
+                    base = self.angle(sid)
+                except CalError:
+                    base = self.cur.get(sid)              # 总线偶尔读不到：按上一次转到的角度算
+                    if base is None:
+                        raise
+                    self.out(f'  (读不到 ID{sid} 的角度，按上一次的 {base:g}° 算；老是读不到要查 ID{sid} 的线)')
             want = base + v if rel else v
             got = self.servo_to(sid, want)
             self.cur[sid] = got

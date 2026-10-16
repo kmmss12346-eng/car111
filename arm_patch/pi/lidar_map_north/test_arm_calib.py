@@ -137,7 +137,7 @@ FULL = [
     'u', ('hand', 350.2, -700.5),      # 原料盘：松开用手摆
     '-80', '',                         # ZGRAB 100 -> 20
     's',                               # ZOBRAW 跳过
-    '2 -760', '',                      # 圆环：ID2 直接到 -760(负数大于 200 = 直接转到)
+    '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
     'c', '1 +0.5', '2 -10', '',        # PL1：第一层放置补偿 ID1 +0.5、ID2 -10
@@ -359,8 +359,13 @@ class WizardTests(unittest.TestCase):
         self.assertTrue(any('ID1 停在 340' in l and '被挡住' in l for l in self.lines))
 
     def test_relative_vs_absolute(self):
-        self.run_wiz(['2', 's', 's', 's', '2 -5', '2 -900', '2 +3', '', 'q'])
+        self.run_wiz(['2', 's', 's', 's', '2 -5', '2 =-900', '2 +3', '', 'q'])
         self.assertAlmostEqual(self.wiz.saved['A2R'], -897.0)
+
+    def test_signed_values_are_always_relative(self):
+        """10-16 用户：2 -400 以前当成"转到 -400 度"(一会往前一会往后)：现在带符号的一律是加减。"""
+        self.run_wiz(['2', 's', 's', 's', '2 =-900', '2 -300', '2 +100', '', 'q'])
+        self.assertAlmostEqual(self.wiz.saved['A2R'], -1100.0)
 
     def test_claw_and_tt_limits(self):
         self.run_wiz(['2', '+2000', '', 'q'])
