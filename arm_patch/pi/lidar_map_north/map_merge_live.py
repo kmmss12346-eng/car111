@@ -706,6 +706,17 @@ def main():
             state['abort']=True;state['aborted']=True
             if link is not None:link.abort()
             print('收到 abort：已给 STM32 发急停(!)，路线停止发送。急停后不会自动收臂；确认车旁没人后输入 park 把升降停到 60mm。',flush=True);return
+        if k=='yaw':
+            # (10-16)看陀螺仪：STM32 每 0.1 秒自己发一次 YAW100(不用发指令，扫描/跑的时候也能看)；yaw 5 = 连着看 5 秒，用手转车看它跟不跟着变
+            if gyro is None:raise ValueError('没有连接 STM32，看不到陀螺仪')
+            n=float(parts[1]) if len(parts)>1 else 0.0
+            t_end=time.monotonic()+n
+            while True:
+                if gyro.fresh(1.0):print(f'陀螺仪车头 {gyro.value/100.0:+.2f}°(逆时针为正)',flush=True)
+                else:print('★ 1 秒内没收到陀螺仪 YAW100：STM32 没发(陀螺仪没接好/没上电)或者串口断了',flush=True)
+                if time.monotonic()>=t_end:break
+                time.sleep(0.5)
+            return
         if k=='ping':
             if link is None:raise ValueError('没有连接 STM32（--stm-port）')
             print('PING ->',link.ping(),flush=True);return
@@ -906,7 +917,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race(比赛：屏上选区、按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race(比赛：屏上选区、按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
     def command_second(parts):
         if len(history.views)!=1:raise ValueError('second 要求已有且仅有第一次扫描')
         if len(parts)<=1:
