@@ -18,7 +18,7 @@ class ArmAbort(ArmError):
 # 每类指令最多等多久(秒)。机械臂整套动作(夹取/放置)比较长
 _TIMEOUTS = (
     ('APZ', 30.0), ('GRAB', 60.0), ('PICK', 60.0), ('PLACE', 70.0), ('TAKE', 40.0), ('DROP', 30.0), ('OBS', 40.0), ('STOW', 40.0),
-    ('LIFT', 25.0), ('AP', 15.0), ('AD', 10.0), ('AF', 10.0), ('A?', 4.0), ('CLAW', 5.0), ('TT', 5.0),
+    ('LIFT', 25.0), ('AP', 15.0), ('APN', 2.0), ('AD', 10.0), ('AF', 10.0), ('A?', 4.0), ('CLAW', 5.0), ('TT', 5.0),
     ('SCR', 2.0), ('SCMD', 2.0), ('QR', 2.0), ('SET', 2.0), ('GET', 4.0),
     ('PARK', 40.0), ('STBY', 40.0), ('ZONE', 3.0), ('ZONE?', 2.0),
 )
@@ -243,6 +243,21 @@ class ArmLink:
             self._no_apz = True
         self.ap(a1, a2)
         self.lift(z)
+
+    def apn(self, a1, a2, ms=None):
+        """(10-16)跟随用：让 ID1、ID2 往 (a1, a2) 转，不等转完(STM32 先回报现在的角度再发目标)。ms = 大约多少毫秒转到。
+        返回发之前读到的 (ID1, ID2)(读不到的是 None)；旧程序不认 APN 返回 False(以后不再试)。"""
+        if getattr(self, '_no_apn', False):
+            return False
+        self.angle[1] = None
+        self.angle[2] = None
+        ok, reply, _info = self.request(f'APN {a1:.3f} {a2:.3f}' + (f' {max(1.0, float(ms)):.0f}' if ms else ''))
+        if not ok:
+            if unknown_cmd(reply):
+                self._no_apn = True
+                return False
+            raise ArmError(f'APN 失败：{reply}')
+        return self.angle[1], self.angle[2]
 
     def ap(self, a1, a2):
         """ID1、ID2 一起转到指定角度，回读实际角度(没回读到就是 None = 不知道，不能当成"没动")。"""

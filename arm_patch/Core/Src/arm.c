@@ -48,6 +48,7 @@ extern void Servo_Report(uint8_t id);
 extern void Servo_SetPower(uint16_t mw);
 extern void Servo_SetComp(uint8_t id, float deg);
 extern void Servo_Hold(uint8_t id, float angle_deg);
+extern void Servo_Track(uint8_t id, float angle_deg, float speed_dps);
 extern int  Servo_Arrived(uint8_t id, float a, float tol_deg);
 extern void Servo_Params(uint8_t id);
 extern int  Servo_WriteParam(uint8_t id, const char *name, long value);
@@ -2271,6 +2272,43 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         Servos_To(f, g, 2, g_atol, spd);
         SayAngle(1);
         SayAngle(2);
+        return 1;
+    }
+
+    /* ---- APN a1 a2 [ms]：(10-16 用户)跟随原料用。先回报现在的两个角度，再让 ID1、ID2 往 (a1, a2) 转，
+     *      不等转完马上回 DONE(树莓派每帧发一次新目标，手臂一直平滑地跟着动，不再"转一下停一下")。
+     *      ms = 大约多少毫秒转到(按现在离目标多远算两个舵机的转速，限在 1~900 度/秒)；不给就用 ASPD ---- */
+    if (strcmp(v, "APN") == 0 && (n == 3 || n == 4))
+    {
+        float ms = 0.0f;
+        float tg[3];
+        uint8_t id;
+
+        if (!ParseF(t[1], &f) || !ParseF(t[2], &g))  FAIL("ERR ARG");
+        if (n == 4 && (!ParseF(t[3], &ms) || ms < 1.0f))  FAIL("ERR ARG");
+        tg[1] = f;
+        tg[2] = g;
+        for (id = 1; id <= 2; id++)
+        {
+            float a;
+            float spd = g_aspd;
+            char m[40];
+            char bb[20];
+
+            if (Servo_ReadAngle(id, &a))
+            {
+                FmtF(bb, (int)sizeof(bb), a);
+                snprintf(m, sizeof(m), "ANG %d %s\r\n", (int)id, bb);
+                Say(m);
+                if (ms > 0.0f)
+                {
+                    spd = Absf(tg[id] - a) * 1000.0f / ms;
+                    if (spd < 1.0f)    spd = 1.0f;
+                    if (spd > 900.0f)  spd = 900.0f;
+                }
+            }
+            Servo_Track(id, tg[id], spd);
+        }
         return 1;
     }
 

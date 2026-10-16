@@ -124,6 +124,9 @@ DEFAULTS = dict(
     raw_follow_deadband_mm=3.0,         # 物料离爪子点不到这么多毫米就不动手臂(省得来回抖)
     raw_follow_lead_s=0.35,             # 原料盘在转时往前多跟这么多秒(物料的速度 × 这个；手臂转过去要时间)
     raw_follow_gain=0.9,                # 跟随时每次修正偏差的多少
+    raw_follow_smooth=True,             # (10-16 用户)跟随时手臂一直平滑地动：每帧读一次实际角度、发一个新目标(APN)就接着看，不等转到；
+                                        #   False 或 STM32 是旧程序(不认 APN) = 以前的"转一下、停住、看一眼"
+    raw_follow_track_ms=250,            # 平滑跟随：每个新目标大约多少毫秒转到(小 = 跟得紧但容易抖，大 = 稳但跟得慢)
     raw_slots=True,                     # (10-16 用户)原料盘的物料每次停在固定的 3 个停靠位：示教过(rteach RAW 停靠位 颜色号)就按停靠位抓——
                                         #   看一次哪个颜色在哪个位、看它转一次知道往哪边挪，推算以后每次停下的颜色；手臂提前到够得着的停靠位上方等，一停就下爪。
                                         #   停偏了照样修一下再夹(跟随抓取的修正)；没示教就用跟随抓取
@@ -1700,6 +1703,9 @@ class MissionHooks:
             return self._raw_stop_pick(cands, mode, t_end, label)
         home = (float(home[0]), float(home[1]))
         cur = [home[0], home[1]]                              # 现在的 ID1、ID2(最后一次发的)
+        pos = [home[0], home[1]]                              # 拍这一帧时手臂实际在哪(平滑跟随每帧读一次；不平滑 = 最后一次 AP 的目标)
+        smooth = [bool(cfg.get('raw_follow_smooth', True)) and hasattr(self.arm, 'apn') and not getattr(self.arm, '_no_apn', False)]
+        track_ms = float(cfg.get('raw_follow_track_ms', 250.0))
         sc = float(v.scale('RAW'))
         lim = dict(id1=25.0, id2=250.0)
         lim.update(cfg.get('raw_follow_limit_deg') or {})
@@ -1715,7 +1721,7 @@ class MissionHooks:
         def need(e):
             """偏差 e(像素)要转到的绝对角度 (ID1, ID2)，和超出跟随范围多少(0 = 够得着)。"""
             d = -Jinv @ np.asarray(e, float)                  # [ID2, ID1] 度
-            a1, a2 = cur[0] + float(d[1]), cur[1] + float(d[0])
+            a1, a2 = pos[0] + float(d[1]), pos[1] + float(d[0])
             over = max(0.0, abs(a1 - home[0]) - float(lim['id1'])) + max(0.0, abs(a2 - home[1]) - float(lim['id2'])) / 10.0
             return a1, a2, over
 
@@ -1729,7 +1735,34 @@ class MissionHooks:
                 self.log(f'      dbg AP {cur[0]:.1f},{cur[1]:.1f} -> {a1:.1f},{a2:.1f}')
             self.arm.ap(a1, a2)
             cur[0], cur[1] = a1, a2
+            pos[0], pos[1] = a1, a2
 
+        def track(a1, a2):
+            """平滑跟随：只发目标(APN)不等，马上接着看；旧程序不认 APN 就改回一步一步的 AP。"""
+            if smooth[0]:
+                if self.arm.apn(a1, a2, track_ms) is not False:
+                    cur[0], cur[1] = a1, a2
+                    return
+                smooth[0] = False
+                self.log(f'  {tag} STM32 是旧程序(不认 APN)：改回"转一下、停住、看一眼"地跟。刷新的 arm.c 才能平滑跟随')
+            go(a1, a2)
+
+        def read_pos():
+            """平滑跟随：读拍这一帧时手臂实际的角度。读不到返回 False(这一帧不算原料盘动没动)。"""
+            try:
+                b = self.arm.read_angles(tries=1)
+            except ArmAbort:
+                raise
+            except ArmError:
+                return False
+            if b[0] is None or b[1] is None:
+                return False
+            pos[0], pos[1] = float(b[0]), float(b[1])
+            return True
+
+        if smooth[0] and not getattr(self, '_smooth_said', False):
+            self._smooth_said = True
+            self.log('    平滑跟随：每帧发一个新目标就接着看(手臂一直在动，不再转一下停一下)')
         target = None                                         # 正在跟的颜色
         prev = None                                           # 上一帧 (时刻, 偏差, 那时的 ID1/ID2)
         state = None                                          # 原料盘 'move' / 'stop'
@@ -1750,9 +1783,11 @@ class MissionHooks:
             if keep_s > 0 and now - t_arm > keep_s:
                 d = float(cfg.get('raw_keepalive_deg', 1.0))
                 self.log(f'  {tag} 手臂 {now - t_arm:.0f} 秒没动了：轻轻摆一下(规则：机器人停止运行 15 秒本轮结束)')
-                self.arm.ap(cur[0] + d, cur[1])
-                self.arm.ap(cur[0], cur[1])
+                self.arm.ap(pos[0] + d, pos[1])
+                go(pos[0], pos[1])
                 t_arm = self.now()
+                prev = None
+            if smooth[0] and not read_pos():                  # 拍这一帧前读手臂实际在哪(手臂一直在动：拍完再读就对不上了)
                 prev = None
             t = self.now()
             errs = v.material_errors([target] if target is not None else colors)
@@ -1777,7 +1812,7 @@ class MissionHooks:
                     if best is not None:                      # 够不着的：手臂先往它那边转到范围边上等着
                         a1, a2 = clampa(*need(vis[best[1]])[:2])
                         if abs(a1 - cur[0]) > 0.5 or abs(a2 - cur[1]) > 2.0:
-                            go(a1, a2)
+                            track(a1, a2)
                             t_arm = self.now()
                     prev = None
                     continue
@@ -1788,13 +1823,16 @@ class MissionHooks:
             moving, vel, arm_moved = None, np.zeros(2), False
             if prev is not None:
                 dt = max(1e-3, t - prev[0])
-                dA = np.array([cur[1] - prev[2][1], cur[0] - prev[2][0]])    # 两帧之间手臂转了多少 [ID2, ID1]
-                arm_moved = float(np.abs(dA).max()) > 1e-6
+                dA = np.array([pos[1] - prev[2][1], pos[0] - prev[2][0]])    # 两帧之间手臂转了多少 [ID2, ID1]
+                if smooth[0]:                                 # 读回来的角度有一点抖：画面里动不到半个"静止"阈值算没动
+                    arm_moved = float(np.linalg.norm(J @ dA)) > 0.5 * still_px
+                else:
+                    arm_moved = float(np.abs(dA).max()) > 1e-6
                 motion = (e - prev[1]) - J @ dA               # 物料自己(原料盘)动了多少像素
                 thr = still_px * (2.0 if arm_moved else 1.0)
                 moving = float(np.linalg.norm(motion)) > thr
                 vel = motion / dt
-            prev = (t, e, (cur[0], cur[1]))
+            prev = (t, e, (pos[0], pos[1]))
             if moving is not None and not (moving is False and arm_moved):
                 want = 'move' if moving else 'stop'
                 if want != state:
@@ -1824,7 +1862,7 @@ class MissionHooks:
                 a1 = cur[0] + gain * (a1 - cur[0])
                 a2 = cur[1] + gain * (a2 - cur[1])
                 if float(np.linalg.norm(ee)) > dead_px and (abs(a1 - cur[0]) > 0.15 or abs(a2 - cur[1]) > 0.5):
-                    go(a1, a2)
+                    track(a1, a2)
                     t_arm = self.now()
                 if need(e)[2] > 0.0 and moving and float(np.linalg.norm(e)) / sc > 30.0 and need(e + vel)[2] > need(e)[2]:
                     target, prev = None, None                 # 正在转出手臂够得着的范围：换一个
@@ -1856,6 +1894,8 @@ class MissionHooks:
             cand = by_color[target]
             self.log(f'  {tag} 手臂已经在物料上方(离爪子点 {np.linalg.norm(e) / sc:.1f}mm)：修一下就下爪'
                      + ('(没看到它什么时候停下的，按刚停下算)' if guess else f'(这次停下大约还剩 {left:.1f} 秒)'))
+            if smooth[0]:
+                cur[0], cur[1] = pos[0], pos[1]               # 手臂已经停在这里了：下面一步一步修(AP)从这里算
             r = self._raw_follow_grab(cand, mode, e, deadline, J, need, clampa, go, cur)
             if r:
                 return cand

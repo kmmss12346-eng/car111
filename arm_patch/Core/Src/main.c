@@ -106,6 +106,7 @@ void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功�
 void  Servo_SetPower(uint16_t mw);                   /* 舵机转动时允许的最大功率(参数 SPOW) */
 void  Servo_SetComp(uint8_t id, float deg);          /* 舵机往前多给的补偿角度(参数 S1COMP / S2COMP) */
 void  Servo_Hold(uint8_t id, float angle_deg);       /* 停在 angle_deg，不再往原来的目标使劲 */
+void  Servo_Track(uint8_t id, float angle_deg, float speed_dps);   /* 跟随用：只发目标不等，不补偿 */
 int   Servo_Arrived(uint8_t id, float a, float tol_deg);   /* 到了没有(转过目标一点也算到) */
 void  Servo_Params(uint8_t id);                      /* SVP?：舵机内部的保护设置 */
 int   Servo_WriteParam(uint8_t id, const char *name, long value);   /* SVW：改舵机内部设置 */
@@ -1080,6 +1081,24 @@ uint32_t Servo_Start(uint8_t id, float *angle_deg, float speed_dps)
 void Servo_Hold(uint8_t id, float angle_deg)
 {
     FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, SERVO_DEFAULT_SPEED,
+                                      SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);
+}
+
+/* (10-16 用户)跟随用：往 angle_deg 转，不等、不多给补偿角度(目标一直在更新，多给了会冲过头)。限位照样管 */
+void Servo_Track(uint8_t id, float angle_deg, float speed_dps)
+{
+    if (id != 1 && id != 2)
+    {
+        return;
+    }
+    angle_deg = Servo_Clamp(id, angle_deg);
+    if (speed_dps <= 0.0f)
+    {
+        speed_dps = SERVO_DEFAULT_SPEED;
+    }
+    servo_goal[id] = angle_deg;
+    servo_dir[id] = 0.0f;
+    FSUS_SetServoAngleMTurnByVelocity(&usart2, id, angle_deg, speed_dps,
                                       SERVO_ACC_MS, SERVO_DEC_MS, servo_power, 0);
 }
 

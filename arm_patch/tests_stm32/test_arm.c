@@ -65,6 +65,7 @@ void Servo_Report(uint8_t id) { EV("rep%u;", id); }
 void Servo_SetPower(uint16_t mw) { EV("pow%u;", mw); }
 void Servo_SetComp(uint8_t id, float deg) { EV("comp%u=%.1f;", id, deg); }
 void Servo_Hold(uint8_t id, float a) { EV("H%u:%.1f;", id, a); }
+void Servo_Track(uint8_t id, float a, float spd) { EV("T%u:%.1f@%.0f;", id, a, spd); }
 static float fgoal[3];
 int Servo_Arrived(uint8_t id, float a, float tol) { float e = a - fgoal[id]; return (e < 0 ? -e : e) <= tol; }
 void Servo_Params(uint8_t id) { EV("svp%u;", id); }
@@ -257,6 +258,12 @@ int main(void) {
     clear();
     CHECK(run("AP 340 -900") == 1 && has("@90;"), "AP 大角度变化：改用大动作速度(90)");
     CHECK(pis("ANG 1") && pis("ANG 2"), "AP 回读两个角度");
+    clear(); CHECK(run("APN 330 -850") == 1 && has("T1:330.0@90;") && has("T2:-850.0@90;") && !has("S1:") && !has("H1"), "APN：只发目标不等(默认 ASPD)，不用 Servo_Start(不补偿)");
+    CHECK(pis("ANG 1") && pis("ANG 2"), "APN 回报现在的两个角度");
+    ang[1] = 320.0f; ang[2] = -800.0f;
+    clear(); CHECK(run("APN 330 -850 500") == 1 && has("T1:330.0@20;") && has("T2:-850.0@100;"), "APN 500ms 到：按离目标多远算转速(10°→20°/s，50°→100°/s)");
+    clear(); CHECK(run("APN 320.1 -100 1") == 1 && has("T1:320.1@100;") && has("T2:-100.0@900;"), "APN 转速限在 1~900");
+    CHECK(run("APN 330") != 1 && run("APN 330 -850 0") != 1, "APN 参数不对：不执行");
 
     /* ---- 舵机被挡住：一起转等到时间还没到位，交给 Servo_StopIfStuck(停在原地，不再顶着发热) ---- */
     ang[1] = 323.0f; ang[2] = -862.0f; block1 = 340.0f; clear();

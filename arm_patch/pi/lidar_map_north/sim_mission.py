@@ -25,7 +25,8 @@ import numpy as np
 from mission_hooks import MissionHooks, Abort
 from task_plan import parse_code, role_of
 
-DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03)
+DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03, APN=0.02)
+_KEEP_TRK = ('APN', 'A?', 'GET', 'SET', 'SCR', 'SCMD', 'QR', 'QR?', 'LIFT?', 'PING', 'ZONE', 'ZONE?')   # 这些指令不动舵机
 MEASURE_S = 0.35
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
@@ -63,7 +64,7 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0):
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -138,6 +139,8 @@ class SimWorld:
         self.qr_code = qr_stale
         self.at = None                                         # 现在停在哪个停车点(角色)
         self.park_cmd = bool(park_cmd)                         # STM32 认识 PARK(新程序)
+        self.apn_fw = bool(apn_fw)                             # (10-16)STM32 认识 APN(只发目标不等，跟随用)
+        self.trk = None                                        # APN 发的目标 [a1, a2, 转速1, 转速2]：时间往前走时舵机跟着转
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
@@ -150,6 +153,16 @@ class SimWorld:
 
     # ------------------------------------------------------------------ 时间
     def advance(self, s):
+        tr = self.__dict__.get('trk')
+        if tr and s > 0:                                   # APN 发过目标：舵机按转速一直往那边转
+            for i, tg, sp in ((1, tr[0], tr[2]), (2, tr[1], tr[3])):
+                cur = self.a1 if i == 1 else self.a2
+                d, step = tg - cur, sp * s
+                new = tg if abs(d) <= step else cur + math.copysign(step, d)
+                if i == 1:
+                    self.a1 = new
+                else:
+                    self.a2 = new
         self.t += s
 
     def now(self):
@@ -364,6 +377,8 @@ class SimWorld:
         parts = text.split()
         verb = parts[0] if parts else ''
         info = []
+        if verb not in _KEEP_TRK:
+            self.trk = None                                    # 别的转动指令接管舵机：APN 的目标作废
         self.advance(DUR.get(verb.rstrip('?'), 0.0) if verb != 'A?' else DUR['A'])
         n = self.count[verb] = self.count.get(verb, 0) + 1
         if self.abort_at and verb == self.abort_at[0] and n == self.abort_at[1]:
@@ -453,6 +468,20 @@ class SimWorld:
             else:
                 self.a2 = new
             ang(i)
+            return True, 'DONE', info
+        if verb == 'APN':
+            if not self.apn_fw:
+                return False, 'ERR CMD', info
+            ang(1)
+            ang(2)
+            a1_, a2_ = float(parts[1]), float(parts[2])
+            if len(parts) > 3:
+                ms = float(parts[3])
+                s1 = min(900.0, max(1.0, abs(a1_ - self.a1) * 1000.0 / ms))
+                s2 = min(900.0, max(1.0, abs(a2_ - self.a2) * 1000.0 / ms))
+            else:
+                s1 = s2 = P['ASPD']
+            self.trk = [a1_, a2_, s1, s2]
             return True, 'DONE', info
         if verb == 'AP':
             a1_, a2_ = float(parts[1]), float(parts[2])
@@ -1668,6 +1697,21 @@ class RawFollowTests(unittest.TestCase):
             self.assertNotIn('跟随抓取', text2)
             self.assertLess(h2.stats.grab_ok, 3)                 # 以前的做法：停偏了就等不到
 
+    def test_follow_moves_smoothly_with_apn(self):
+        """(10-16 用户)跟随时手臂一直平滑地动：原料盘转的时候发 APN(只发目标不等)，不是 AP(转到、停住再看)；照样三个都夹到。
+        STM32 是旧程序(不认 APN)：改回一步一步的 AP，也能夹到。"""
+        w, h, text = self._run(1, plate_off_tan=40.0)
+        self.assertIn('平滑跟随', text)
+        self.assertGreater(sum(1 for r in w.requests if r.startswith('APN ')), 10)
+        self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+        w2, h2, text2 = self._run(1, plate_off_tan=40.0, apn_fw=False)
+        self.assertIn('不认 APN', text2)
+        self.assertEqual(sum(1 for r in w2.requests if r.startswith('APN ')), 1)
+        self.assertEqual((h2.stats.grab_ok, w2.air, w2.loose, w2.collisions), (3, 0, 0, 0), text2[-3000:])
+        w3, h3, text3 = self._run(1, dict(raw_follow_smooth=False), plate_off_tan=40.0)
+        self.assertNotIn('平滑跟随', text3)
+        self.assertFalse(any(r.startswith('APN') for r in w3.requests))
+
     def test_follow_stays_inside_its_range(self):
         """跟随时 ID1/ID2 不超出 OBS RAW 姿态 ± raw_follow_limit_deg。"""
         w = plate_world(2, plate_off_tan=-35.0, plate_off_mm=25.0)
@@ -1679,7 +1723,7 @@ class RawFollowTests(unittest.TestCase):
         orig = w.link.request
 
         def req(text, *a, **k):
-            if text.startswith('AP ') and w.zone == 'RAW':
+            if (text.startswith('AP ') or text.startswith('APN ')) and w.zone == 'RAW':
                 aps.append(tuple(float(x) for x in text.split()[1:3]))
             return orig(text, *a, **k)
         w.link.request = req
