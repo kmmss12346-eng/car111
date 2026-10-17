@@ -191,8 +191,8 @@ static const Tun tun[] =
     { "SCKI",   &g_sc_ki,       0.0f,   3.0f },
     { "SCLPF",  &g_sc_lpf,      0.0f,   0.5f },
     { "SCRL",   &g_sc_rate,     0.0f,   500.0f },
-    { "SCBF",   &g_sc_bias[0], -0.06f,  0.06f },
-    { "SCBB",   &g_sc_bias[1], -0.06f,  0.06f },
+    { "SCBF",   &g_sc_bias[0], -0.2f,   0.2f },
+    { "SCBB",   &g_sc_bias[1], -0.2f,   0.2f },
     { "SCCM",   &g_sc_cm,       0.05f,  1.0f },
     { "SCDEC",  &g_sc_dec,      0.0f,   600.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
@@ -338,7 +338,7 @@ uint8_t move_acc = 200;           /* 旧的位置模式动作、转弯后备方�
 #define SC_DEADBAND_F    0.05f    /* v12a：滤波以后的死区(滤波后噪声只剩约 0.05°) */
 #define SC_CORR_MAX      0.25f    /* 直行纠偏量最多占当前速度的比例 */
 #define SC_I_MAX         6.0f     /* 直行积分最多贡献多少 转/分 */
-#define SC_BIAS_MAX      0.05f
+#define SC_BIAS_MAX      0.2f     /* (10-17)后退要 -0.13 左右：从 0.05 放宽 */
 #define SC_SIGN          1
 #define SC_CMD_GAP_MS    2        /* 给 4 个电机发指令之间的间隔 */
 #define SC_EMM_ACC       200      /* 电机自己在两次速度指令之间平滑过渡 */
