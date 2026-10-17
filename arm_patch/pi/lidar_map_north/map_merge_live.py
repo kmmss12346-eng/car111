@@ -752,7 +752,7 @@ def main():
                 ps,rep_=link.get_params()
                 if ps is None:raise ValueError('读 STM32 参数失败：'+str(rep_))
                 if n_ not in ps:raise ValueError(f'STM32 里没有 {n_}：先刷新的 chassis.c / main.c')
-                old=ps[n_];new=old+left/dist_
+                old=ps[n_];new=old-left/dist_       # (10-17 用户实测：+ 号方向反了，按实际改成减)
                 ok_,rep_=link.set_param(n_,new)
                 if not ok_:raise ValueError(f'STM32 拒绝：{rep_}')
                 save_params({n_:round(new,5)});print(f'{n_}: {old:.4f} → {new:.4f}，已存进配置。再走一次同样的距离验证。',flush=True);return
