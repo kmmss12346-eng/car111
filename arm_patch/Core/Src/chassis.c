@@ -120,7 +120,9 @@ static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化�
 static float g_sc_cm   = 0.25f;     /* (10-17)SCCM：直行纠偏量最多占当前速度的比例(以前写死 0.25)；刹车时车头甩得厉害就调大 */
 static float g_sc_imax = 6.0f;      /* (10-17)SCIM：直行积分最多贡献多少 转/分(以前写死 6)；车天生往一边拐得厉害就调大，积分自己把它纠掉 */
 static float g_sc_blrn[2] = { 1.0f, 1.0f };  /* (10-17 用户)SCBLF/SCBLB：1 = 前进/后退走完自动学 SCBF/SCBB；0 = 锁住不学 */
-static float g_wmap = 0.0f;         /* (10-17 用户)WMAP：0 = ID3 右后、ID4 左后(原来的接法)；1 = ID3 左后、ID4 右后(两个后轮驱动器地址对调了) */
+static float g_wmap = 0.0f;         /* (10-17 用户)WMAP：0 = 用 WADR/WINV；1 = 老写法(右后接 ID4、左后接 ID3，等于 WADR 1243) */
+static float g_wadr = 1234.0f;      /* (10-17 用户)WADR：4 位数，依次是 右前、左前、右后、左后 这 4 个轮子各接几号驱动器(WT 1~4 测出来) */
+static float g_winv = 0.0f;         /* (10-17 用户)WINV：4 位 0/1，依次是 右前、左前、右后、左后：WT 测的时候这个轮子往后转就填 1 */
 static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
@@ -202,6 +204,8 @@ static const Tun tun[] =
     { "SCBLF",  &g_sc_blrn[0],  0.0f,   1.0f },
     { "SCBLB",  &g_sc_blrn[1],  0.0f,   1.0f },
     { "WMAP",   &g_wmap,        0.0f,   1.0f },
+    { "WADR",   &g_wadr,        1234.0f, 4321.0f },
+    { "WINV",   &g_winv,        0.0f,   1111.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -269,6 +273,34 @@ static void Link_Say(const char *s)
 }
 
 /* 返回 0=没有这个名字，1=成功，2=数值超出范围 */
+/* 程序里 4 个轮子(0 右前 1 左前 2 右后 3 左后)"往前"用的方向字节，也是 WT n 用的方向(n 号驱动器按第 n-1 个轮子的方向) */
+static const uint8_t k_wheel_fwd[4] = {0, 1, 1, 0};
+
+/* WADR/WINV 拆成 4 个轮子的地址和"要不要反向"；WADR 不是 1~4 各出现一次就返回 0 */
+static int Wmap_Decode(float wadr, float winv, uint8_t addr[4], uint8_t inv[4])
+{
+    long a = (long)(wadr + 0.5f);
+    long b = (long)(winv + 0.5f);
+    uint8_t seen = 0;
+    int k;
+
+    for (k = 3; k >= 0; k--)
+    {
+        uint8_t d = (uint8_t)(a % 10);
+
+        if (d < 1 || d > 4 || (seen & (uint8_t)(1u << d)))
+        {
+            return 0;
+        }
+        seen |= (uint8_t)(1u << d);
+        addr[k] = d;
+        inv[k] = (uint8_t)((b % 10) ? 1 : 0);
+        a /= 10;
+        b /= 10;
+    }
+    return (a == 0) ? 1 : 0;
+}
+
 int Car_Param_Set(const char *name, float v)
 {
     int i;
@@ -280,6 +312,15 @@ int Car_Param_Set(const char *name, float v)
             if (v < tun[i].lo || v > tun[i].hi)
             {
                 return 2;
+            }
+            if (tun[i].p == &g_wadr)
+            {
+                uint8_t a[4], d[4];
+
+                if (!Wmap_Decode(v, 0.0f, a, d))
+                {
+                    return 2;                     /* 1~4 要各出现一次 */
+                }
             }
             *tun[i].p = v;
             return 1;
@@ -374,16 +415,57 @@ static void Wheels_Vel(const float s[4]);
 /* ================= 底层：4 个电机同时按指定方向走 pulse 脉冲 =================
  * dirs[0..3] 分别是 ID1..ID4 的方向。
  * 注意：ID1、ID3 在车的物理右侧，ID2、ID4 在物理左侧。 */
-/* 第 i 个轮子(0 右前 1 左前 2 右后 3 左后)的驱动器地址和方向。
- * WMAP=1：右后接的是 ID4、左后接的是 ID3，方向跟着各自那一侧的前轮，所以地址对调、方向取反(直走时发给 ID3/ID4 的指令和原来一模一样) */
-static uint8_t Wheel_Addr(uint8_t i)
+/* (10-17 用户)第 i 个轮子(0 右前 1 左前 2 右后 3 左后)接的驱动器地址，和 WT 测的时候它是不是往后转 */
+static void Wheel_Map(uint8_t addr[4], uint8_t inv[4])
 {
-    return (g_wmap >= 0.5f && i >= 2) ? (uint8_t)(6 - i) : (uint8_t)(i + 1);
+    if (g_wmap >= 0.5f)
+    {
+        addr[0] = 1; addr[1] = 2; addr[2] = 4; addr[3] = 3;      /* 老写法：右后 ID4、左后 ID3 */
+        inv[0] = 0;  inv[1] = 0;  inv[2] = 0;  inv[3] = 0;
+    }
+    else if (!Wmap_Decode(g_wadr, g_winv, addr, inv))
+    {
+        addr[0] = 1; addr[1] = 2; addr[2] = 3; addr[3] = 4;
+        inv[0] = 0;  inv[1] = 0;  inv[2] = 0;  inv[3] = 0;
+    }
 }
 
+static uint8_t Wheel_Addr(uint8_t i)
+{
+    uint8_t a[4], v[4];
+
+    Wheel_Map(a, v);
+    return a[i];
+}
+
+/* dir 是按第 i 个轮子的方向表算出来的；换成它实际接的那个驱动器要的方向：
+ * 那个驱动器按自己的方向表"往前"时，这个轮子是往前(WINV=0)还是往后(WINV=1)转 */
 static uint8_t Wheel_Dir(uint8_t i, uint8_t dir)
 {
-    return (g_wmap >= 0.5f && i >= 2) ? (uint8_t)(1 - dir) : dir;
+    uint8_t a[4], v[4];
+
+    Wheel_Map(a, v);
+    return (uint8_t)(dir ^ k_wheel_fwd[i] ^ k_wheel_fwd[a[i] - 1] ^ v[i]);
+}
+
+/* (10-17 用户)WT n：只转 n 号驱动器(1~4)，按程序里第 n 个轮子"往前"的方向转 2 秒再停。
+ * 车架空一个一个试：看是哪个轮子在转、往前还是往后，就能填 WADR/WINV。不经过 WADR/WINV，急停(!)马上停 */
+void Car_Wheel_Test(uint8_t addr, uint16_t rpm)
+{
+    uint32_t t0;
+
+    if (addr < 1 || addr > 4)
+    {
+        return;
+    }
+    Emm_V5_Vel_Control(addr, k_wheel_fwd[addr - 1], rpm, SC_EMM_ACC, false);
+    t0 = HAL_GetTick();
+    while (!car_abort && (HAL_GetTick() - t0) < 2000u)
+    {
+        HAL_Delay(10);
+    }
+    Emm_V5_Stop_Now(addr, false);
+    HAL_Delay(10);
 }
 
 static void Car_Drive(const uint8_t dirs[4], uint16_t speed, uint32_t pulse)

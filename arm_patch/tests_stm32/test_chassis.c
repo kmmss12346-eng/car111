@@ -218,18 +218,22 @@ float HWT101_GetYawContinuous(void) { return (float)yaw; }
 uint8_t HWT101_IsFresh(uint32_t timeout_ms) { (void)timeout_ms; return 1; }
 uint8_t HWT101_IsReady(void) { return 1; }
 
-/* (10-17)hw_swap34=1：假车右后轮接的是 ID4、左后轮接的是 ID3(驱动器方向跟着各自那一侧的前轮) */
+/* (10-17)假车的轮子接法：hw_swap34=1 右后轮接 ID4、左后轮接 ID3(驱动器方向跟着各自那一侧的前轮，直走照样正常)；
+ * 2 = 前面两个对调(右前接 ID2、左前接 ID1)；3 = 后面两个对调、方向没跟着改(直走时后轮往后转) */
 static int hw_swap34 = 0;
+static double w_imm[4];            /* WT 用：最近一次直接(不同步)发给每个轮子的转速 */
 
 static int phys_of(uint8_t addr)
 {
     int i = addr - 1;
-    return (hw_swap34 && i >= 2) ? 5 - i : i;
+    if ((hw_swap34 == 1 || hw_swap34 == 3) && i >= 2) return 5 - i;
+    if (hw_swap34 == 2 && i <= 1) return 1 - i;
+    return i;
 }
 
 static double signed_rpm(int i, uint8_t dir, uint16_t vel)
 {
-    uint8_t f = (hw_swap34 && i >= 2) ? (uint8_t)(1 - fwd_tab[i]) : fwd_tab[i];
+    uint8_t f = ((hw_swap34 == 1 && i >= 2) || (hw_swap34 == 2 && i <= 1)) ? (uint8_t)(1 - fwd_tab[i]) : fwd_tab[i];
     return (dir == f) ? (double)vel : -(double)vel;
 }
 
@@ -240,7 +244,7 @@ void Emm_V5_Vel_Control(uint8_t addr, uint8_t dir, uint16_t vel, uint8_t acc, bo
     {
         int p = phys_of(addr);
         if (snF) { w_pend[p] = signed_rpm(p, dir, vel); pend_set[p] = 1; }
-        else     { w_cmd[p]  = signed_rpm(p, dir, vel); pos_left[p] = 0.0; }
+        else     { w_cmd[p]  = signed_rpm(p, dir, vel); pos_left[p] = 0.0; if (vel) w_imm[p] = w_cmd[p]; }
     }
 }
 
@@ -636,6 +640,71 @@ static void test_wmap(void)
     hw_swap34 = 0;
 }
 
+/* WT n：只有 1 个轮子转；返回是哪个轮子(0 右前 1 左前 2 右后 3 左后)，*back=1 表示往后转；没有或不止一个轮子转返回 -1 */
+static int wt_probe(int n, int *back)
+{
+    int i, p = -1, cnt = 0;
+    char cmd[16];
+    for (i = 0; i < 4; i++) w_imm[i] = 0.0;
+    snprintf(cmd, sizeof(cmd), "WT %d", n);
+    (void)cmd;
+    Car_Wheel_Test((uint8_t)n, 30);
+    for (i = 0; i < 4; i++)
+    {
+        if (w_imm[i] != 0.0) { p = i; cnt++; *back = (w_imm[i] < 0.0); }
+    }
+    return (cnt == 1) ? p : -1;
+}
+
+/* (10-17 用户)WT 1~4 一个一个转，按看到的结果填 WADR(每个轮子接几号)、WINV(往后转的填 1)，各种接错的车都能走对 */
+static void test_wt(void)
+{
+    static const char *nm[4] = { "右前", "左前", "右后", "左后" };
+    int hw;
+
+    printf("== WT + WADR/WINV：先一个一个转轮子看接法，再照着填\n");
+    CHECK(Car_Param_Set("WADR", 1224.0f) == 2 && Car_Param_Set("WADR", 5123.0f) == 2, "WADR 不是 1~4 各一次要拒绝");
+    for (hw = 0; hw <= 3; hw++)
+    {
+        int n, digit[4] = {0, 0, 0, 0}, inv[4] = {0, 0, 0, 0}, ok = 1;
+        float wadr, winv;
+        double ye;
+
+        reset_car(); user_params();
+        hw_swap34 = hw;
+        Car_Param_Set("WADR", 1234.0f); Car_Param_Set("WINV", 0.0f); Car_Param_Set("WMAP", 0.0f);
+        printf("   假车接法 %d：", hw);
+        for (n = 1; n <= 4; n++)
+        {
+            int back = 0;
+            int p = wt_probe(n, &back);
+            if (p < 0) { ok = 0; continue; }
+            digit[p] = n; inv[p] = back;
+            printf("WT %d=%s%s  ", n, nm[p], back ? "往后" : "往前");
+        }
+        CHECK(ok, "WT 每次应该只转 1 个轮子");
+        wadr = (float)(digit[0] * 1000 + digit[1] * 100 + digit[2] * 10 + digit[3]);
+        winv = (float)(inv[0] * 1000 + inv[1] * 100 + inv[2] * 10 + inv[3]);
+        printf("→ WADR %.0f WINV %04.0f\n", wadr, winv);
+        CHECK(Car_Param_Set("WADR", wadr) == 1 && Car_Param_Set("WINV", winv) == 1, "SET WADR/WINV");
+
+        reset_car(); user_params(); hw_swap34 = hw;
+        Car_Straight_Closed(150, 1000.0f); ye = settle_yaw();
+        CHECK(fabs(px - 1000.0) < 3.0 && fabs(py) < 10.0 && fabs(ye) < 0.5, "接法 %d：F 1000 走 %.1f 横偏 %.1f 车头 %.2f°", hw, px, py, ye);
+        reset_car(); user_params(); hw_swap34 = hw;
+        Car_Strafe_Closed(140, 300.0f); ye = settle_yaw();
+        CHECK(fabs(py - 300.0) < 12.0 && fabs(px) < 10.0 && fabs(ye) < 1.0, "接法 %d：S 300 横移 %.1f 前后 %.1f 车头 %.2f°", hw, py, px, ye);
+        reset_car(); user_params(); hw_swap34 = hw;
+        Car_Strafe_Closed(140, -300.0f); ye = settle_yaw();
+        CHECK(fabs(py + 300.0) < 12.0 && fabs(px) < 10.0 && fabs(ye) < 1.0, "接法 %d：S -300 横移 %.1f 前后 %.1f 车头 %.2f°", hw, py, px, ye);
+        reset_car(); user_params(); hw_swap34 = hw;
+        Car_TurnBy_Center(90.0f); ye = settle_yaw();
+        CHECK(!car_stalled && fabs(wrap180(ye - 90.0)) < 1.0, "接法 %d：R 90 车头 %.2f° stalled=%d", hw, ye, car_stalled);
+    }
+    Car_Param_Set("WADR", 1234.0f); Car_Param_Set("WINV", 0.0f);
+    hw_swap34 = 0;
+}
+
 /* 记录里第 k 条的走的速度(前进分量和横移分量里大的那个，转/分；差速不算) */
 static double log_move(int k)
 {
@@ -982,6 +1051,7 @@ int main(void)
 #ifndef CHASSIS_V12A
     test_drift();
     test_wmap();
+    test_wt();
     test_vel();
     test_precision();
     test_parse();

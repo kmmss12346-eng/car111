@@ -745,6 +745,24 @@ void Link_Poll(void)
         Link_Reply("DONE\r\n");
         return;
     }
+    /* (10-17 用户)WT n [转速]：只转 n 号轮子驱动器(1~4) 2 秒，默认 30 转/分。车架空看是哪个轮子、往前还是往后 */
+    if (cmd[0] == 'W' && cmd[1] == 'T' && cmd[2] == ' ')
+    {
+        char *e1;
+        char *e2;
+        long id = strtol(&cmd[3], &e1, 10);
+        long rpm = 30;
+        if (e1 == &cmd[3] || id < 1 || id > 4)                       { Link_Reply("ERR ARG\r\n"); return; }
+        if (*e1 == ' ')
+        {
+            rpm = strtol(e1 + 1, &e2, 10);
+            if (e2 == e1 + 1 || *e2 != 0 || rpm < 5 || rpm > 120)   { Link_Reply("ERR ARG\r\n"); return; }
+        }
+        else if (*e1 != 0)                                           { Link_Reply("ERR ARG\r\n"); return; }
+        Car_Wheel_Test((uint8_t)id, (uint16_t)rpm);
+        Link_Reply("DONE\r\n");
+        return;
+    }
     if (strcmp(cmd, "MOT EN") == 0)
     {
         Car_Motor_Enable();
