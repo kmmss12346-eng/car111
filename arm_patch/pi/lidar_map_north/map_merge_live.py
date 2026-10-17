@@ -744,6 +744,18 @@ def main():
             # 距离校准：fix F 1000 985 = 命令走了1000mm，尺子量实际只走了985mm。算出新的 脉冲/mm 发给 STM32 并存进配置
             if link is None:raise ValueError('没有连接 STM32（--stm-port）')
             names={'F':'FPPM','B':'BPPM','L':'LPPM','R':'RPPM'}
+            if len(parts)==4 and parts[1].upper() in ('SF','SB'):
+                # (10-17)直线平移校准：fix SF 2000 15 = 前进2000mm后，车头是正的、整车往左平移了15mm(往右填负数)；SB 是后退。要新固件(有 SCDF/SCDB)
+                n_='SCDF' if parts[1].upper()=='SF' else 'SCDB';dist_=float(parts[2]);left=float(parts[3])
+                if dist_<=0 or abs(left)>0.1*dist_:raise ValueError('距离要是正数，平移的毫米数不能超过距离的10%')
+                sync_now()
+                ps,rep_=link.get_params()
+                if ps is None:raise ValueError('读 STM32 参数失败：'+str(rep_))
+                if n_ not in ps:raise ValueError(f'STM32 里没有 {n_}：先刷新的 chassis.c / main.c')
+                old=ps[n_];new=old+left/dist_
+                ok_,rep_=link.set_param(n_,new)
+                if not ok_:raise ValueError(f'STM32 拒绝：{rep_}')
+                save_params({n_:round(new,5)});print(f'{n_}: {old:.4f} → {new:.4f}，已存进配置。再走一次同样的距离验证。',flush=True);return
             if len(parts)==4 and parts[1].upper() in ('DL','DR'):
                 # 横移时往前后漂的校准：fix DL 600 40 = 左移600mm后，车往后偏了40mm(往前偏就填负数)；DR 是右移
                 n_='DRL' if parts[1].upper()=='DL' else 'DRR';dist_=float(parts[2]);back=float(parts[3])
@@ -755,7 +767,7 @@ def main():
                 ok_,rep_=link.set_param(n_,new)
                 if not ok_:raise ValueError(f'STM32 拒绝：{rep_}')
                 save_params({n_:round(new,5)});print(f'{n_}: {old:.4f} → {new:.4f}，已存进配置。再横移一次同样的距离验证。',flush=True);return
-            if len(parts)!=4 or parts[1].upper() not in names:raise ValueError('格式：fix F 1000 985（F前进 B后退 L左移 R右移；命令的距离 实际量到的距离）；横移前后漂：fix DL 600 40（左移600后偏后40mm，偏前填负数；DR是右移）')
+            if len(parts)!=4 or parts[1].upper() not in names:raise ValueError('格式：fix F 1000 985（F前进 B后退 L左移 R右移；命令的距离 实际量到的距离）；横移前后漂：fix DL 600 40（左移600后偏后40mm，偏前填负数；DR是右移）；直线平移：fix SF 2000 15（前进2000后整车往左平移15mm，往右填负数；SB是后退）')
             n_=names[parts[1].upper()];cmd_d=float(parts[2]);real=float(parts[3])
             if cmd_d<=0 or real<=0:raise ValueError('距离要是正数')
             sync_now()

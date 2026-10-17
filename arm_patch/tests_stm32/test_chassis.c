@@ -51,6 +51,7 @@ static double vf_b = 0.0, vl_b = 0.0, vl_w = 0.0;   /* 车身实际的前进/左
 static double pivot_back = 103.0;          /* 车原地转时绕车中心后面多少 mm 的点转 */
 static double ss_c[2][2];                  /* 横移自转 [左,右][0=加速/匀速 CA, 1=减速 CD]，度/秒 = C×速度^1.5 */
 static double ss_drift[2];                 /* 横移时往前漂(每横移 1mm 往前多少 mm) */
+static double fwd_drift = 0.0;             /* (10-17)直行时整车天生往左平移：每走 1mm 往左多少 mm(前进后退都往左) */
 static double fwd_yaw = 0.0;               /* 直行时车头天生往一边转：度/秒 每 转/分 */
 static double lat_prev = 0.0;
 static double noise_sd = 0.0;              /* 陀螺仪噪声(度，标准差)，每 10ms 一帧，帧内不变 */
@@ -145,7 +146,7 @@ static void step_1ms(void)
 
     /* 车中心的速度：轮子的前进/横移分量 + 绕车中心后面的点转带出来的横移 + 横移时往前漂 */
     vf_t = eff * fwd * K_FWD + ss_drift[di] * al * K_LAT;
-    vl_t = eff * lat * K_LAT;
+    vl_t = eff * lat * K_LAT + fwd_drift * fabs(eff * fwd * K_FWD);
     vf_b += (vf_t - vf_b) * dt / (tau_body + dt);           /* 车身跟上轮子和转动一样有延迟 */
     vl_w += (vl_t - vl_w) * dt / (tau_body + dt);
     vl_b = vl_w + rate * 0.01745329 * pivot_back;           /* 绕后面的点转，车中心往左移 ω×距离 */
@@ -314,7 +315,7 @@ static void reset_car(void)
     pos_cmds = 0;
     px = py = vf_b = vl_b = vl_w = 0.0; lat_prev = 0.0;
     memset(ss_c, 0, sizeof(ss_c)); memset(ss_drift, 0, sizeof(ss_drift));
-    fwd_yaw = 0.0; noise_sd = 0.0; gyro_frame_t = 0xFFFFFFFFu; rng = 12345u;
+    fwd_yaw = 0.0; fwd_drift = 0.0; noise_sd = 0.0; gyro_frame_t = 0xFFFFFFFFu; rng = 12345u;
     abort_at = -1; kick_deg = 0.0;
     log_on = 0; log_n = 0;
 }
@@ -444,6 +445,35 @@ static void test_straight(void)
     CHECK(jump <= 2.0, "F 1000 差速一个周期跳了 %.1f 转/分(应 ≤2)", jump);
     CHECK(fabs(px - 1000.0) < 3.0, "F 1000 走了 %.1f mm", px);
     CHECK(fabs(py) < 10.0, "F 1000 横偏 %.1f mm", py);
+}
+
+/* (10-17 用户)车头正、整车往左平移：SCDF/SCDB 顺带往右横移抵消 */
+static void test_drift(void)
+{
+    double py0;
+    printf("== SCDF/SCDB：车天生每走 1m 往左平移 20mm，补偿以后横偏应该很小\n");
+    reset_car();
+    user_params();
+    fwd_drift = 0.02;
+    Car_Straight_Closed(150, 1000.0f);
+    settle_yaw();
+    py0 = py;
+    CHECK(py0 > 12.0, "没补偿时 F 1000 应该往左偏约 20mm，实际 %.1f", py0);
+    reset_car();
+    user_params();
+    fwd_drift = 0.02;
+    CHECK(Car_Param_Set("SCDF", 0.02f) == 1 && Car_Param_Set("SCDB", 0.02f) == 1, "SET SCDF/SCDB");
+    Car_Straight_Closed(150, 1000.0f);
+    CHECK(fabs(py) < 4.0 && fabs(settle_yaw()) < 0.5 && fabs(px - 1000.0) < 5.0,
+          "SCDF=0.02：F 1000 横偏 %.1f mm(补偿前 %.1f)，走了 %.1f mm", py, py0, px);
+    reset_car();
+    user_params();
+    fwd_drift = 0.02;
+    Car_Straight_Closed(150, -1000.0f);
+    CHECK(fabs(py) < 4.0 && fabs(px + 1000.0) < 8.0, "SCDB=0.02：F -1000 横偏 %.1f mm，走了 %.1f mm", py, px);
+    CHECK(Car_Param_Set("SCDF", 0.5f) == 2, "SCDF 超出范围被拒绝");
+    Car_Param_Set("SCDF", 0.0f);
+    Car_Param_Set("SCDB", 0.0f);
 }
 
 static void test_strafe(float mm)
@@ -813,6 +843,7 @@ int main(void)
 
     test_abort();
 #ifndef CHASSIS_V12A
+    test_drift();
     test_vel();
     test_precision();
     test_parse();

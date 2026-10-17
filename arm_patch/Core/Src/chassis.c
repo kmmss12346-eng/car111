@@ -117,6 +117,8 @@ static float g_sc_kp   = 2.0f;      /* 直行：车头每偏 1°，左右轮差�
 static float g_sc_ki   = 1.0f;      /* 直行积分 */
 static float g_sc_lpf  = 0.08f;     /* v12a：直行时车头误差的低通滤波时间常数(秒)，0=不滤波 */
 static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化多少 转/分，0=不限制 */
+static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
+                                                * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
 static float g_sc_bias[2] = { 0.0f, 0.0f };   /* 直行/后退 天生的偏向补偿(自动学习) */
 
 static float g_ss_acc  = 200.0f;    /* 横移加减速(转/分/秒) */
@@ -189,6 +191,8 @@ static const Tun tun[] =
     { "SCRL",   &g_sc_rate,     0.0f,   500.0f },
     { "SCBF",   &g_sc_bias[0], -0.06f,  0.06f },
     { "SCBB",   &g_sc_bias[1], -0.06f,  0.06f },
+    { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
+    { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
     { "SSKP",   &g_ss_kp,       0.0f,   6.0f },
     { "SSKI",   &g_ss_ki,       0.0f,   3.0f },
@@ -1066,7 +1070,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
     while (1)
     {
         uint32_t now;
-        float dt, rem, vbrake, pi_out, corr, lim, yaw_now;
+        float dt, rem, vbrake, pi_out, corr, lim, yaw_now, lat;
 
         HAL_Delay(SC_PERIOD_MS);
         now  = HAL_GetTick();
@@ -1149,10 +1153,14 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
             bn++;
         }
 
-        s[0] = sgn * v + corr;    /* ID1 右前 */
-        s[2] = sgn * v + corr;    /* ID3 右后 */
-        s[1] = sgn * v - corr;    /* ID2 左前 */
-        s[3] = sgn * v - corr;    /* ID4 左后 */
+        /* (10-17 用户)车头正、整车往旁边平移：顺带往反方向横移(左移为正，按 LPPM/RPPM 换成轮速) */
+        lat = -g_sc_drift[di] * v;
+        lat *= ((lat >= 0.0f) ? g_lppm : g_rppm) / ppm;
+
+        s[0] = sgn * v + corr + lat;    /* ID1 右前 */
+        s[2] = sgn * v + corr - lat;    /* ID3 右后 */
+        s[1] = sgn * v - corr - lat;    /* ID2 左前 */
+        s[3] = sgn * v - corr + lat;    /* ID4 左后 */
         {
             /* v12a：4 个轮子取整后的速度都没变，就不重复发指令(电机只认整数 转/分)；但最多隔 0.2 秒补发一次 */
             int16_t q[4];
