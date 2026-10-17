@@ -123,6 +123,9 @@ static float g_sc_blrn[2] = { 1.0f, 1.0f };  /* (10-17 用户)SCBLF/SCBLB：1 = 
 static float g_wmap = 0.0f;         /* (10-17 用户)WMAP：0 = 用 WADR/WINV；1 = 老写法(右后接 ID4、左后接 ID3，等于 WADR 1243) */
 static float g_wadr = 1234.0f;      /* (10-17 用户)WADR：4 位数，依次是 右前、左前、右后、左后 这 4 个轮子各接几号驱动器(WT 1~4 测出来) */
 static float g_winv = 0.0f;         /* (10-17 用户)WINV：4 位 0/1，依次是 右前、左前、右后、左后：WT 测的时候这个轮子往后转就填 1 */
+static float g_wrol = 0.0f;         /* (10-17 用户)WROL：麦轮装法。0 = 标准(从上往下看顶上辊子连成 X)；
+                                     * 1 = 后面两个轮子左右装反(同一侧前后两个辊子平行)；2 = 前面两个左右装反。WCHK 自动测 */
+static float g_wq   = 0.0f;         /* (10-17 用户)WQ：WROL=1/2 时原地转那一对以外的轮子要转多少：(半轮距-半轴距)/(半轮距+半轴距)，方车 0 */
 static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
@@ -206,6 +209,8 @@ static const Tun tun[] =
     { "WMAP",   &g_wmap,        0.0f,   1.0f },
     { "WADR",   &g_wadr,        1234.0f, 4321.0f },
     { "WINV",   &g_winv,        0.0f,   1111.0f },
+    { "WROL",   &g_wrol,        0.0f,   2.0f },
+    { "WQ",     &g_wq,         -0.5f,   0.5f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -448,6 +453,39 @@ static uint8_t Wheel_Dir(uint8_t i, uint8_t dir)
     return (uint8_t)(dir ^ k_wheel_fwd[i] ^ k_wheel_fwd[a[i] - 1] ^ v[i]);
 }
 
+/* (10-17 用户)麦轮装法不标准时的换算。程序里各处都按标准装法算 4 个轮子(0 右前 1 左前 2 右后 3 左后)的速度：
+ *   前进 (1,1,1,1)、左移 (1,-1,-1,1)、逆时针转 (1,-1,1,-1)。
+ * 这里先算出车身要怎么动(前进 vx、左移 vy、转 wr)，再按实际装法分给 4 个轮子：
+ *   WROL=1(后面两个装反，右边两个辊子一样、左边两个一样)：左移 = 右边往前、左边往后；转 = 只靠前面两个轮子
+ *   WROL=2(前面两个装反)：左移 = 右边往后、左边往前；转 = 只靠后面两个轮子
+ * (按麦轮运动学：每个轮子 = vx + 辊子方向×vy + (辊子方向×前后位置 - 左右位置)×wr) */
+static void Wheel_Mix(float s[4])
+{
+    float vx, vy, wr, q = g_wq;
+
+    if (g_wrol < 0.5f)
+    {
+        return;
+    }
+    vx = (s[0] + s[1] + s[2] + s[3]) * 0.25f;
+    vy = (s[0] - s[1] - s[2] + s[3]) * 0.25f;
+    wr = (s[0] - s[1] + s[2] - s[3]) * 0.25f;
+    if (g_wrol < 1.5f)
+    {
+        s[0] = vx + vy + wr;
+        s[1] = vx - vy - wr;
+        s[2] = vx + vy + q * wr;
+        s[3] = vx - vy - q * wr;
+    }
+    else
+    {
+        s[0] = vx - vy + q * wr;
+        s[1] = vx + vy - q * wr;
+        s[2] = vx - vy + wr;
+        s[3] = vx + vy - wr;
+    }
+}
+
 /* (10-17 用户)WT n：只转 n 号驱动器(1~4)，按程序里第 n 个轮子"往前"的方向转 2 秒再停。
  * 车架空一个一个试：看是哪个轮子在转、往前还是往后，就能填 WADR/WINV。不经过 WADR/WINV，急停(!)马上停 */
 void Car_Wheel_Test(uint8_t addr, uint16_t rpm)
@@ -468,10 +506,24 @@ void Car_Wheel_Test(uint8_t addr, uint16_t rpm)
     HAL_Delay(10);
 }
 
+static void Car_Drive_Signed(const int32_t s[4], uint16_t speed);
+
 static void Car_Drive(const uint8_t dirs[4], uint16_t speed, uint32_t pulse)
 {
     unsigned int i;
 
+    if (g_wrol >= 0.5f)
+    {
+        /* 麦轮装法不标准：换成带符号脉冲，在 Car_Drive_Signed 里按实际装法换算 */
+        int32_t sp[4];
+
+        for (i = 0; i < 4; i++)
+        {
+            sp[i] = (dirs[i] == k_wheel_fwd[i]) ? (int32_t)pulse : -(int32_t)pulse;
+        }
+        Car_Drive_Signed(sp, speed);
+        return;
+    }
     for (i = 0; i < 4; i++)
     {
         Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dirs[i]), speed, MOVE_ACC, pulse, 0, true);
@@ -483,12 +535,21 @@ static void Car_Drive(const uint8_t dirs[4], uint16_t speed, uint32_t pulse)
 
 
 /* 带符号脉冲：s>0 该轮前进，s<0 该轮后退；各轮速度按脉冲数成比例，保证同时到位 */
-static void Car_Drive_Signed(const int32_t s[4], uint16_t speed)
+static void Car_Drive_Signed(const int32_t s_in[4], uint16_t speed)
 {
     static const uint8_t fwd[4] = {0, 1, 1, 0};     /* 和 Car_Forward 的方向表一致 */
     int32_t smax = 0;
+    int32_t s[4];
     unsigned int i;
 
+    {
+        /* (10-17)麦轮装法不标准时按实际装法换算(WROL=0 原样) */
+        float f[4];
+
+        for (i = 0; i < 4; i++) f[i] = (float)s_in[i];
+        Wheel_Mix(f);
+        for (i = 0; i < 4; i++) s[i] = (int32_t)((f[i] >= 0.0f) ? (f[i] + 0.5f) : (f[i] - 0.5f));
+    }
     for (i = 0; i < 4; i++)
     {
         int32_t a = (s[i] < 0) ? -s[i] : s[i];
@@ -1072,14 +1133,24 @@ void Car_Forward_Hold(uint16_t speed, float distance_mm)
         pr = step + (int32_t)corr;     /* 物理右侧：ID1、ID3 */
         pl = step - (int32_t)corr;     /* 物理左侧：ID2、ID4 */
 
-        for (i = 0; i < 4; i++)
+        if (g_wrol >= 0.5f)
         {
-            uint32_t p = (uint32_t)((i == 0 || i == 2) ? pr : pl);
+            int32_t sp[4];
 
-            Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dirs[i]), speed, MOVE_ACC, p, 0, true);
-            HAL_Delay(10);
+            sp[0] = pr; sp[1] = pl; sp[2] = pr; sp[3] = pl;
+            Car_Drive_Signed(sp, speed);       /* (10-17)麦轮装法不标准：按实际装法换算 */
         }
-        Emm_V5_Synchronous_motion(0x00);
+        else
+        {
+            for (i = 0; i < 4; i++)
+            {
+                uint32_t p = (uint32_t)((i == 0 || i == 2) ? pr : pl);
+
+                Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dirs[i]), speed, MOVE_ACC, p, 0, true);
+                HAL_Delay(10);
+            }
+            Emm_V5_Synchronous_motion(0x00);
+        }
 
         pmax = (pr > pl) ? pr : pl;
         HAL_Delay((uint32_t)((float)pmax * 60000.0f / ((float)speed * PULSES_PER_REV)) + 15);
@@ -1095,11 +1166,14 @@ void Car_Forward_Hold(uint16_t speed, float distance_mm)
 
 /* 4 个轮子按带符号速度转：s>0 该轮往前，s<0 往后，单位 转/分
  * ID1、ID3 在车的右侧，ID2、ID4 在左侧 */
-static void Wheels_Vel(const float s[4])
+static void Wheels_Vel(const float s_in[4])
 {
     static const uint8_t fwd[4] = {0, 1, 1, 0};   /* 和 Car_Forward 的方向表一致 */
+    float s[4];
     uint8_t i;
 
+    for (i = 0; i < 4; i++) s[i] = s_in[i];
+    Wheel_Mix(s);                                 /* (10-17)麦轮装法不标准时按实际装法换算 */
     for (i = 0; i < 4; i++)
     {
         float a = (s[i] < 0.0f) ? -s[i] : s[i];
@@ -2078,4 +2152,88 @@ void Car_Vel_Read(float *s_mm, float *f_mm)
 uint8_t Car_Vel_On(void)
 {
     return vel_on;
+}
+
+
+/* ================= (10-17 用户)WCHK：自动判断麦轮是怎么装的 =================
+ * 车放在地上(周围留 30cm)。按标准装法分别给"逆时针原地转"和"左移"的轮速各走 0.6 秒、再反过来走回去，
+ * 用陀螺仪看车头转了多少(去回两次取平均，抵消车自己的漂)：
+ *   原地转的轮速车头转得动、左移的轮速车头基本不转 → 标准装法(WROL 0)
+ *   原地转的轮速车头基本不转、左移的轮速车头猛转   → 有一对左右装反：逆时针转是 WROL 1(后面两个反)，顺时针是 WROL 2(前面两个反)
+ *   两个都基本不转                               → 四个轮子整体装反(MODE 3)：程序补不了，前两个、后两个都要左右对调
+ * 打印 "WCHK R=.. S=.. R0=.. MODE=.."(R、S、R0 是 0.1 度：原地转、左移时车头转的角度，标准装法原地转应该转的角度)。只报告，不改参数 */
+#define WCHK_RPM   20.0f
+#define WCHK_MS    600u
+
+static float Wchk_Leg(float sgn, uint8_t rot)
+{
+    float s[4];
+    float y0, y1;
+    uint32_t t0;
+
+    y0 = Yaw_Median5();
+    if (rot)
+    {
+        s[0] = sgn * WCHK_RPM; s[1] = -sgn * WCHK_RPM; s[2] = sgn * WCHK_RPM; s[3] = -sgn * WCHK_RPM;
+    }
+    else
+    {
+        s[0] = sgn * WCHK_RPM; s[1] = -sgn * WCHK_RPM; s[2] = -sgn * WCHK_RPM; s[3] = sgn * WCHK_RPM;
+    }
+    Wheels_Vel(s);
+    t0 = HAL_GetTick();
+    while (!car_abort && (HAL_GetTick() - t0) < WCHK_MS)
+    {
+        HAL_Delay(10);
+    }
+    s[0] = s[1] = s[2] = s[3] = 0.0f;
+    Wheels_Vel(s);
+    Stop_Quick();
+    HAL_Delay(400);
+    y1 = Yaw_Median5();
+    return HWT101_AngleDiff(y1, y0);
+}
+
+int Car_Wheel_Check(void)
+{
+    float keep = g_wrol;
+    float k = PULSES_PER_REV / 60.0f / PULSE_PER_DEG;
+    float r0 = WCHK_RPM * k * (float)WCHK_MS / 1000.0f;
+    float dr, ds;
+    int mode;
+    char m[80];
+
+    if (!HWT101_IsFresh(500))
+    {
+        return -2;
+    }
+    Car_Motor_Enable();
+    g_wrol = 0.0f;                                    /* 按标准装法给轮速 */
+    dr = 0.5f * (Wchk_Leg(1.0f, 1) - Wchk_Leg(-1.0f, 1));
+    ds = 0.5f * (Wchk_Leg(1.0f, 0) - Wchk_Leg(-1.0f, 0));
+    g_wrol = keep;
+    if (car_abort)
+    {
+        return -3;
+    }
+
+    if (dr >= 0.4f * r0 && Absf(ds) <= 0.3f * dr)
+    {
+        mode = 0;
+    }
+    else if (Absf(dr) <= 0.3f * r0 && Absf(ds) >= 0.5f * r0)
+    {
+        mode = (ds > 0.0f) ? 1 : 2;
+    }
+    else if (Absf(dr) <= 0.3f * r0 && Absf(ds) <= 0.3f * r0)
+    {
+        mode = 3;
+    }
+    else
+    {
+        mode = -1;                                    /* 看不出来：把数字发给我们 */
+    }
+    snprintf(m, sizeof(m), "WCHK R=%d S=%d R0=%d MODE=%d\r\n", (int)(dr * 10.0f), (int)(ds * 10.0f), (int)(r0 * 10.0f), mode);
+    Link_Say(m);
+    return mode;
 }

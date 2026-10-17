@@ -111,6 +111,45 @@ uint32_t fake_uart4_poll(void)
     return 0u;
 }
 
+/* (10-17)假车的麦轮装法：0 标准；1 后面两个左右装反；2 前面两个左右装反；3 四个整体装反(方车，转不动) */
+static int hw_rol = 0;
+
+/* 4 个轮子实际转速 → 车身 前进/左移/转(都按"轮子 转/分"算)。装法不标准时按那种装法的运动学取最小二乘(轮速对不上时打滑) */
+static void body_from_wheels(const double w[4], double *fwd, double *lat, double *rot)
+{
+    static const double ks[4][4] = { {1, -1, -1, 1}, {1, -1, 1, -1}, {-1, 1, -1, 1}, {-1, 1, 1, -1} };
+    static const double kr[4][4] = { {1, -1, 1, -1}, {1, -1, 0, 0},  {0, 0, 1, -1},  {0, 0, 0, 0} };
+    double a = 0, bb = 0, d = 0, ys = 0, yr = 0, det;
+    int i, m = hw_rol;
+
+    *fwd = (w[0] + w[1] + w[2] + w[3]) / 4.0;
+    if (m == 0)
+    {
+        *rot = (w[0] - w[1] + w[2] - w[3]) / 4.0;
+        *lat = (w[0] - w[1] - w[2] + w[3]) / 4.0;     /* 左移为正 */
+        return;
+    }
+    for (i = 0; i < 4; i++)
+    {
+        a  += ks[m][i] * ks[m][i];
+        bb += ks[m][i] * kr[m][i];
+        d  += kr[m][i] * kr[m][i];
+        ys += ks[m][i] * w[i];
+        yr += kr[m][i] * w[i];
+    }
+    det = a * d - bb * bb;
+    if (det < 1e-9)
+    {
+        *lat = ys / a;
+        *rot = 0.0;
+    }
+    else
+    {
+        *lat = (ys * d - bb * yr) / det;
+        *rot = (a * yr - bb * ys) / det;
+    }
+}
+
 static void step_1ms(void)
 {
     double dt = 0.001, target_rate, rot, lat, fwd, al, c, vf_t, vl_t, yr;
@@ -129,9 +168,7 @@ static void step_1ms(void)
         else                 { w_act[i] -= acc_rpm_s * dt; if (w_act[i] < want) w_act[i] = want; }
     }
     /* 和 chassis.c 一样：s0 - s1 + s2 - s3 的平均 = 车身转速对应的轮速；1 转/分 ≈ 3200/60/25.4 度/秒 */
-    rot = (w_act[0] - w_act[1] + w_act[2] - w_act[3]) / 4.0;
-    lat = (w_act[0] - w_act[1] - w_act[2] + w_act[3]) / 4.0;     /* 左移为正 */
-    fwd = (w_act[0] + w_act[1] + w_act[2] + w_act[3]) / 4.0;
+    body_from_wheels(w_act, &fwd, &lat, &rot);
     al  = fabs(lat);
     di  = (lat >= 0.0) ? 0 : 1;
     c   = (al < fabs(lat_prev) - 1e-9) ? ss_c[di][1] : ss_c[di][0];   /* 横移在减速：CD，否则 CA */
@@ -332,7 +369,7 @@ static void reset_car(void)
     pos_cmds = 0;
     px = py = vf_b = vl_b = vl_w = 0.0; lat_prev = 0.0;
     memset(ss_c, 0, sizeof(ss_c)); memset(ss_drift, 0, sizeof(ss_drift));
-    hw_swap34 = 0;
+    hw_swap34 = 0; hw_rol = 0;
     fwd_yaw = 0.0; fwd_drift = 0.0; noise_sd = 0.0; gyro_frame_t = 0xFFFFFFFFu; rng = 12345u;
     abort_at = -1; kick_deg = 0.0;
     log_on = 0; log_n = 0;
@@ -705,6 +742,62 @@ static void test_wt(void)
     hw_swap34 = 0;
 }
 
+/* (10-17 用户)麦轮装法：WCHK 自动判断；WROL=1/2(一对左右装反)以后直走、横移、原地转都正常 */
+static void test_rol(void)
+{
+    static const char *nm[4] = { "标准", "后两个装反", "前两个装反", "整体装反" };
+    int h;
+
+    printf("== WCHK + WROL：麦轮装法不标准\n");
+    for (h = 0; h <= 3; h++)
+    {
+        int mo;
+        const char *q;
+        double ye;
+
+        reset_car(); user_params();
+        hw_rol = h;
+        Car_Param_Set("WROL", 0.0f);
+        out3_n = 0; out3[0] = 0;
+        mo = Car_Wheel_Check();
+        q = strstr(out3, "WCHK ");
+        printf("   %s：%s", nm[h], q ? q : "(没有输出)\n");
+        CHECK(mo == h && q != NULL, "WCHK 应该判断出装法 %d，实际 %d", h, mo);
+        if (h == 1 || h == 2)
+        {
+            reset_car(); user_params(); hw_rol = h;
+            CHECK(Car_Param_Set("WROL", (float)h) == 1, "SET WROL");
+            Car_Straight_Closed(150, 1000.0f); ye = settle_yaw();
+            CHECK(fabs(px - 1000.0) < 3.0 && fabs(py) < 10.0 && fabs(ye) < 0.5, "WROL %d：F 1000 走 %.1f 横偏 %.1f 车头 %.2f°", h, px, py, ye);
+            reset_car(); user_params(); hw_rol = h; Car_Param_Set("WROL", (float)h);
+            Car_Strafe_Closed(140, 300.0f); ye = settle_yaw();
+            CHECK(fabs(py - 300.0) < 12.0 && fabs(px) < 10.0 && fabs(ye) < 1.0, "WROL %d：S 300 横移 %.1f 前后 %.1f 车头 %.2f°", h, py, px, ye);
+            reset_car(); user_params(); hw_rol = h; Car_Param_Set("WROL", (float)h);
+            Car_Strafe_Closed(140, -300.0f); ye = settle_yaw();
+            CHECK(fabs(py + 300.0) < 12.0 && fabs(px) < 10.0 && fabs(ye) < 1.0, "WROL %d：S -300 横移 %.1f 前后 %.1f 车头 %.2f°", h, py, px, ye);
+            reset_car(); user_params(); hw_rol = h; Car_Param_Set("WROL", (float)h);
+            Car_TurnBy_Center(90.0f); ye = settle_yaw();
+            CHECK(!car_stalled && fabs(wrap180(ye - 90.0)) < 1.0, "WROL %d：R 90 车头 %.2f° stalled=%d", h, ye, car_stalled);
+            reset_car(); user_params(); hw_rol = h; Car_Param_Set("WROL", (float)h);
+            Car_TurnBy_Center(-90.0f); ye = settle_yaw();
+            CHECK(!car_stalled && fabs(wrap180(ye + 90.0)) < 1.0, "WROL %d：R -90 车头 %.2f° stalled=%d", h, ye, car_stalled);
+            printf("   WROL %d：F/S/R 都正常\n", h);
+        }
+    }
+    {
+        /* 对照：后两个装反、还按标准装法算(WROL 0)：横移变成原地打转 */
+        double ye;
+        reset_car(); user_params();
+        hw_rol = 1;
+        Car_Param_Set("WROL", 0.0f);
+        Car_Strafe_Closed(140, 300.0f); ye = settle_yaw();
+        printf("   对照(后两个装反、WROL 0)：S 300 横移 %.1f mm，车头 %.1f°\n", py, ye);
+        CHECK(fabs(py - 300.0) > 60.0 || fabs(ye) > 10.0, "对照：WROL 0 时这台车横移应该是乱的");
+    }
+    Car_Param_Set("WROL", 0.0f);
+    hw_rol = 0;
+}
+
 /* 记录里第 k 条的走的速度(前进分量和横移分量里大的那个，转/分；差速不算) */
 static double log_move(int k)
 {
@@ -1052,6 +1145,7 @@ int main(void)
     test_drift();
     test_wmap();
     test_wt();
+    test_rol();
     test_vel();
     test_precision();
     test_parse();

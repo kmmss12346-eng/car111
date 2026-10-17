@@ -745,6 +745,15 @@ void Link_Poll(void)
         Link_Reply("DONE\r\n");
         return;
     }
+    /* (10-17 用户)WCHK：车放在地上，自动判断麦轮是怎么装的(打印 WCHK ... MODE=)，只报告不改参数 */
+    if (strcmp(cmd, "WCHK") == 0)
+    {
+        int mo = Car_Wheel_Check();
+        if (mo == -2)      Link_Reply("ERR GYRO\r\n");
+        else if (mo == -3) Link_Reply("ERR ABORT\r\n");
+        else               Link_Reply("DONE\r\n");
+        return;
+    }
     /* (10-17 用户)WT n [转速]：只转 n 号轮子驱动器(1~4) 2 秒，默认 30 转/分。车架空看是哪个轮子、往前还是往后 */
     if (cmd[0] == 'W' && cmd[1] == 'T' && cmd[2] == ' ')
     {
