@@ -218,17 +218,30 @@ float HWT101_GetYawContinuous(void) { return (float)yaw; }
 uint8_t HWT101_IsFresh(uint32_t timeout_ms) { (void)timeout_ms; return 1; }
 uint8_t HWT101_IsReady(void) { return 1; }
 
+/* (10-17)hw_swap34=1：假车右后轮接的是 ID4、左后轮接的是 ID3(驱动器方向跟着各自那一侧的前轮) */
+static int hw_swap34 = 0;
+
+static int phys_of(uint8_t addr)
+{
+    int i = addr - 1;
+    return (hw_swap34 && i >= 2) ? 5 - i : i;
+}
+
 static double signed_rpm(int i, uint8_t dir, uint16_t vel)
 {
-    return (dir == fwd_tab[i]) ? (double)vel : -(double)vel;
+    uint8_t f = (hw_swap34 && i >= 2) ? (uint8_t)(1 - fwd_tab[i]) : fwd_tab[i];
+    return (dir == f) ? (double)vel : -(double)vel;
 }
 
 void Emm_V5_Vel_Control(uint8_t addr, uint8_t dir, uint16_t vel, uint8_t acc, bool snF)
 {
     (void)acc;
     if (addr < 1 || addr > 4) return;
-    if (snF) { w_pend[addr - 1] = signed_rpm(addr - 1, dir, vel); pend_set[addr - 1] = 1; }
-    else     { w_cmd[addr - 1]  = signed_rpm(addr - 1, dir, vel); pos_left[addr - 1] = 0.0; }
+    {
+        int p = phys_of(addr);
+        if (snF) { w_pend[p] = signed_rpm(p, dir, vel); pend_set[p] = 1; }
+        else     { w_cmd[p]  = signed_rpm(p, dir, vel); pos_left[p] = 0.0; }
+    }
 }
 
 void Emm_V5_Pos_Control(uint8_t addr, uint8_t dir, uint16_t vel, uint8_t acc, uint32_t clk, bool raF, bool snF)
@@ -236,8 +249,8 @@ void Emm_V5_Pos_Control(uint8_t addr, uint8_t dir, uint16_t vel, uint8_t acc, ui
     (void)acc; (void)raF; (void)snF;
     if (addr < 1 || addr > 4) return;
     pos_cmds++;
-    pos_vel[addr - 1] = signed_rpm(addr - 1, dir, vel);
-    pos_left[addr - 1] = (double)clk;
+    pos_vel[phys_of(addr)] = signed_rpm(phys_of(addr), dir, vel);
+    pos_left[phys_of(addr)] = (double)clk;
 }
 
 void Emm_V5_Stop_Now(uint8_t addr, bool snF)
@@ -315,6 +328,7 @@ static void reset_car(void)
     pos_cmds = 0;
     px = py = vf_b = vl_b = vl_w = 0.0; lat_prev = 0.0;
     memset(ss_c, 0, sizeof(ss_c)); memset(ss_drift, 0, sizeof(ss_drift));
+    hw_swap34 = 0;
     fwd_yaw = 0.0; fwd_drift = 0.0; noise_sd = 0.0; gyro_frame_t = 0xFFFFFFFFu; rng = 12345u;
     abort_at = -1; kick_deg = 0.0;
     log_on = 0; log_n = 0;
@@ -581,6 +595,45 @@ static void test_strafe(float mm)
     CHECK(fabs(ye) < 1.0, "S %.0f 停下车头误差 %.2f°", mm, ye);
     CHECK(fabs(py - mm) < 0.03 * fabs(mm) + 3.0, "S %.0f 实际横移 %.1f mm", mm, py);
     CHECK(fabs(px) < 10.0, "S %.0f 前后漂了 %.1f mm", mm, px);
+}
+
+/* (10-17 用户)后面两个驱动器地址对调(右后=ID4、左后=ID3)：横移变成原地转；WMAP=1 以后横移、直走都正常 */
+static void test_wmap(void)
+{
+    double ye;
+
+    printf("== WMAP：右后轮接 ID4、左后轮接 ID3 的车\n");
+    reset_car(); user_params();
+    hw_swap34 = 1;
+    Car_Strafe_Closed(140, 300.0f);
+    ye = settle_yaw();
+    printf("   WMAP=0：S 300 横移 %.1f mm，前后 %.1f mm，车头 %.2f°\n", py, px, ye);
+    CHECK(fabs(py - 300.0) > 60.0, "WMAP=0 时这台车横移应该是乱的(横移 %.1f mm)", py);
+
+    reset_car(); user_params();
+    hw_swap34 = 1;
+    CHECK(Car_Param_Set("WMAP", 1.0f) == 1, "SET WMAP");
+    Car_Strafe_Closed(140, 300.0f);
+    ye = settle_yaw();
+    printf("   WMAP=1：S 300 横移 %.1f mm，前后 %.1f mm，车头 %.2f°\n", py, px, ye);
+    CHECK(fabs(py - 300.0) < 12.0 && fabs(px) < 10.0 && fabs(ye) < 1.0, "WMAP=1：S 300 横移 %.1f 前后 %.1f 车头 %.2f°", py, px, ye);
+
+    reset_car(); user_params();
+    hw_swap34 = 1;
+    Car_Param_Set("WMAP", 1.0f);
+    Car_Straight_Closed(150, 1000.0f);
+    ye = settle_yaw();
+    CHECK(fabs(px - 1000.0) < 3.0 && fabs(py) < 10.0 && fabs(ye) < 0.5, "WMAP=1：F 1000 走 %.1f 横偏 %.1f 车头 %.2f°", px, py, ye);
+
+    reset_car(); user_params();
+    hw_swap34 = 1;
+    Car_Param_Set("WMAP", 1.0f);
+    Car_TurnBy_Center(90.0f);
+    ye = settle_yaw();
+    CHECK(fabs(wrap180(ye - 90.0)) < 1.0 || fabs(wrap180(ye + 90.0)) < 1.0, "WMAP=1：转 90° 后车头 %.2f°", ye);
+
+    Car_Param_Set("WMAP", 0.0f);
+    hw_swap34 = 0;
 }
 
 /* 记录里第 k 条的走的速度(前进分量和横移分量里大的那个，转/分；差速不算) */
@@ -928,6 +981,7 @@ int main(void)
     test_abort();
 #ifndef CHASSIS_V12A
     test_drift();
+    test_wmap();
     test_vel();
     test_precision();
     test_parse();

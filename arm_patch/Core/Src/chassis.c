@@ -120,6 +120,7 @@ static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化�
 static float g_sc_cm   = 0.25f;     /* (10-17)SCCM：直行纠偏量最多占当前速度的比例(以前写死 0.25)；刹车时车头甩得厉害就调大 */
 static float g_sc_imax = 6.0f;      /* (10-17)SCIM：直行积分最多贡献多少 转/分(以前写死 6)；车天生往一边拐得厉害就调大，积分自己把它纠掉 */
 static float g_sc_blrn[2] = { 1.0f, 1.0f };  /* (10-17 用户)SCBLF/SCBLB：1 = 前进/后退走完自动学 SCBF/SCBB；0 = 锁住不学 */
+static float g_wmap = 0.0f;         /* (10-17 用户)WMAP：0 = ID3 右后、ID4 左后(原来的接法)；1 = ID3 左后、ID4 右后(两个后轮驱动器地址对调了) */
 static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
@@ -200,6 +201,7 @@ static const Tun tun[] =
     { "SCIM",   &g_sc_imax,     0.0f,   40.0f },
     { "SCBLF",  &g_sc_blrn[0],  0.0f,   1.0f },
     { "SCBLB",  &g_sc_blrn[1],  0.0f,   1.0f },
+    { "WMAP",   &g_wmap,        0.0f,   1.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -372,13 +374,25 @@ static void Wheels_Vel(const float s[4]);
 /* ================= 底层：4 个电机同时按指定方向走 pulse 脉冲 =================
  * dirs[0..3] 分别是 ID1..ID4 的方向。
  * 注意：ID1、ID3 在车的物理右侧，ID2、ID4 在物理左侧。 */
+/* 第 i 个轮子(0 右前 1 左前 2 右后 3 左后)的驱动器地址和方向。
+ * WMAP=1：右后接的是 ID4、左后接的是 ID3，方向跟着各自那一侧的前轮，所以地址对调、方向取反(直走时发给 ID3/ID4 的指令和原来一模一样) */
+static uint8_t Wheel_Addr(uint8_t i)
+{
+    return (g_wmap >= 0.5f && i >= 2) ? (uint8_t)(6 - i) : (uint8_t)(i + 1);
+}
+
+static uint8_t Wheel_Dir(uint8_t i, uint8_t dir)
+{
+    return (g_wmap >= 0.5f && i >= 2) ? (uint8_t)(1 - dir) : dir;
+}
+
 static void Car_Drive(const uint8_t dirs[4], uint16_t speed, uint32_t pulse)
 {
     unsigned int i;
 
     for (i = 0; i < 4; i++)
     {
-        Emm_V5_Pos_Control(i + 1, dirs[i], speed, MOVE_ACC, pulse, 0, true);
+        Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dirs[i]), speed, MOVE_ACC, pulse, 0, true);
         HAL_Delay(10);
     }
 
@@ -427,7 +441,7 @@ static void Car_Drive_Signed(const int32_t s[4], uint16_t speed)
                 if (a2 < 1) a2 = 1;
                 acc_i = (uint8_t)a2;
             }
-            Emm_V5_Pos_Control(i + 1, dir, v, acc_i, (uint32_t)a, 0, true);
+            Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dir), v, acc_i, (uint32_t)a, 0, true);
         }
         HAL_Delay(10);
     }
@@ -980,7 +994,7 @@ void Car_Forward_Hold(uint16_t speed, float distance_mm)
         {
             uint32_t p = (uint32_t)((i == 0 || i == 2) ? pr : pl);
 
-            Emm_V5_Pos_Control(i + 1, dirs[i], speed, MOVE_ACC, p, 0, true);
+            Emm_V5_Pos_Control(Wheel_Addr(i), Wheel_Dir(i, dirs[i]), speed, MOVE_ACC, p, 0, true);
             HAL_Delay(10);
         }
         Emm_V5_Synchronous_motion(0x00);
@@ -1009,7 +1023,7 @@ static void Wheels_Vel(const float s[4])
         float a = (s[i] < 0.0f) ? -s[i] : s[i];
         uint8_t dir = (s[i] >= 0.0f) ? fwd[i] : (uint8_t)(1 - fwd[i]);
 
-        Emm_V5_Vel_Control(i + 1, dir, (uint16_t)(a + 0.5f), SC_EMM_ACC, true);
+        Emm_V5_Vel_Control(Wheel_Addr(i), Wheel_Dir(i, dir), (uint16_t)(a + 0.5f), SC_EMM_ACC, true);
         HAL_Delay(SC_CMD_GAP_MS);
     }
     Emm_V5_Synchronous_motion(0x00);
