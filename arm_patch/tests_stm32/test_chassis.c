@@ -521,6 +521,37 @@ static void test_drift(void)
         }
         printf("   后退天生拐：SCIM=6 匀速后段车头平均偏 %.2f°，SCIM=25 %.2f°\n", e6, e25);
         CHECK(e6 > 1.2 && e25 < e6 * 0.6, "SCIM=25 应明显压住车头偏差(%.2f -> %.2f°)", e6, e25);
+        {
+            /* (10-17 用户)SCBLB=0：后退走完不再自动改 SCBB；前进照常学 SCBF */
+            int lk;
+            for (lk = 0; lk < 2; lk++)
+            {
+                const char *q;
+                reset_car(); user_params();
+                Car_Param_Set("SCBB", 0.02f);
+                Car_Param_Set("SCBF", 0.02f);
+                CHECK(Car_Param_Set("SCBLB", lk ? 0.0f : 1.0f) == 1, "SET SCBLB");
+                fwd_yaw = 0.03;
+                Car_Straight_Closed(150, -2000.0f);
+                Car_Straight_Closed(150, 2000.0f);
+                out3_n = 0; out3[0] = 0;
+                Car_Param_Dump();
+                q = strstr(out3, "P SCBB=");
+                if (lk)
+                {
+                    CHECK(q && fabs(atof(q + 7) - 0.02) < 1e-4, "SCBLB=0：SCBB 锁住不变(%.10s)", q ? q + 7 : "?");
+                    q = strstr(out3, "P SCBF=");
+                    CHECK(q && fabs(atof(q + 7) - 0.02) > 1e-3, "SCBLB=0：SCBF 照常学习(%.10s)", q ? q + 7 : "?");
+                }
+                else
+                {
+                    CHECK(q && fabs(atof(q + 7) - 0.02) > 1e-3, "SCBLB=1：SCBB 照常学习(%.10s)", q ? q + 7 : "?");
+                }
+            }
+            Car_Param_Set("SCBLB", 1.0f);
+            Car_Param_Set("SCBB", 0.0f);
+            Car_Param_Set("SCBF", 0.0f);
+        }
         fwd_yaw = 0.0;
         Car_Param_Set("SCIM", 6.0f); Car_Param_Set("SCCM", 0.25f);
     }

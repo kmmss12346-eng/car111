@@ -119,6 +119,7 @@ static float g_sc_lpf  = 0.08f;     /* v12a：直行时车头误差的低通滤�
 static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化多少 转/分，0=不限制 */
 static float g_sc_cm   = 0.25f;     /* (10-17)SCCM：直行纠偏量最多占当前速度的比例(以前写死 0.25)；刹车时车头甩得厉害就调大 */
 static float g_sc_imax = 6.0f;      /* (10-17)SCIM：直行积分最多贡献多少 转/分(以前写死 6)；车天生往一边拐得厉害就调大，积分自己把它纠掉 */
+static float g_sc_blrn[2] = { 1.0f, 1.0f };  /* (10-17 用户)SCBLF/SCBLB：1 = 前进/后退走完自动学 SCBF/SCBB；0 = 锁住不学 */
 static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
@@ -197,6 +198,8 @@ static const Tun tun[] =
     { "SCCM",   &g_sc_cm,       0.05f,  1.0f },
     { "SCDEC",  &g_sc_dec,      0.0f,   600.0f },
     { "SCIM",   &g_sc_imax,     0.0f,   40.0f },
+    { "SCBLF",  &g_sc_blrn[0],  0.0f,   1.0f },
+    { "SCBLB",  &g_sc_blrn[1],  0.0f,   1.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -1229,7 +1232,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
         float ym = Yaw_Median5();
 
         /* 学习偏向：巡航够久、结束时车头基本正，才更新(撞到东西/打滑的那次不学) */
-        if (!car_abort && bn >= 12 && bw > 1.0 && Absf(Wrap180(yaw_target - ym)) < 2.0f)
+        if (g_sc_blrn[di] >= 0.5f && !car_abort && bn >= 12 && bw > 1.0 && Absf(Wrap180(yaw_target - ym)) < 2.0f)
         {
             float b = g_sc_bias[di] + 0.6f * (float)(bsum / bw);
 
