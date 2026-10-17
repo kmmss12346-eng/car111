@@ -117,6 +117,8 @@ static float g_sc_kp   = 2.0f;      /* 直行：车头每偏 1°，左右轮差�
 static float g_sc_ki   = 1.0f;      /* 直行积分 */
 static float g_sc_lpf  = 0.08f;     /* v12a：直行时车头误差的低通滤波时间常数(秒)，0=不滤波 */
 static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化多少 转/分，0=不限制 */
+static float g_sc_cm   = 0.25f;     /* (10-17)SCCM：直行纠偏量最多占当前速度的比例(以前写死 0.25)；刹车时车头甩得厉害就调大 */
+static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
 static float g_sc_bias[2] = { 0.0f, 0.0f };   /* 直行/后退 天生的偏向补偿(自动学习) */
@@ -191,6 +193,8 @@ static const Tun tun[] =
     { "SCRL",   &g_sc_rate,     0.0f,   500.0f },
     { "SCBF",   &g_sc_bias[0], -0.06f,  0.06f },
     { "SCBB",   &g_sc_bias[1], -0.06f,  0.06f },
+    { "SCCM",   &g_sc_cm,       0.05f,  1.0f },
+    { "SCDEC",  &g_sc_dec,      0.0f,   600.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -1063,7 +1067,8 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
     float acc    = (prec && g_p_acc < g_sc_acc) ? g_p_acc : g_sc_acc;
     float vmin   = prec ? g_p_min : SC_MIN_RPM;
     float creep  = prec ? P_CREEP_MM * ppm : 0.0f;                    /* 最后慢慢爬的脉冲数 */
-    float a_pps2 = acc * PULSES_PER_REV / 60.0f;
+    float dec    = (g_sc_dec >= 1.0f && !(prec && g_p_acc < g_sc_dec)) ? g_sc_dec : acc;   /* (10-17)SCDEC：刹车单独的减速度 */
+    float a_pps2 = dec * PULSES_PER_REV / 60.0f;                     /* 按减速度算什么时候开始刹车 */
     float vmax   = (float)speed;
     float done   = 0.0f;
     float v      = 0.0f;
@@ -1155,7 +1160,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
             }
             integ += g_sc_ki * err * dt;
         }
-        lim = SC_CORR_MAX * v;
+        lim = g_sc_cm * v;                        /* (10-17)SCCM，默认 0.25(以前写死的 SC_CORR_MAX) */
         if (integ >  SC_I_MAX) integ =  SC_I_MAX;
         if (integ < -SC_I_MAX) integ = -SC_I_MAX;
         pi_out = SC_SIGN * (g_sc_kp * err + integ);

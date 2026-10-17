@@ -475,6 +475,18 @@ static void test_drift(void)
     fwd_drift = 0.02;
     Car_Straight_Closed(150, -1000.0f);
     CHECK(fabs(py) < 4.0 && fabs(px + 1000.0) < 8.0, "SCDB=0.02：F -1000 横偏 %.1f mm，走了 %.1f mm", py, px);
+    {
+        uint32_t ta, tb;
+        reset_car(); user_params();
+        ta = now_ms; Car_Straight_Closed(150, 1000.0f); ta = now_ms - ta;
+        reset_car(); user_params();
+        CHECK(Car_Param_Set("SCDEC", 60.0f) == 1 && Car_Param_Set("SCCM", 0.6f) == 1, "SET SCDEC/SCCM");
+        tb = now_ms; Car_Straight_Closed(150, 1000.0f); tb = now_ms - tb;
+        CHECK(tb > ta + 300 && fabs(px - 1000.0) < 8.0 && fabs(settle_yaw()) < 0.5,
+              "SCDEC=60：刹车更慢(用时 %u -> %u ms)，照样走 1000mm(%.1f)", (unsigned)ta, (unsigned)tb, px);
+        Car_Param_Set("SCDEC", 0.0f);
+        Car_Param_Set("SCCM", 0.25f);
+    }
     CHECK(Car_Param_Set("SCDF", 0.5f) == 2, "SCDF 超出范围被拒绝");
     Car_Param_Set("SCDF", 0.0f);
     Car_Param_Set("SCDB", 0.0f);
