@@ -752,7 +752,7 @@ def main():
                 ps,rep_=link.get_params()
                 if ps is None:raise ValueError('读 STM32 参数失败：'+str(rep_))
                 if n_ not in ps:raise ValueError(f'STM32 里没有 {n_}：先刷新的 chassis.c / main.c')
-                old=ps[n_];new=old-left/dist_       # (10-17 用户实测：+ 号方向反了，按实际改成减)
+                old=ps[n_];new=old+left/dist_       # SCDF/SCDB = 车天生每走 1mm 往左平移多少，往左偏就加大(补偿往右横移)。(10-17 之前改成减，是因为那时前两个电机接反、横移变成了旋转；WADR 2134 接对以后改回加)
                 ok_,rep_=link.set_param(n_,new)
                 if not ok_:raise ValueError(f'STM32 拒绝：{rep_}')
                 save_params({n_:round(new,5)});print(f'{n_}: {old:.4f} → {new:.4f}，已存进配置。再走一次同样的距离验证。',flush=True);return
