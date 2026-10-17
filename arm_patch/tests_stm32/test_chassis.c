@@ -487,6 +487,43 @@ static void test_drift(void)
         Car_Param_Set("SCDEC", 0.0f);
         Car_Param_Set("SCCM", 0.25f);
     }
+    {
+        /* (10-17 用户)后退时车天生往一边拐、积分只有 6 转/分压不住：SCIM 放大以后车头偏差小很多 */
+        double e6 = 0.0, e25 = 0.0;
+        int k;
+        for (k = 0; k < 2; k++)
+        {
+            double m = 0.0;
+            int n = 0;
+            reset_car(); user_params();
+            Car_Param_Set("SCKP", 3.0f); Car_Param_Set("SCKI", 2.0f); Car_Param_Set("SCCM", 0.6f);
+            Car_Param_Set("SCBB", 0.0f);
+            CHECK(Car_Param_Set("SCIM", k ? 25.0f : 6.0f) == 1, "SET SCIM");
+            fwd_yaw = 0.15;
+            Car_Straight_Closed(150, -2000.0f);
+            out3_n = 0; out3[0] = 0;
+            Car_Trace_Dump();
+            {
+                const char *q = out3;
+                while ((q = strstr(q, "\r\nTR ")) != NULL)
+                {
+                    int mm, er;
+                    if (sscanf(q + 5, "%d %d", &mm, &er) == 2 && mm >= 1000 && mm <= 1700)
+                    {
+                        m += fabs(er / 100.0);
+                        n++;
+                    }
+                    q += 5;
+                }
+            }
+            if (n > 0) m /= n;
+            if (k) e25 = m; else e6 = m;
+        }
+        printf("   后退天生拐：SCIM=6 匀速后段车头平均偏 %.2f°，SCIM=25 %.2f°\n", e6, e25);
+        CHECK(e6 > 1.2 && e25 < e6 * 0.6, "SCIM=25 应明显压住车头偏差(%.2f -> %.2f°)", e6, e25);
+        fwd_yaw = 0.0;
+        Car_Param_Set("SCIM", 6.0f); Car_Param_Set("SCCM", 0.25f);
+    }
     CHECK(Car_Param_Set("SCDF", 0.5f) == 2, "SCDF 超出范围被拒绝");
     Car_Param_Set("SCDF", 0.0f);
     Car_Param_Set("SCDB", 0.0f);

@@ -118,6 +118,7 @@ static float g_sc_ki   = 1.0f;      /* 直行积分 */
 static float g_sc_lpf  = 0.08f;     /* v12a：直行时车头误差的低通滤波时间常数(秒)，0=不滤波 */
 static float g_sc_rate = 30.0f;     /* v12a：直行纠偏量每秒最多变化多少 转/分，0=不限制 */
 static float g_sc_cm   = 0.25f;     /* (10-17)SCCM：直行纠偏量最多占当前速度的比例(以前写死 0.25)；刹车时车头甩得厉害就调大 */
+static float g_sc_imax = 6.0f;      /* (10-17)SCIM：直行积分最多贡献多少 转/分(以前写死 6)；车天生往一边拐得厉害就调大，积分自己把它纠掉 */
 static float g_sc_dec  = 0.0f;      /* (10-17)SCDEC：直行刹车的减速度(转/分/秒)；0 = 和 SCACC 一样 */
 static float g_sc_drift[2] = { 0.0f, 0.0f };  /* (10-17 用户)SCDF/SCDB：前进/后退时车头是正的，整车每走 1mm 往左平移多少 mm(往右是负数)；
                                                 * 走的时候顺带往反方向横移这么多抵消。0 = 不补 */
@@ -195,6 +196,7 @@ static const Tun tun[] =
     { "SCBB",   &g_sc_bias[1], -0.2f,   0.2f },
     { "SCCM",   &g_sc_cm,       0.05f,  1.0f },
     { "SCDEC",  &g_sc_dec,      0.0f,   600.0f },
+    { "SCIM",   &g_sc_imax,     0.0f,   40.0f },
     { "SCDF",   &g_sc_drift[0], -0.1f,  0.1f },
     { "SCDB",   &g_sc_drift[1], -0.1f,  0.1f },
     { "SSACC",  &g_ss_acc,      30.0f,  600.0f },
@@ -337,7 +339,6 @@ uint8_t move_acc = 200;           /* 旧的位置模式动作、转弯后备方�
 #define SC_DEADBAND      0.2f     /* 偏差小于这么多度就不纠(陀螺仪噪声约 0.35°) */
 #define SC_DEADBAND_F    0.05f    /* v12a：滤波以后的死区(滤波后噪声只剩约 0.05°) */
 #define SC_CORR_MAX      0.25f    /* 直行纠偏量最多占当前速度的比例 */
-#define SC_I_MAX         6.0f     /* 直行积分最多贡献多少 转/分 */
 #define SC_BIAS_MAX      0.2f     /* (10-17)后退要 -0.13 左右：从 0.05 放宽 */
 #define SC_SIGN          1
 #define SC_CMD_GAP_MS    2        /* 给 4 个电机发指令之间的间隔 */
@@ -1161,8 +1162,8 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
             integ += g_sc_ki * err * dt;
         }
         lim = g_sc_cm * v;                        /* (10-17)SCCM，默认 0.25(以前写死的 SC_CORR_MAX) */
-        if (integ >  SC_I_MAX) integ =  SC_I_MAX;
-        if (integ < -SC_I_MAX) integ = -SC_I_MAX;
+        if (integ >  g_sc_imax) integ =  g_sc_imax;
+        if (integ < -g_sc_imax) integ = -g_sc_imax;
         pi_out = SC_SIGN * (g_sc_kp * err + integ);
         corr = pi_out + g_sc_bias[di] * v;
         if (g_sc_rate > 0.001f)
