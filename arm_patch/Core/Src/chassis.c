@@ -1031,6 +1031,28 @@ static uint8_t Prec_On(uint16_t speed)
 }
 
 /* 闭环直行 distance_mm：正数前进，负数后退 */
+/* (10-17 用户)直行记录：每 0.1 秒记一次 走了多少 mm、车头偏差、纠偏量、速度；TRACE? 打印上一次直行的记录 */
+#define TR_MAX 120
+static int16_t  tr_mm[TR_MAX];
+static int16_t  tr_err[TR_MAX];     /* 车头偏差 ×100(度) */
+static int16_t  tr_corr[TR_MAX];    /* 左右轮差 ×10(转/分) */
+static int16_t  tr_v[TR_MAX];       /* 速度(转/分) */
+static uint8_t  tr_n = 0;
+
+void Car_Trace_Dump(void)
+{
+    uint8_t i;
+    char m[64];
+
+    snprintf(m, sizeof(m), "TRACE %u (mm err/100deg corr/10rpm v)\r\n", (unsigned)tr_n);
+    Link_Say(m);
+    for (i = 0; i < tr_n; i++)
+    {
+        snprintf(m, sizeof(m), "TR %d %d %d %d\r\n", (int)tr_mm[i], (int)tr_err[i], (int)tr_corr[i], (int)tr_v[i]);
+        Link_Say(m);
+    }
+}
+
 void Car_Straight_Closed(uint16_t speed, float distance_mm)
 {
     float sgn    = (distance_mm >= 0.0f) ? 1.0f : -1.0f;
@@ -1057,11 +1079,14 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
     float yg_last;
     uint8_t yg_bad = 0;
     uint32_t last;
+    uint32_t tr_t;
 
     if (!HWT101_IsFresh(500) || target < 1.0f || car_abort)
     {
         return;                                   /* 陀螺仪没数据，不盲走 */
     }
+    tr_n = 0;
+    tr_t = HAL_GetTick();
 
     last = HAL_GetTick();
     yg_last = Yaw_Median5();
@@ -1145,6 +1170,16 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
         if (corr > lim)  corr = lim;
         if (corr < -lim) corr = -lim;
         corr_prev = corr;
+
+        if (HAL_GetTick() - tr_t >= 100u && tr_n < TR_MAX)
+        {
+            tr_t = HAL_GetTick();
+            tr_mm[tr_n]   = (int16_t)(done / ppm);
+            tr_err[tr_n]  = (int16_t)(HWT101_AngleDiff(yaw_target, yaw_now) * 100.0f);
+            tr_corr[tr_n] = (int16_t)(corr * 10.0f);
+            tr_v[tr_n]    = (int16_t)v;
+            tr_n++;
+        }
 
         if (v >= 0.6f * vmax && rem > 0.25f * target)   /* 巡航中(还没开始减速)：记下 PI 输出，用来学习偏向 */
         {

@@ -445,6 +445,10 @@ static void test_straight(void)
     CHECK(jump <= 2.0, "F 1000 差速一个周期跳了 %.1f 转/分(应 ≤2)", jump);
     CHECK(fabs(px - 1000.0) < 3.0, "F 1000 走了 %.1f mm", px);
     CHECK(fabs(py) < 10.0, "F 1000 横偏 %.1f mm", py);
+    out3_n = 0; out3[0] = 0;
+    Car_Trace_Dump();
+    CHECK(strstr(out3, "TRACE ") && strstr(out3, "\r\nTR ") && atoi(strstr(out3, "TRACE ") + 6) >= 10,
+          "TRACE?：F 1000 每 0.1 秒记一行(%.40s)", out3);
 }
 
 /* (10-17 用户)车头正、整车往左平移：SCDF/SCDB 顺带往右横移抵消 */

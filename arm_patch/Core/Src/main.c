@@ -775,6 +775,12 @@ void Link_Poll(void)
 
     /* (10-16)连续速度："V 横移 前进"(mm/s，左/前为正)，马上回 DONE，车一直按这个速度走，400ms 没新的 V 自动停；
      * "V?" 回 "VD 横移 前进"(V 一共走了多少 mm) */
+    if (strcmp(cmd, "TRACE?") == 0)
+    {
+        Car_Trace_Dump();                          /* (10-17)上一次直行每 0.1 秒的记录 */
+        Link_Reply("DONE\r\n");
+        return;
+    }
     if (cmd[0] == 'V' && cmd[1] == '?' && cmd[2] == 0)
     {
         float vs, vf;

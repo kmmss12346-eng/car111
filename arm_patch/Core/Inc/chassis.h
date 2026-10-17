@@ -29,6 +29,7 @@ void Car_Vel(float s_mmps, float f_mmps);         /* (10-16)V：按速度一直�
 void Car_Vel_Poll(void);                          /* 主循环里调用：超时/急停就停车 */
 void Car_Vel_Read(float *s_mm, float *f_mm);      /* V?：V 一共走了多少 mm */
 uint8_t Car_Vel_On(void);                         /* 现在是不是在按 V 走 */
+void Car_Trace_Dump(void);                        /* (10-17)TRACE?：打印上一次直行的记录 */
 
 int  Car_Param_Set(const char *name, float v);    /* 0=没有这个名字 1=成功 2=超出范围 */
 void Car_Param_Dump(void);                        /* 串口打印全部参数 */
