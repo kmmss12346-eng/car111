@@ -3192,10 +3192,27 @@ class MissionHooks:
         if not isinstance(d, dict) or not d.get('c') or not d.get('home'):
             return None
         sl = {str(k): s for k, s in (d.get('slots') or {}).items() if isinstance(s, dict) and s.get('px')}
+        if len(sl) == 2:                                       # 有一个位的物料被爪子挡住、没示教画面位置：按另外两个推出来
+            k = next(x for x in ('1', '2', '3') if x not in sl)
+            g = self._raw_ct_guess_px(d, k)
+            if g is not None:
+                sl[k] = dict((d.get('slots') or {}).get(k) or {}, px=[float(g[0]), float(g[1])], guessed=True)
         if len(sl) < 3 or not any(s.get('a') for s in sl.values()):
             return None
         return dict(home=[float(x) for x in d['home'][:2]], c=[float(x) for x in d['c'][:2]],
                     r=float(d.get('r') or 0.0), slots=sl)
+
+    @staticmethod
+    def _raw_ct_guess_px(D, n):
+        """(10-18)n 号停靠位的物料被爪子挡住、在看原料盘的姿态下看不到：三个停靠位在原料盘上隔 120°，
+        按圆心和另外两个(看得到、示教过的)位推出它在画面里的位置(三个位相对圆心的向量加起来是 0)。推不出来返回 None。"""
+        c = D.get('c') if isinstance(D, dict) else None
+        sl = (D.get('slots') or {}) if isinstance(D, dict) else {}
+        others = [np.asarray(s['px'], float)[:2] for k, s in sl.items()
+                  if str(k) != str(int(n)) and isinstance(s, dict) and s.get('px') and not s.get('guessed')]
+        if not c or len(others) != 2:
+            return None
+        return 3.0 * np.asarray(c, float)[:2] - others[0] - others[1]
 
     def _raw_ct_keepalive(self):
         """等原料盘时手臂太久没动：ID1 轻轻摆一下再回来(规则：机器人停止运行 15 秒、等转盘时 23 秒，本轮结束)。"""
@@ -3576,9 +3593,17 @@ class MissionHooks:
             if dc > 3.0 * float(cfg.get('raw_ct_tol_mm', 3.0)):
                 raise ArmError(f'原料盘中心和 rteach RAW center 时差了 {dc:.0f}mm(车动过了？)：先重新 rteach RAW center')
         e = v.material_error(int(color), n=3)
-        if e is None:
-            raise VisionError('画面里没看到这个颜色的物料：原料盘停着、物料在画面里再试')
         claw = np.array(v.claw('RAW'), float)
+        guessed = False
+        if e is None:
+            g = self._raw_ct_guess_px(D, n)
+            if g is None:
+                raise VisionError('画面里没看到这个颜色的物料：原料盘停着、物料在画面里再试。'
+                                  '物料被爪子挡住看不到的话：先示教另外两个位，这个位会按它们推出来')
+            guessed = True
+            e = (float(g[0] - claw[0]), float(g[1] - claw[1]))
+            self.log(f'   画面里看不到 {n} 号位的物料(可能被爪子挡住)：按圆心和另外两个位推出它在画面 ({g[0]:.0f}, {g[1]:.0f})，'
+                     '手臂先按这个位置转过去，再看着对准')
         px = claw + np.asarray(e, float)
         a = None
         J = self.store.get('RAW', 'arm') if self.store is not None else None
@@ -3606,6 +3631,12 @@ class MissionHooks:
                              f'稍微超出范围(范围：{lim_txt})：先在范围里对，看能对到多近')
                 rng = dict(id1=(max(float(a1r[0]) - home[0], -float(lim['id1'])), min(float(a1r[1]) - home[0], float(lim['id1']))),
                            id2=(max(A2_MIN - home[1], -float(lim['id2'])), min(A2_MAX - home[1], float(lim['id2']))))
+                if guessed:                                    # 看不到：手臂先一下转到推出来的位置(物料就到爪子点附近、看得到了)，再从那里看着对
+                    g1 = min(max(a1, home[0] + rng['id1'][0]), home[0] + rng['id1'][1])
+                    g2 = min(max(a2, home[1] + rng['id2'][0]), home[1] + rng['id2'][1])
+                    self.arm.ap(g1, g2)
+                    m1, m2 = g1 - home[0], g2 - home[1]
+                    rng = dict(id1=(rng['id1'][0] - m1, rng['id1'][1] - m1), id2=(rng['id2'][0] - m2, rng['id2'][1] - m2))
                 res = self.servo.run('RAW', lambda: v.material_error(int(color), n=2), v.scale('RAW'),
                                      float(cfg.get('raw_tol_mm') or cfg['tol_mm']['RAW']), allow_chassis=False, wheels_only=False,
                                      label=f'示教停靠位{n}', bounds=v.bounds('RAW'), arm_range=rng, max_iter=12)
@@ -3621,12 +3652,13 @@ class MissionHooks:
                         raise
                     except ArmError:
                         b = (None, None)
-                    self.log(f'   没对上(最近还差 {res.err_mm:.1f}mm' + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
+                    self.log('   没对上(' + (f'最近还差 {res.err_mm:.1f}mm' if math.isfinite(res.err_mm) else '转过去以后还是看不到物料') + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
                              + f')：只记位置。用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
         self.arm.ap(home[0], home[1])
         d = load_place_adj(path)
         r_ = d.setdefault('RAW_CT', D)
-        r_.setdefault('slots', {})[str(int(n))] = dict(px=[round(float(px[0]), 1), round(float(px[1]), 1)], a=a, color=int(color))
+        r_.setdefault('slots', {})[str(int(n))] = dict(px=[round(float(px[0]), 1), round(float(px[1]), 1)], a=a, color=int(color),
+                                                       **({'guessed': True} if guessed else {}))
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
         done = sorted(k for k, s in r_['slots'].items() if s.get('px'))
@@ -3642,7 +3674,13 @@ class MissionHooks:
             raise ValueError('先做 rteach RAW center')
         s = (D.get('slots') or {}).get(str(int(n)))
         if not isinstance(s, dict) or not s.get('px'):
-            raise ValueError(f'先做 rteach RAW {n} 颜色号(记下这个停靠位在画面里的位置)')
+            g = self._raw_ct_guess_px(D, n)                    # 物料被爪子挡住看不到：按另外两个位推出画面位置
+            if g is None:
+                raise ValueError(f'先做 rteach RAW {n} 颜色号(记下这个停靠位在画面里的位置)；'
+                                 '这个位的物料被爪子挡住看不到的话，先示教另外两个位')
+            s = D.setdefault('slots', {})[str(int(n))] = dict(px=[round(float(g[0]), 1), round(float(g[1]), 1)], a=None,
+                                                              color=None, guessed=True)
+            self.log(f'   {n} 号停靠位的画面位置按另外两个位推出来：({g[0]:.0f}, {g[1]:.0f})')
         a = self.arm.read_angles()
         if a[0] is None or a[1] is None:
             raise ArmError('读不到手臂角度，没保存')

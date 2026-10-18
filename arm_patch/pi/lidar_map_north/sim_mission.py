@@ -2284,6 +2284,45 @@ class RawCenterTeachTests(unittest.TestCase):
             del w.plate_phase
         self.assertGreaterEqual(refused, 1, '\n'.join(lines))
 
+    def test_slot_hidden_behind_the_claw_is_guessed(self):
+        """(10-18 实车：上面那个位的蓝色物料在两根爪子中间，看原料盘的姿态下认不出来)先示教看得到的两个位，
+        看不到的那个位按圆心和另外两个位推出画面位置，手臂先转过去再看着对准、记下角度；比赛时按任务码顺序三个都夹到。"""
+        import tempfile
+        for seed in (1, 2):
+            w = self._world(seed)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            hide_k = 2
+            orig_me, orig_mes = w.vision.material_error, w.vision.material_errors
+
+            def hidden(color, w=w, hide_k=hide_k):
+                if abs(w.a1 - w.params['A1G']) > 1.0 or abs(w.a2 - w.params['A2E']) > 5.0:
+                    return False                               # 手臂不在看原料盘的姿态：爪子挡不住它
+                its = [it for it in w.raw_items if it['color'] == int(color)]
+                return bool(its) and self._slot_of(w, its[0], w.plate_phase()[0]) == hide_k
+            w.vision.material_error = lambda color_id, n=None, orig=orig_me, hid=hidden: None if hid(color_id) else orig(color_id, n)
+            w.vision.material_errors = lambda colors, orig=orig_mes, hid=hidden: {k: (None if hid(k) else q) for k, q in orig(colors).items()}
+            ph = self._center_only(w, h, path)
+            order = sorted(w.raw_items, key=lambda it: self._slot_of(w, it, ph) == hide_k)    # 看不到的那个位最后示教
+            try:
+                for it in order:
+                    self.assertTrue(h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path), '\n'.join(lines))
+            finally:
+                del w.plate_phase
+            text = '\n'.join(lines)
+            self.assertIn('按圆心和另外两个位推出', text)
+            with open(path, encoding='utf-8') as f:
+                d = json.load(f)['RAW_CT']
+            self.assertTrue(d['slots'][str(hide_k)].get('guessed'), d)
+            self.assertTrue(all(sv['a'] for sv in d['slots'].values()), d)
+            lines.clear()
+            w.requests.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
