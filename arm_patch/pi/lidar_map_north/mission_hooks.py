@@ -3866,6 +3866,14 @@ class MissionHooks:
         m = self._raw_center_align(goal=np.asarray(D['c'], float)[:2] + comp, tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
         if m is None or not (getattr(self, '_rc_last', None) or {}).get('ok'):
             raise VisionError('没对准示教时的位置，车不挪：' + str((getattr(self, '_rc_last', None) or {}).get('why') or ''))
+        # 10-18 实车：被爪子挡住、按另外两个位推出来的位置不准(摄像头斜着看，画面上面压扁了)：按它算会以为够得着、其实差几十毫米。
+        # 看到过的位有两个以上就只按看到过的算
+        sl_ = D.get('slots') or {}
+        guessed = {k for k in P if not isinstance(sl_.get(k), dict) or not sl_[k].get('px') or sl_[k].get('guessed')}
+        if len(P) - len(guessed) >= 2:
+            P = {k: px for k, px in P.items() if k not in guessed}
+            if guessed:
+                self.log('  ' + '、'.join(f'{k}号位' for k in sorted(guessed)) + '的位置是按另外两个位推出来的(被爪子挡住看不到)，不准：只按看到过的位算')
         keys = sorted(P)
         now = self._raw_ct_margins(P, home, Ja, np.zeros((1, 2)))
 
@@ -3873,10 +3881,11 @@ class MissionHooks:
             return '  '.join(f'{k}号位 ' + (f'够得着(离边上还有 {mg[k][2][j]:.0f}mm)' if mg[k][2][j] >= 0 else f'够不着(差 {-mg[k][2][j]:.0f}mm)')
                              for k in keys)
         self.log('  现在的位置：' + say(now, 0))
-        S, F = np.meshgrid(np.arange(-smax, smax + 0.5, 1.0), np.arange(-fmax, fmax + 0.5, 1.0))
-        cand = np.c_[S.ravel(), F.ravel()]                       # 车挪多少 (横移, 前进) 毫米
+        old = np.asarray(D.get('shift_mm') or [0.0, 0.0], float)[:2]   # 以前 shift 已经挪过的(车轮能挪的范围按停车点算总共挪了多少)
+        S, F = np.meshgrid(np.arange(-smax, smax + 0.5, 1.0) - old[0], np.arange(-fmax, fmax + 0.5, 1.0) - old[1])
+        cand = np.c_[S.ravel(), F.ravel()]                       # 车(从现在的位置)再挪多少 (横移, 前进) 毫米
         mg = self._raw_ct_margins(P, home, Ja, cand @ Jc.T)
-        M = np.stack([mg[k][2] for k in keys], axis=1)          # N×3 余量
+        M = np.stack([mg[k][2] for k in keys], axis=1)          # N×(几个位) 余量
         n_ok = (M >= ok_mm).sum(axis=1)
         Ms = -np.sort(-M, axis=1)                               # 每行从大到小
         worst = np.where(n_ok > 0, np.take_along_axis(Ms, np.maximum(n_ok - 1, 0)[:, None], axis=1)[:, 0], Ms[:, 0])
@@ -3907,7 +3916,7 @@ class MissionHooks:
         c_new = np.asarray(ms[0], float) - comp                # 按示教时看原料盘的角度记(还差的那一点角度让画面挪了 comp)
         dc = c_new - np.asarray(D['c'], float)[:2]
         D['c'] = [round(float(c_new[0]), 1), round(float(c_new[1]), 1)]
-        D['shift_mm'] = [round(ds, 1), round(df, 1)]
+        D['shift_mm'] = [round(float(old[0]) + ds, 1), round(float(old[1]) + df, 1)]   # 从停车点算一共挪了多少
         for k, sv in (D.get('slots') or {}).items():
             if isinstance(sv, dict) and sv.get('px'):
                 sv['px'] = [round(float(sv['px'][0] + dc[0]), 1), round(float(sv['px'][1] + dc[1]), 1)]

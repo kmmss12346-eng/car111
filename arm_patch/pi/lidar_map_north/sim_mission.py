@@ -2517,6 +2517,56 @@ class RawCenterTeachTests(unittest.TestCase):
         finally:
             del w.plate_phase
 
+    def test_shift_ignores_a_guessed_slot_and_adds_up(self):
+        """(10-18 实车：蓝色在爪子后面看不到，按另外两个位推出来的位置不准，shift 按它算以为够得着，挪过去差了 45mm)
+        shift 只按看到过的位算；再做一次 shift，记下的是从停车点算一共挪了多少。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=dict(raw_center_reach_deg=dict(id1=60.0, id2=190.0)))
+        ph = self._center_only(w, h, path)
+        try:
+            for it in w.raw_items:
+                h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path)
+            with open(path, encoding='utf-8') as f:
+                d = json.load(f)
+            D = d['RAW_CT']
+            k_bad = '2'
+            c = np.asarray(D['c'], float)
+            D['slots'][k_bad]['px'] = list(c + 0.6 * (np.asarray(D['slots'][k_bad]['px'], float) - c))   # 推得太靠近圆心
+            D['slots'][k_bad]['guessed'] = True
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(d, f)
+            lines.clear()
+            ds, df = h.raw_ct_shift(path)
+            text = '\n'.join(lines)
+            self.assertIn('2号位的位置是按另外两个位推出来的', text)
+            best = [x for x in lines if '最好：' in x or '已经是最好的' in x]
+            self.assertTrue(best, text)
+            self.assertNotIn('2号位', best[0], text)                              # 只按看到过的 1、3 号位算
+            with open(path, encoding='utf-8') as f:
+                s1 = json.load(f)['RAW_CT'].get('shift_mm') or [0.0, 0.0]
+            for it in w.raw_items:                                              # 挪过以后重新示教(看到的两个)
+                k = self._slot_of(w, it, ph)
+                if str(k) != k_bad:
+                    h.raw_ct_teach_slot(k, it['color'], path)
+            with open(path, encoding='utf-8') as f:
+                d = json.load(f)
+            d['RAW_CT']['slots'][k_bad]['guessed'] = True
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(d, f)
+            ds2, df2 = h.raw_ct_shift(path)
+            with open(path, encoding='utf-8') as f:
+                s2 = json.load(f)['RAW_CT'].get('shift_mm') or [0.0, 0.0]
+            if abs(ds2) + abs(df2) > 0.5:
+                self.assertAlmostEqual(s2[0], s1[0] + ds2, delta=0.2)
+                self.assertAlmostEqual(s2[1], s1[1] + df2, delta=0.2)
+            self.assertLessEqual(abs(s2[0]), 40.5)
+            self.assertLessEqual(abs(s2[1]), 60.5)
+        finally:
+            del w.plate_phase
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
