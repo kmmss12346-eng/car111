@@ -170,6 +170,10 @@ DEFAULTS = dict(
     raw_ct_check=True,                  # 转到停靠位上方、下爪前拍一帧：看到要夹的物料离爪子点超过 raw_slot_accept_mm(原料盘又转了)就不下爪；看不到照样下爪
     raw_ct_stop_s=6.0,                  # (10-18 用户量的)原料盘每次大约停多久、转多久(秒)：还没量到之前按这个估计(停的时间按九折算，留余量)；
     raw_ct_move_s=3.0,                  #   亲眼看到两次停下以后，按量到的周期推算回到看的姿态时这一次已经停了多久
+    raw_ct_accept_mm=5.0,               # 比赛时对准圆心：到时间还没对到 raw_ct_tol_mm，但离示教的位置不到这么多毫米也照样抓；再远就这次不抓(会砸到物料)
+    raw_frame_thread=True,              # (10-18)对准圆心车在走时，认一帧放在后台线程，这边每 raw_vel_keep_s 秒给 STM32 续一次速度
+    raw_vel_keep_s=0.15,                #   (STM32 0.4 秒收不到新的 V 就停车，实车上认一帧要零点几秒到一秒多：不续的话车走一下停一下)
+    raw_center_probe_speed=10.0,        # 测车轮和画面的对应关系时车轮走多快(毫米/秒)
     raw_any_order=False,                # (10-11 晚 用户：原料区要按顺序夹，不能随机夹)False = 按任务码顺序一个一个等着夹；True = 哪个需要的颜色停在爪子附近就先夹哪个(放进它自己的槽)。只想这一次不按顺序：mtest RAW 1 force any
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_seek=False,                     # (10-11 早 用户：到了原料区停车点车就不动，只动爪子对准夹)True = 原料盘停下时要夹的物料都停在手臂够不着的地方：车挪过去
@@ -1407,13 +1411,18 @@ class MissionHooks:
             self.act.chassis_move(int(round(sv)), int(round(f)))
 
     def _raw_seek_end(self):
-        """原料区做完：车挪回停车点(路线下一段从停车点算)。"""
+        """原料区做完：车挪回停车点(路线下一段从停车点算)。离得不远(对准圆心挪的)就只用 V 挪回去：V 不纠车头，
+        S/F 走完会把车头转回 STM32 记着的方向(STM32 复位过、单站测试时那个方向可能差很多)。STM32 不认 V 才用 S/F。"""
         self._seek = None
         if self.act is None:
             return
         d = self.act.disp
         if abs(d['S']) >= 1 or abs(d['F']) >= 1:
-            self._return_to_stop('RAW')
+            if math.hypot(float(d['S']), float(d['F'])) <= 80.0 and self._vel_goto(0.0, 0.0, tol_mm=0.4):
+                self.log('    车轮挪回停车点(只用 V，不转车头)')
+            d = self.act.disp
+            if abs(d['S']) >= 1 or abs(d['F']) >= 1:
+                self._return_to_stop('RAW')
 
     def _raw_recenter(self):
         """挪回原料区的工作位置：停车点，或者挪着找到的够得着物料的地方(raw_seek)。"""
@@ -2106,12 +2115,13 @@ class MissionHooks:
             errs = self.vision.material_errors(colors)
         P = [claw + np.asarray(q, float) for q in errs.values() if q is not None]
         if plate is not None:
-            c = np.asarray(plate['c'], float)
+            # 10-18：用这一帧的外圈(c_now)。plate['c'] 是最近 3 帧的中值，车在走时落后一两帧，测车轮和画面的对应关系就测小了
+            c = np.asarray(plate.get('c_now', plate['c']), float)
             if P:                                              # 物料所在圆的半径(推停靠位、只看到一个物料时用)：按看到的物料现量
                 rr = float(np.median([np.linalg.norm(p - c) for p in P]))
                 old = getattr(self, '_rc_orbit', None)
                 self._rc_orbit = rr if old is None else 0.7 * old + 0.3 * rr
-            r = getattr(self, '_rc_orbit', None) or float(self.cfg.get('raw_orbit_ratio', 0.77)) * float(plate['r'])
+            r = getattr(self, '_rc_orbit', None) or float(self.cfg.get('raw_orbit_ratio', 0.77)) * float(plate.get('r_now', plate['r']))
             self._rc_pts = P
             return c, r, len(P)
         got = None
@@ -2124,16 +2134,18 @@ class MissionHooks:
             return None, None, len(P)
         return got[0], got[1], len(P)
 
-    def _raw_center_align(self, goal=None, tol=None):
-        """让爪子点(看原料盘的姿态)对准原料盘中心。返回 (圆心像素, 半径像素) 或 None(认不出圆心)。
-        goal = 画面里的一个点(10-18：示教时圆心的位置)：把圆心对到这里；tol = 对准到多少毫米(None = raw_center_tol_mm)。
-        STM32 认识 V：车轮连续慢慢走、每帧看(_raw_center_align_smooth)；否则一步一步挪(下面)。"""
+    def _raw_center_align(self, goal=None, tol=None, fresh=False):
+        """让爪子点(看原料盘的姿态)对准原料盘中心。返回 (圆心像素, 半径像素) 或 None(认不出圆心、测不出车轮和画面的对应关系)；
+        对准了没有看 self._rc_last['ok']。goal = 画面里的一个点(10-18：示教时圆心的位置)：把圆心对到这里；
+        tol = 对准到多少毫米(None = raw_center_tol_mm)；fresh = 车轮和画面的对应关系现测(示教时)。
+        STM32 认识 V：车轮连续慢慢走、每帧看(_raw_center_align_smooth，测不出来就停下，不再改成一步一步挪)；
+        只有 STM32 是旧程序(不认 V)才一步一步挪(下面)。"""
+        self._rc_last = dict(ok=False, err_mm=None, why='')
         if self.cfg.get('raw_center_smooth', True) and hasattr(self.act, 'vel') and not getattr(self.act, '_no_vel', False):
-            r = self._raw_center_align_smooth(goal=goal, tol=tol)
-            if r not in ('nofw', 'noprobe'):
+            r = self._raw_center_align_smooth(goal=goal, tol=tol, fresh=fresh)
+            if r != 'nofw':
                 return r
-            if r == 'nofw':
-                self.log('    STM32 是旧程序(不认 V 指令)：改成一步一步挪。刷新的 main.c / chassis.c 才能连续顺滑地挪')
+            self.log('    STM32 是旧程序(不认 V 指令)：改成一步一步挪。刷新的 main.c / chassis.c 才能连续顺滑地挪')
         cfg, v = self.cfg, self.vision
         sc = float(v.scale('RAW'))
         claw = np.array(v.claw('RAW'), float) if goal is None else np.asarray(goal, float)   # 下面"爪子点"都换成要对到的点
@@ -2151,9 +2163,11 @@ class MissionHooks:
         c, r = m
         self.log(f'    原料盘中心离{where} {np.linalg.norm(c - claw) / sc:.1f}mm(原料盘半径约 {r / sc:.0f}mm)')
         if float(np.linalg.norm(c - claw)) / sc <= tol:
+            self._rc_last = dict(ok=True, err_mm=float(np.linalg.norm(c - claw)) / sc, why='')
             return c, r
         J, c = self._raw_chassis_J(c)
         if J is None:
+            self._rc_last = dict(ok=False, err_mm=float(np.linalg.norm(c - claw)) / sc, why='测不出车轮和画面的对应关系')
             return c, r
         for _k in range(int(cfg.get('raw_center_iters', 5))):
             e = c - claw
@@ -2174,20 +2188,94 @@ class MissionHooks:
                 break
             c, r = m
             self.log(f'    原料盘中心离{where} {np.linalg.norm(c - claw) / sc:.1f}mm')
+        em = float(np.linalg.norm(c - claw)) / sc
+        self._rc_last = dict(ok=em <= tol, err_mm=em, why='' if em <= tol else f'还差 {em:.1f}mm')
         return c, r
 
-    def _raw_center_align_smooth(self, start=None, target_dir=None, goal=None, tol=None):
-        """(10-16 用户)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心：
+    @staticmethod
+    def _raw_J_bad(J, sc, rms=None, moved=None, pmm=None):
+        """(10-18)车轮和画面的对应关系 J(列：横移 1mm、前进 1mm，原料盘中心在画面里动多少像素)合不合理：合理返回 ''，不合理返回原因。
+        摄像头装在手臂上、看原料盘的姿态固定：车走 1mm，画面里该动约 px_per_mm.RAW 像素，横移和前进在画面里差不多垂直。"""
+        J = np.asarray(J, float)
+        if J.shape != (2, 2) or not np.all(np.isfinite(J)):
+            return '数据不对'
+        n1, n2 = float(np.linalg.norm(J[:, 0])), float(np.linalg.norm(J[:, 1]))
+        for nm, n in (('横移', n1), ('前进', n2)):
+            if not 0.5 * sc <= n <= 2.0 * sc:
+                return (f'{nm} 1mm 画面里动 {n:.2f} 像素，应该约 {sc:.2f}'
+                        + ('(画面里圆心几乎没跟着动：车轮真的走了吗？)' if n < 0.5 * sc else ''))
+        cosang = abs(float(J[:, 0] @ J[:, 1])) / (n1 * n2)
+        if cosang > 0.5:
+            return f'横移和前进在画面里几乎是同一个方向(夹角 {math.degrees(math.acos(min(1.0, cosang))):.0f}°，应该约 90°)'
+        if moved is not None and pmm and min(moved) < 0.5 * float(pmm):
+            return f'车只走了 {min(moved):.0f}mm(要走 {float(pmm):g}mm)：车轮没走起来？'
+        if rms is not None and rms > 2.0 * sc:
+            return f'圆心一帧一帧跳得厉害(拟合误差 {rms / sc:.1f}mm)'
+        return ''
+
+    def _vel_goto(self, s_t, f_t, tol_mm=0.8, max_s=10.0):
+        """(10-18)车轮只用 V 速度指令挪到 disp = (s_t, f_t)(相对停车点，毫米)。V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，
+        STM32 复位过以后那个方向可能差很多)，车不会转；走了多少按 STM32 自己算的(V?)。到了返回 True；
+        STM32 不认 V、读不到 V? 返回 False(调用的地方改用 S/F)。"""
+        act = self.act
+        if act is None or not hasattr(act, 'vel') or getattr(act, '_no_vel', False):
+            return False
+        try:
+            v0 = act.vel_read()
+        except ArmAbort:
+            raise
+        except ArmError:
+            v0 = None
+        if v0 is None:
+            return False
+        v0 = np.array(v0, float)
+        d0 = np.array([float(act.disp['S']), float(act.disp['F'])])
+        goal = np.array([float(s_t), float(f_t)])
+        vmax = float(self.cfg.get('raw_center_search_speed', 20.0))
+        vmin = float(self.cfg.get('raw_center_min_speed', 5.0))
+        ok, cur = False, d0
+        t_lim = self.now() + float(max_s)
+        try:
+            while self.now() < t_lim:
+                self._check_abort()
+                v1 = act.vel_read()
+                if v1 is None:
+                    break
+                cur = d0 + (np.array(v1, float) - v0)
+                d = goal - cur
+                dn = float(np.linalg.norm(d))
+                if dn <= tol_mm:
+                    ok = True
+                    break
+                vv = d / dn * min(vmax, max(vmin, 1.5 * dn))
+                if not act.vel(float(vv[0]), float(vv[1])):
+                    break
+                self.sleep(0.03)
+        finally:
+            try:
+                act.vel(0.0, 0.0)
+                v1 = act.vel_read()
+                if v1 is not None:
+                    cur = d0 + (np.array(v1, float) - v0)
+            except ArmError:
+                pass
+            act.disp['S'], act.disp['F'] = float(cur[0]), float(cur[1])
+        return ok
+
+    def _raw_center_align_smooth(self, start=None, target_dir=None, goal=None, tol=None, fresh=False):
+        """(10-16 用户；10-18 按实车重写)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心。只用 V 速度指令，不发 S/F：
+        V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，STM32 复位过以后车会突然转一大圈)。
           ① 停车点看不到圆心：一边按 raw_center_search_mm 的路线慢慢走一边看，连着几帧认出圆心就停；
-          ② 车轮和画面的对应关系：没有(或者只测过前后)就慢慢前进、横移各一小段，边走边记圆心怎么动，算出来存起来；
-          ③ 按圆心偏差给车轮速度(越近越慢)，一直到对准(连着 3 帧在 raw_center_tol_mm 以内)。某一帧没认出圆心也不停车：
-             按车走了多少推算圆心现在在画面哪里；只看到一个物料时，用它和已知半径修正推算的圆心。偏差越走越大就重新测对应关系。
-          每秒打一行：这一秒处理了几帧、圆心还偏多少、车轮速度多少。
+          ② 车轮和画面的对应关系 J：没有、只测过前后、存的不合理，或者 fresh=True(示教时每次现测)：慢慢前进、横移各一小段，
+             边走边记圆心怎么动，算出来先检查(_raw_J_bad)，合理才用、才存；测不出来/不合理就挪回原处停下(不再一步一步乱挪)；
+          ③ 按圆心偏差给车轮速度(越近越慢)，一直到对准(停着连 3 帧在 tol 以内)。
+        实车上认一帧要零点几秒到一秒多，STM32 0.4 秒收不到新的 V 就停车：识别放在后台线程，这边每 raw_vel_keep_s 秒续一次速度，
+        车一直在走；每帧记下拍照那一刻车走了多少(STM32 自己算的 V?，不按时间估)；圆心用这一帧的(几帧的中值车在走时会落后)。
         start = (圆心, 半径)：已经认出圆心了，跳过 ①；target_dir = 单位向量(画面里)：对准的不是圆心，是"圆心 + 半径 × target_dir"
-        (原料盘上的抓取位，车轮把爪子对到那里)。goal = 画面里的一个点(10-18：示教时圆心的位置)：把圆心对到这里，不是对到爪子点；
-        tol = 对准到多少毫米(None = raw_center_tol_mm)。
-        返回 (圆心, 半径) / None(认不出) / 'nofw'(STM32 不认 V) / 'noprobe'(只在对准圆心时：边走边看测不出车轮和画面的对应关系，
-        改用一步一步挪、停稳再看的办法测)。"""
+        (原料盘上的抓取位)；goal = 画面里的一个点(示教时圆心的位置)：把圆心对到这里，不是对到爪子点；tol = 对准到多少毫米。
+        结果另外放在 self._rc_last = dict(ok=对准了没有, err_mm=最后还偏多少毫米, why=没对准的原因)。
+        返回 (圆心, 半径) / None(认不出圆心、测不出对应关系) / 'nofw'(STM32 不认 V)。"""
+        import threading
         cfg, v, act = self.cfg, self.vision, self.act
         tdir = None if target_dir is None else np.asarray(target_dir, float)
         what = '原料盘中心' if tdir is None else '抓取位'
@@ -2205,8 +2293,10 @@ class MissionHooks:
         vsearch = float(cfg.get('raw_center_search_speed', 20.0))
         smax, fmax = float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0))
         wait = float(cfg.get('raw_center_wait_s', 12.0))
-        base = (float(act.disp['S']), float(act.disp['F']))
-        st = dict(est=np.zeros(2), cmd=np.zeros(2), t=self.now())
+        keep_s = float(cfg.get('raw_vel_keep_s', 0.15))
+        threaded = bool(cfg.get('raw_frame_thread', True))
+        self._rc_last = dict(ok=False, err_mm=None, why='')
+        base = np.array([float(act.disp['S']), float(act.disp['F'])])
         try:
             v0 = act.vel_read()
         except ArmAbort:
@@ -2215,78 +2305,162 @@ class MissionHooks:
             v0 = None
         if not act.vel(0.0, 0.0):
             return 'nofw'
+        v0 = None if v0 is None else np.array(v0, float)
+        st = dict(p=np.zeros(2), tp=self.now(), cmd=np.zeros(2), stop_at=None)    # p：车走了多少(相对开始时)，tp：那时的时刻
+        try:
+            v.live_goal = (float(tgt(goalp, 0.0)[0]), float(tgt(goalp, 0.0)[1])) if tdir is None else None
+        except Exception:
+            pass
 
-        def est_now():
-            return st['est'] + st['cmd'] * (self.now() - st['t'])
+        def pos_est():
+            return st['p'] + st['cmd'] * (self.now() - st['tp'])
 
-        def send(vs, vf):
-            now = self.now()
-            st['est'] = st['est'] + st['cmd'] * (now - st['t'])
-            st['t'] = now
-            ps, pf = base[0] + float(st['est'][0]), base[1] + float(st['est'][1])
+        def pos_meas():
+            """车走了多少：STM32 自己算的 V 走过的距离(V?)；读不到才按发的速度推。"""
+            p = None
+            if v0 is not None:
+                try:
+                    v1 = act.vel_read()
+                except ArmAbort:
+                    raise
+                except ArmError:
+                    v1 = None
+                if v1 is not None:
+                    p = np.array(v1, float) - v0
+            if p is None:
+                p = pos_est()
+            st['p'], st['tp'] = p, self.now()
+            return p
+
+        def send(vs, vf, run_s=None):
+            """发车轮速度(到范围边上的方向不再走)。run_s：最多走这么久就停(下一帧认得慢也不会走过头)。"""
+            p = pos_est()
+            st['p'], st['tp'] = p, self.now()
+            ps, pf = base[0] + float(p[0]), base[1] + float(p[1])
             if (ps >= smax and vs > 0) or (ps <= -smax and vs < 0):
-                vs = 0.0                                       # 到范围边上了：这个方向不再走
+                vs = 0.0
             if (pf >= fmax and vf > 0) or (pf <= -fmax and vf < 0):
                 vf = 0.0
             act.vel(vs, vf)
             st['cmd'] = np.array([vs, vf], float)
+            moving = abs(vs) > 1e-9 or abs(vf) > 1e-9
+            st['stop_at'] = (self.now() + float(run_s)) if (moving and run_s is not None) else None
+
+        def keep():
+            """识别一帧的时候：到点了就停，不然续一次速度(STM32 0.4 秒收不到新的 V 就停车)。"""
+            if float(np.linalg.norm(st['cmd'])) < 1e-9:
+                return
+            if st['stop_at'] is not None and self.now() >= st['stop_at']:
+                send(0.0, 0.0)
+            else:
+                stop_at = st['stop_at']
+                send(float(st['cmd'][0]), float(st['cmd'][1]))
+                st['stop_at'] = stop_at
 
         def finish():
-            send(0.0, 0.0)
+            """停车，V 走过的距离记进 disp(挪回停车点、路线下一段按它算)。"""
+            act.vel(0.0, 0.0)
+            st['cmd'], st['stop_at'] = np.zeros(2), None
+            p = pos_meas()
+            act.disp['S'] = float(base[0] + p[0])
+            act.disp['F'] = float(base[1] + p[1])
+
+        def go_back():
+            """测不出/认不出：车挪回开始的地方(只用 V)。"""
+            finish()
+            if float(np.linalg.norm(np.array([act.disp['S'], act.disp['F']], float) - base)) >= 1.0:
+                self._vel_goto(float(base[0]), float(base[1]))
+
+        def frame(near):
+            """认一帧圆心，返回 (圆心, 半径, 看到几个物料, 拍这一帧时车走了多少)。车在走：识别放后台线程，这边每 keep_s 秒续一次速度。"""
+            p_cap = pos_meas()
+            if not threaded or float(np.linalg.norm(st['cmd'])) < 1e-9:
+                cc, rr, n = self._raw_center_frame(colors, claw, near)
+                return cc, rr, n, p_cap
+            box = {}
+
+            def work():
+                try:
+                    box['r'] = self._raw_center_frame(colors, claw, near)
+                except BaseException as ex:                    # 识别出错：交给这边抛出
+                    box['e'] = ex
+            th = threading.Thread(target=work, daemon=True)
+            th.start()
             try:
-                v1 = act.vel_read()
-            except ArmError:
-                v1 = None
-            d = (np.array(v1, float) - np.array(v0, float)) if (v0 is not None and v1 is not None) else st['est']
-            act.disp['S'] = base[0] + float(d[0])
-            act.disp['F'] = base[1] + float(d[1])
+                while th.is_alive():
+                    th.join(keep_s)
+                    if th.is_alive():
+                        self._check_abort()
+                        keep()
+            except BaseException:
+                th.join(3.0)                                   # 等识别线程停下再往外抛(别让它和下一次识别一起用摄像头)
+                raise
+            if 'e' in box:
+                raise box['e']
+            cc, rr, n = box['r']
+            return cc, rr, n, p_cap
 
         def clampv(d, lim):
             n = float(np.linalg.norm(d))
             return d if n <= lim else d * (lim / n)
 
-        def probe(c):
-            """慢慢前进、横移各 raw_center_probe_mm，边走边记圆心(看到两个以上物料的帧)，拟合 J。返回 (J 或 None, 最后的圆心)。"""
-            p = float(cfg.get('raw_center_probe_mm', 15.0))
-            X, Y = [], []
+        def probe(c, p_c):
+            """慢慢前进、横移各 raw_center_probe_mm，边走边认圆心(记下拍每一帧时车走了多少)，拟合 J 并检查。
+            返回 (J 或 None, 最后认出的圆心, 拍它时车走了多少)。"""
+            pmm = float(cfg.get('raw_center_probe_mm', 15.0))
+            spd = float(cfg.get('raw_center_probe_speed', 10.0))
+            X, Y, moved = [np.asarray(p_c, float)], [np.asarray(c, float)], []
             for dirv in (np.array([0.0, 1.0]), np.array([1.0, 0.0])):
-                e0 = est_now()
-                t_lim = self.now() + 3.0 * p / 10.0 + 3.0
-                while float(np.linalg.norm(est_now() - e0)) < p and self.now() < t_lim:
+                p0 = pos_meas()
+                t_lim = self.now() + 2.5 * pmm / spd + 3.0
+                while True:
                     self._check_abort()
-                    cc, _r, _n = self._raw_center_frame(colors, claw, c)
+                    cc, _r, _n, pc = frame(c)
                     if cc is not None and float(np.linalg.norm(cc - c)) < 40.0 * sc:
-                        X.append(np.array(base) + est_now())
-                        Y.append(cc)
-                        c = cc
-                    vv = dirv * 10.0
-                    send(float(vv[0]), float(vv[1]))
+                        X.append(pc)
+                        Y.append(np.asarray(cc, float))
+                        c, p_c = np.asarray(cc, float), pc
+                    left = pmm - float(np.linalg.norm(pos_meas() - p0))   # 按现在走到哪算(拍这一帧以后车又走了一点)
+                    if left <= 0.3 or self.now() > t_lim:
+                        break
+                    send(float(dirv[0] * spd), float(dirv[1] * spd), run_s=max(0.1, left / spd))   # 走够了就停(认得慢也不走过头)
                     if float(np.linalg.norm(st['cmd'])) < 0.1:
                         break                                  # 到范围边上走不动了
                 send(0.0, 0.0)
-            if len(X) < 4:
-                self.log(f'    (边走边看只有 {len(X)} 帧认出了圆心，至少要 4 帧)')
-                return None, c
+                moved.append(float(np.linalg.norm(pos_meas() - p0)))
+            cc, _r, _n, pc = frame(c)                          # 停稳以后再看一帧
+            if cc is not None and float(np.linalg.norm(cc - c)) < 40.0 * sc:
+                X.append(pc)
+                Y.append(np.asarray(cc, float))
+                c, p_c = np.asarray(cc, float), pc
+            if len(X) < 5:
+                self.log(f'    ★ 边走边看只有 {len(X)} 帧认出了圆心(至少要 5 帧)：看实时画面(python3 vview.py)，圆盘外圈认出来没有')
+                return None, c, p_c
             A = np.c_[np.asarray(X), np.ones(len(X))]
-            sol, *_ = np.linalg.lstsq(A, np.asarray(Y), rcond=None)
+            Yv = np.asarray(Y)
+            sol, *_ = np.linalg.lstsq(A, Yv, rcond=None)
             J = sol[:2].T                                      # 列：[横移 S, 前进 F]
-            if abs(float(np.linalg.det(J))) < (0.3 * sc) ** 2:
-                self.log(f'    ({len(X)} 帧里圆心几乎没跟着车轮动：横移 1mm 动 {np.linalg.norm(J[:, 0]):.2f} 像素、'
-                         f'前进 1mm 动 {np.linalg.norm(J[:, 1]):.2f} 像素，应该各约 {sc:.2f}。车轮真的动了吗？)')
-                return None, c
+            rms = float(np.sqrt(((Yv - A @ sol) ** 2).sum(axis=1).mean()))
+            bad = self._raw_J_bad(J, sc, rms=rms, moved=moved, pmm=pmm)
+            self.log(f'    车轮：横移 1mm 画面动 {np.linalg.norm(J[:, 0]):.2f} 像素，前进 1mm 动 {np.linalg.norm(J[:, 1]):.2f} 像素'
+                     f'(应该各约 {sc:.2f})；车走了 前进 {moved[0]:.0f}mm、横移 {moved[1]:.0f}mm，{len(X)} 帧，拟合误差 {rms / sc:.1f}mm'
+                     + (f'  ★ 不合理：{bad}' if bad else '(已存)'))
+            if bad:
+                return None, c, p_c
             if self.store is not None:
                 self.store.put('RAW', 'ch', J)
                 if hasattr(self.store, 'set_synth'):
                     self.store.set_synth('RAW', False)
-            self.log(f'    车轮：横移 1mm 画面动 {np.linalg.norm(J[:, 0]):.2f} 像素，前进 1mm 动 {np.linalg.norm(J[:, 1]):.2f} 像素(已存)')
-            return J, c
+            return J, c, p_c
 
         hist, most = [], 0
         try:
             # ---- ① 找圆心(找不到就边走边找)
-            found = start
+            found = None
+            if start is not None:
+                found = (np.asarray(start[0], float), float(start[1]), pos_meas())
             spots = [] if start is not None else [(0.0, 0.0)] + [(max(-smax, min(smax, float(p[0]))), max(-fmax, min(fmax, float(p[1]))))
-                                    for p in (cfg.get('raw_center_search_mm') or [])]
+                                                              for p in (cfg.get('raw_center_search_mm') or [])]
             for k, spot in enumerate(spots):
                 if k == 1:
                     self.log(f'    停车点认不出原料盘中心：车轮边走边找(一帧里最多看到过 {most} 个物料)')
@@ -2294,15 +2468,16 @@ class MissionHooks:
                 t_at = None
                 while self.now() < t_end and found is None:
                     self._check_abort()
-                    c, r, n = self._raw_center_frame(colors, claw, hist[-1][0] if hist else claw)
+                    c, r, n, pc = frame(hist[-1][0] if hist else claw)
                     most = max(most, n)
                     if c is not None:
-                        hist.append((c, r))
+                        hist.append((np.asarray(c, float), float(r), pc))
                         last = hist[-3:]
                         if len(last) == 3 and max(float(np.linalg.norm(a[0] - last[-1][0])) for a in last) <= 8.0 * sc:
-                            found = (np.median([a[0] for a in last], axis=0), float(np.median([a[1] for a in last])))
+                            found = (np.median([a[0] for a in last], axis=0), float(np.median([a[1] for a in last])),
+                                     np.median([a[2] for a in last], axis=0))
                             break
-                    d = np.array(spot, float) - (np.array(base) + est_now())
+                    d = np.array(spot, float) - (base + pos_est())
                     if k == 0 or float(np.linalg.norm(d)) < 2.0:
                         send(0.0, 0.0)
                         t_at = t_at or self.now()
@@ -2310,48 +2485,48 @@ class MissionHooks:
                             break                              # 到了这一处、看了一会儿：去下一处
                     else:
                         vv = clampv(d * 1.5, vsearch)
-                        send(float(vv[0]), float(vv[1]))
+                        send(float(vv[0]), float(vv[1]), run_s=float(np.linalg.norm(d)) / max(1e-6, float(np.linalg.norm(vv))))
                 if found is not None:
                     break
             if found is None:
-                finish()
-                self.log(f'    ★ 边走边找也认不出原料盘中心(一帧里最多看到 {most} 个物料，要相邻两个以上)')
-                d = act.disp
-                if abs(float(d['S']) - base[0]) >= 1.0 or abs(float(d['F']) - base[1]) >= 1.0:
-                    act.chassis_move(int(round(base[0] - float(d['S']))), int(round(base[1] - float(d['F']))))
+                self.log(f'    ★ 边走边找也认不出原料盘中心(一帧里最多看到 {most} 个物料；外圈也没认出来)')
+                self._rc_last['why'] = '认不出原料盘中心'
+                go_back()
                 return None
             send(0.0, 0.0)
-            c, r = found
-            c = np.asarray(c, float)
+            c, r, p_c = np.asarray(found[0], float), float(found[1]), np.asarray(found[2], float)
             if start is None:
                 self.log(f'    原料盘中心离{where} {np.linalg.norm(c - goalp) / sc:.1f}mm(原料盘半径约 {r / sc:.0f}mm)')
             # ---- ② 车轮和画面的对应关系
-            J = self.store.get('RAW', 'ch') if self.store is not None else None
+            J = None if fresh else (self.store.get('RAW', 'ch') if self.store is not None else None)
             if J is not None and hasattr(self.store, 'synth') and self.store.synth('RAW'):
                 J = None                                       # 存的只测过前后(横移是补出来的)：重新测
+            if J is not None:
+                bad = self._raw_J_bad(J, sc)
+                if bad:
+                    self.log(f'    存的车轮和画面的对应关系不合理({bad})：重新测')
+                    J = None
             if J is None:
                 self.log(f'    车轮慢慢前进、横移各 {float(cfg.get("raw_center_probe_mm", 15.0)):g}mm，边走边看圆心怎么动(测车轮和画面的对应关系)')
-                J, c = probe(c)
+                J, c, p_c = probe(c, p_c)
                 if J is None:
-                    finish()
-                    if tdir is None:
-                        self.log('    ★ 车轮边走边看没测出画面里圆心怎么动：改成一步一步挪、停稳了再看')
-                        return 'noprobe'
-                    self.log('    ★ 车轮走了，画面里圆心怎么动没测出来：停在这里')
-                    return c, r
+                    self._rc_last['why'] = '测不出车轮和画面的对应关系'
+                    self.log('    ★ 测不出车轮和画面的对应关系：车挪回原处停下，不对准(不乱挪)')
+                    go_back()
+                    return None
             J = np.asarray(J, float)
             # ---- ③ 边走边对准
             self.log(f'    车轮边走边对准{what}(最快 {vmax:g}mm/s，越近越慢)')
             t_end = self.now() + float(cfg.get('raw_center_align_s', 25.0))
             good, t_meas = 0, self.now()
-            ref = est_now()                                    # c 对应的车的位置
             t_log, frames, src = self.now(), 0, {'2+': 0, '1': 0, '推算': 0}
             e_start, t_start, reprobed = float(np.linalg.norm(tgt(c, r) - goalp)), self.now(), False
+            em = e_start / sc
             while self.now() < t_end:
                 self._check_abort()
-                cp = c + J @ (est_now() - ref)                 # 车走了：圆心在画面里应该挪到这里
-                cc, rr, n = self._raw_center_frame(colors, claw, cp)
+                cc, rr, n, pc = frame(c + J @ (pos_est() - p_c))
                 frames += 1
+                cp = c + J @ (pc - p_c)                        # 拍这一帧时，圆心按车走了多少应该在这里
                 if cc is not None and float(np.linalg.norm(cc - cp)) < 30.0 * sc:
                     c = 0.3 * cp + 0.7 * cc                    # 认出来了：以它为主，和推算的平均一下(去掉一帧一帧的抖动)
                     r = 0.8 * r + 0.2 * rr
@@ -2369,8 +2544,8 @@ class MissionHooks:
                 else:
                     c = cp                                     # 这一帧什么都没认出：按车走的距离推算
                     src['推算'] += 1
-                ref = est_now()
-                e = tgt(c, r) - goalp
+                p_c = pc
+                e = tgt(c + J @ (pos_est() - p_c), r) - goalp  # 认这一帧的时候车又走了一点：按现在的位置算偏差
                 em = float(np.linalg.norm(e)) / sc
                 if self.now() - t_meas > 4.0:
                     send(0.0, 0.0)                             # 4 秒都只能推算：先停下，等认出来
@@ -2386,24 +2561,30 @@ class MissionHooks:
                     nv = float(np.linalg.norm(vv))
                     if 1e-6 < nv < vmin:
                         vv = vv * (vmin / nv)                  # 太慢电机按 0 转/分算会不动：至少 vmin
-                    send(float(vv[0]), float(vv[1]))
+                        nv = vmin
+                    send(float(vv[0]), float(vv[1]), run_s=max(0.1, float(np.linalg.norm(d)) / max(nv, 1e-6)))
                 if not reprobed and self.now() - t_start > 3.0 and em * sc > e_start + 6.0 * sc:
-                    reprobed = True                            # 越走越偏：存的对应关系方向不对，重新测
+                    reprobed = True                            # 越走越偏：对应关系方向不对，重新测
                     self.log(f'    ★ 越走越偏({e_start / sc:.0f}mm → {em:.0f}mm)：车轮和画面的对应关系不对，重新测')
                     send(0.0, 0.0)
-                    J2, c = probe(c)
-                    if J2 is not None:
-                        J = np.asarray(J2, float)
-                    ref = est_now()
+                    J2, c, p_c = probe(c, p_c)
+                    if J2 is None:
+                        self._rc_last['why'] = '车轮和画面的对应关系不对、重新测也测不出'
+                        go_back()
+                        return None
+                    J = np.asarray(J2, float)
                     e_start, t_start = float(np.linalg.norm(tgt(c, r) - goalp)), self.now()
                 if self.now() - t_log >= 1.0:
                     dt = self.now() - t_log
-                    self.log(f'      {frames / dt:.0f} 帧/秒(认出圆心 {src["2+"]}、一个物料修正 {src["1"]}、推算 {src["推算"]})  '
+                    self.log(f'      {frames / dt:.1f} 帧/秒(认出圆心 {src["2+"]}、一个物料修正 {src["1"]}、推算 {src["推算"]})  '
                              f'{what}还偏 {em:.1f}mm  车轮 横移 {st["cmd"][0]:+.0f}、前进 {st["cmd"][1]:+.0f}mm/s')
                     t_log, frames, src = self.now(), 0, {'2+': 0, '1': 0, '推算': 0}
             finish()
-            self.log(f'    {what}离{where} {np.linalg.norm(tgt(c, r) - goalp) / sc:.1f}mm'
-                     + ('' if good >= 3 else '(没完全对准，到时间了)'))
+            c = c + J @ (st['p'] - p_c)                        # 停下的地方
+            em = float(np.linalg.norm(tgt(c, r) - goalp)) / sc
+            ok = good >= 3
+            self._rc_last = dict(ok=ok, err_mm=em, why='' if ok else f'到时间了还差 {em:.1f}mm(要 {tol:g}mm 以内)')
+            self.log(f'    {what}离{where} {em:.1f}mm' + ('' if ok else '(没完全对准，到时间了)'))
             return c, r
         except BaseException:
             try:
@@ -2411,6 +2592,11 @@ class MissionHooks:
             except Exception:
                 pass
             raise
+        finally:
+            try:
+                v.live_goal = None
+            except Exception:
+                pass
 
     def _raw_center_search(self, wait):
         """停车点认不出原料盘中心：车轮依次挪到 raw_center_search_mm 里的位置去找，认出来就停在那里返回 (圆心, 半径)；
@@ -3156,6 +3342,12 @@ class MissionHooks:
             self.log(f'    ★ 对准原料盘中心出错：{ex}')
         if m is None:
             return give_up('认不出原料盘中心、车轮对不准：这次不抓(示教的角度是按对准以后的位置记的，没对准就下爪会砸到物料)')
+        info = getattr(self, '_rc_last', None) or {}
+        acc = float(cfg.get('raw_ct_accept_mm', 5.0))
+        if not info.get('ok') and (info.get('err_mm') is None or float(info['err_mm']) > acc):
+            em_ = info.get('err_mm')
+            return give_up('车轮没对准' + (f'(还差 {float(em_):.1f}mm，超过 {acc:g}mm)' if em_ is not None else '')
+                           + '：这次不抓(示教的角度是按对准以后的位置记的，没对准就下爪会砸到物料)')
         c = np.asarray(m[0], float)
         self._raw_center_disp = (float(self.act.disp['S']), float(self.act.disp['F']))
         self._ct_t_arm = self.now()
@@ -3268,38 +3460,92 @@ class MissionHooks:
             return None
         return sorted({int(it.color) for it in self.plan.items(1)}) if self.plan is not None else [1, 2, 3, 4, 5, 6]
 
+    def _raw_center_still(self, n=5, max_s=8.0):
+        """(10-18)车停着：连着认 n 帧原料盘中心(和对准时同一个办法：外圈，认不出外圈才用物料)，取中值。返回 (圆心, 半径) 或 None。"""
+        v = self.vision
+        claw = np.array(v.claw('RAW'), float)
+        colors = self._raw_center_colors()
+        cs, rs, near = [], [], claw
+        t_lim = self.now() + float(max_s)
+        while len(cs) < int(n) and self.now() < t_lim:
+            self._check_abort()
+            c, r, _n = self._raw_center_frame(colors, claw, near)
+            if c is not None:
+                cs.append(np.asarray(c, float))
+                rs.append(float(r))
+                near = cs[-1]
+        if len(cs) < max(2, int(n) // 2 + 1):
+            return None
+        return np.median(np.asarray(cs), axis=0), float(np.median(rs))
+
+    def _raw_teach_seen_cols(self, cols):
+        """示教时没有任务码、要认 6 种颜色(每帧慢)：先看几帧原料盘上有哪几种颜色，以后只认这几种。返回颜色列表。"""
+        if not cols or len(cols) <= 3:
+            return cols
+        seen = set()
+        for _ in range(3):
+            self._check_abort()
+            errs = self.vision.material_errors(cols)
+            seen |= {int(k) for k, q in errs.items() if q is not None}
+        if not seen:
+            return cols
+        self.log('  原料盘上认出的颜色：' + '、'.join(COLOR_NAMES.get(c, str(c)) for c in sorted(seen)) + '(之后只认这几种，每帧快一些)')
+        return sorted(seen)
+
     def raw_ct_teach_center(self, path, move=True):
-        """rteach RAW center：车停在原料区停车点(附近)，原料盘上放好物料。手臂摆到看原料盘的姿态(OBS RAW)；
-        move=True：车轮把原料盘中心对到爪子点下面(和比赛时一样边走边看)；False(rteach RAW center here)：车不动，按现在的位置记。
-        记下原料盘中心在画面里的位置和手臂姿态；以前示教的三个停靠位清掉(要重新示教)。返回 (圆心, 半径)。"""
+        """rteach RAW center：车停在原料区停车点(附近)，原料盘停着、上面放好物料。手臂摆到看原料盘的姿态(OBS RAW)；
+        move=True：车轮把原料盘中心对到爪子点下面(和比赛时一样边走边看，只用 V 速度指令，车头不会转)，
+        车轮和画面的对应关系每次都现测(测完检查合不合理)；没对准到 raw_ct_tol_mm 以内就不保存，说明原因。
+        move=False(rteach RAW center here)：车不动，按现在的位置记。
+        记下原料盘中心在画面里的位置(车停着认几帧取中值)和手臂姿态；以前示教的三个停靠位清掉(要重新示教)。返回 (圆心, 半径)。"""
         cfg, v = self.cfg, self.vision
         sc = float(v.scale('RAW'))
+        tol = float(cfg.get('raw_ct_tol_mm', 3.0))
         old_cols = getattr(self, '_raw_center_cols', None)
         self._raw_center_cols = self._raw_ct_teach_cols() or old_cols
+        m = None
         try:
             self.arm.obs('RAW', open_claw=True)
             home = self.arm.read_angles()
             if home[0] is None or home[1] is None:
                 raise ArmError('读不到手臂角度，没保存')
+            if self._raw_center_cols:
+                self._raw_center_cols = self._raw_teach_seen_cols(self._raw_center_cols)
             if move:
                 if self.act is None:
                     raise ArmError('没有底盘(车轮)：车手动摆好以后用 rteach RAW center here')
-                self.log('  车轮边走边看，把原料盘中心对到爪子点下面(手臂不动)……')
-                m = self._raw_center_align(tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
-            else:
-                m = self._raw_plate_center(float(cfg.get('raw_center_wait_s', 12.0)))
+                self.log('  车轮边走边看，把原料盘中心对到爪子点下面(手臂不动，只用 V 慢慢走，车头不转)。'
+                         '另开终端 python3 vview.py 可以看实时画面……')
+                m = self._raw_center_align(tol=tol, fresh=True)
+                info = getattr(self, '_rc_last', None) or {}
+                if m is None:
+                    raise VisionError(f'没对准，没保存：{info.get("why") or "认不出原料盘中心"}。'
+                                      '看实时画面(python3 vview.py)：黄圈要套住原料盘外圈')
+                if not info.get('ok'):
+                    raise VisionError(f'没对准，没保存：{info.get("why") or "没对到"}。'
+                                      '车别动，再输入一次 rteach RAW center(会从现在的位置接着对)')
+            m2 = self._raw_center_still(5)
+            if m2 is None and not move:
+                m2 = self._raw_plate_center(float(cfg.get('raw_center_wait_s', 12.0)))
+            if m2 is not None:
+                m = m2
         finally:
             self._raw_center_cols = old_cols
         if m is None:
-            raise VisionError('认不出原料盘中心：原料盘上要有物料、在画面里')
+            raise VisionError('认不出原料盘中心：原料盘上要有物料、外圈在画面里，没保存')
         c, rr = np.asarray(m[0], float), float(m[1])
         claw = np.array(v.claw('RAW'), float)
+        dmm = float(np.linalg.norm(c - claw)) / sc
+        if move and dmm > tol + 1.0:
+            raise VisionError(f'停稳以后再看，原料盘中心离爪子点 {dmm:.1f}mm(要 {tol:g}mm 以内)，没保存：车别动，再输入一次 rteach RAW center')
         d = load_place_adj(path)
         d['RAW_CT'] = dict(home=[round(float(home[0]), 2), round(float(home[1]), 2)],
                            c=[round(float(c[0]), 1), round(float(c[1]), 1)], r=round(rr, 1), slots={})
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
-        self.log(f'  记下了：原料盘中心在画面 ({c[0]:.0f}, {c[1]:.0f})(离爪子点 {np.linalg.norm(c - claw) / sc:.1f}mm)，'
+        if self.store is not None:
+            self.store.save()                                  # 刚测的车轮和画面的对应关系存进 servo_cal.json：比赛时直接用
+        self.log(f'  记下了：原料盘中心在画面 ({c[0]:.0f}, {c[1]:.0f})(离爪子点 {dmm:.1f}mm)，'
                  f'物料所在圆半径约 {rr / sc:.0f}mm。以前示教的停靠位清掉了。'
                  '车别动，原料盘停着，接着 rteach RAW 1 颜色号、rteach RAW 2 颜色号、rteach RAW 3 颜色号')
         return c, rr
@@ -3322,7 +3568,7 @@ class MissionHooks:
         old_cols = getattr(self, '_raw_center_cols', None)
         self._raw_center_cols = self._raw_ct_teach_cols() or old_cols
         try:
-            m = self._raw_plate_center(5.0)
+            m = self._raw_center_still(5)                      # 和 rteach RAW center 同一个办法认圆心(外圈)
         finally:
             self._raw_center_cols = old_cols
         if m is not None:

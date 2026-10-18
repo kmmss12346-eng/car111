@@ -19,11 +19,13 @@ import json
 import math
 import os
 import sys
+import time
 import unittest
 
 import numpy as np
 
 from mission_hooks import MissionHooks, Abort
+from vision import VisionError
 from task_plan import parse_code, role_of
 
 DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03, APN=0.02)
@@ -145,6 +147,10 @@ class SimWorld:
         self.vel = None                                        # (10-16)V 发的底盘速度 [横移 mm/s, 前进 mm/s, 发的时刻]：400ms 没新的就停
         self.vel_fw = True                                     # STM32 认识 V
         self.vel_sum = [0.0, 0.0]                              # V 一共走了多少(V? 回的)
+        self.vel_quant = False                                 # (10-18)和 STM32 一样把 V 的速度取整成整数 转/分(低速时走得比发的慢/快一点)
+        self.stale_turn_deg = 0.0                              # (10-18)STM32 复位过、车被手搬动过：要保持的车头和现在差这么多度，
+                                                               #   第一条 S/F 走完车会转过去(HOME / R 0 以后就没了)
+        self.frame_extra_s = 0.0                               # (10-18)实车上认一帧原料盘外圈 + 物料要零点几秒到一秒多：每帧多花这么久
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
@@ -160,8 +166,9 @@ class SimWorld:
         vl = self.__dict__.get('vel')
         if vl and s > 0:                                   # 底盘按 V 的速度走(超过 400ms 没新的 V 就停)
             dt = max(0.0, min(s, vl[2] + 0.4 - self.t))
-            self.off_s += vl[0] * dt
-            self.off_f += vl[1] * dt * self.f_gain
+            if not self.__dict__.get('vel_stuck'):            # vel_stuck：轮子没跟着走(STM32 照样按发的速度算走了多少)
+                self.off_s += vl[0] * dt
+                self.off_f += vl[1] * dt * self.f_gain
             self.vel_sum[0] += vl[0] * dt
             self.vel_sum[1] += vl[1] * dt
             if self.t + s > vl[2] + 0.4:
@@ -359,6 +366,12 @@ class SimWorld:
         self.moves.append((cmd, val, self.zone))
         self.move_speeds.append(speed)
         f_before = self.off_f
+        if cmd == 'R' and int(val) == 0:
+            self.stale_turn_deg = 0.0                          # R 0 = HOME：现在的车头记为要保持的方向
+        elif cmd in ('S', 'F') and self.stale_turn_deg:
+            z = self.zone or 'NONE'                            # S/F 走完 STM32 把车头转回它记着的方向：车(连摄像头)转了一大圈
+            self.tilt[z] = float(self.tilt.get(z, 0.0)) + float(self.stale_turn_deg)
+            self.stale_turn_deg = 0.0
         if cmd == 'S':
             self.off_s += val * (1 + self.rng.normal(0, 0.03)) + self.rng.normal(0, 1.0)
         elif cmd == 'F':
@@ -400,6 +413,10 @@ class SimWorld:
                 return True, 'DONE', info
             vs, vf = float(parts[1]), float(parts[2])
             vs, vf = max(-60.0, min(60.0, vs)), max(-60.0, min(60.0, vf))
+            if self.vel_quant:                                 # chassis.c Car_Vel：每个方向按整数 转/分 走
+                ps, pf = (13.593 if vs >= 0 else 13.741), (12.84 if vf >= 0 else 12.78)
+                vs = round(vs * ps * 60.0 / 3200.0) * 3200.0 / 60.0 / ps
+                vf = round(vf * pf * 60.0 / 3200.0) * 3200.0 / 60.0 / pf
             self.vel = None if (vs == 0.0 and vf == 0.0) else [vs, vf, self.t]
             return True, 'DONE', info
         self.vel = None                                        # 别的指令：STM32 先停下 V 的连续走
@@ -420,6 +437,7 @@ class SimWorld:
             return True, 'PONG', info
         if verb == 'HOME':
             self.homed += 1                                      # 现在的车头方向记为要保持的方向
+            self.stale_turn_deg = 0.0
             return True, 'DONE', info
         if verb == 'GET':
             info += [f'P {k}={v:.4f}' for k, v in P.items()]
@@ -711,12 +729,26 @@ class SimVision:
         """和真的 Vision.plate_scan 一样：同一帧里的原料盘外圆 + 物料。原料盘外圆很大，总看得到一段弧。"""
         w = self.w
         pc = None
+        hist = self.__dict__.setdefault('_pc_hist', [])
         if self.outer_on and w.zone == 'RAW' and w.plate_stop:
             e = w.scale['RAW'] * (w._cam() @ (w.plate_c - w.claw())) + w.rng.normal(0, 1.5, 2)
             o = self._off('RAW', e)
             cl = self.claw('RAW')
-            pc = dict(c=(cl[0] + o[0], cl[1] + o[1]), r=w.scale['RAW'] * (w.plate_r + 60.0), stable=True, rms=1.0)
-        return pc, self.material_errors(colors)
+            now = (cl[0] + o[0], cl[1] + o[1])
+            if abs(e[0]) > 330 or abs(e[1]) > 260:
+                now = None                                     # 原料盘跑出画面了(车转了一大圈)：外圈也认不出
+            if now is not None:
+                hist.append(now)
+                del hist[:-3]                                  # 和 turntable_detector 一样：报的是最近 3 帧的中值(车在走时落后一两帧)
+                med = (float(np.median([q[0] for q in hist])), float(np.median([q[1] for q in hist])))
+                rr = w.scale['RAW'] * (w.plate_r + 60.0)
+                pc = dict(c=med, r=rr, stable=len(hist) >= 3, rms=1.0, c_now=now, r_now=rr)
+        if pc is None:
+            hist.clear()
+        out = self.material_errors(colors)
+        if w.frame_extra_s:
+            w.advance(w.frame_extra_s)
+        return pc, out
 
     def material_error(self, color_id, n=None):
         w = self.w
@@ -876,7 +908,8 @@ LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=Tr
 def make(world, cfg_extra=None, log=lambda m: None, raw=None):
     """raw：配置文件里 mission_cfg 以外的东西(stops、car_length_mm…)，QR 前后挪着找码要用 stops。"""
     cfg = dict(time_limit_s=1e9, servo_cal_file=None, vision_cal_file='', place_shift_mm=dict(F=0.0, S=0.0),      # 测试里不限时、不读写文件
-               ring_order={z: world.ring_order(z) for z in ('ROUGH', 'TEMP')})  # 假摄像头装的方向是随机的
+               ring_order={z: world.ring_order(z) for z in ('ROUGH', 'TEMP')},  # 假摄像头装的方向是随机的
+               raw_frame_thread=False)                         # 模拟的时间只有一条线：认一帧不放后台线程(后台线程 + 续速度另有真实时间的测试)
     # 以前的测试是按"按任务码顺序抓、先动手臂"写的：这里固定成那样；测比赛默认(不按顺序、先动车轮)的用 LIVE_DEFAULTS
     cfg.update(LEGACY)
     if not world.plate_stop:
@@ -1782,7 +1815,7 @@ class RawFollowTests(unittest.TestCase):
         for seed in (1, 2, 5):
             w = self._center_world(seed)
             lines = []
-            h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+            h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0], raw_grab_fixed=False), log=lines.append)   # 测按停靠位抓(不用固定抓取位)
             h._ensure(w.link)
             h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
             run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
@@ -1828,7 +1861,7 @@ class RawFollowTests(unittest.TestCase):
         """(10-16 用户)停车点认不出原料盘中心：车轮挪着去找(raw_center_search_mm)，找到了就对准、按停靠位抓；不是原地不动。"""
         w = self._center_world(1)
         lines = []
-        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0], raw_grab_fixed=False), log=lines.append)   # 测按停靠位抓
         h._ensure(w.link)
         h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
         real = h._raw_center_frame
@@ -1964,6 +1997,113 @@ class RawFollowTests(unittest.TestCase):
         self.assertNotIn('跟随抓取：', text)
 
 
+class RawFrameThreadTests(unittest.TestCase):
+    """(10-18 实车)认一帧要 0.5 秒(比 STM32 的 0.4 秒停车还久)：识别放在后台线程，这边每 0.15 秒续一次 V，车一直在走、不走一下停一下；
+    拍每一帧时车走了多少按 V? 记，测出的车轮和画面的对应关系准，对得上。用真实时间跑(十来秒)。"""
+
+    class Car:
+        """假底盘(真实时间)：V 一直按这个速度走，0.4 秒没收到新的 V 就停(和 chassis.c 一样)；V? 回一共走了多少。"""
+
+        def __init__(self):
+            import threading
+            self.lock = threading.Lock()
+            self.pos, self.v, self.t_cmd, self.t = np.zeros(2), np.zeros(2), None, time.monotonic()
+            self.disp = dict(S=0.0, F=0.0)
+            self.sent = []                                     # (时刻, 横移, 前进)
+
+        def _upd(self):
+            now = time.monotonic()
+            if self.t_cmd is not None and np.any(self.v):
+                t_end = min(now, self.t_cmd + 0.4)
+                if t_end > self.t:
+                    self.pos = self.pos + self.v * (t_end - self.t)
+                if now >= self.t_cmd + 0.4:
+                    self.v = np.zeros(2)
+            self.t = now
+
+        def vel(self, vs, vf):
+            with self.lock:
+                self._upd()
+                self.v, self.t_cmd = np.array([vs, vf], float), time.monotonic()
+                self.sent.append((self.t_cmd, float(vs), float(vf)))
+            return True
+
+        def vel_read(self):
+            with self.lock:
+                self._upd()
+                return float(self.pos[0]), float(self.pos[1])
+
+        def where(self):
+            with self.lock:
+                self._upd()
+                return self.pos.copy()
+
+        def chassis_move(self, s, f):
+            raise AssertionError(f'对准圆心不该发 S/F(车头会转)：S {s} F {f}')
+
+    class Cam:
+        """假摄像头：拍照那一刻车在哪，原料盘中心就在画面哪里；认一帧要 frame_s 秒(真实时间)。"""
+
+        def __init__(self, car, J, c0, frame_s=0.5):
+            self.car, self.J, self.c0, self.frame_s = car, np.asarray(J, float), np.asarray(c0, float), frame_s
+            self.rng = np.random.default_rng(3)
+            self.live_goal = None
+
+        def scale(self, kind):
+            return 1.97
+
+        def claw(self, kind):
+            return (320.0, 240.0)
+
+        def plate_scan(self, colors):
+            c = self.c0 + self.J @ self.car.where() + self.rng.normal(0, 1.0, 2)
+            time.sleep(self.frame_s)
+            return dict(c=(0.0, 0.0), c_now=(float(c[0]), float(c[1])), r=240.0, r_now=240.0, stable=True, rms=1.0), {1: None}
+
+        def material_errors(self, colors):
+            return {}
+
+    class Store:
+        def __init__(self):
+            self.d = {}
+
+        def get(self, kind, g):
+            return self.d.get((kind, g))
+
+        def put(self, kind, g, J):
+            self.d[(kind, g)] = np.asarray(J, float)
+
+        def set_synth(self, kind, v):
+            pass
+
+        def synth(self, kind):
+            return False
+
+    def test_keeps_moving_while_a_frame_is_slow(self):
+        sc = 1.97
+        th = math.radians(30.0)
+        J = sc * np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]]) @ np.diag([1.0, -1.0])
+        car = self.Car()
+        cam = self.Cam(car, J, (320.0 + 16.0, 240.0 - 12.0), frame_s=0.5)
+        lines = []
+        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, raw_center_colors=[1])}, log=lines.append, vision=cam,
+                         now=time.monotonic, sleep=time.sleep)
+        h.act, h.store = car, self.Store()
+        m = h._raw_center_align_smooth(tol=2.0, fresh=True)
+        text = '\n'.join(lines)
+        self.assertIsNotNone(m, text)
+        self.assertTrue(h._rc_last['ok'], text)
+        c_true = cam.c0 + J @ car.where()
+        self.assertLess(float(np.linalg.norm(c_true - np.array([320.0, 240.0]))) / sc, 2.5, text)
+        Jm = h.store.get('RAW', 'ch')
+        self.assertLess(float(np.abs(Jm - J).max()), 0.15 * sc, (Jm, J, text))
+        gaps = [b[0] - a[0] for a, b in zip(car.sent, car.sent[1:]) if abs(a[1]) + abs(a[2]) > 1e-9]
+        self.assertTrue(gaps, text)
+        self.assertLess(max(gaps), 0.35, (max(gaps), text))                           # 车在走的时候一直续着，没有停下来过
+        self.assertAlmostEqual(car.disp['S'], float(car.where()[0]), delta=0.5)        # V 走过的距离记进 disp
+        self.assertAlmostEqual(car.disp['F'], float(car.where()[1]), delta=0.5)
+
+
 class RawCenterTeachTests(unittest.TestCase):
     """(10-18 用户)原料区：手臂摆到看原料盘的姿态不动，车轮边走边看把原料盘中心对到示教时的位置；对准以后车不再动，
     按任务码顺序，要的颜色停在几号位就按几号位示教的手臂角度直接下爪(不拿画面再修手臂)。"""
@@ -2039,33 +2179,59 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完车挪回停车点
             self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
-    def test_probe_fails_falls_back_to_step_moves(self):
-        """(10-18 实车)rteach RAW center 边走边看没测出车轮和画面的对应关系：改成一步一步挪、停稳再看，照样对准、存下对应关系。"""
+    def test_wheels_not_moving_stops_and_saves_nothing(self):
+        """(10-18 实车)车轮没跟着 V 走(STM32 以为走了)：测出来的车轮和画面的对应关系不合理 -> 不保存、说明原因；
+        不改成一步一步挪(不发一条 S/F)，STM32 复位过也不会转车头。"""
         import tempfile
         w = self._world(2)
         path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
         lines = []
         h = self._make(w, path, lines)
-        orig = w._handle
-
-        def handle(text):                                      # 车轮不跟 V 走(实车上可能速度太慢走不动)：STM32 照样回 DONE
-            if text.startswith('V '):
-                return orig('V 0.0 0.0')
-            return orig(text)
-        w._handle = handle
+        w.vel_stuck, w.stale_turn_deg = True, 90.0
         w.arrive('RAW')
         while w.plate_phase()[1]:
             w.advance(0.1)
         ph = w.plate_phase()[0]
         w.plate_phase = lambda t=None: (ph, False)
         h.act.reset_disp()
-        c, _r = h.raw_ct_teach_center(path, move=True)
+        n_moves = len(w.moves)
+        with self.assertRaises(VisionError) as cm:
+            h.raw_ct_teach_center(path, move=True)
         text = '\n'.join(lines)
-        self.assertIn('改成一步一步挪', text)
-        self.assertIn('车轮真的动了吗', text)
-        self.assertIsNotNone(h.store.get('RAW', 'ch'), text)
-        claw = np.array(h.vision.claw('RAW'), float)
-        self.assertLess(float(np.linalg.norm(np.asarray(c) - claw)) / w.scale['RAW'], 4.5, text)
+        self.assertIn('没对准，没保存', str(cm.exception))
+        self.assertIn('车轮真的走了吗', text)
+        self.assertEqual(w.moves[n_moves:], [], text)                                  # 一条 S/F 都没发
+        self.assertEqual(float(w.tilt.get('RAW', 0.0)), 0.0)                           # 车头没转
+        self.assertFalse(os.path.exists(path) and 'RAW_CT' in json.load(open(path, encoding='utf-8')))
+
+    def test_teach_and_match_like_the_real_car(self):
+        """(10-18 实车)原料盘外圈报的是 3 帧中值(车在走时落后)、每帧多花 0.5 秒(比 STM32 0.4 秒停车还久，车走一下停一下)、
+        V 取整成整数 转/分、STM32 复位过(S/F 走完车头会转 90°)：示教照样对准，测出的车轮和画面的对应关系准；
+        示教和比赛的原料区都不发一条 S/F(车头不转)，按任务码顺序三个都夹到、放对槽。"""
+        import tempfile
+        for seed in (1, 2):
+            w = self._world(seed)
+            w.frame_extra_s, w.vel_quant, w.stale_turn_deg = 0.5, True, 90.0
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            self._teach(w, h, path)
+            text = '\n'.join(lines)
+            J = np.asarray(h.store.get('RAW', 'ch'), float)
+            for k in (0, 1):
+                self.assertAlmostEqual(float(np.linalg.norm(J[:, k])), w.scale['RAW'], delta=0.15 * w.scale['RAW'], msg=text)
+            self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [], text)
+            self.assertEqual(float(w.tilt.get('RAW', 0.0)), 0.0, text)
+            lines.clear()
+            w.requests.clear()
+            n_moves = len(w.moves)
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+            self.assertEqual([m for m in w.moves[n_moves:] if m[2] == 'RAW' and m[0] in ('S', 'F')], [], text[-3000:])
+            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完只用 V 挪回停车点
+            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""

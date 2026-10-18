@@ -373,6 +373,7 @@ class Vision:
         self._pick = None               # 认圆环上物料用的 matdet(和原料盘的分开)
         self.last_pick_r = None         # 最近一次 pick_px 认到的物料顶面半径(像素)
         self._live_t = 0.0
+        self.live_goal = None           # (10-18)原料区对准圆心时要对到的点(画面像素)：实时画面里画成紫色菱形
 
     # ------------------------------------------------------------ 基础
     def open(self):
@@ -556,7 +557,9 @@ class Vision:
 
     def plate_scan(self, colors):
         """(10-16 用户：照抄开源方案)同一帧里：原料盘(转盘)外圆 + 这几个颜色的物料。
-        返回 (外圆 dict(c=(x, y), r=半径, stable=是否连续几帧稳定, rms=拟合残差) 或 None, {颜色: 偏差像素 或 None})。
+        返回 (外圆 dict(c=(x, y), r=半径, stable=是否连续几帧稳定, rms=拟合残差, c_now=(x, y), r_now=半径) 或 None, {颜色: 偏差像素 或 None})。
+        c、r 是最近几帧的中值(车停着时更稳)；c_now、r_now 只是这一帧(10-18：车在走时用它，中值会落后一两帧)。
+        这一帧连同认出来的外圆、物料写给 vview.py 实时看(live_goal = 要对到的点，画成紫色菱形)。
         外圆用 turntable_detector.py(开源方案原样)：粗 Hough 找大圆 -> 沿径向采样边缘精修；锁定以后每帧只做局部精修(快)。
         参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。"""
         det = self._material_det()
@@ -588,6 +591,13 @@ class Vision:
             if r is not None and r.detected:
                 plate = dict(c=(float(r.center_x_px), float(r.center_y_px)), r=float(r.radius_px), stable=bool(r.stable),
                              rms=float(r.fit_rms_px))
+                now = tt.samples[-1] if getattr(tt, 'samples', None) else None
+                if now is not None and getattr(now, 'detected', True):
+                    plate['c_now'] = (float(now.center_x_px), float(now.center_y_px))
+                    plate['r_now'] = float(now.radius_px)
+        if fr is not None:
+            pts = [(cu + q[0], cv_ + q[1]) for q in out.values() if q is not None]
+            self._publish(fr, 'RAW', None if plate is None else plate.get('c_now', plate['c']), color_id='plate', plate=plate, pts=pts)
         return plate, out
 
     def material_error(self, color_id, n=None):
@@ -931,8 +941,10 @@ class Vision:
         return bool(cv2.imwrite(path, out))
 
     # ------------------------------------------------------------ 实时画面(给 vview.py 看)
-    def overlay(self, fr, kind, target=None, color_id=None, rings=None):
-        """在一帧上画出识别结果，返回新图。kind='RAW' 物料 / 'RING' 圆环；target = 认到的中心(像素)或 None。"""
+    def overlay(self, fr, kind, target=None, color_id=None, rings=None, plate=None, pts=None):
+        """在一帧上画出识别结果，返回新图。kind='RAW' 物料 / 'RING' 圆环；target = 认到的中心(像素)或 None。
+        color_id='plate'：原料盘外圆(plate，黄圈)、它的圆心(target)、这一帧认出的物料(pts，青色小圈)；
+        live_goal(原料区要把圆心对到的点)画成紫色菱形，左上角写离它多少。"""
         import cv2
         out = fr.copy()
         md = None
@@ -967,30 +979,48 @@ class Vision:
             what = f'RING ({len(kept)} found' + (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
         else:
             res = getattr(md, 'last', None) if md is not None else None
-            if target is not None and res is not None:
+            if color_id == 'plate':
+                if plate is not None:
+                    pc = plate.get('c_now', plate['c'])
+                    pr = float(plate.get('r_now', plate['r']))
+                    cv2.circle(out, (int(round(pc[0])), int(round(pc[1]))), int(round(pr)), (0, 255, 255), 2)
+                    info = f' plate r={pr:.0f}px'
+                for q in pts or []:
+                    cv2.circle(out, (int(round(q[0])), int(round(q[1]))), 8, (255, 255, 0), 2)
+                info += f' {len(pts or [])} materials'
+            elif target is not None and res is not None:
                 cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
                 info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
-            what = 'WATCHING PLATE' if color_id == 'any' else f'MATERIAL {color_id}'
+            what = 'PLATE CENTER' if color_id == 'plate' else ('WATCHING PLATE' if color_id == 'any' else f'MATERIAL {color_id}')
             if kind == 'PICK':
                 what += ' on ring' + ('' if self.has_pick() else ' (PICK point not learned)')
+        goal = getattr(self, 'live_goal', None) if color_id == 'plate' else None
+        if goal is not None:
+            cv2.drawMarker(out, (int(round(goal[0])), int(round(goal[1]))), (255, 0, 255), cv2.MARKER_DIAMOND, 24, 2)
         if target is not None:
             cv2.drawMarker(out, (int(round(target[0])), int(round(target[1]))), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 28, 2)
-            cv2.line(out, (int(cu), int(cv_)), (int(round(target[0])), int(round(target[1]))), (255, 0, 255), 1)
-            du, dv = target[0] - cu, target[1] - cv_
+            ref = goal if goal is not None else (cu, cv_)
+            cv2.line(out, (int(round(ref[0])), int(round(ref[1]))), (int(round(target[0])), int(round(target[1]))), (255, 0, 255), 1)
+            du, dv = target[0] - ref[0], target[1] - ref[1]
             try:
                 mm = (du * du + dv * dv) ** 0.5 / self.scale(kind)
             except Exception:
                 mm = float('nan')
-            msg = f'{what}: off {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm{info}'
+            msg = f'{what}: ' + ('to goal' if goal is not None else 'off') + f' {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm'
         else:
             msg = f'{what}: NOT FOUND'
         cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
-        msg += time.strftime('   %H:%M:%S')
-        cv2.putText(out, msg, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
-        cv2.putText(out, msg, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        lines = [msg + time.strftime('   %H:%M:%S')]
+        if info.strip():
+            lines.append(info.strip())                 # 第二行：半径、遮挡、看到几个物料(一行写不下)
+        for i, t in enumerate(lines):
+            (tw, th), _b = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            y = 22 + 22 * i
+            cv2.rectangle(out, (4, y - th - 5), (12 + tw, y + 6), (0, 0, 0), -1)      # 黑底白字(描粗边的字会错开、看不清)
+            cv2.putText(out, t, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         return out
 
-    def _publish(self, fr, kind, target=None, color_id=None, rings=None):
+    def _publish(self, fr, kind, target=None, color_id=None, rings=None, plate=None, pts=None):
         """把带标注的这一帧写到 live_view 文件(限速)，另一个终端里 python3 vview.py 就能实时看。出错也不影响识别。"""
         path = self.cfg.get('live_view')
         if not path or fr is None:
@@ -1001,7 +1031,8 @@ class Vision:
         self._live_t = now
         try:
             import cv2
-            ok, buf = cv2.imencode('.jpg', self.overlay(fr, kind, target, color_id, rings), [cv2.IMWRITE_JPEG_QUALITY, 80])
+            ok, buf = cv2.imencode('.jpg', self.overlay(fr, kind, target, color_id, rings, plate=plate, pts=pts),
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 tmp = path + '.tmp'
                 with open(tmp, 'wb') as f:
