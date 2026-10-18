@@ -151,6 +151,7 @@ class SimWorld:
         self.stale_turn_deg = 0.0                              # (10-18)STM32 复位过、车被手搬动过：要保持的车头和现在差这么多度，
                                                                #   第一条 S/F 走完车会转过去(HOME / R 0 以后就没了)
         self.frame_extra_s = 0.0                               # (10-18)实车上认一帧原料盘外圈 + 物料要零点几秒到一秒多：每帧多花这么久
+        self.obs_err_deg = 0.0                                 # (10-18)OBS 到位误差(ATOLC 1°、摩擦)：每次 OBS 以后 ID1 随机差 ±这么多度、ID2 差 ±10 倍
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
@@ -555,6 +556,9 @@ class SimWorld:
                 self._open_claw()
             self._lift_to(P['ZHI'])
             self._servos_to(self.a1_ref, self.a2_ref, P['ASPD'])
+            if self.obs_err_deg:
+                self.a1 += float(self.rng.uniform(-1.0, 1.0)) * self.obs_err_deg
+                self.a2 += float(self.rng.uniform(-1.0, 1.0)) * self.obs_err_deg * 10.0
             self._lift_to(P['ZOBRNG'] if ring else P['ZOBRAW'])
             return True, 'DONE', info
         if verb in ('GRAB', 'PICK'):
@@ -2166,9 +2170,10 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])      # 按任务码顺序：1 红、5 黑、6 浅蓝
             self.assertFalse([q for q in req if q.split()[0] in ('APN', 'AD', 'AF')], req)    # 手臂不跟随、不微调
             i_obs = req.index('OBS RAW O')
-            i_ap = next(i for i, q in enumerate(req) if q.startswith('AP '))
-            self.assertTrue(any(q.startswith('V ') for q in req[i_obs:i_ap]))                # 对准时只有车轮在走
-            self.assertFalse([q for q in req[i_obs:i_ap] if q.split()[0] not in ('V', 'OBS')], req[i_obs:i_ap])
+            i_v = next(i for i, q in enumerate(req) if i > i_obs and q.startswith('V '))
+            i_ap = next(i for i, q in enumerate(req) if i > i_v and q.startswith('AP '))
+            self.assertFalse([q for q in req[i_obs:i_v] if q.split()[0] not in ('OBS', 'AP')], req[i_obs:i_v])   # 看原料盘的姿态，再精确转到示教的角度
+            self.assertFalse([q for q in req[i_v:i_ap] if q.split()[0] != 'V'], req[i_v:i_ap])                  # 对准时只有车轮在走
             for g in range(len(req)):
                 if req[g].startswith('GRAB'):
                     ap = next(q for q in reversed(req[:g]) if q.startswith('AP '))
@@ -2362,6 +2367,67 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
             self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
             self.assertIn('够不着', text)
+
+    def test_obs_pose_error_and_a_bump_like_the_real_car(self):
+        """(10-18 实车)OBS 每次到位差 ±2°(ID1 每度动好几毫米，原料盘在画面里跟着挪)，示教中途车被碰了一下(rteach RAW 2 3 报差了 23mm)：
+        每次先用 AP 精确转到示教时的角度(还差的按画面补)，圆心偏了先让车轮对回去再示教；比赛时按任务码顺序三个都夹到。"""
+        import tempfile
+        for seed in (1, 2):
+            w = self._world(seed)
+            w.obs_err_deg = 2.0
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            ph = self._center_only(w, h, path)
+            w.off_s += 12.0                                    # 车被碰了一下
+            n_moves = len(w.moves)
+            try:
+                for it in w.raw_items:
+                    self.assertTrue(h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path), '\n'.join(lines))
+            finally:
+                del w.plate_phase
+            text = '\n'.join(lines)
+            self.assertIn('先让车轮对回去', text)
+            self.assertEqual(w.moves[n_moves:], [], text)                       # 对回去只用 V
+            lines.clear()
+            w.requests.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+
+    def test_id1_near_its_limit_is_out_of_reach_and_id2_is_not_pushed(self):
+        """(10-18 实车 rteach RAW 3 4：ID1 停在 48.3°(限位 44°)转不下去，手臂又把 ID2 一路推到 -300)：ID1 离限位 5° 以内算够不着；
+        示教时每个关节只在按画面估的角度附近转，不拿另一个关节硬凑。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=dict(a1_range=[0.0, 515.0]))      # 3 号位要 ID1 520°：限位 515°，再往里收 5° = 510°
+        ph = self._center_only(w, h, path)
+        h2 = float(w.params['A2E'])
+        res, a2_seen = {}, []
+        orig = w._handle
+
+        def handle(text):
+            out = orig(text)
+            a2_seen.append(w.a2)
+            return out
+        w._handle = handle
+        try:
+            for it in w.raw_items:
+                k = self._slot_of(w, it, ph)
+                a2_seen.clear()
+                res[k] = (h.raw_ct_teach_slot(k, it['color'], path), max(abs(a - h2) for a in a2_seen))
+        finally:
+            del w.plate_phase
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)['RAW_CT']
+        far = [k for k, sv in d['slots'].items() if sv['a'] is None]
+        self.assertEqual(len(far), 1, ('\n'.join(lines), d))
+        k_far = int(far[0])
+        self.assertFalse(res[k_far][0])
+        self.assertLess(res[k_far][1], 260.0, '\n'.join(lines))              # ID2 没被推到头(估的只要转一点点)
 
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""

@@ -170,6 +170,8 @@ DEFAULTS = dict(
     raw_ct_check=True,                  # 转到停靠位上方、下爪前拍一帧：看到要夹的物料离爪子点超过 raw_slot_accept_mm(原料盘又转了)就不下爪；看不到照样下爪
     raw_ct_stop_s=6.0,                  # (10-18 用户量的)原料盘每次大约停多久、转多久(秒)：还没量到之前按这个估计(停的时间按九折算，留余量)；
     raw_ct_move_s=3.0,                  #   亲眼看到两次停下以后，按量到的周期推算回到看的姿态时这一次已经停了多久
+    raw_a1_margin_deg=5.0,              # (10-18 实车)ID1 离限位这么多度以内算够不着：STM32 给 ID1 往前多给 5° 补偿摩擦，靠近限位时多给的被限位截掉，
+                                        #   ID1 停在离限位四五度的地方(示教 3 号位时停在 48.3°，限位 44°)
     raw_ct_accept_mm=5.0,               # 比赛时对准圆心：到时间还没对到 raw_ct_tol_mm，但离示教的位置不到这么多毫米也照样抓；再远就这次不抓(会砸到物料)
     raw_frame_thread=True,              # (10-18)对准圆心车在走时，认一帧放在后台线程，这边每 raw_vel_keep_s 秒给 STM32 续一次速度
     raw_vel_keep_s=0.15,                #   (STM32 0.4 秒收不到新的 V 就停车，实车上认一帧要零点几秒到一秒多：不续的话车走一下停一下)
@@ -3214,6 +3216,33 @@ class MissionHooks:
             return None
         return 3.0 * np.asarray(c, float)[:2] - others[0] - others[1]
 
+    def _raw_ct_pose(self, D):
+        """(10-18 实车)手臂摆到看原料盘的姿态(OBS RAW 到位误差约 1°；ID1 每度 7mm，差 1° 原料盘在画面里就挪 7mm)，
+        再用 AP(到位误差 0.3°)转到示教时的角度。返回 (现在的 [ID1, ID2], 和示教时还差的那一点角度让画面挪了多少像素)。
+        和示教时差太多(改过 A1G/A2E)就不 AP，原样返回(调用的地方判断)。"""
+        self.arm.obs('RAW', open_claw=True)
+        h0 = [float(x) for x in D['home'][:2]]
+        a = self.arm.read_angles()
+        if a[0] is None or a[1] is None:
+            raise ArmError('读不到手臂角度')
+        if math.hypot(a[0] - h0[0], (a[1] - h0[1]) / 10.0) <= 5.0 and (abs(a[0] - h0[0]) > 0.2 or abs(a[1] - h0[1]) > 2.0):
+            self.arm.ap(h0[0], h0[1])
+            a = self.arm.read_angles()
+            if a[0] is None or a[1] is None:
+                raise ArmError('读不到手臂角度')
+        a = [float(a[0]), float(a[1])]
+        comp = np.zeros(2)
+        Ja = self.store.get('RAW', 'arm') if self.store is not None else None
+        if Ja is not None:
+            comp = np.asarray(Ja, float) @ np.array([a[1] - h0[1], a[0] - h0[0]])
+        return a, comp
+
+    def _raw_a1_range(self):
+        """ID1 真正能转到的范围：限位往里收 raw_a1_margin_deg(补偿摩擦多给的角度被限位截掉，靠近限位转不到)。"""
+        a1r = self.cfg.get('a1_range') or (A1_MIN, A1_MAX)
+        mg = float(self.cfg.get('raw_a1_margin_deg', 5.0))
+        return float(a1r[0]) + mg, float(a1r[1]) - mg
+
     def _raw_ct_keepalive(self):
         """等原料盘时手臂太久没动：ID1 轻轻摆一下再回来(规则：机器人停止运行 15 秒、等转盘时 23 秒，本轮结束)。"""
         h = self._ct_home
@@ -3336,13 +3365,12 @@ class MissionHooks:
             self._stow_quiet()
             return True
         try:
-            self.arm.obs('RAW', open_claw=True)
+            home, comp = self._raw_ct_pose(D)                 # 精确转到示教时看原料盘的角度(还差的一点按画面补)
         except ArmAbort:
             raise
         except ArmError as ex:
             self._recover(f'摆到看原料盘的姿态出错：{ex}')
             return give_up('摆不到看原料盘的姿态：这次不抓')
-        home = self._raw_home()
         if math.hypot(home[0] - D['home'][0], (home[1] - D['home'][1]) / 10.0) > 5.0:
             self.log('    ★ 看原料盘的姿态(ID1/ID2)和示教时不一样(改过 A1G/A2E？)：示教的停靠位用不了，这次照旧用以前的做法。'
                      '要重新示教：rteach RAW center，再 rteach RAW 1/2/3 颜色号')
@@ -3351,7 +3379,7 @@ class MissionHooks:
         self._ct_stops, self._ct_used = [], None
         # ---- ① 车轮对准原料盘中心(手臂不动)
         try:
-            m = self._raw_center_align(goal=D['c'], tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
+            m = self._raw_center_align(goal=np.asarray(D['c'], float)[:2] + comp, tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
         except (ArmError, VisionError) as ex:
             if isinstance(ex, ArmAbort):
                 raise
@@ -3377,7 +3405,7 @@ class MissionHooks:
         T = self._raw_close_delay('grab')
         batch_cols = sorted({int(it.color) for it in items})
         watch = sorted(set(self._raw_center_colors()) | {it.color for it in todo})
-        self.log('    对准了(还差 ' + f'{float(np.linalg.norm(off)) / sc:.1f}mm)，车不再动：'
+        self.log('    对准了(还差 ' + f'{float(np.linalg.norm(off - comp)) / sc:.1f}mm)，车不再动：'
                  + '  '.join(f'{k}号位' + (f' ID1 {reach[k][0]:.1f}°、ID2 {reach[k][1]:.1f}°' if k in reach else ' 手臂够不着') for k in keys))
         Pp = self.arm.params() or {}
         spd = max(10.0, float(Pp.get('ASPD', 90.0)))
@@ -3523,6 +3551,9 @@ class MissionHooks:
         m = None
         try:
             self.arm.obs('RAW', open_claw=True)
+            P_ = self.arm.params() or {}
+            if 'A1G' in P_ and 'A2E' in P_:
+                self.arm.ap(float(P_['A1G']), float(P_['A2E']))   # OBS 到位误差约 1°：用 AP(0.3°)精确转到 A1G、A2E，以后每次都转到这里
             home = self.arm.read_angles()
             if home[0] is None or home[1] is None:
                 raise ArmError('读不到手臂角度，没保存')
@@ -3568,30 +3599,36 @@ class MissionHooks:
         return c, rr
 
     def raw_ct_teach_slot(self, n, color, path):
-        """rteach RAW n 颜色号：rteach RAW center 以后车没动过，原料盘停着，颜色 color 的物料停在 n 号停靠位。
-        手臂在看原料盘的姿态记下物料在画面里的位置；再只动手臂对准它，对上了记下角度(抓取动作)。
+        """rteach RAW n 颜色号：原料盘停着，颜色 color 的物料停在 n 号停靠位。
+        ① 手臂摆到看原料盘的姿态、精确转到示教时的角度；车被碰过(原料盘中心离示教时的位置超过 raw_ct_tol_mm)就先让车轮对回去
+           (每次都从头对，10-18 用户)；② 记下物料在画面里的位置；③ 只动手臂对准它，对上了记下角度(抓取动作)。
+        手臂每个关节只在按画面估的角度附近转(一个关节到头了不拿另一个关节硬凑)。
         对不上(够不着/看不清)只记位置：用 arm AD 1 / arm AD 2 把爪子摆到物料正上方，再 rteach RAW n save。返回记没记下角度。"""
         cfg, v = self.cfg, self.vision
         sc = float(v.scale('RAW'))
+        tol = float(cfg.get('raw_ct_tol_mm', 3.0))
         D = load_place_adj(path).get('RAW_CT')
         if not isinstance(D, dict) or not D.get('c'):
             raise ValueError('先做 rteach RAW center(车轮把原料盘中心对到爪子点下面)')
-        self.arm.obs('RAW', open_claw=True)
-        home = self.arm.read_angles()
-        if home[0] is None or home[1] is None:
-            raise ArmError('读不到手臂角度，没保存')
+        home, comp = self._raw_ct_pose(D)
         if math.hypot(home[0] - float(D['home'][0]), (home[1] - float(D['home'][1])) / 10.0) > 5.0:
             raise ArmError('看原料盘的姿态和 rteach RAW center 时不一样(改过 A1G/A2E？)：先重新 rteach RAW center')
+        goal = np.asarray(D['c'], float)[:2] + comp
         old_cols = getattr(self, '_raw_center_cols', None)
         self._raw_center_cols = self._raw_ct_teach_cols() or old_cols
         try:
             m = self._raw_center_still(5)                      # 和 rteach RAW center 同一个办法认圆心(外圈)
+            dc = None if m is None else float(np.linalg.norm(np.asarray(m[0], float) - goal)) / sc
+            if dc is not None and dc > tol:
+                if self.act is None:
+                    raise ArmError(f'原料盘中心离示教时的位置 {dc:.0f}mm，又没有底盘：先重新 rteach RAW center')
+                self.log(f'   原料盘中心离示教时的位置 {dc:.1f}mm(车被碰过？)：先让车轮对回去(只用 V，车头不转)')
+                mm = self._raw_center_align(goal=goal, tol=tol)
+                info = getattr(self, '_rc_last', None) or {}
+                if mm is None or not info.get('ok'):
+                    raise VisionError('车轮对不回示教时的位置，没示教：' + str(info.get('why') or '认不出原料盘中心'))
         finally:
             self._raw_center_cols = old_cols
-        if m is not None:
-            dc = float(np.linalg.norm(np.asarray(m[0], float) - np.asarray(D['c'], float))) / sc
-            if dc > 3.0 * float(cfg.get('raw_ct_tol_mm', 3.0)):
-                raise ArmError(f'原料盘中心和 rteach RAW center 时差了 {dc:.0f}mm(车动过了？)：先重新 rteach RAW center')
         e = v.material_error(int(color), n=3)
         claw = np.array(v.claw('RAW'), float)
         guessed = False
@@ -3601,10 +3638,11 @@ class MissionHooks:
                 raise VisionError('画面里没看到这个颜色的物料：原料盘停着、物料在画面里再试。'
                                   '物料被爪子挡住看不到的话：先示教另外两个位，这个位会按它们推出来')
             guessed = True
+            g = np.asarray(g, float) + comp                    # 示教数据是按示教时的角度记的：换到现在的画面
             e = (float(g[0] - claw[0]), float(g[1] - claw[1]))
             self.log(f'   画面里看不到 {n} 号位的物料(可能被爪子挡住)：按圆心和另外两个位推出它在画面 ({g[0]:.0f}, {g[1]:.0f})，'
                      '手臂先按这个位置转过去，再看着对准')
-        px = claw + np.asarray(e, float)
+        px = claw + np.asarray(e, float) - comp                # 存的画面位置按示教时看原料盘的角度算
         a = None
         J = self.store.get('RAW', 'arm') if self.store is not None else None
         if J is None:
@@ -3614,23 +3652,28 @@ class MissionHooks:
             dd = -np.linalg.solve(np.asarray(J, float), np.asarray(e, float))       # [ID2, ID1] 度
             lim = dict(id1=60.0, id2=700.0)
             lim.update(cfg.get('raw_center_reach_deg') or {})
-            a1r = cfg.get('a1_range') or (A1_MIN, A1_MAX)
+            a1r = self._raw_a1_range()
             a1, a2 = home[0] + float(dd[1]), home[1] + float(dd[0])
             # 10-18：离得远(八九十毫米)时按画面估的角度会差一二成：稍微超出范围也先在范围里试着对，看能对到多近
-            over1 = max(0.0, abs(float(dd[1])) - float(lim['id1']), float(a1r[0]) - a1, a1 - float(a1r[1]))
+            over1 = max(0.0, abs(float(dd[1])) - float(lim['id1']), a1r[0] - a1, a1 - a1r[1])
             over2 = max(0.0, abs(float(dd[0])) - float(lim['id2']), A2_MIN - a2, a2 - A2_MAX)
-            lim_txt = (f'ID1 {float(a1r[0]):.0f}~{float(a1r[1]):.0f}° 且离看的姿态 ±{float(lim["id1"]):.0f}°以内，'
+            lim_txt = (f'ID1 {a1r[0]:.0f}~{a1r[1]:.0f}°(限位往里收 {float(cfg.get("raw_a1_margin_deg", 5.0)):g}°) 且离看的姿态 ±{float(lim["id1"]):.0f}°以内，'
                        f'ID2 {A2_MIN:.0f}~{A2_MAX:.0f}° 且离看的姿态 ±{float(lim["id2"]):.0f}°以内')
             if over1 > float(cfg.get('raw_teach_over_id1', 15.0)) or over2 > float(cfg.get('raw_teach_over_id2', 200.0)):
                 self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°(看的姿态 ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)，'
                          f'超出范围太多(范围：{lim_txt})：手臂不动，只记位置。'
-                         f'能够到的话用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
+                         '三个位的位置都记下以后 rteach RAW shift 让车挪到够得着的地方')
             else:
                 if over1 > 0.0 or over2 > 0.0:
                     self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°(看的姿态 ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)，'
                              f'稍微超出范围(范围：{lim_txt})：先在范围里对，看能对到多近')
-                rng = dict(id1=(max(float(a1r[0]) - home[0], -float(lim['id1'])), min(float(a1r[1]) - home[0], float(lim['id1']))),
-                           id2=(max(A2_MIN - home[1], -float(lim['id2'])), min(A2_MAX - home[1], float(lim['id2']))))
+                w1 = float(cfg.get('raw_teach_slack_id1', 8.0))   # 每个关节只在估的角度附近转：一个到头了不拿另一个硬凑(10-18 实车 ID2 被推到 -300)
+                w2 = float(cfg.get('raw_teach_slack_id2', 150.0))
+                d1, d2 = float(dd[1]), float(dd[0])
+                rng = dict(id1=(max(a1r[0] - home[0], -float(lim['id1']), min(0.0, d1) - w1),
+                                min(a1r[1] - home[0], float(lim['id1']), max(0.0, d1) + w1)),
+                           id2=(max(A2_MIN - home[1], -float(lim['id2']), min(0.0, d2) - w2),
+                                min(A2_MAX - home[1], float(lim['id2']), max(0.0, d2) + w2)))
                 if guessed:                                    # 看不到：手臂先一下转到推出来的位置(物料就到爪子点附近、看得到了)，再从那里看着对
                     g1 = min(max(a1, home[0] + rng['id1'][0]), home[0] + rng['id1'][1])
                     g2 = min(max(a2, home[1] + rng['id2'][0]), home[1] + rng['id2'][1])
@@ -3652,8 +3695,9 @@ class MissionHooks:
                         raise
                     except ArmError:
                         b = (None, None)
-                    self.log('   没对上(' + (f'最近还差 {res.err_mm:.1f}mm' if math.isfinite(res.err_mm) else '转过去以后还是看不到物料') + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
-                             + f')：只记位置。用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
+                    self.log('   没对上(' + (f'最近还差 {res.err_mm:.1f}mm' if math.isfinite(res.err_mm) else '转过去以后还是看不到物料')
+                             + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
+                             + ')：只记位置。三个位的位置都记下以后 rteach RAW shift 让车挪到够得着的地方')
         self.arm.ap(home[0], home[1])
         d = load_place_adj(path)
         r_ = d.setdefault('RAW_CT', D)
@@ -3684,7 +3728,7 @@ class MissionHooks:
         claw = np.array(v.claw('RAW'), float)
         lim = dict(id1=60.0, id2=700.0)
         lim.update(cfg.get('raw_center_reach_deg') or {})
-        a1r = cfg.get('a1_range') or (A1_MIN, A1_MAX)
+        a1r = self._raw_a1_range()
         Ja = np.asarray(Ja, float)
         Ainv = np.linalg.inv(Ja)
         mm2 = float(np.linalg.norm(Ja[:, 0])) / sc                # ID2 每度多少毫米
@@ -3725,9 +3769,9 @@ class MissionHooks:
         home = [float(x) for x in D['home'][:2]]
         smax, fmax = float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0))
         ok_mm = float(cfg.get('raw_shift_margin_mm', 3.0))
-        self.arm.obs('RAW', open_claw=True)
+        _a, comp = self._raw_ct_pose(D)
         self.log('  先让车轮把原料盘中心对到示教时的位置(车可能被碰过)……')
-        m = self._raw_center_align(goal=D['c'], tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
+        m = self._raw_center_align(goal=np.asarray(D['c'], float)[:2] + comp, tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
         if m is None or not (getattr(self, '_rc_last', None) or {}).get('ok'):
             raise VisionError('没对准示教时的位置，车不挪：' + str((getattr(self, '_rc_last', None) or {}).get('why') or ''))
         keys = sorted(P)
@@ -3754,15 +3798,15 @@ class MissionHooks:
             return 0.0, 0.0
         self.log(f'  车停在横移 {ds:+.0f}mm、前进 {df:+.0f}mm 的地方最好：' + say(mg, j))
         if int(n_ok[j]) < len(keys):
-            self.log(f'  (手臂伸缩 ID2 的行程不够同时够着三个停靠位：比赛时要的颜色停在够不着的位上就等下一次停，'
-                     f'原料盘每次转 120°，下一次就转到够得着的位了)')
+            self.log('  (手臂够不着三个停靠位：比赛时要的颜色停在够不着的位上就等下一次停，'
+                     '原料盘每次转 120°，下一次就转到够得着的位了)')
         d0 = (float(act.disp['S']), float(act.disp['F']))
         if not self._vel_goto(d0[0] + ds, d0[1] + df, tol_mm=0.5):
             raise ArmError('车轮没挪过去(只用 V 挪)：没保存')
         ms = self._raw_center_still(5)
         if ms is None:
             raise VisionError('挪过去以后认不出原料盘中心：没保存')
-        c_new = np.asarray(ms[0], float)
+        c_new = np.asarray(ms[0], float) - comp                # 按示教时看原料盘的角度记(还差的那一点角度让画面挪了 comp)
         dc = c_new - np.asarray(D['c'], float)[:2]
         D['c'] = [round(float(c_new[0]), 1), round(float(c_new[1]), 1)]
         D['shift_mm'] = [round(ds, 1), round(df, 1)]
