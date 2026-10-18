@@ -1423,7 +1423,7 @@ class MissionHooks:
             return
         d = self.act.disp
         if abs(d['S']) >= 1 or abs(d['F']) >= 1:
-            if math.hypot(float(d['S']), float(d['F'])) <= 80.0 and self._vel_goto(0.0, 0.0, tol_mm=0.4):
+            if math.hypot(float(d['S']), float(d['F'])) <= 90.0 and self._vel_goto(0.0, 0.0, tol_mm=0.6):
                 self.log('    车轮挪回停车点(只用 V，不转车头)')
             d = self.act.disp
             if abs(d['S']) >= 1 or abs(d['F']) >= 1:
@@ -2139,7 +2139,7 @@ class MissionHooks:
             return None, None, len(P)
         return got[0], got[1], len(P)
 
-    def _raw_center_align(self, goal=None, tol=None, fresh=False):
+    def _raw_center_align(self, goal=None, tol=None, fresh=False, rng_c=None):
         """让爪子点(看原料盘的姿态)对准原料盘中心。返回 (圆心像素, 半径像素) 或 None(认不出圆心、测不出车轮和画面的对应关系)；
         对准了没有看 self._rc_last['ok']。goal = 画面里的一个点(10-18：示教时圆心的位置)：把圆心对到这里；
         tol = 对准到多少毫米(None = raw_center_tol_mm)；fresh = 车轮和画面的对应关系现测(示教时)。
@@ -2147,7 +2147,7 @@ class MissionHooks:
         只有 STM32 是旧程序(不认 V)才一步一步挪(下面)。"""
         self._rc_last = dict(ok=False, err_mm=None, why='')
         if self.cfg.get('raw_center_smooth', True) and hasattr(self.act, 'vel') and not getattr(self.act, '_no_vel', False):
-            r = self._raw_center_align_smooth(goal=goal, tol=tol, fresh=fresh)
+            r = self._raw_center_align_smooth(goal=goal, tol=tol, fresh=fresh, rng_c=rng_c)
             if r != 'nofw':
                 return r
             self.log('    STM32 是旧程序(不认 V 指令)：改成一步一步挪。刷新的 main.c / chassis.c 才能连续顺滑地挪')
@@ -2218,56 +2218,75 @@ class MissionHooks:
             return f'圆心一帧一帧跳得厉害(拟合误差 {rms / sc:.1f}mm)'
         return ''
 
-    def _vel_goto(self, s_t, f_t, tol_mm=0.8, max_s=10.0):
+    def _vel_goto(self, s_t, f_t, tol_mm=0.8, max_s=None):
         """(10-18)车轮只用 V 速度指令挪到 disp = (s_t, f_t)(相对停车点，毫米)。V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，
         STM32 复位过以后那个方向可能差很多)，车不会转；走了多少按 STM32 自己算的(V?)。到了返回 True；
-        STM32 不认 V、读不到 V? 返回 False(调用的地方改用 S/F)。"""
+        STM32 不认 V、读不到 V?、到时间还没到返回 False(原因在 self._vel_why，调用的地方改用 S/F 或者报错)。
+        max_s = 最多挪多久(None = 按距离算：实车上串口来回一次要零点几秒，最后几毫米走得慢)；V? 偶尔读不到就再读，连着 3 次读不到才算。"""
         act = self.act
+        self._vel_why = ''
         if act is None or not hasattr(act, 'vel') or getattr(act, '_no_vel', False):
+            self._vel_why = 'STM32 不认 V(旧程序)'
             return False
-        try:
-            v0 = act.vel_read()
-        except ArmAbort:
-            raise
-        except ArmError:
-            v0 = None
+
+        def read():
+            for k in range(3):
+                try:
+                    v1 = act.vel_read()
+                except ArmAbort:
+                    raise
+                except ArmError:
+                    v1 = None
+                if v1 is not None:
+                    return np.array(v1, float)
+                self.sleep(0.05 * (k + 1))
+            return None
+        v0 = read()
         if v0 is None:
+            self._vel_why = '读不到 STM32 走了多少(V?)'
             return False
-        v0 = np.array(v0, float)
         d0 = np.array([float(act.disp['S']), float(act.disp['F'])])
         goal = np.array([float(s_t), float(f_t)])
         vmax = float(self.cfg.get('raw_center_search_speed', 20.0))
         vmin = float(self.cfg.get('raw_center_min_speed', 5.0))
+        dist0 = float(np.linalg.norm(goal - d0))
+        if max_s is None:
+            max_s = 6.0 + 2.5 * dist0 / max(vmin, 1.0)
         ok, cur = False, d0
         t_lim = self.now() + float(max_s)
         try:
-            while self.now() < t_lim:
+            while True:
                 self._check_abort()
-                v1 = act.vel_read()
+                v1 = read()
                 if v1 is None:
+                    self._vel_why = '读不到 STM32 走了多少(V?)'
                     break
-                cur = d0 + (np.array(v1, float) - v0)
+                cur = d0 + (v1 - v0)
                 d = goal - cur
                 dn = float(np.linalg.norm(d))
                 if dn <= tol_mm:
                     ok = True
                     break
-                vv = d / dn * min(vmax, max(vmin, 1.5 * dn))
+                if self.now() >= t_lim:
+                    self._vel_why = f'{max_s:.0f} 秒还没挪到(还差 {dn:.1f}mm)'
+                    break
+                vv = d / dn * min(vmax, max(vmin, 2.0 * dn))
                 if not act.vel(float(vv[0]), float(vv[1])):
+                    self._vel_why = 'STM32 不认 V(旧程序)'
                     break
                 self.sleep(0.03)
         finally:
             try:
                 act.vel(0.0, 0.0)
-                v1 = act.vel_read()
+                v1 = read()
                 if v1 is not None:
-                    cur = d0 + (np.array(v1, float) - v0)
+                    cur = d0 + (v1 - v0)
             except ArmError:
                 pass
             act.disp['S'], act.disp['F'] = float(cur[0]), float(cur[1])
         return ok
 
-    def _raw_center_align_smooth(self, start=None, target_dir=None, goal=None, tol=None, fresh=False):
+    def _raw_center_align_smooth(self, start=None, target_dir=None, goal=None, tol=None, fresh=False, rng_c=None):
         """(10-16 用户；10-18 按实车重写)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心。只用 V 速度指令，不发 S/F：
         V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，STM32 复位过以后车会突然转一大圈)。
           ① 停车点看不到圆心：一边按 raw_center_search_mm 的路线慢慢走一边看，连着几帧认出圆心就停；
@@ -2277,7 +2296,9 @@ class MissionHooks:
         实车上认一帧要零点几秒到一秒多，STM32 0.4 秒收不到新的 V 就停车：识别放在后台线程，这边每 raw_vel_keep_s 秒续一次速度，
         车一直在走；每帧记下拍照那一刻车走了多少(STM32 自己算的 V?，不按时间估)；圆心用这一帧的(几帧的中值车在走时会落后)。
         start = (圆心, 半径)：已经认出圆心了，跳过 ①；target_dir = 单位向量(画面里)：对准的不是圆心，是"圆心 + 半径 × target_dir"
-        (原料盘上的抓取位)；goal = 画面里的一个点(示教时圆心的位置)：把圆心对到这里，不是对到爪子点；tol = 对准到多少毫米。
+        (原料盘上的抓取位)；goal = 画面里的一个点(示教时圆心的位置)：把圆心对到这里，不是对到爪子点；tol = 对准到多少毫米；
+        rng_c = (横移, 前进)：车轮能挪的范围(±raw_center_s_mm、±raw_center_f_mm)以这里为中心(默认停车点；10-18：rteach RAW shift
+        挪过车，比赛时以挪过的地方为中心)。
         结果另外放在 self._rc_last = dict(ok=对准了没有, err_mm=最后还偏多少毫米, why=没对准的原因)。
         返回 (圆心, 半径) / None(认不出圆心、测不出对应关系) / 'nofw'(STM32 不认 V)。"""
         import threading
@@ -2302,6 +2323,7 @@ class MissionHooks:
         threaded = bool(cfg.get('raw_frame_thread', True))
         self._rc_last = dict(ok=False, err_mm=None, why='')
         base = np.array([float(act.disp['S']), float(act.disp['F'])])
+        rc = np.zeros(2) if rng_c is None else np.asarray(rng_c, float)[:2]
         try:
             v0 = act.vel_read()
         except ArmAbort:
@@ -2341,7 +2363,7 @@ class MissionHooks:
             """发车轮速度(到范围边上的方向不再走)。run_s：最多走这么久就停(下一帧认得慢也不会走过头)。"""
             p = pos_est()
             st['p'], st['tp'] = p, self.now()
-            ps, pf = base[0] + float(p[0]), base[1] + float(p[1])
+            ps, pf = base[0] + float(p[0]) - rc[0], base[1] + float(p[1]) - rc[1]
             if (ps >= smax and vs > 0) or (ps <= -smax and vs < 0):
                 vs = 0.0
             if (pf >= fmax and vf > 0) or (pf <= -fmax and vf < 0):
@@ -2482,7 +2504,7 @@ class MissionHooks:
                             found = (np.median([a[0] for a in last], axis=0), float(np.median([a[1] for a in last])),
                                      np.median([a[2] for a in last], axis=0))
                             break
-                    d = np.array(spot, float) - (base + pos_est())
+                    d = np.array(spot, float) + rc - (base + pos_est())
                     if k == 0 or float(np.linalg.norm(d)) < 2.0:
                         send(0.0, 0.0)
                         t_at = t_at or self.now()
@@ -3205,7 +3227,7 @@ class MissionHooks:
         if len(sl) < 3 or not any(s.get('a') for s in sl.values()):
             return None
         return dict(home=[float(x) for x in d['home'][:2]], c=[float(x) for x in d['c'][:2]],
-                    r=float(d.get('r') or 0.0), slots=sl)
+                    r=float(d.get('r') or 0.0), slots=sl, shift=[float(x) for x in (d.get('shift_mm') or [0.0, 0.0])[:2]])
 
     @staticmethod
     def _raw_ct_guess_px(D, n):
@@ -3408,7 +3430,8 @@ class MissionHooks:
         self._ct_stops, self._ct_used = [], None
         # ---- ① 车轮对准原料盘中心(手臂不动)
         try:
-            m = self._raw_center_align(goal=np.asarray(D['c'], float)[:2] + comp, tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
+            m = self._raw_center_align(goal=np.asarray(D['c'], float)[:2] + comp, tol=float(cfg.get('raw_ct_tol_mm', 3.0)),
+                                       rng_c=D.get('shift'))       # rteach RAW shift 挪过车：车轮能挪的范围以挪过的地方为中心
         except (ArmError, VisionError) as ex:
             if isinstance(ex, ArmAbort):
                 raise
@@ -3870,8 +3893,14 @@ class MissionHooks:
             self.log('  (手臂够不着三个停靠位：比赛时要的颜色停在够不着的位上就等下一次停，'
                      '原料盘每次转 120°，下一次就转到够得着的位了)')
         d0 = (float(act.disp['S']), float(act.disp['F']))
-        if not self._vel_goto(d0[0] + ds, d0[1] + df, tol_mm=0.5):
-            raise ArmError('车轮没挪过去(只用 V 挪)：没保存')
+        self.log(f'  车轮只用 V 慢慢挪过去(车头不转)：横移 {ds:+.0f}mm、前进 {df:+.0f}mm……')
+        okv = self._vel_goto(d0[0] + ds, d0[1] + df, tol_mm=1.0)
+        ms_, mf_ = float(act.disp['S']) - d0[0], float(act.disp['F']) - d0[1]
+        left = math.hypot(ds - ms_, df - mf_)
+        if not okv and left > 3.0:
+            raise ArmError(f'车轮没挪到(只用 V 挪：{getattr(self, "_vel_why", "") or "不知道为什么"}；挪了横移 {ms_:+.0f}mm、前进 {mf_:+.0f}mm，'
+                           f'还差 {left:.0f}mm)：没保存。车被挡住了吗？再输入一次 rteach RAW shift')
+        ds, df = ms_, mf_                                      # 按真挪了多少记(挪完重新认圆心，差一两毫米没关系)
         ms = self._raw_center_still(5)
         if ms is None:
             raise VisionError('挪过去以后认不出原料盘中心：没保存')

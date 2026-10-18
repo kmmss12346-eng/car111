@@ -2466,6 +2466,57 @@ class RawCenterTeachTests(unittest.TestCase):
         self.assertIn('ID2 -1210~-700°', text)
         self.assertEqual(sum(ok.values()), 1, text)                          # 只剩要往 -1130 转的那个位够得着
 
+    def test_vel_goto_survives_a_slow_link_and_read_glitches(self):
+        """(10-18 实车 rteach RAW shift：要前进 50mm，报"车轮没挪过去(只用 V 挪)")串口来回一次要 0.15 秒、V? 偶尔读不到：
+        照样挪到(读不到就再读，按距离给够时间)。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        w.arrive('RAW')
+        h.act.reset_disp()
+        orig = w._handle
+        n = {'q': 0}
+
+        def handle(text):
+            if text.startswith('V'):
+                w.advance(0.15)                                # 实车上串口来回一次要零点几秒
+            if text == 'V?':
+                n['q'] += 1
+                if n['q'] % 5 == 0:
+                    return True, 'DONE', []                    # 这一次没带 VD 行
+            return orig(text)
+        w._handle = handle
+        self.assertTrue(h._vel_goto(2.0, 50.0, tol_mm=1.0), getattr(h, '_vel_why', ''))
+        self.assertAlmostEqual(h.act.disp['S'], 2.0, delta=1.5)
+        self.assertAlmostEqual(h.act.disp['F'], 50.0, delta=1.5)
+        self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [])
+
+    def test_alignment_range_is_centered_on_the_taught_shift(self):
+        """(10-18)rteach RAW shift 让车往前挪了几十毫米：比赛时车轮能挪的范围(±raw_center_f_mm)以挪过的地方为中心，
+        不然从停车点往前挪几十毫米就到范围边上了、对不准。"""
+        import tempfile
+        w = self._world(1, dx=5.0, dy=40.0)                  # 要往前挪 40mm 左右才对得上
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=dict(raw_center_f_mm=15.0))
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        try:
+            h.arm.obs('RAW', open_claw=True)
+            h.act.reset_disp()
+            h._raw_center_align(tol=3.0, fresh=True)
+            self.assertFalse(h._rc_last['ok'], '\n'.join(lines))           # 以停车点为中心：最多往前 15mm，对不上
+            h._vel_goto(0.0, 0.0)
+            h._raw_center_align(tol=3.0, rng_c=(0.0, 40.0))
+            self.assertTrue(h._rc_last['ok'], '\n'.join(lines[-30:]))       # 以挪过的地方为中心：对上了
+        finally:
+            del w.plate_phase
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
