@@ -1,4 +1,4 @@
-# car111 小车项目：给下一个 AI 的完整接手说明（2026-10-12 晚）
+# car111 小车项目：给下一个 AI 的完整接手说明（最新：2026-10-18 → 先看第 12 节；1~11 节是 10-12 ~ 10-15 写的，部分已过时）
 
 > 用法：先读完这份，再读同一个包里的 `docs/HANDOFF.md`（更细的历史和规矩）、`docs/integration/*.md`（6 份系统分析）。
 > 代码在包里 `code/` 下，和 GitHub 仓库 `kmmss12346-eng/car111` 分支 `claude/tender-heisenberg-2t1awl` 的提交 HEAD 完全一样。
@@ -164,3 +164,236 @@ git_log.txt                ← 分支最近 120 条提交记录
 - 夹爪大小：`CLWO`(张开，用户车上 2350)/`CLWC`(合上，用户改成过 1920)；用户车上张开值 > 合上值（数大=张得大）。
 - 用户输入习惯：在 run_live 里一次只输一条、等回复再输下一条（连着打会粘成一行回 ERR CMD）。
 - 对话记录：`docs/对话记录/`；更早的过程在 `docs/HANDOFF.md`。
+
+## 12. 10-18 现在的状态（最新，下一个接手的先看这里）
+
+### 12.0 一句话
+原料区改成用户 10-18 定的 **"最近那格"做法**：手臂固定在看原料盘的姿态。用 arm_calib 的"原料盘上方的姿态"把爪子摆到原料盘上**离车最近那一格**正上方，车轮只用 V 慢慢对准。原料盘转一次停一次，**按任务码顺序**，要的颜色转到这一格就直接下爪。
+代码写完、仿真跑通（提交 `9e36ebd`），部署包 `near_1018k.zip` 已经发给用户，**还没上车试**。
+
+对话原文：`docs/对话记录/2026-10-15_18_对话记录.md`（纯文字，里面有几段"上下文压缩"摘要，折叠着）。
+
+### 12.1 规矩（这个阶段用户/系统定的，接着照做）
+- **回复：**
+  - 回复用简体中文。
+  - **每条命令单独放一个代码块**，并提醒用户命令里用英文的 `-`（用户常打成中文的破折号）。
+  - run_live 里用户一次输一条、等回复再输下一条。
+- **先复述再动手：** 用户常说"你先说说我什么意思、你准备怎么干"。
+  - 先用自己的话复述加计划，等用户说"对 / 开始改"再改代码。
+  - 用户理解错时会很急（10-18："你是傻逼吗定位圆心都乱走"），先复述能避免。
+  - 用户会打断很长的工具调用（例如一次跑全部测试）：先回答用户的问题，测试分开跑。
+- **Git：**
+  - 在 `claude/tender-heisenberg-2t1awl` 上提交，同时 `git push origin HEAD:claude/claim-credit-qb8b1c`。
+  - 推之前 `git fetch` + `git merge`；不 rebase、不 force push、不开 PR。
+  - 提交、文件里不写模型名；提交信息结尾两行：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`、`Claude-Session: <当前会话链接>`。
+- **这个阶段的交付方式：**
+  - 只把改了的文件打成一个名字唯一的 zip，例如 `near_1018k.zip`，文件直接放在 zip 根目录。用户解压到 `下载\<zip名>\`。
+  - 每个文件一条命令：`scp C:\Users\Lenovo\Downloads\<zip名>\mission_hooks.py zstu@10.109.173.12:/home/zstu/lidar_map_north/`，传完重启 run_live。
+- **固件烧录：**
+  1. 改了的 arm.c / main.c 拷到 `E:\CubeMXcode\car_2027 - zhengshiban\Core\Src\`，Keil Rebuild all。
+  2. `scp "E:\CubeMXcode\car_2027 - zhengshiban\MDK-ARM\car_2027\car_2027.hex" zstu@10.109.173.12:/home/zstu/`
+  3. 在 run_live 里 `arm LIFT 60`，再 `q`。
+  4. `openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program /home/zstu/car_2027.hex verify reset exit"`
+  5. 烧之前用 12.6 的一行 python 检查 hex 是不是新的。
+- **车上独有、不能放进包、不能覆盖：**
+  - 模块：lidar_map_live、ld14p_scan、pose_fix、merge_stations、reference_correction、stm32_link、home_fix。
+  - 数据：map_config_*.json、place_adj.json、servo_cal.json、vision_cal.json、claw_mask.png、**ring_teach.json**（原料区示教 RAW_CT 也存在这个文件里）。
+- **CRLF 文件：** STM32 的 arm.c、main.c、chassis.c、chassis.h 是 CRLF，改的时候保持 `\r\n`（用 Python 按字节替换）。
+
+### 12.2 机构和实车上量到的数
+- **机械臂：**
+  - ID1 = 旋转，多圈角度。限位 S1MIN/S1MAX，默认 44 / 244。
+  - ID2 = 伸缩齿条，约 0.114mm/度，负的往里缩、正的往外伸。限位 S2MIN/S2MAX，用户 10-18 设成 -1240 / -278。
+  - AEXT=2（ID2 管伸缩）。限位参数存在树莓派配置 stm32_params，每次启动发给 STM32。
+- **摄像头：**
+  - 装在爪子上（爪子后上方往下看），跟着 ID1/ID2 一起动。
+  - 画面里的"爪子点"（claw_px.RAW）= 物料在爪子正下方时的像素位置。
+  - 原料区画面约 1.97 像素/毫米，斜着看，远处被压扁。
+  - 看原料盘中心时，靠车那一格在画面上方、被爪子挡住；所以按另外两格推它的位置不准。
+- **ID1 的精度：**
+  - 在原料盘处每度约 4.7~6.9mm。
+  - 有齿轮间隙：同一个角度画面差 8mm。所以转到看的姿态都从小往大转，先到 a1-2° 再到 a1（raw_backlash_deg）。
+  - OBS 到位误差约 1°（ATOLC），AP 是 0.3°。
+  - ID1 摩擦补偿 S1COMP=5°，靠近限位时补偿被截掉，会停在离限位 4~5° 的地方（raw_a1_margin_deg=5）。
+- **原料盘：** 物料在半径约 87mm 的圆上，三格隔 120°（边长约 151mm）。每次停约 6 秒、转约 3 秒、转 120°。
+  - 转盘外圈半径约 240 像素，用 turntable_detector 认。plate['c'] 是 3 帧中值，车在走时落后；c_now 是这一帧的。
+- **识别和 V 指令的速度：**
+  - 实车认一帧（外圈加物料）约 0.8 秒，约 1.2 帧/秒。
+  - STM32 的 V 速度指令 400ms 收不到新的就停。所以识别放后台线程，主线程每 0.15 秒续一次速度。
+  - `V?` 回 STM32 自己积分的走过距离（0.1mm）。
+- **原料区只用 V，不发 S/F：**
+  - S/F 走完 STM32 会把车头纠回 yaw_target（开机、HOME、`R 0`、转弯时定的）。
+  - STM32 复位过、车被手搬过以后，车头会突然转一大圈（10-18 实车转了 90°）。
+  - 单站调试前先 `send R 0`。
+- **舵机读角度：** 偶尔 ERR READ，或回 OK 不带 ANG 行。read_angles 重读 6 次，STBY SAVE 每个舵机读 3 次。
+- **最后一次 `get`（10-17 12:39 UTC）：**
+  - 升降：LFMAX 115，ZHI 114，ZGRAB 88，ZDROP 95，ZOBRAW 114。
+  - 姿态：A1G 58.2，A1D 240.4，A1H 242，A1P 50.3；A2E -576.6，A2R -1065.6，A2P -786。
+  - 其它：ASPD 180，CLWO 1600，CLWC 1280，AEXT 2。
+  - 10-18 又 set 了 S2MAX -278、S2MIN -1240。
+- **待机姿态 STBY**（存在 STM32 Flash，10-18 11:5x UTC 的 `arm STBY?`）：Z=114，A1=231.1，A2=-1099.7，CLAW=1600。
+  - 用户在按新齿条调待机位置（当时 ID2 在 -898 左右），可能已经 `arm STBY SAVE` 过。
+  - 存了 STBY 以后，开机（`arm LIFT?` 显示 BOOT=ENC/POS 才动）、`arm STBY`、PARK、STOW（不动夹爪）都回到它。**第 6.6 节"待机 = A1H/A2R"已经过时。**
+- **10-18 用户把 ID2 齿条重新装过**（想多出 3~4cm），同一个 ID2 角度下爪子的位置可能变了。
+  - 两头限位 S2MIN/S2MAX、A2R（放车上转盘，最要紧）、A2P 和圆环示教、STBY 都可能要重新量 / 重调。
+  - 还不知道用户量没量。量两头的办法见 12.7。
+- **车上 ring_teach.json 里现在的 RAW_CT**（三个停靠位那套，做完 shift 以后）：
+  - shift_mm ≈ [0, 55]，圆心像素 (260, 275)。
+  - 3 号位（绿）ID1 51.01、ID2 -331.67；2 号位（蓝）是推出来的；1 号位（红）够不着。
+  - 用户做 `rteach RAW near` 会整个覆盖掉。
+
+### 12.3 原料区这几天的经过（为什么变成"最近那格"）
+1. **10-15 ~ 10-16：** 先后做了跟随抓取（raw_follow）、按示教停靠位等着抓、照开源方案用转盘外圈认圆心、车轮对准圆心加固定抓取位（`_raw_grabpos_*`）。
+2. **10-18 用户定：** 对准圆心，三个停靠位各示教一套手臂角度，按任务码顺序抓（raw_ct：`rteach RAW center` / `rteach RAW 1~3 颜色号`）。实车上遇到的问题和修法：
+   - **对准圆心时车乱走、转了 90°。** 原因是 3 帧中值落后，一步一步挪时用了 S/F，S/F 会纠车头。重写成只用 V 连续走，用 c_now，测出 J 先检查，测不出来就挪回原处停下，不再乱挪。
+   - **示教两步之间圆心漂了 23mm。** 每次示教前先对回圆心（用户："每一次从头开始"）。
+   - **OBS 不准，又有齿轮间隙。** AP 从同一边转过去，再按手臂 J 补画面偏差（comp）；示教完按比赛的走法验证一次（raw_teach_verify）。
+   - **ID2 被限位挡住。** STM32 加了参数 S1MIN/S1MAX/S2MIN/S2MAX，可以在线改；用户电动推着量出 -1240 / -278。
+   - **三个位够不全。**
+     - 红、蓝两格沿伸缩方向差约 134mm，ID2 行程只有约 110mm。
+     - 加了 `rteach RAW shift`，算车停在哪够得着的格最多。
+     - 但被挡住的蓝色格按另外两格推出来的位置不准，shift +55mm 以后蓝色反而差 45mm 以上，红色也够不着，只剩绿色。
+3. **用户想过的办法：** 先顾蓝色（离车最近）让车往后退、放开 ID1 去够绿色、把齿条重新装多出 3~4cm。最后 10-18 定："**老老实实在最近的那个地方等着合适转过来夹取就行了**"。
+   - 用户先以为 vview.py 里能改爪子停的位置，后来确认是在 **arm_calib.py 的"原料盘上方的姿态"** 改 A1G/A2E：直接把爪子摆到最近那格上方，车就不用往后挪太多。
+   - 用户确认按任务码顺序一个一个来；"缓慢移动" = 车轮慢慢挪过去对位。
+
+### 12.4 "最近那格"怎么实现的（提交 9e36ebd）
+- **示教 `rteach RAW near 颜色号`**（mission_cli `_rteach_raw` → MissionHooks `raw_ct_teach_near`）：
+  1. OBS RAW，再 AP 从同一边转到 A1G/A2E。
+  2. 认这个颜色的物料（`_raw_near_material`：3 帧一致取中值）和原料盘中心（`_raw_center_still`）。
+  3. 原料盘中心的目标 = 中心 − 物料离爪子点的偏差。车轮对过去（`_raw_center_align`）：第一轮 fresh=True，现测车轮 J；车轮最多挪 raw_near_teach_s_mm / raw_near_teach_f_mm = 100mm。
+  4. 再看物料还差多少，最多对 raw_near_iters=3 轮。物料离爪子点不超过 raw_near_tol_mm+1 才保存。
+- **存到 ring_teach.json 的 RAW_CT：**
+  - home：手臂角度；c：原料盘中心像素，比赛时对准的目标；r：半径。
+  - slots：'1' = 最近那格，a = home；'2'、'3' 是绕圆心转 ±120° 推出来的或看到的位置，a=None。
+  - near='1'；shift_mm：示教时车轮从停车点挪了多少。
+- **比赛 `_raw_ct_body`**（near_k = D['near']）：
+  1. 对准原料盘中心到 c+comp：tol = raw_near_tol_mm = 2mm；rng_c = shift_mm，车轮能挪的 ±raw_center_s_mm(40) / ±raw_center_f_mm(60) 以示教时挪到的地方为中心。
+  2. 对准以后车不动，按任务码顺序等。每次停下只看最近那一格（`_raw_ct_watch(focus=(P[near], 0.5×格间距))`），画面边上一会儿认得出、一会儿认不出的物料不算"转了"。
+  3. 是要的颜色、这次停下剩的时间也够，就直接 GRAB。`_raw_ct_grab` 下爪前拍一帧，物料离爪子点超过 raw_slot_accept_mm(25) 就不下爪。
+  4. 同一次停下不重复算（两次停下的时间差小于 0.75 个周期）。
+  5. 夹完用 `_raw_ct_pose` 回到看的姿态，再 `_raw_near_recheck`：认 3 帧圆心，偏了超过 raw_near_redo_mm(4) 就车轮再对回去。
+  6. 连着 raw_ct_skip_stops(4) 次停下都没看到要的颜色转到这一格，就跳过它。
+- **near 模式下：**
+  - `rteach RAW 1~3 颜色号`、`rteach RAW shift` 会拒绝并说明原因。
+  - 换回三个停靠位的做法：`rteach RAW center`。
+  - 原料区做完，离停车点 raw_vel_back_mm(160) 以内只用 V 挪回去。
+- **固件：**
+  - A1G/A1D/A1H/A1P 范围改成 -720~720，A2E/A2R/A2P 改成 -5000~5000，S1MIN/S1MAX 改成 -720~720。真转的时候 main.c 还是按 S1/S2 限位截住。
+  - 这样 arm_calib 才能存更往里缩的 A2E。
+- **树莓派：** 放圆环时的 ID2 范围（`_a2_env`）和 ID1 的默认范围，改成按 STM32 的 S1/S2 限位，不再写死 -1210~-300 / 44~244。
+- **arm_calib：** "原料盘上方的姿态"的提示改成"爪子摆到离车最近那一格正上方"。
+- **仿真 RawNearSlotTests（7 个）：**
+  - 示教加比赛，按顺序 3 个都夹到；示教时车要挪 60mm 也行；夹完车被碰偏 7mm 会对回去。
+  - 和实车一样慢帧、V 取整、车头会转，也能示教。
+  - near 下别的示教命令会拒绝；颜色不对不保存。
+  - 整场两次原料区：夹 6/6、放 12/12。
+- **仿真里的数：**
+  - 对准容差 3mm 时，爪子离物料最多 7~9mm（仿真里超过 8mm 算夹空）；2mm 时最多约 6.6mm；1.5mm 更慢，也不更准。
+  - 原料区一次约 110~140 秒：按顺序、只在一格夹，夹一个约 12 秒，夹完回来常常错过下一次停。
+
+### 12.5 用户接下来要做（等结果再改）。near_1018k.zip 已经发给用户
+1. 烧固件（这次只有 arm.c 变了），烧之前用 12.6 的命令检查 hex。
+2. scp 三个树莓派文件 mission_hooks.py、mission_cli.py、arm_calib.py，然后重启 run_live。
+3. 在 arm_calib 里摆爪子：
+   - 车停在原料区比赛时停的位置，原料盘停着。run_live 里先 `q` 退出。
+   - 在树莓派桌面（VNC）的终端里运行（会自动打开摄像头）：`cd ~/lidar_map_north`，`python3 arm_calib.py --from A1G`。
+   - 到"原料盘上方的姿态"：用 `2 -50` / `2 +50`、`1 +1` / `1 -1` 把爪子摆到最近那格物料正上方，回车保存，再 `q` 退出。
+   - 齿条缩到限位也没关系，车轮会补（最多 10cm）。
+4. 重启 run_live，车别动、原料盘别转：`rteach RAW near 颜色号`（红 1、蓝 3、绿 4；另开终端 `python3 vview.py` 看画面）。
+5. 原料盘转起来：`mcode 134+123+413+231`（颜色要和盘上的一样），然后 `mtest RAW 1`，把日志发来。
+- 另外，待机位置可能要按新齿条重新存：`arm STBY` → `arm AD 2 ±10` 等摆好 → `arm STBY SAVE` → `arm STBY?`。
+
+### 12.6 要留意的风险
+- **near 的示教和对准还没在实车上试过。** 爪子在最近那格上方时，原料盘中心在画面下边缘附近，外圈只看得到上半圈。外圈认不认得出、对得准不准，要看实车日志；认不出时看 vview 里的黄圈。
+- **23 秒规则：**
+  - 只在一格夹又按顺序，一个颜色最多等 3 次停（约 27 秒）。等的时候 ID1 每 12 秒摆 1°（raw_keepalive_s / raw_keepalive_deg）。
+  - 裁判如果严格按"等转盘超过 23 秒"算，可能会被判。已经告诉用户，要他按规则确认。
+- **时间：** 仿真里原料区一次约 2 分钟，整场时间要留意。
+- **示教时车可能要挪很远**（爪子摆不到最近那格时）。比赛时以示教时挪到的地方为中心，只能再挪 ±40 / ±60mm。导航停车点和示教时车放的位置差太多，就会对不上。
+- **齿条重装的影响**，见 12.2。
+- **检查 hex 是不是新固件**（看 hex 里有没有 -720 / 720 这一对浮点数）：
+  ```
+  python3 -c "import binascii,struct;d=b''.join(binascii.unhexlify(l[9:-2]) for l in open('/home/zstu/car_2027.hex').read().split() if l[7:9]=='00');print('新固件(A2E范围已放宽)' if struct.pack('<ff',-720.0,720.0) in d else '旧固件(A2E还限在-1210~-300)')"
+  ```
+  上一版（有 S2MAX 的固件）的检查：把 `struct.pack('<ff',-720.0,720.0)` 换成 `b'S2MAX'`。
+
+### 12.7 常用命令（run_live 里，一次只输一条）
+- **参数：**
+  - `get`：看全部参数。
+  - `set 名字 数值`：存进配置，每次启动发给 STM32。
+  - `sync`：把配置里的参数重新发给 STM32。
+- **手臂：**
+  - 读角度：`arm A? 1`、`arm A? 2`。
+  - 转：`arm AD 2 30`（相对转，一次最多 AMAXD=60°）、`arm AF 2 -950`（直接转到这个角度）、`arm AP a1 a2`。
+  - 姿态：`arm OBS RAW O`。
+  - 升降：`arm LIFT 90`；`arm LIFT?`（显示 BOOT=ENC/POS 才是开机认准了高度）。
+  - 夹爪：`arm CLAW 1600` / `arm CLAW O` / `arm CLAW C`。
+  - 待机：`arm STBY`、`arm STBY SAVE`、`arm STBY?`、`arm STBY CLR`、`arm STOW`、`arm PARK`。
+- **量 ID2 两头**（齿条重装以后要做）：
+  1. `arm OBS RAW O`；伸出去会碰到东西就先 `arm LIFT 110`。
+  2. `set S2MAX 1000`，然后 `arm AD 2 30` 一步步往外推，快到头改成 `arm AD 2 10`。顶住了就 `arm A? 2`，记为 A。
+  3. `set S2MIN -3000`，然后 `arm AF 2 <A-700>`，再 `arm AD 2 -60` / `arm AD 2 -10` 往里推。到头 `arm A? 2`，记为 B。
+  4. `arm OBS RAW O`，两头各往里留 30°：`set S2MAX <A-30>`、`set S2MIN <B+30>`。这一步一定要做，不然限位一直是放开的。
+- **原料区示教：**
+  - 现在用的：`rteach RAW near 颜色号`。
+  - 三个停靠位那套：`rteach RAW center [here]`、`rteach RAW 1~3 颜色号`、`rteach RAW n save` / `rteach RAW n go`、`rteach RAW shift`、`rteach RAW clear`。
+  - 看示教数据：`rteach show`。
+- **看画面：**
+  - 另开桌面终端：`cd ~/lidar_map_north`，`python3 vview.py`。绿十字 = 爪子点，黄圈 = 转盘外圈，紫菱形 = 要对到的点，红叉 = 目标。
+  - `vwatch RAW 颜色号`：一直认这个颜色，配合 arm AD 手动调；`vwatch off` 停。
+- **标定：**
+  - `vcal RAW 颜色号 arm`：手臂 J；`vcal RAW 颜色号`：车轮 J。
+  - `python3 arm_calib.py --from A1G`。
+- **测试：** `mcode 任务码`、`mtest RAW 1`、`mtest ROUGH 1 force`、`mtest TEMP 1 force`。
+- **单站调试前重设车头基准：** `send R 0`。
+
+### 12.8 代码地图（原料区）
+- **mission_hooks.py：**
+  - 入口：`_raw` → `_raw_body`。有 RAW_CT 就走 `_raw_ct_body`（near 或三个停靠位）；没有就走以前的做法（`_raw_center_setup` / `_raw_grabpos_loop` / 跟随）。
+  - 示教：`raw_ct_teach_near`、`raw_ct_teach_center`、`raw_ct_teach_slot`、`_raw_ct_verify`、`raw_ct_shift`、`_raw_ct_margins`、`raw_ct_save_slot`、`raw_ct_goto_slot`。
+  - 读示教数据和摆姿态：
+    - `_raw_ct`：读 ring_teach.json 的 RAW_CT，带 near。
+    - `_raw_ct_pose`：OBS 加同一边 AP，再算 comp。
+    - `_raw_ct_approach`；`_arm_limits` / `_a2_limits` / `_raw_a1_range`。
+  - 对准：
+    - `_raw_center_align` → `_raw_center_align_smooth`：只用 V，后台线程续速度，probe 测 J，`_raw_J_bad` 检查，测不出就 go_back。
+    - `_raw_center_frame`：用 plate_scan 外圈的 c_now。
+    - `_raw_center_still`、`_vel_goto`。
+  - 比赛时等和夹：`_raw_ct_watch`（focus）、`_raw_ct_predict`、`_raw_ct_keepalive`、`_raw_ct_grab`、`_raw_near_recheck`；做完 `_raw_seek_end`。
+  - 配置默认值都在 DEFAULTS：raw_ct_*、raw_near_*、raw_center_*、raw_backlash_deg、raw_a1_margin_deg、raw_vel_back_mm 等。
+- **mission_cli.py：** `_rteach_raw`（rteach RAW …）、`vwatch`；帮助文字在文件开头。
+- **其它树莓派文件：**
+  - vision.py：`plate_scan`（turntable_detector 外圈加物料，写给 vview 看）、`overlay`（vview 的画面）。
+  - visual_servo.py：手臂 J 探测（列归一化以后算 cond）。
+  - arm_link.py：read_angles 重试、vel / vel_read、params 缓存。
+- **固件：**
+  - arm.c：参数表 `tun[]`（Arm_Param_Set 检查范围）、`Seq_Standby` / `Seq_Stow` / `Seq_Park`、`Lift_Boot`、STBY 指令。
+  - main.c：`Servo_SetLimits` / `Servo_Clamp`，SERVO1/2_MIN/MAX 是开机默认值。
+- **仿真 sim_mission.py：** SimWorld（plate_stop_s 等）、SimVision（plate_scan 3 帧中值、material_errors）、RawCenterTeachTests、RawNearSlotTests、RawFrameThreadTests。
+
+### 12.9 测试（10-18 全部通过）
+- `bash arm_patch/tests_stm32/run.sh`：arm 225、chassis 222、servo 41。
+- `cd arm_patch/pi/lidar_map_north` 以后：
+  - `python3 -m unittest sim_mission`：94 个，约 25 秒。
+  - `python3 -m unittest discover -p "test_*.py"`：430 个，跳过 3 个，约 90 秒。
+- 两组分开跑（用户会打断很长的命令）。
+
+### 12.10 这个阶段的提交（10-15 ~ 10-18 共 50 个，详见 `git log af5d7da..9e36ebd`）
+- **10-15：**
+  - STBY 待机姿态存进 Flash，开机、PARK 回到它。
+  - 夹爪下限 500us。
+  - 原料区跟随抓取、示教停靠位。
+- **10-16：**
+  - 用户手量的限位：ID1 44~244、ID2 -1210~-300；升降 LFMAX 115。
+  - STOW 也回到 STBY。
+  - APN 平滑跟随、V 速度指令。
+  - 原料区车轮对准圆心、用转盘外圈认圆心（开源方案）、固定抓取位。
+- **10-17：**
+  - 底盘直行补偿和记录：SCDF/SCDB、TRACE?、SCCM、SCDEC、SCIM、SCBL*。
+  - 轮子接线映射：WMAP/WADR/WINV/WROL/WCHK；fix SF/SB。
+- **10-18：**
+  - 原料区"对准圆心 + 示教三个停靠位"（84213ab 起）。
+  - 读角度重试；对准圆心按实车重写（只用 V）；推算被挡住的格；shift。
+  - 限位在线改（S1MIN 等）；消齿轮间隙、按比赛走法验证。
+  - 最后是 9e36ebd "最近那格"。
