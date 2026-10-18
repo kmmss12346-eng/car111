@@ -1478,6 +1478,26 @@ class ZoneFlowTests(unittest.TestCase):
         self._assert_all_good(w, h, text, 6)
         self.assertNotIn('ERR READ', text)
 
+    def test_servo_read_ok_without_angle_is_retried(self):
+        """A? 回了 OK 却没带 ANG 行(STM32 第二次读舵机没回话，10-18 实车 rteach RAW center 报“读不到手臂角度”)：也要再读。"""
+        w = SimWorld(seed=6, code=self.CODE, cam_deg=90.0)
+        h = make(w)
+        orig = w._handle
+        st = {'n': 0}
+
+        def handle(text):
+            if text.startswith('A?'):
+                st['n'] += 1
+                if st['n'] % 5 in (1, 2):                      # 每 5 次里连着两次 OK 但没有角度
+                    ok, reply, _info = orig(text)
+                    return ok, reply, []
+            return orig(text)
+        w._handle = handle
+        lines = []
+        run_mission(w, h, log=lines.append)
+        self._assert_all_good(w, h, '\n'.join(lines), 6)
+        self.assertGreater(st['n'], 5)
+
     def test_two_frame_measurements_are_faster(self):
         """工位里对准时每次测量只拍 2 帧(zone_frames=2)：比 5 帧快，照样全放对，误差还在 2 环以内(<4mm)。"""
         tot, errs = {}, {}
