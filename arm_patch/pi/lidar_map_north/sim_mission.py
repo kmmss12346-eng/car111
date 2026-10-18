@@ -2614,6 +2614,192 @@ class RawCenterTeachTests(unittest.TestCase):
         self.assertIn('车轮边走边对准', text)
 
 
+class RawNearSlotTests(unittest.TestCase):
+    """(10-18 用户)"最近那格"的做法：齿条不够长、手臂够不全三个停靠位。arm_calib 里把爪子摆到原料盘上离车最近那一格的正上方，
+    rteach RAW near 颜色号：车轮(只用 V)把这一格上的物料对到爪子正下方、记下原料盘中心；比赛时车轮对准以后车不动，
+    按任务码顺序，要的颜色转到这一格就直接下爪(手臂不转去别的格)。"""
+
+    def _world(self, seed, dx=18.0, dy=-14.0, **kw):
+        """原料盘上物料所在圆半径 87mm(真车)；最近那一格在 OBS RAW 爪子点外面 (dx, dy)mm(arm_calib 摆得差一点)；停 6 秒、转 3 秒。"""
+        return plate_world(seed, plate_r=87.0, plate_off_mm=dx, plate_off_tan=dy, **kw)
+
+    def _make(self, w, path, lines, cfg=None):
+        h = make(w, dict(dict(raw_follow=True, raw_center=True, ring_teach_file=path), **(cfg or {})), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        return h
+
+    def _teach(self, w, h, path):
+        """车停在原料区(停车误差随便)、原料盘停着：rteach RAW near 最近那一格上物料的颜色。返回示教的数据和那个颜色。"""
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        try:
+            it = min(w.raw_items, key=lambda i: abs(math.remainder(ph + i['off'], 2 * math.pi)))   # 转到最近那一格(角度 0)的物料
+            h.act.reset_disp()
+            h.raw_ct_teach_near(it['color'], path)
+        finally:
+            del w.plate_phase
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)['RAW_CT']
+        return d, it['color']
+
+    def test_near_teach_then_grab_only_there_in_code_order(self):
+        """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，按任务码顺序三个都在最近那一格夹到、放对槽，
+        每次下爪都是示教时的手臂角度(没转去别的格)。"""
+        import tempfile
+        for seed in (1, 2, 5):
+            w = self._world(seed)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            d, col = self._teach(w, h, path)
+            text = '\n'.join(lines)
+            self.assertEqual(d.get('near'), '1', text)
+            self.assertEqual(sorted(d['slots']), ['1', '2', '3'])
+            self.assertEqual(d['slots']['1']['color'], col)
+            self.assertEqual([k for k, s in d['slots'].items() if s.get('a')], ['1'])         # 只有最近那一格有抓取动作
+            self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [], text)            # 示教时车轮只用 V
+            lines.clear()
+            w.requests.clear()
+            n_moves = len(w.moves)
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('原料区(最近那格)', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+            req = [q for q in w.requests if q.split()[0] in ('OBS', 'AP', 'APN', 'AD', 'AF', 'GRAB', 'V')]
+            self.assertEqual([q for q in req if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])   # 按任务码顺序
+            self.assertFalse([q for q in req if q.split()[0] in ('APN', 'AD', 'AF')], req)
+            a = tuple(round(float(x), 2) for x in d['slots']['1']['a'])
+            for g in range(len(req)):
+                if req[g].startswith('GRAB'):
+                    ap = next(q for q in reversed(req[:g]) if q.startswith('AP '))
+                    self.assertEqual(tuple(round(float(x), 2) for x in ap.split()[1:3]), a, ap)   # 下爪前就是示教的角度
+            self.assertEqual([m for m in w.moves[n_moves:] if m[2] == 'RAW' and m[0] in ('S', 'F')], [], text[-3000:])
+            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完只用 V 挪回停车点
+            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+
+    def test_full_course_two_raw_visits(self):
+        """整场(两次原料区都用最近那格的做法)：6 个都夹到、12 次都放对，没有夹空、碰倒。"""
+        import tempfile
+        for seed in (1, 4, 7):
+            w = self._world(seed)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            self._teach(w, h, path)
+            lines.clear()
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual(text.count('原料区(最近那格)'), 2, text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, f'seed {seed}')
+
+    def test_arm_cannot_reach_so_wheels_move_far(self):
+        """arm_calib 里齿条缩到头也差 60mm 才到最近那一格：示教时车轮挪过去(超过平时对准的 ±40mm 也行)，记下挪了多少；
+        比赛时车停在停车点，车轮以示教时挪到的地方为中心挪过去对准，三个都夹到。"""
+        import tempfile
+        for seed in (1, 3):
+            w = self._world(seed, dx=60.0, dy=-10.0)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            d, _col = self._teach(w, h, path)
+            text = '\n'.join(lines)
+            self.assertGreater(math.hypot(*d['shift_mm']), 45.0, text)
+            lines.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertNotIn('车轮挪到范围边上', text)
+            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+
+    def test_bumped_after_a_grab_wheels_realign(self):
+        """夹完第一个，车被带偏了 7mm：回到看的姿态看一眼原料盘中心，车轮慢慢对回去，后面两个照样夹到(不夹空)。"""
+        import tempfile
+        w = self._world(2)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        self._teach(w, h, path)
+        orig, n = h.arm.grab_here, [0]
+
+        def bump(slot):
+            r = orig(slot)
+            n[0] += 1
+            if n[0] == 1:
+                w.off_s += 5.0
+                w.off_f -= 5.0
+            return r
+        h.arm.grab_here = bump
+        lines.clear()
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('车被带偏了', text)
+        self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_teach_like_the_real_car(self):
+        """原料盘外圈报 3 帧中值(车在走时落后)、每帧多花 0.5 秒、V 取整成整数 转/分、STM32 复位过(S/F 走完车头会转 90°)：
+        示教照样对准(物料离爪子点 4mm 以内)，测出的车轮和画面的对应关系准，一条 S/F 都不发、车头不转。"""
+        import tempfile
+        for seed in (1, 2):
+            w = self._world(seed)
+            w.frame_extra_s, w.vel_quant, w.stale_turn_deg = 0.5, True, 90.0
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            d, col = self._teach(w, h, path)
+            text = '\n'.join(lines)
+            got = float(text.split('记下了(最近那格的做法)：')[1].split(' 物料离爪子点 ')[1].split('mm')[0])
+            self.assertLessEqual(got, 4.0, text)
+            J = np.asarray(h.store.get('RAW', 'ch'), float)
+            for k in (0, 1):
+                self.assertAlmostEqual(float(np.linalg.norm(J[:, k])), w.scale['RAW'], delta=0.15 * w.scale['RAW'], msg=text)
+            self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [], text)
+            self.assertEqual(float(w.tilt.get('RAW', 0.0)), 0.0, text)
+
+    def test_other_teach_commands_refused_in_near_mode(self):
+        """最近那格的做法示教过：rteach RAW 1~3 颜色号、rteach RAW shift 不能用(说清楚怎么重新示教/换回三个停靠位)。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        _d, col = self._teach(w, h, path)
+        with self.assertRaises(ValueError) as cm:
+            h.raw_ct_teach_slot(2, col, path)
+        self.assertIn('rteach RAW near', str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            h.raw_ct_shift(path)
+        self.assertIn('最近那格', str(cm.exception))
+
+    def test_material_not_on_near_slot_is_not_saved(self):
+        """最近那一格上不是这个颜色(看不到这个颜色的物料，或者它不在爪子附近)：不保存，说清楚原因。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        try:
+            h.act.reset_disp()
+            with self.assertRaises(VisionError) as cm:
+                h.raw_ct_teach_near(4, path)                       # 这一批没有绿色
+        finally:
+            del w.plate_phase
+        self.assertIn('没看到 GREEN 物料', str(cm.exception))
+        self.assertFalse(os.path.exists(path) and 'RAW_CT' in json.load(open(path, encoding='utf-8')))
+
+
 class WheelsAlignTests(unittest.TestCase):
     """10-12 用户："在对每个任务点进行任务的时候要求通过微调轮子进行对准和对齐，不要调控机械臂了，太慢了"(align_by)。
     对准时手臂一下都不动(不发 AP/AD/AF/OBS…，ID1/ID2 角度不变)，车轮横移/前后都限着范围；对不准也尽量放(place_anyway_mm)。"""

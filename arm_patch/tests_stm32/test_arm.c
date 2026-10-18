@@ -297,6 +297,13 @@ int main(void) {
     CHECK(Arm_Param_Set("S2MAX", -1300) == 2 && Arm_Param_Set("S2MIN", -100) == 2 && Arm_Param_Set("S1MIN", 300) == 2,
           "下限比上限大(或上限比下限小)就拒绝");
     Arm_Param_Set("S2MAX", -300);
+    /* (10-18 用户：齿条重装、ID1 放开)姿态角度不再限在 -1210~-300 / 44~244，S1MIN 可以是负的(真转的时候 main.c 按限位截住) */
+    CHECK(Arm_Param_Set("A2E", -1400) == 1 && Arm_Param_Set("A2R", -250) == 1 && Arm_Param_Set("A2P", -1500) == 1 &&
+          Arm_Param_Set("A1G", 30) == 1 && Arm_Param_Set("A1D", 260) == 1 && Arm_Param_Set("S1MIN", -20) == 1 && has("lim1=-20,244;"),
+          "A2E/A2R/A2P、A1G/A1D 超出以前的范围也能设，S1MIN 能设负数");
+    CHECK(Arm_Param_Set("A2E", -6000) == 2 && Arm_Param_Set("A1G", 800) == 2, "太离谱的数还是拒绝");
+    Arm_Param_Set("S1MIN", 44); Arm_Param_Set("A2E", -862); Arm_Param_Set("A2R", -862); Arm_Param_Set("A2P", -862);
+    Arm_Param_Set("A1G", 323); Arm_Param_Set("A1D", 323);
     clear();
     CHECK(run("SVP? 2") == 1 && has("svp2;") && run("SVP? 0") == -1, "SVP? 读舵机内部设置");
     clear();
