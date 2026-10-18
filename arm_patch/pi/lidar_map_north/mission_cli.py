@@ -37,7 +37,13 @@ pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
                              再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
                              比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
-rteach RAW <停靠位> <颜色号> (10-16)原料区停靠位示教：车停在原料区停车点、原料盘停着，这个停靠位上是这个颜色的物料。记下它在画面里的位置；
+rteach RAW center          (10-18)原料区示教第一步：车停在原料区、原料盘上放好物料。手臂摆到看原料盘的姿态不动，车轮边走边看，
+                             把原料盘中心对到爪子点下面，记下这时圆心在画面里的位置(以后比赛每次都对到这里)。rteach RAW center here = 车不动，按现在的位置记
+rteach RAW 1|2|3 <颜色号>  (10-18)接着(车别动、原料盘停着)：这个停靠位上是这个颜色的物料。记下它在画面里的位置，手臂自动对准它、记下角度
+                             (这个位的抓取动作)。对不上就用 arm AD 1 / arm AD 2 手动摆到物料正上方，再 rteach RAW 1|2|3 save。
+                             rteach RAW 1|2|3 go = 手臂转到这个位示教的角度看看；rteach RAW clear = 清掉原料区示教。
+                             三个位都示教好以后，比赛时：车轮对准圆心(手臂不动)→ 车不再动 → 按任务码顺序，要的颜色停在几号位就按几号位的角度直接下爪
+rteach RAW <停靠位> <颜色号> (10-16，没做 rteach RAW center 时)原料区停靠位示教：车停在原料区停车点、原料盘停着，这个停靠位上是这个颜色的物料。记下它在画面里的位置；
                              手臂够得着就对准、记下角度。3 个停靠位都示教(够不着的也要，用来认颜色在哪个位)。比赛时看一次就推算以后每次停下的颜色，
                              手臂提前到够得着的停靠位等，一停就下爪
 mtest START                单独测回家后的显示(会收臂、升降停 60)
@@ -480,19 +486,8 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 d = load_place_adj(path)
                 log(f'示教({path})：' + (json.dumps(d, ensure_ascii=False) if d else '还没有'))
             return None
-        if len(parts) == 4 and parts[1].upper() == 'RAW' and parts[2] in ('1', '2', '3') and parts[3] in ('1', '2', '3', '4', '5', '6'):
-            n_, col_ = int(parts[2]), int(parts[3])
-
-            def go_raw():
-                h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
-                state['abort'] = False
-                _tools(h, link)
-                P_ = h.arm.params(refresh=True)
-                if P_.get('ARMOK', 0) < 0.5:
-                    raise ValueError('先把姿态标定好并 set ARMOK 1')
-                log(f'示教原料区 {n_} 号停靠位(原料盘要停着，{n_} 号位上是颜色 {col_} 的物料)……')
-                h.raw_teach_slot(n_, col_, path)
-            return _run_async(state, log, go_raw, vision=True)
+        if len(parts) >= 2 and parts[1].upper() == 'RAW':
+            return _rteach_raw(h, link, parts, path, state, log)
         if len(parts) != 3 or parts[1].upper() not in ('ROUGH', 'TEMP') or parts[2] not in ('1', '2', '3'):
             raise ValueError('格式：rteach ROUGH 2 / rteach ROUGH 1 / rteach ROUGH 3(TEMP 一样)；rteach RAW 停靠位(1~3) 颜色号；rteach show / rteach clear')
         zone, ring = parts[1].upper(), int(parts[2])
@@ -814,6 +809,64 @@ def _zone_preflight(h, zone, batch, force, log):
     if h.store is not None and h.store.get('RING', 'arm') is None:
         log('   第一次对圆环：会先小幅动几下手臂(和底盘)，测出动作和画面的对应关系，存下来以后直接用')
     log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
+
+
+def _rteach_raw(h, link, parts, path, state, log):
+    """(10-18 用户)原料区示教：车轮对准原料盘中心以后，三个停靠位各记一套抓取动作(手臂角度)。
+    rteach RAW center [here] / rteach RAW 1~3 颜色号 / rteach RAW 1~3 save / rteach RAW 1~3 go / rteach RAW clear"""
+    from mission_hooks import load_place_adj
+    sub = [p.lower() for p in parts[2:]]
+    if sub == ['clear']:
+        d = load_place_adj(path)
+        gone = [k for k in ('RAW_CT', 'RAW') if k in d]
+        for k in gone:
+            del d[k]
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        log('已清掉原料区的示教' + ('' if gone else '(本来就没有)') + '：比赛时原料区用以前的做法')
+        return None
+    ok_n = len(sub) == 2 and sub[0] in ('1', '2', '3')
+    if sub[:1] == ['center'] and len(sub) <= 2 and (len(sub) == 1 or sub[1] == 'here'):
+        what, move = 'center', len(sub) == 1
+    elif ok_n and sub[1] in ('1', '2', '3', '4', '5', '6'):
+        what = 'slot'
+    elif ok_n and sub[1] in ('save', 'go'):
+        what = sub[1]
+    else:
+        raise ValueError('格式：rteach RAW center(车轮对准原料盘中心) / rteach RAW center here(车不动，按现在的位置记) / '
+                         'rteach RAW 停靠位(1~3) 颜色号 / rteach RAW 停靠位 save(手臂现在的角度记成这个位的抓取角度) / '
+                         'rteach RAW 停靠位 go(手臂转到这个位示教的角度看看) / rteach RAW clear')
+    n_ = int(sub[0]) if what != 'center' else 0
+
+    def go_raw():
+        h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+        state['abort'] = False
+        _tools(h, link)
+        P_ = h.arm.params(refresh=True)
+        if P_.get('ARMOK', 0) < 0.5:
+            raise ValueError('先把姿态标定好并 set ARMOK 1')
+        ct = (load_place_adj(path).get('RAW_CT') or {}).get('c')
+        if what == 'center':
+            if h.act is not None:
+                h.act.reset_disp()                      # 车是手放到原料区的：底盘位移从 0 算
+            log('示教原料区：先把原料盘中心对到爪子点下面(手臂不动，车轮边走边看)……' if move else
+                '示教原料区：车不动，记下现在原料盘中心在画面里的位置……')
+            h.raw_ct_teach_center(path, move=move)
+        elif what == 'slot':
+            col_ = int(sub[1])
+            if not ct:
+                log('  (还没做 rteach RAW center：按以前的做法示教停靠位(相对停车点)。'
+                    '要用"车轮对准圆心 + 示教三个停靠位"的做法，先 rteach RAW center)')
+                log(f'示教原料区 {n_} 号停靠位(原料盘要停着，{n_} 号位上是颜色 {col_} 的物料)……')
+                h.raw_teach_slot(n_, col_, path)
+                return
+            log(f'示教原料区 {n_} 号停靠位(车别动、原料盘停着，{n_} 号位上是颜色 {col_} 的物料)……')
+            h.raw_ct_teach_slot(n_, col_, path)
+        elif what == 'save':
+            h.raw_ct_save_slot(n_, path)
+        else:
+            h.raw_ct_goto_slot(n_, path)
+    return _run_async(state, log, go_raw, vision=what in ('center', 'slot'))
 
 
 def _rteach(h, link, zone, ring, path, log):

@@ -15,6 +15,7 @@
 用时估计：按 STM32 的速度参数(LFRPM、ASPD、CLWAIT……)和 arm.c 里每个动作的实际步骤累加，
 不含路线行驶时间；是估计，真车要以实测为准。
 """
+import json
 import math
 import os
 import sys
@@ -1941,6 +1942,128 @@ class RawFollowTests(unittest.TestCase):
         w, h, text = self._run(1, arm_j=False)
         self.assertIn('还没有手臂和画面的对应关系', text)
         self.assertNotIn('跟随抓取：', text)
+
+
+class RawCenterTeachTests(unittest.TestCase):
+    """(10-18 用户)原料区：手臂摆到看原料盘的姿态不动，车轮边走边看把原料盘中心对到示教时的位置；对准以后车不再动，
+    按任务码顺序，要的颜色停在几号位就按几号位示教的手臂角度直接下爪(不拿画面再修手臂)。"""
+
+    def _world(self, seed, dx=25.0, dy=-18.0, **kw):
+        """原料盘中心在 OBS RAW 爪子点下面偏 (dx, dy)mm，物料在半径 60mm 的圆上(三个位手臂都够得着)；停 6 秒、转 3 秒。"""
+        return plate_world(seed, plate_r=60.0, plate_off_mm=-60.0 + dx, plate_off_tan=dy, **kw)
+
+    def _make(self, w, path, lines, cfg=None):
+        h = make(w, dict(dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0], ring_teach_file=path), **(cfg or {})),
+                 log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        return h
+
+    @staticmethod
+    def _slot_of(w, it, ph):
+        th = (ph + it['off']) % (2 * math.pi)
+        return 1 + min(range(3), key=lambda i: abs(((th - i * 2 * math.pi / 3) + math.pi) % (2 * math.pi) - math.pi))
+
+    def _teach(self, w, h, path):
+        """车停在原料区(停车误差随便)、原料盘停着：rteach RAW center(车轮对准圆心)，再三个停靠位 rteach RAW n 颜色号。"""
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        try:
+            h.act.reset_disp()
+            h.raw_ct_teach_center(path, move=True)
+            for it in w.raw_items:
+                self.assertTrue(h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path))
+        finally:
+            del w.plate_phase
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)['RAW_CT']
+        self.assertEqual(sorted(d['slots']), ['1', '2', '3'])
+        self.assertTrue(all(s['a'] for s in d['slots'].values()))
+        return d
+
+    def test_center_then_taught_slots_in_code_order(self):
+        """示教一次；再来原料区(车停的位置不一样)：车轮对准圆心(手臂不动)，按任务码顺序用示教的角度夹到三个、放对槽。"""
+        import tempfile
+        for seed in (1, 2, 5):
+            w = self._world(seed)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            d = self._teach(w, h, path)
+            taught = [tuple(s['a']) for s in d['slots'].values()]
+            lines.clear()
+            w.requests.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('对准圆心 + 示教的三个停靠位', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+            req = [q for q in w.requests if q.split()[0] in ('OBS', 'AP', 'APN', 'AD', 'AF', 'GRAB', 'V')]
+            grabs = [q for q in req if q.startswith('GRAB')]
+            self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])      # 按任务码顺序：1 红、5 黑、6 浅蓝
+            self.assertFalse([q for q in req if q.split()[0] in ('APN', 'AD', 'AF')], req)    # 手臂不跟随、不微调
+            i_obs = req.index('OBS RAW O')
+            i_ap = next(i for i, q in enumerate(req) if q.startswith('AP '))
+            self.assertTrue(any(q.startswith('V ') for q in req[i_obs:i_ap]))                # 对准时只有车轮在走
+            self.assertFalse([q for q in req[i_obs:i_ap] if q.split()[0] not in ('V', 'OBS')], req[i_obs:i_ap])
+            for g in range(len(req)):
+                if req[g].startswith('GRAB'):
+                    ap = next(q for q in reversed(req[:g]) if q.startswith('AP '))
+                    a = tuple(round(float(x), 2) for x in ap.split()[1:3])
+                    self.assertIn(a, [tuple(round(x, 2) for x in t) for t in taught], ap)    # 下爪前就是示教的角度
+            ds = [float(x.split('原料盘中心离示教时的位置 ')[1].split('mm')[0]) for x in lines if '原料盘中心离示教时的位置' in x]
+            self.assertLess(ds[-1], 3.0, text)
+            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完车挪回停车点
+            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+
+    def test_waits_for_the_next_color_in_order(self):
+        """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
+        import tempfile
+        w = self._world(3)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        self._teach(w, h, path)
+        lines.clear()
+        w.requests.clear()
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        grabs = [q for q in w.requests if q.startswith('GRAB')]
+        self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+        order = [l for l in lines if '按示教的角度转过去下爪' in l]
+        self.assertEqual(len(order), 3, text[-3000:])
+        self.assertEqual([l.split('[抓 ')[1].split(']')[0] for l in order], ['RED', 'BLACK', 'LIGHT_BLUE'], text[-3000:])
+
+    def test_pose_changed_falls_back(self):
+        """示教以后改了看原料盘的姿态(A1G)：示教的停靠位不用，照旧用以前的做法，并提醒重新示教。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        self._teach(w, h, path)
+        w.params['A1G'] += 20.0
+        h.arm.params(refresh=True)
+        lines.clear()
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('和示教时不一样', text)
+        self.assertNotIn('按示教的角度转过去下爪', text)
+
+    def test_untaught_uses_the_old_way(self):
+        """没示教过(rteach RAW center)：和以前一样。"""
+        import tempfile
+        w = self._world(2)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertNotIn('对准圆心 + 示教的三个停靠位', text)
+        self.assertIn('车轮边走边对准', text)
 
 
 class WheelsAlignTests(unittest.TestCase):
