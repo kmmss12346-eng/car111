@@ -47,6 +47,7 @@ extern void Servo_StopIfStuck(uint8_t id, float target);
 extern void Servo_Report(uint8_t id);
 extern void Servo_SetPower(uint16_t mw);
 extern void Servo_SetComp(uint8_t id, float deg);
+extern void Servo_SetLimits(uint8_t id, float lo, float hi);
 extern void Servo_Hold(uint8_t id, float angle_deg);
 extern void Servo_Track(uint8_t id, float angle_deg, float speed_dps);
 extern int  Servo_Arrived(uint8_t id, float a, float tol_deg);
@@ -121,6 +122,10 @@ static float g_aext   = 2.0f;      /* AEXT   哪个舵机管前后伸缩：2 = I
 static float g_spow   = 30000.0f;  /* SPOW   ID1/ID2 转动时允许的最大功率(mW)，30000 = 当时 set SPOW 30000 的值。发烫就减小 */
 static float g_s1comp = 5.0f;      /* S1COMP ID1 补偿(度)：手臂有摩擦，舵机总停在离目标差这么多的地方，就往前多给这么多，到了目标马上停 */
 static float g_s2comp = 0.0f;      /* S2COMP ID2 补偿(度)，0 = 不补 */
+static float g_s1min  = 44.0f;     /* S1MIN  ID1 限位(度，多圈角度)：10-16 用户松开 ID1 用手转到两头量的 42.4~244.2，各留一点余量 */
+static float g_s1max  = 244.0f;    /* S1MAX */
+static float g_s2min  = -1210.0f;  /* S2MIN  ID2 限位(伸缩齿条，度)：10-16 用户 -1210 ~ -300；10-18 用户：齿条够长，可以调大 */
+static float g_s2max  = -300.0f;   /* S2MAX */
 
 typedef struct
 {
@@ -178,6 +183,10 @@ static const ArmTun tun[] =
     { "SPOW",   &g_spow,    1000.0f, 30000.0f },
     { "S1COMP", &g_s1comp,  0.0f,    15.0f },
     { "S2COMP", &g_s2comp,  0.0f,    15.0f },
+    { "S1MIN",  &g_s1min,   0.0f,    720.0f },
+    { "S1MAX",  &g_s1max,   0.0f,    720.0f },
+    { "S2MIN",  &g_s2min,  -5000.0f, 5000.0f },
+    { "S2MAX",  &g_s2max,  -5000.0f, 5000.0f },
 };
 #define TUN_N  ((int)(sizeof(tun) / sizeof(tun[0])))
 
@@ -193,7 +202,20 @@ int Arm_Param_Set(const char *name, float v)
             {
                 return 2;
             }
+            if ((tun[i].p == &g_s1min && v >= g_s1max) || (tun[i].p == &g_s1max && v <= g_s1min) ||
+                (tun[i].p == &g_s2min && v >= g_s2max) || (tun[i].p == &g_s2max && v <= g_s2min))
+            {
+                return 2;                          /* 下限要比上限小 */
+            }
             *tun[i].p = v;
+            if (tun[i].p == &g_s1min || tun[i].p == &g_s1max)
+            {
+                Servo_SetLimits(1, g_s1min, g_s1max);   /* main.c 里的限位马上换 */
+            }
+            if (tun[i].p == &g_s2min || tun[i].p == &g_s2max)
+            {
+                Servo_SetLimits(2, g_s2min, g_s2max);
+            }
             if (tun[i].p == &g_spow)
             {
                 Servo_SetPower((uint16_t)v);       /* main.c 里的舵机功率马上换 */
@@ -2013,6 +2035,8 @@ void Arm_Init(void)
     Servo_SetPower((uint16_t)g_spow);
     Servo_SetComp(1, g_s1comp);
     Servo_SetComp(2, g_s2comp);
+    Servo_SetLimits(1, g_s1min, g_s1max);
+    Servo_SetLimits(2, g_s2min, g_s2max);
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     scr_boot = 0;                                  /* 这之前屏发来的开机帧不用管：下面马上画；这之后再来说明屏又重启了，Arm_Poll 重画 */

@@ -825,9 +825,10 @@ def _rteach_raw(h, link, parts, path, state, log):
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
             _tools(h, link)
+            h.arm.params(refresh=True)                  # 限位 S2MAX 这些可能刚 set 过
             if h.act is not None:
                 h.act.reset_disp()
-            log('原料区：算车停在哪里够得着的停靠位最多(手臂伸缩的行程不够同时够着三个时用)……')
+            log('原料区：算车停在哪里够得着的停靠位最多(手臂够不着三个停靠位时用)……')
             h.raw_ct_shift(path)
             if h.store is not None:
                 h.store.save()

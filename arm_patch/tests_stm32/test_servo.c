@@ -210,6 +210,19 @@ int main(void) {
     reset1(300); Servo_SetComp(2, 5.0f); pos[2] = tgt[2] = -400;
     Servo_Move(2, -300, 40, 0.3f, 400);
     CHECK(fabs(cmdv[0] - -300) < 0.01, "ID2 补偿 5°：目标在限位上，不多给(还是 -300)");
+    /* (10-18)限位在线改(SET S2MAX)：放宽以后能转过 -300，超出新的限位照样截住 */
+    reset1(300); pos[2] = tgt[2] = -400;
+    Servo_SetLimits(2, -1210.0f, -150.0f);
+    Servo_Move(2, -200, 40, 0.3f, 400);
+    CHECK(fabs(cmdv[0] - -195) < 0.01, "S2MAX 放宽到 -150：转到 -200 不再被截在 -300(补偿 5° 发 -195)");
+    reset1(300); pos[2] = tgt[2] = -400;
+    Servo_Move(2, -100, 40, 0.3f, 400);
+    CHECK(fabs(cmdv[0] - -150) < 0.01, "超出新的限位 -150：截在 -150");
+    Servo_SetLimits(2, -1210.0f, -100.0f - 2000.0f);
+    reset1(300); pos[2] = tgt[2] = -400;
+    Servo_Move(2, -200, 40, 0.3f, 400);
+    CHECK(fabs(cmdv[0] - -195) < 0.01, "下限比上限大的设置不收：还是 -1210 ~ -150");
+    Servo_SetLimits(2, -1210.0f, -300.0f);
     Servo_SetComp(2, 0.0f);
     /* Servo_Arrived：转过一点也算到；Servo_StopIfStuck 换了目标就按距离算，不会拿错方向 */
     reset1(396); t = 300.0f; Servo_Start(1, &t, 40.0f);

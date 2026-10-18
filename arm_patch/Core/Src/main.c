@@ -105,6 +105,7 @@ void  Servo_StopIfStuck(uint8_t id, float target);   /* 没转到位又停住了
 void  Servo_Report(uint8_t id);                      /* SV?：电压/电流/功率/温度/状态 */
 void  Servo_SetPower(uint16_t mw);                   /* 舵机转动时允许的最大功率(参数 SPOW) */
 void  Servo_SetComp(uint8_t id, float deg);          /* 舵机往前多给的补偿角度(参数 S1COMP / S2COMP) */
+void  Servo_SetLimits(uint8_t id, float lo, float hi);   /* 舵机限位(参数 S1MIN / S1MAX / S2MIN / S2MAX) */
 void  Servo_Hold(uint8_t id, float angle_deg);       /* 停在 angle_deg，不再往原来的目标使劲 */
 void  Servo_Track(uint8_t id, float angle_deg, float speed_dps);   /* 跟随用：只发目标不等，不补偿 */
 int   Servo_Arrived(uint8_t id, float a, float tol_deg);   /* 到了没有(转过目标一点也算到) */
@@ -1064,6 +1065,20 @@ void Servo_SetComp(uint8_t id, float deg)
 #define SERVO2_MIN_DEG   -1210.0f   /* 10-16 用户：ID2 最低限位 -1210 */
 #define SERVO2_MAX_DEG    -300.0f   /* 10-16 用户：ID2 最高限位 -300 */
 
+/* (10-18 用户：齿条够长，限位要能调)上面是开机默认值；SET S1MIN / S1MAX / S2MIN / S2MAX 在线改(arm.c 的参数表，
+ * 树莓派 set 过的存进配置、每次开机发过来) */
+static float servo_lim_lo[3] = { 0.0f, SERVO1_MIN_DEG, SERVO2_MIN_DEG };
+static float servo_lim_hi[3] = { 0.0f, SERVO1_MAX_DEG, SERVO2_MAX_DEG };
+
+void Servo_SetLimits(uint8_t id, float lo, float hi)
+{
+    if ((id == 1 || id == 2) && lo < hi)
+    {
+        servo_lim_lo[id] = lo;
+        servo_lim_hi[id] = hi;
+    }
+}
+
 /* 读当前角度(多圈)。读成功返回 1，角度放进 *angle；读失败返回 0 */
 int Servo_ReadAngle(uint8_t id, float *angle)
 {
@@ -1087,8 +1102,8 @@ float Servo_GetAngle(uint8_t id)
 /* 把目标角度限制在限位里 */
 static float Servo_Clamp(uint8_t id, float angle_deg)
 {
-    float lo = (id == 1) ? SERVO1_MIN_DEG : SERVO2_MIN_DEG;
-    float hi = (id == 1) ? SERVO1_MAX_DEG : SERVO2_MAX_DEG;
+    float lo = servo_lim_lo[(id == 1) ? 1 : 2];
+    float hi = servo_lim_hi[(id == 1) ? 1 : 2];
 
     if (angle_deg < lo) angle_deg = lo;
     if (angle_deg > hi) angle_deg = hi;

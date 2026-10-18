@@ -2282,7 +2282,7 @@ class RawCenterTeachTests(unittest.TestCase):
                 if any('超出范围太多' in x for x in lines[l0:]):
                     refused += 1
                     moved = [q for q in w.requests[n0:] if q.split()[0] in ('AD', 'AF', 'APN')
-                             or (q.startswith('AP ') and abs(float(q.split()[1]) - w.params['A1G']) > 0.5)]
+                             or (q.startswith('AP ') and abs(float(q.split()[1]) - w.params['A1G']) > 2.5)]   # 回看的姿态(先到小 2°)不算
                     self.assertEqual(moved, [], '\n'.join(lines[l0:]))
                     self.assertIn('看的姿态 ID1', '\n'.join(lines[l0:]))
         finally:
@@ -2428,6 +2428,43 @@ class RawCenterTeachTests(unittest.TestCase):
         k_far = int(far[0])
         self.assertFalse(res[k_far][0])
         self.assertLess(res[k_far][1], 260.0, '\n'.join(lines))              # ID2 没被推到头(估的只要转一点点)
+
+    def test_teach_is_verified_the_way_the_match_moves(self):
+        """(10-18 实车：ID1 齿轮间隙，一点一点对和一下转过去停的地方不一样)大幅 AP 总是多转 (2.5°, 5°)：示教对上以后按比赛的走法
+        (从看的姿态一下转过去)再试，差了就修角度；比赛时一下转过去照样对在物料上，三个都夹到。"""
+        import tempfile
+        for seed in (1, 2):
+            w = plate_world(seed, plate_r=60.0, plate_off_mm=-35.0, plate_off_tan=-18.0, ap_bias=(2.5, 5.0))
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines)
+            self._teach(w, h, path)
+            text = '\n'.join(lines)
+            self.assertIn('角度修成', text)
+            lines.clear()
+            w.requests.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_id2_limits_come_from_the_stm32(self):
+        """(10-18 用户：齿条够长，限位可以调大)ID2 能转的范围按 STM32 的参数 S2MIN / S2MAX 算(set S2MAX 改了马上用上)。"""
+        import tempfile
+        w = self._world(1)
+        w.params['S2MIN'], w.params['S2MAX'] = -1210.0, -700.0               # 收紧：要转到 -610 的两个位够不着了
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        ph = self._center_only(w, h, path)
+        h.arm.params(refresh=True)
+        self.assertEqual(h._a2_limits(), (-1210.0, -700.0))
+        try:
+            ok = {self._slot_of(w, it, ph): h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path) for it in w.raw_items}
+        finally:
+            del w.plate_phase
+        text = '\n'.join(lines)
+        self.assertIn('ID2 -1210~-700°', text)
+        self.assertEqual(sum(ok.values()), 1, text)                          # 只剩要往 -1130 转的那个位够得着
 
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""

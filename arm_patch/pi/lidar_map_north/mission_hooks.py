@@ -170,6 +170,9 @@ DEFAULTS = dict(
     raw_ct_check=True,                  # 转到停靠位上方、下爪前拍一帧：看到要夹的物料离爪子点超过 raw_slot_accept_mm(原料盘又转了)就不下爪；看不到照样下爪
     raw_ct_stop_s=6.0,                  # (10-18 用户量的)原料盘每次大约停多久、转多久(秒)：还没量到之前按这个估计(停的时间按九折算，留余量)；
     raw_ct_move_s=3.0,                  #   亲眼看到两次停下以后，按量到的周期推算回到看的姿态时这一次已经停了多久
+    raw_backlash_deg=2.0,               # (10-18 实车 ID1 有齿轮间隙)转到看原料盘的姿态时 ID1 先到小这么多度再转过去：每次都从同一边转到，停的地方一样
+    raw_teach_verify=True,              # 示教停靠位对上以后按比赛的走法(从看的姿态一下转过去)再试，差了修角度(一点一点对和一下转过去停的地方不一样)
+    raw_teach_verify_n=3,
     raw_a1_margin_deg=5.0,              # (10-18 实车)ID1 离限位这么多度以内算够不着：STM32 给 ID1 往前多给 5° 补偿摩擦，靠近限位时多给的被限位截掉，
                                         #   ID1 停在离限位四五度的地方(示教 3 号位时停在 48.3°，限位 44°)
     raw_ct_accept_mm=5.0,               # 比赛时对准圆心：到时间还没对到 raw_ct_tol_mm，但离示教的位置不到这么多毫米也照样抓；再远就这次不抓(会砸到物料)
@@ -2693,7 +2696,7 @@ class MissionHooks:
             d = -Jinv @ (p - claw)                              # [ID2, ID1] 度
             a1, a2 = home[0] + float(d[1]), home[1] + float(d[0])
             ok = (abs(a1 - home[0]) <= float(lim['id1']) and abs(a2 - home[1]) <= float(lim['id2'])
-                  and float(a1r[0]) <= a1 <= float(a1r[1]) and A2_MIN <= a2 <= A2_MAX)
+                  and float(a1r[0]) <= a1 <= float(a1r[1]) and self._a2_limits()[0] <= a2 <= self._a2_limits()[1])
             slots[str(k)] = dict(px=[round(float(p[0]), 1), round(float(p[1]), 1)], a=[round(a1, 2), round(a2, 2)] if ok else None)
             self.log(f'    {k} 号位：离爪子点 {np.linalg.norm(p - claw) / sc:.0f}mm，'
                      + (f'手臂转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°' if ok else f'手臂够不着(要 ID1 {a1:.1f}°、ID2 {a2:.1f}°)'))
@@ -3225,8 +3228,8 @@ class MissionHooks:
         a = self.arm.read_angles()
         if a[0] is None or a[1] is None:
             raise ArmError('读不到手臂角度')
-        if math.hypot(a[0] - h0[0], (a[1] - h0[1]) / 10.0) <= 5.0 and (abs(a[0] - h0[0]) > 0.2 or abs(a[1] - h0[1]) > 2.0):
-            self.arm.ap(h0[0], h0[1])
+        if math.hypot(a[0] - h0[0], (a[1] - h0[1]) / 10.0) <= 5.0:
+            self._raw_ct_approach(h0[0], h0[1])                # 从同一边转过去(齿轮间隙)，AP 到位误差 0.3°
             a = self.arm.read_angles()
             if a[0] is None or a[1] is None:
                 raise ArmError('读不到手臂角度')
@@ -3237,18 +3240,44 @@ class MissionHooks:
             comp = np.asarray(Ja, float) @ np.array([a[1] - h0[1], a[0] - h0[0]])
         return a, comp
 
+    def _arm_limits(self):
+        """ID1、ID2 的限位 ((ID1 下, 上), (ID2 下, 上))：STM32 的参数 S1MIN/S1MAX、S2MIN/S2MAX(10-18 可以 set 在线改)；
+        旧程序没有这几个参数就用 A1_MIN/A1_MAX、A2_MIN/A2_MAX。"""
+        try:
+            P = (self.arm.params() if self.arm is not None else None) or {}
+        except ArmAbort:
+            raise
+        except ArmError:
+            P = {}
+
+        def pair(a, b, dflt):
+            lo, hi = P.get(a), P.get(b)
+            return (float(lo), float(hi)) if lo is not None and hi is not None and float(lo) < float(hi) else dflt
+        return pair('S1MIN', 'S1MAX', (A1_MIN, A1_MAX)), pair('S2MIN', 'S2MAX', (A2_MIN, A2_MAX))
+
+    def _a2_limits(self):
+        return self._arm_limits()[1]
+
     def _raw_a1_range(self):
         """ID1 真正能转到的范围：限位往里收 raw_a1_margin_deg(补偿摩擦多给的角度被限位截掉，靠近限位转不到)。"""
-        a1r = self.cfg.get('a1_range') or (A1_MIN, A1_MAX)
+        a1r = self.cfg.get('a1_range') or self._arm_limits()[0]
         mg = float(self.cfg.get('raw_a1_margin_deg', 5.0))
         return float(a1r[0]) + mg, float(a1r[1]) - mg
+
+    def _raw_ct_approach(self, a1, a2):
+        """(10-18 实车：ID1 有齿轮间隙，vcal 前后同一个角度、画面里原料盘差了 8mm)转到 (a1, a2)：
+        ID1 总是从小往大转过去(先到 a1 - raw_backlash_deg)，每次停的地方都一样。"""
+        bl = float(self.cfg.get('raw_backlash_deg', 2.0))
+        if bl > 0.0:
+            self.arm.ap(float(a1) - bl, float(a2))
+        self.arm.ap(float(a1), float(a2))
 
     def _raw_ct_keepalive(self):
         """等原料盘时手臂太久没动：ID1 轻轻摆一下再回来(规则：机器人停止运行 15 秒、等转盘时 23 秒，本轮结束)。"""
         h = self._ct_home
         d = float(self.cfg.get('raw_keepalive_deg', 1.0))
         self.log(f'    手臂 {self.now() - self._ct_t_arm:.0f} 秒没动了：ID1 轻轻摆一下')
-        self.arm.ap(h[0] + d, h[1])
+        self.arm.ap(h[0] - d, h[1])                           # 往小摆、再往大回来：还是从同一边转到看的姿态(齿轮间隙)
         self.arm.ap(h[0], h[1])
         self._ct_t_arm = self.now()
 
@@ -3487,6 +3516,7 @@ class MissionHooks:
                     self._show_stats()
                 try:
                     self.arm.obs('RAW', open_claw=True)        # 回到看原料盘的姿态(车没动，还对着圆心)
+                    self._raw_ct_approach(home[0], home[1])    # 和示教时一样从同一边转到看的姿态(齿轮间隙)
                 except ArmAbort:
                     raise
                 except ArmError as ex:
@@ -3553,7 +3583,8 @@ class MissionHooks:
             self.arm.obs('RAW', open_claw=True)
             P_ = self.arm.params() or {}
             if 'A1G' in P_ and 'A2E' in P_:
-                self.arm.ap(float(P_['A1G']), float(P_['A2E']))   # OBS 到位误差约 1°：用 AP(0.3°)精确转到 A1G、A2E，以后每次都转到这里
+                # OBS 到位误差约 1°：用 AP(0.3°)、从同一边(齿轮间隙)精确转到 A1G、A2E，以后每次都这样转到这里
+                self._raw_ct_approach(float(P_['A1G']), float(P_['A2E']))
             home = self.arm.read_angles()
             if home[0] is None or home[1] is None:
                 raise ArmError('读不到手臂角度，没保存')
@@ -3653,12 +3684,13 @@ class MissionHooks:
             lim = dict(id1=60.0, id2=700.0)
             lim.update(cfg.get('raw_center_reach_deg') or {})
             a1r = self._raw_a1_range()
+            a2lo, a2hi = self._a2_limits()
             a1, a2 = home[0] + float(dd[1]), home[1] + float(dd[0])
             # 10-18：离得远(八九十毫米)时按画面估的角度会差一二成：稍微超出范围也先在范围里试着对，看能对到多近
             over1 = max(0.0, abs(float(dd[1])) - float(lim['id1']), a1r[0] - a1, a1 - a1r[1])
-            over2 = max(0.0, abs(float(dd[0])) - float(lim['id2']), A2_MIN - a2, a2 - A2_MAX)
+            over2 = max(0.0, abs(float(dd[0])) - float(lim['id2']), a2lo - a2, a2 - a2hi)
             lim_txt = (f'ID1 {a1r[0]:.0f}~{a1r[1]:.0f}°(限位往里收 {float(cfg.get("raw_a1_margin_deg", 5.0)):g}°) 且离看的姿态 ±{float(lim["id1"]):.0f}°以内，'
-                       f'ID2 {A2_MIN:.0f}~{A2_MAX:.0f}° 且离看的姿态 ±{float(lim["id2"]):.0f}°以内')
+                       f'ID2 {a2lo:.0f}~{a2hi:.0f}°(STM32 限位 S2MIN/S2MAX) 且离看的姿态 ±{float(lim["id2"]):.0f}°以内')
             if over1 > float(cfg.get('raw_teach_over_id1', 15.0)) or over2 > float(cfg.get('raw_teach_over_id2', 200.0)):
                 self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°(看的姿态 ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)，'
                          f'超出范围太多(范围：{lim_txt})：手臂不动，只记位置。'
@@ -3672,8 +3704,8 @@ class MissionHooks:
                 d1, d2 = float(dd[1]), float(dd[0])
                 rng = dict(id1=(max(a1r[0] - home[0], -float(lim['id1']), min(0.0, d1) - w1),
                                 min(a1r[1] - home[0], float(lim['id1']), max(0.0, d1) + w1)),
-                           id2=(max(A2_MIN - home[1], -float(lim['id2']), min(0.0, d2) - w2),
-                                min(A2_MAX - home[1], float(lim['id2']), max(0.0, d2) + w2)))
+                           id2=(max(a2lo - home[1], -float(lim['id2']), min(0.0, d2) - w2),
+                                min(a2hi - home[1], float(lim['id2']), max(0.0, d2) + w2)))
                 if guessed:                                    # 看不到：手臂先一下转到推出来的位置(物料就到爪子点附近、看得到了)，再从那里看着对
                     g1 = min(max(a1, home[0] + rng['id1'][0]), home[0] + rng['id1'][1])
                     g2 = min(max(a2, home[1] + rng['id2'][0]), home[1] + rng['id2'][1])
@@ -3687,7 +3719,10 @@ class MissionHooks:
                 if res.ok or res.err_mm <= float(cfg.get('raw_tol_mm', 3.0)) + 2.0:
                     b = self.arm.read_angles()
                     if b[0] is not None and b[1] is not None:
-                        a = [round(float(b[0]), 2), round(float(b[1]), 2)]
+                        a = [float(b[0]), float(b[1])]
+                        if cfg.get('raw_teach_verify', True):
+                            a = self._raw_ct_verify(int(color), a, home)
+                        a = [round(float(a[0]), 2), round(float(a[1]), 2)]
                 else:
                     try:
                         b = self.arm.read_angles()
@@ -3698,7 +3733,7 @@ class MissionHooks:
                     self.log('   没对上(' + (f'最近还差 {res.err_mm:.1f}mm' if math.isfinite(res.err_mm) else '转过去以后还是看不到物料')
                              + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
                              + ')：只记位置。三个位的位置都记下以后 rteach RAW shift 让车挪到够得着的地方')
-        self.arm.ap(home[0], home[1])
+        self._raw_ct_approach(home[0], home[1])                # 回到看的姿态(从同一边转过去)
         d = load_place_adj(path)
         r_ = d.setdefault('RAW_CT', D)
         r_.setdefault('slots', {})[str(int(n))] = dict(px=[round(float(px[0]), 1), round(float(px[1]), 1)], a=a, color=int(color),
@@ -3709,6 +3744,39 @@ class MissionHooks:
         self.log(f'   {n} 号停靠位：画面位置 ({px[0]:.0f}, {px[1]:.0f})' + (f'，抓取角度 ID1 {a[0]:.2f}°、ID2 {a[1]:.2f}°' if a else '，还没有抓取角度')
                  + f'。已示教 {"、".join(done)} 号位' + ('，三个都有了' if len(done) >= 3 else ''))
         return a is not None
+
+    def _raw_ct_verify(self, color, a, home):
+        """(10-18)示教对上以后，按比赛时的走法再试：回到看的姿态(从同一边转过去)，再一下转到记下的角度，看物料是不是在爪子点下面。
+        一点一点对和一下转过去停的地方会不一样(齿轮间隙、舵机过冲)：差了就按差的修角度，最多试 raw_teach_verify_n 次。返回修过的角度。"""
+        cfg, v = self.cfg, self.vision
+        sc = float(v.scale('RAW'))
+        tolmm = float(cfg.get('raw_tol_mm') or cfg['tol_mm']['RAW'])
+        Ja = self.store.get('RAW', 'arm') if self.store is not None else None
+        (lo1, hi1), (lo2, hi2) = self._raw_a1_range(), self._a2_limits()
+        a = [float(a[0]), float(a[1])]
+        for k in range(int(cfg.get('raw_teach_verify_n', 3))):
+            self._raw_ct_approach(home[0], home[1])
+            self.arm.ap(a[0], a[1])
+            e = v.material_error(int(color), n=2)
+            if e is None:
+                self.log('   按比赛的走法(从看的姿态一下转过去)试了一次：看不到物料，按对准时的角度记')
+                return a
+            em = float(np.linalg.norm(e)) / sc
+            if em <= tolmm:
+                self.log(f'   按比赛的走法(从看的姿态一下转过去)试了一次：离爪子点 {em:.1f}mm，可以' + ('(角度修过)' if k else ''))
+                return a
+            if Ja is None:
+                return a
+            dd = -np.linalg.solve(np.asarray(Ja, float), np.asarray(e, float))       # [ID2, ID1] 度
+            a = [min(max(a[0] + float(dd[1]), lo1), hi1), min(max(a[1] + float(dd[0]), lo2), hi2)]
+            self.log(f'   按比赛的走法(从看的姿态一下转过去)试了一次：离爪子点 {em:.1f}mm(一点一点对和一下转过去停的地方不一样)，'
+                     f'角度修成 ID1 {a[0]:.2f}°、ID2 {a[1]:.2f}°')
+        self._raw_ct_approach(home[0], home[1])
+        self.arm.ap(a[0], a[1])
+        e = v.material_error(int(color), n=2)
+        if e is not None:
+            self.log(f'   修了 {int(cfg.get("raw_teach_verify_n", 3))} 次以后离爪子点 {float(np.linalg.norm(e)) / sc:.1f}mm')
+        return a
 
     def _raw_ct_slot_px(self, D):
         """示教数据里三个停靠位的画面位置 {k: 像素}；有一个没示教(被爪子挡住)就按另外两个推出来。不够三个返回 None。"""
@@ -3729,6 +3797,7 @@ class MissionHooks:
         lim = dict(id1=60.0, id2=700.0)
         lim.update(cfg.get('raw_center_reach_deg') or {})
         a1r = self._raw_a1_range()
+        a2lo, a2hi = self._a2_limits()
         Ja = np.asarray(Ja, float)
         Ainv = np.linalg.inv(Ja)
         mm2 = float(np.linalg.norm(Ja[:, 0])) / sc                # ID2 每度多少毫米
@@ -3738,7 +3807,7 @@ class MissionHooks:
             e = (np.asarray(px, float) - claw)[:, None] + np.asarray(shifts, float).T      # 2×N
             d = -Ainv @ e                                          # [ID2, ID1] 度
             a1, a2 = float(home[0]) + d[1], float(home[1]) + d[0]
-            m2 = np.minimum.reduce([a2 - A2_MIN, A2_MAX - a2, float(lim['id2']) - np.abs(d[0])]) * mm2
+            m2 = np.minimum.reduce([a2 - a2lo, a2hi - a2, float(lim['id2']) - np.abs(d[0])]) * mm2
             m1 = np.minimum.reduce([a1 - float(a1r[0]), float(a1r[1]) - a1, float(lim['id1']) - np.abs(d[1])]) * mm1
             out[k] = (a1, a2, np.minimum(m1, m2))
         return out

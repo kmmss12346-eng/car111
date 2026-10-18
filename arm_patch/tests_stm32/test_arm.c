@@ -64,6 +64,7 @@ void Servo_StopIfStuck(uint8_t id, float t) { EV("stuck%u:%.1f;", id, t); }
 void Servo_Report(uint8_t id) { EV("rep%u;", id); }
 void Servo_SetPower(uint16_t mw) { EV("pow%u;", mw); }
 void Servo_SetComp(uint8_t id, float deg) { EV("comp%u=%.1f;", id, deg); }
+void Servo_SetLimits(uint8_t id, float lo, float hi) { EV("lim%u=%.0f,%.0f;", id, lo, hi); }
 void Servo_Hold(uint8_t id, float a) { EV("H%u:%.1f;", id, a); }
 void Servo_Track(uint8_t id, float a, float spd) { EV("T%u:%.1f@%.0f;", id, a, spd); }
 static float fgoal[3];
@@ -288,6 +289,14 @@ int main(void) {
           "SET S1COMP / S2COMP 马上换补偿角度，超范围拒绝");
     Arm_Param_Set("S1COMP", 5); Arm_Param_Set("S2COMP", 0);
     Arm_Param_Set("SPOW", 30000);
+    /* (10-18)舵机限位 S1MIN/S1MAX/S2MIN/S2MAX：开机交给 main.c；SET 马上换；下限不能比上限大 */
+    clear(); Arm_Init();
+    CHECK(has("lim1=44,244;") && has("lim2=-1210,-300;"), "开机把限位 S1MIN/S1MAX、S2MIN/S2MAX 交给 main.c");
+    clear();
+    CHECK(Arm_Param_Set("S2MAX", -150) == 1 && has("lim2=-1210,-150;"), "SET S2MAX 马上换 ID2 限位");
+    CHECK(Arm_Param_Set("S2MAX", -1300) == 2 && Arm_Param_Set("S2MIN", -100) == 2 && Arm_Param_Set("S1MIN", 300) == 2,
+          "下限比上限大(或上限比下限小)就拒绝");
+    Arm_Param_Set("S2MAX", -300);
     clear();
     CHECK(run("SVP? 2") == 1 && has("svp2;") && run("SVP? 0") == -1, "SVP? 读舵机内部设置");
     clear();
