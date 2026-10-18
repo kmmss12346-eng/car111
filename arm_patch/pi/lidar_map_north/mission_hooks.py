@@ -3666,6 +3666,120 @@ class MissionHooks:
                  + f'。已示教 {"、".join(done)} 号位' + ('，三个都有了' if len(done) >= 3 else ''))
         return a is not None
 
+    def _raw_ct_slot_px(self, D):
+        """示教数据里三个停靠位的画面位置 {k: 像素}；有一个没示教(被爪子挡住)就按另外两个推出来。不够三个返回 None。"""
+        sl = {str(k): np.asarray(s['px'], float)[:2] for k, s in (D.get('slots') or {}).items() if isinstance(s, dict) and s.get('px')}
+        if len(sl) == 2:
+            k = next(x for x in ('1', '2', '3') if x not in sl)
+            g = self._raw_ct_guess_px(D, k)
+            if g is not None:
+                sl[k] = np.asarray(g, float)
+        return sl if len(sl) >= 3 else None
+
+    def _raw_ct_margins(self, P, home, Ja, shifts):
+        """(10-18)车挪了 shifts(N×2 像素：画面里所有东西一起挪多少)以后，每个停靠位手臂要转到哪、离能转的范围边上还剩多少毫米
+        (负的 = 够不着，差这么多)。按手臂和画面的对应关系 Ja 估。返回 {k: (ID1 N个, ID2 N个, 余量毫米 N个)}。"""
+        cfg, v = self.cfg, self.vision
+        sc = float(v.scale('RAW'))
+        claw = np.array(v.claw('RAW'), float)
+        lim = dict(id1=60.0, id2=700.0)
+        lim.update(cfg.get('raw_center_reach_deg') or {})
+        a1r = cfg.get('a1_range') or (A1_MIN, A1_MAX)
+        Ja = np.asarray(Ja, float)
+        Ainv = np.linalg.inv(Ja)
+        mm2 = float(np.linalg.norm(Ja[:, 0])) / sc                # ID2 每度多少毫米
+        mm1 = float(np.linalg.norm(Ja[:, 1])) / sc                # ID1 每度多少毫米
+        out = {}
+        for k, px in P.items():
+            e = (np.asarray(px, float) - claw)[:, None] + np.asarray(shifts, float).T      # 2×N
+            d = -Ainv @ e                                          # [ID2, ID1] 度
+            a1, a2 = float(home[0]) + d[1], float(home[1]) + d[0]
+            m2 = np.minimum.reduce([a2 - A2_MIN, A2_MAX - a2, float(lim['id2']) - np.abs(d[0])]) * mm2
+            m1 = np.minimum.reduce([a1 - float(a1r[0]), float(a1r[1]) - a1, float(lim['id1']) - np.abs(d[1])]) * mm1
+            out[k] = (a1, a2, np.minimum(m1, m2))
+        return out
+
+    def raw_ct_shift(self, path):
+        """rteach RAW shift(10-18)：三个停靠位的画面位置都示教过以后用(够不着的位 rteach RAW n 颜色号 也会记下位置)。
+        手臂伸缩(ID2)的行程不够同时够着三个停靠位时：按手臂和画面、车轮和画面的对应关系，算车停在哪里够得着的停靠位最多、
+        离能转的范围边上最远；车轮(只用 V，车头不转)挪过去，停稳了重新认圆心，记成以后比赛对准的位置；
+        停靠位的画面位置跟着挪，抓取角度清掉(要重新示教够得着的那几个)。返回车挪了多少 (横移, 前进) 毫米。"""
+        cfg, v, act = self.cfg, self.vision, self.act
+        sc = float(v.scale('RAW'))
+        d = load_place_adj(path)
+        D = d.get('RAW_CT')
+        if not isinstance(D, dict) or not D.get('c'):
+            raise ValueError('先做 rteach RAW center')
+        P = self._raw_ct_slot_px(D)
+        if P is None:
+            raise ValueError('三个停靠位的画面位置还没示教全：先 rteach RAW 1/2/3 颜色号(够不着也会记下位置；被爪子挡住的那个最后做)')
+        Ja = self.store.get('RAW', 'arm') if self.store is not None else None
+        Jc = self.store.get('RAW', 'ch') if self.store is not None else None
+        if Ja is None:
+            raise ValueError('还没有手臂和画面的对应关系：先 vcal RAW 颜色号 arm')
+        if Jc is None or self._raw_J_bad(Jc, sc):
+            raise ValueError('没有车轮和画面的对应关系(或者不合理)：先 rteach RAW center(会现测)')
+        if act is None:
+            raise ArmError('没有底盘(车轮)')
+        Jc = np.asarray(Jc, float)
+        home = [float(x) for x in D['home'][:2]]
+        smax, fmax = float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0))
+        ok_mm = float(cfg.get('raw_shift_margin_mm', 3.0))
+        self.arm.obs('RAW', open_claw=True)
+        self.log('  先让车轮把原料盘中心对到示教时的位置(车可能被碰过)……')
+        m = self._raw_center_align(goal=D['c'], tol=float(cfg.get('raw_ct_tol_mm', 3.0)))
+        if m is None or not (getattr(self, '_rc_last', None) or {}).get('ok'):
+            raise VisionError('没对准示教时的位置，车不挪：' + str((getattr(self, '_rc_last', None) or {}).get('why') or ''))
+        keys = sorted(P)
+        now = self._raw_ct_margins(P, home, Ja, np.zeros((1, 2)))
+
+        def say(mg, j):
+            return '  '.join(f'{k}号位 ' + (f'够得着(离边上还有 {mg[k][2][j]:.0f}mm)' if mg[k][2][j] >= 0 else f'够不着(差 {-mg[k][2][j]:.0f}mm)')
+                             for k in keys)
+        self.log('  现在的位置：' + say(now, 0))
+        S, F = np.meshgrid(np.arange(-smax, smax + 0.5, 1.0), np.arange(-fmax, fmax + 0.5, 1.0))
+        cand = np.c_[S.ravel(), F.ravel()]                       # 车挪多少 (横移, 前进) 毫米
+        mg = self._raw_ct_margins(P, home, Ja, cand @ Jc.T)
+        M = np.stack([mg[k][2] for k in keys], axis=1)          # N×3 余量
+        n_ok = (M >= ok_mm).sum(axis=1)
+        Ms = -np.sort(-M, axis=1)                               # 每行从大到小
+        worst = np.where(n_ok > 0, np.take_along_axis(Ms, np.maximum(n_ok - 1, 0)[:, None], axis=1)[:, 0], Ms[:, 0])
+        good_mm = float(cfg.get('raw_shift_good_mm', 8.0))      # 余量到这么多就够了：再多也不值得多挪车
+        score = n_ok * 1e6 + np.minimum(np.round(worst, 1), good_mm) * 1e3 - np.hypot(cand[:, 0], cand[:, 1])
+        j = int(np.argmax(score))
+        ds, df = float(cand[j, 0]), float(cand[j, 1])
+        n_now = int((np.array([now[k][2][0] for k in keys]) >= ok_mm).sum())
+        if int(n_ok[j]) <= n_now and math.hypot(ds, df) < 3.0:
+            self.log('  现在的位置已经是最好的了，不用挪')
+            return 0.0, 0.0
+        self.log(f'  车停在横移 {ds:+.0f}mm、前进 {df:+.0f}mm 的地方最好：' + say(mg, j))
+        if int(n_ok[j]) < len(keys):
+            self.log(f'  (手臂伸缩 ID2 的行程不够同时够着三个停靠位：比赛时要的颜色停在够不着的位上就等下一次停，'
+                     f'原料盘每次转 120°，下一次就转到够得着的位了)')
+        d0 = (float(act.disp['S']), float(act.disp['F']))
+        if not self._vel_goto(d0[0] + ds, d0[1] + df, tol_mm=0.5):
+            raise ArmError('车轮没挪过去(只用 V 挪)：没保存')
+        ms = self._raw_center_still(5)
+        if ms is None:
+            raise VisionError('挪过去以后认不出原料盘中心：没保存')
+        c_new = np.asarray(ms[0], float)
+        dc = c_new - np.asarray(D['c'], float)[:2]
+        D['c'] = [round(float(c_new[0]), 1), round(float(c_new[1]), 1)]
+        D['shift_mm'] = [round(ds, 1), round(df, 1)]
+        for k, sv in (D.get('slots') or {}).items():
+            if isinstance(sv, dict) and sv.get('px'):
+                sv['px'] = [round(float(sv['px'][0] + dc[0]), 1), round(float(sv['px'][1] + dc[1]), 1)]
+                sv['a'] = None
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        good = [k for k in keys if mg[k][2][j] >= ok_mm]
+        cols = {str(k): (sv or {}).get('color') for k, sv in (D.get('slots') or {}).items()}
+        self.log(f'  记下了新的对准位置：原料盘中心在画面 ({c_new[0]:.0f}, {c_new[1]:.0f})(比赛时车轮对到这里)。抓取角度清掉了，'
+                 '车别动、原料盘别转，接着重新示教够得着的位：'
+                 + '、'.join(f'rteach RAW {k} ' + (str(cols.get(k)) if cols.get(k) else '颜色号') for k in good)
+                 + '。以后别再做 rteach RAW center(会回到正中、清掉这些)')
+        return ds, df
+
     def raw_ct_save_slot(self, n, path):
         """rteach RAW n save：手臂现在的角度记成 n 号停靠位的抓取角度(rteach RAW n 颜色号 没对上时，用 arm AD 手动摆到物料正上方以后用)。"""
         d = load_place_adj(path)

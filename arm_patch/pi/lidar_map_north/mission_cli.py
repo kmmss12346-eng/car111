@@ -37,6 +37,8 @@ pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
                              再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
                              比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
+rteach RAW shift           (10-18)三个停靠位都示教过画面位置以后：手臂伸缩够不着三个位时，算车停在哪里够得着的位最多、离限位最远，
+                             车轮(只用 V)挪过去，记成以后比赛对准的位置；抓取角度清掉，要重新 rteach RAW n 颜色号 示教够得着的位
 rteach RAW center          (10-18)原料区示教第一步：车停在原料区、原料盘停着、上面放好物料。手臂摆到看原料盘的姿态不动，车轮边走边看
                              (只用 V 慢慢走，车头不转)：先现测车轮和画面的对应关系，再把原料盘中心对到爪子点下面，记下这时圆心在画面里的位置
                              (以后比赛每次都对到这里)。没对准就不保存，并说明原因。另开终端 python3 vview.py 看实时画面(黄圈 = 认出的外圈)。
@@ -818,6 +820,18 @@ def _rteach_raw(h, link, parts, path, state, log):
     rteach RAW center [here] / rteach RAW 1~3 颜色号 / rteach RAW 1~3 save / rteach RAW 1~3 go / rteach RAW clear"""
     from mission_hooks import load_place_adj
     sub = [p.lower() for p in parts[2:]]
+    if sub == ['shift']:
+        def go_shift():
+            h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
+            state['abort'] = False
+            _tools(h, link)
+            if h.act is not None:
+                h.act.reset_disp()
+            log('原料区：算车停在哪里够得着的停靠位最多(手臂伸缩的行程不够同时够着三个时用)……')
+            h.raw_ct_shift(path)
+            if h.store is not None:
+                h.store.save()
+        return _run_async(state, log, go_shift, vision=True)
     if sub == ['clear']:
         d = load_place_adj(path)
         gone = [k for k in ('RAW_CT', 'RAW') if k in d]
@@ -835,7 +849,7 @@ def _rteach_raw(h, link, parts, path, state, log):
     elif ok_n and sub[1] in ('save', 'go'):
         what = sub[1]
     else:
-        raise ValueError('格式：rteach RAW center(车轮对准原料盘中心) / rteach RAW center here(车不动，按现在的位置记) / '
+        raise ValueError('格式：rteach RAW center(车轮对准原料盘中心) / rteach RAW center here(车不动，按现在的位置记) / rteach RAW shift / '
                          'rteach RAW 停靠位(1~3) 颜色号 / rteach RAW 停靠位 save(手臂现在的角度记成这个位的抓取角度) / '
                          'rteach RAW 停靠位 go(手臂转到这个位示教的角度看看) / rteach RAW clear')
     n_ = int(sub[0]) if what != 'center' else 0

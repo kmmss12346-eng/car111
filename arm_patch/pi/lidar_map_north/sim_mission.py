@@ -2323,6 +2323,46 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
             self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
 
+    def test_shift_when_the_arm_cannot_reach_all_three(self):
+        """(10-18 实车：1 号位要伸缩到 +10°，限位 -300°，差 36mm；三个位在伸缩方向上隔得比伸缩的行程还远)
+        rteach RAW shift：算车停在哪里够得着的位最多、离边上最远，车轮只用 V 挪过去，记成新的对准位置；
+        重新示教够得着的两个位；比赛时要的颜色停在够不着的位上就等下一次停，按任务码顺序三个都夹到。"""
+        import tempfile
+        for seed in (1, 2):
+            w = self._world(seed)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines, cfg=dict(raw_center_reach_deg=dict(id1=60.0, id2=190.0)))   # 伸缩只能 ±190°(±33mm)：有一个位差一点
+            ph = self._center_only(w, h, path)
+            got = {}
+            try:
+                for it in w.raw_items:
+                    k = self._slot_of(w, it, ph)
+                    got[k] = h.raw_ct_teach_slot(k, it['color'], path)
+                n_moves = len(w.moves)
+                ds, df = h.raw_ct_shift(path)
+                text = '\n'.join(lines)
+                self.assertGreater(math.hypot(ds, df), 2.0, text)
+                self.assertEqual(w.moves[n_moves:], [], text)                       # 只用 V 挪，不发 S/F
+                with open(path, encoding='utf-8') as f:
+                    d = json.load(f)['RAW_CT']
+                self.assertTrue(all(sv['a'] is None for sv in d['slots'].values()), d)
+                good = [k for k in ('1', '2', '3') if f'{k}号位 够得着' in text.split('最好：')[-1].split('\n')[0]]
+                self.assertEqual(len(good), 2, text)
+                for it in w.raw_items:
+                    k = self._slot_of(w, it, ph)
+                    if str(k) in good:
+                        self.assertTrue(h.raw_ct_teach_slot(k, it['color'], path), '\n'.join(lines))
+            finally:
+                del w.plate_phase
+            lines.clear()
+            w.requests.clear()
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+            self.assertEqual([q for q in w.requests if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+            self.assertIn('够不着', text)
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
