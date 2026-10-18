@@ -2130,12 +2130,14 @@ class MissionHooks:
         STM32 认识 V：车轮连续慢慢走、每帧看(_raw_center_align_smooth)；否则一步一步挪(下面)。"""
         if self.cfg.get('raw_center_smooth', True) and hasattr(self.act, 'vel') and not getattr(self.act, '_no_vel', False):
             r = self._raw_center_align_smooth(goal=goal, tol=tol)
-            if r != 'nofw':
+            if r not in ('nofw', 'noprobe'):
                 return r
-            self.log('    STM32 是旧程序(不认 V 指令)：改成一步一步挪。刷新的 main.c / chassis.c 才能连续顺滑地挪')
+            if r == 'nofw':
+                self.log('    STM32 是旧程序(不认 V 指令)：改成一步一步挪。刷新的 main.c / chassis.c 才能连续顺滑地挪')
         cfg, v = self.cfg, self.vision
         sc = float(v.scale('RAW'))
         claw = np.array(v.claw('RAW'), float) if goal is None else np.asarray(goal, float)   # 下面"爪子点"都换成要对到的点
+        where = '爪子点' if goal is None else '示教时的位置'
         wait = float(cfg.get('raw_center_wait_s', 12.0))
         tol = float(cfg.get('raw_center_tol_mm', 4.0)) if tol is None else float(tol)
         step = float(cfg.get('raw_center_step_mm', 20.0))
@@ -2147,7 +2149,7 @@ class MissionHooks:
             self.log('    ★ 挪了几个地方都认不出原料盘中心：不对准中心')
             return None
         c, r = m
-        self.log(f'    原料盘中心离爪子点 {np.linalg.norm(c - claw) / sc:.1f}mm(原料盘半径约 {r / sc:.0f}mm)')
+        self.log(f'    原料盘中心离{where} {np.linalg.norm(c - claw) / sc:.1f}mm(原料盘半径约 {r / sc:.0f}mm)')
         if float(np.linalg.norm(c - claw)) / sc <= tol:
             return c, r
         J, c = self._raw_chassis_J(c)
@@ -2171,7 +2173,7 @@ class MissionHooks:
                 self.log('    ★ 挪了以后认不出原料盘中心：停在这里')
                 break
             c, r = m
-            self.log(f'    原料盘中心离爪子点 {np.linalg.norm(c - claw) / sc:.1f}mm')
+            self.log(f'    原料盘中心离{where} {np.linalg.norm(c - claw) / sc:.1f}mm')
         return c, r
 
     def _raw_center_align_smooth(self, start=None, target_dir=None, goal=None, tol=None):
@@ -2184,7 +2186,8 @@ class MissionHooks:
         start = (圆心, 半径)：已经认出圆心了，跳过 ①；target_dir = 单位向量(画面里)：对准的不是圆心，是"圆心 + 半径 × target_dir"
         (原料盘上的抓取位，车轮把爪子对到那里)。goal = 画面里的一个点(10-18：示教时圆心的位置)：把圆心对到这里，不是对到爪子点；
         tol = 对准到多少毫米(None = raw_center_tol_mm)。
-        返回 (圆心, 半径) / None(认不出) / 'nofw'(STM32 不认 V)。"""
+        返回 (圆心, 半径) / None(认不出) / 'nofw'(STM32 不认 V) / 'noprobe'(只在对准圆心时：边走边看测不出车轮和画面的对应关系，
+        改用一步一步挪、停稳再看的办法测)。"""
         cfg, v, act = self.cfg, self.vision, self.act
         tdir = None if target_dir is None else np.asarray(target_dir, float)
         what = '原料盘中心' if tdir is None else '抓取位'
@@ -2262,11 +2265,14 @@ class MissionHooks:
                         break                                  # 到范围边上走不动了
                 send(0.0, 0.0)
             if len(X) < 4:
+                self.log(f'    (边走边看只有 {len(X)} 帧认出了圆心，至少要 4 帧)')
                 return None, c
             A = np.c_[np.asarray(X), np.ones(len(X))]
             sol, *_ = np.linalg.lstsq(A, np.asarray(Y), rcond=None)
             J = sol[:2].T                                      # 列：[横移 S, 前进 F]
             if abs(float(np.linalg.det(J))) < (0.3 * sc) ** 2:
+                self.log(f'    ({len(X)} 帧里圆心几乎没跟着车轮动：横移 1mm 动 {np.linalg.norm(J[:, 0]):.2f} 像素、'
+                         f'前进 1mm 动 {np.linalg.norm(J[:, 1]):.2f} 像素，应该各约 {sc:.2f}。车轮真的动了吗？)')
                 return None, c
             if self.store is not None:
                 self.store.put('RAW', 'ch', J)
@@ -2328,6 +2334,9 @@ class MissionHooks:
                 J, c = probe(c)
                 if J is None:
                     finish()
+                    if tdir is None:
+                        self.log('    ★ 车轮边走边看没测出画面里圆心怎么动：改成一步一步挪、停稳了再看')
+                        return 'noprobe'
                     self.log('    ★ 车轮走了，画面里圆心怎么动没测出来：停在这里')
                     return c, r
             J = np.asarray(J, float)

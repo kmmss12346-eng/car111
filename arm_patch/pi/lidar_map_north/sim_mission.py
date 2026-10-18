@@ -2039,6 +2039,34 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完车挪回停车点
             self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
+    def test_probe_fails_falls_back_to_step_moves(self):
+        """(10-18 实车)rteach RAW center 边走边看没测出车轮和画面的对应关系：改成一步一步挪、停稳再看，照样对准、存下对应关系。"""
+        import tempfile
+        w = self._world(2)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines)
+        orig = w._handle
+
+        def handle(text):                                      # 车轮不跟 V 走(实车上可能速度太慢走不动)：STM32 照样回 DONE
+            if text.startswith('V '):
+                return orig('V 0.0 0.0')
+            return orig(text)
+        w._handle = handle
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        h.act.reset_disp()
+        c, _r = h.raw_ct_teach_center(path, move=True)
+        text = '\n'.join(lines)
+        self.assertIn('改成一步一步挪', text)
+        self.assertIn('车轮真的动了吗', text)
+        self.assertIsNotNone(h.store.get('RAW', 'ch'), text)
+        claw = np.array(h.vision.claw('RAW'), float)
+        self.assertLess(float(np.linalg.norm(np.asarray(c) - claw)) / w.scale['RAW'], 4.5, text)
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
