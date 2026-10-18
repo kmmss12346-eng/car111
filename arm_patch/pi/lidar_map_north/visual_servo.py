@@ -55,6 +55,7 @@ DEFAULTS = dict(
     broyden_gain=0.5,
     broyden_max_rel=0.5,        # 实际移动和预计差太多(比如原料盘自己在转)就不拿来修正 J
     max_cond=40.0,              # J 的条件数超过这个说明两个轴在画面里几乎平行，没法解
+    max_cond_arm=6.0,           # (10-18)手臂 J 两列各自归一化以后的条件数超过这个(两个方向夹角不到约 19°)才算平行：ID1、ID2 每度动的距离差几十倍，不能直接比
     chassis_axes='SF',          # 底盘能动哪几个方向：'SF' = 横移和前后；'F' = 只前后；
                                 #   'Fs' = 前后随便挪，横移(靠近/远离目标)只在手臂伸缩够不着时用，而且只挪够不着的那一段(粗加工区/暂存区)
     strafe_margin=0.2,          # 'Fs' 横移时给手臂伸缩留的余量(行程上限的比例)：横移到手臂伸缩还剩这么多余量就够了，不多挪
@@ -422,9 +423,20 @@ class VisualServo:
             J[:, 0] = (-J[1, 1], J[0, 1])                 # 不横移：S 那一列用不到，按"和 F 垂直、一样大"补上(只为了 J 能求逆)
         if group != 'arm':
             self._ch_synth = f_only
-        cond = float(np.linalg.cond(J))
-        if not np.isfinite(cond) or cond > c['max_cond']:
-            raise ServoError(f'探测失败：{names[0]} 和 {names[1]} 在画面里的移动方向几乎平行(条件数 {cond:.0f})')
+        if group == 'arm':
+            # 10-18 实车：ID2 每度只伸缩零点几毫米、ID1 每度转好几毫米，两列大小差几十倍，直接算条件数会把互相垂直的两列也当成"平行"。
+            # 两列各自除以自己的大小以后再算(只看方向的夹角)
+            nrm = np.linalg.norm(J, axis=0)
+            cond = float(np.linalg.cond(J / nrm)) if np.all(nrm > 1e-12) else float('inf')
+            lim = float(c.get('max_cond_arm', 6.0))
+        else:
+            cond = float(np.linalg.cond(J))
+            lim = float(c['max_cond'])
+        if not np.isfinite(cond) or cond > lim:
+            n0, n1 = float(np.linalg.norm(J[:, 0])), float(np.linalg.norm(J[:, 1]))
+            cos = abs(float(J[:, 0] @ J[:, 1])) / max(n0 * n1, 1e-12)
+            raise ServoError(f'探测失败：{names[0]} 和 {names[1]} 在画面里的移动方向几乎平行(夹角 {math.degrees(math.acos(min(1.0, cos))):.0f}°，'
+                             f'条件数 {cond:.0f}；J=[{J[0, 0]:+.3f} {J[0, 1]:+.3f}; {J[1, 0]:+.3f} {J[1, 1]:+.3f}] 像素/单位)')
         self.log(f'    探测 {group}：J=[{J[0, 0]:+.3f} {J[0, 1]:+.3f}; {J[1, 0]:+.3f} {J[1, 1]:+.3f}] 像素/单位')
         return J
 

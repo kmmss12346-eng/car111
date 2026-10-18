@@ -249,6 +249,30 @@ class ServoTests(unittest.TestCase):
             ok += res.ok
         self.assertGreaterEqual(ok, 34)
 
+    def test_probe_ok_when_id1_moves_much_more_per_degree(self):
+        """(10-18 实车 vcal RAW 1 arm：探测失败，ID2 和 ID1 几乎平行(条件数 61))ID2 每度只伸缩 0.175mm，ID1 每度转 9mm(差 50 倍)，
+        两个方向在画面里是垂直的：探测要成功(按两列各自的大小归一化以后再看是不是平行)，对得上。"""
+        rng = np.random.default_rng(21)
+        ok = 0
+        for _ in range(20):
+            pl = SimPlant(rng, mm_per_deg_id1=9.0, err_mm=20.0)
+            sv = make_servo(pl)
+            J = sv._probe(pl.measure, 'arm')
+            self.assertGreater(float(np.linalg.cond(J)), 40.0)                   # 直接算条件数会以为平行
+            res = make_servo(pl).run('RAW', pl.measure, pl.scale, 3.0, allow_chassis=False, max_iter=12, timeout_s=60)   # 原料区容差 3mm
+            ok += res.ok
+        self.assertGreaterEqual(ok, 19)
+
+    def test_probe_rejects_truly_parallel_arm_axes(self):
+        """ID1、ID2 在画面里真的朝同一个方向动(比如摄像头没跟着伸缩走)：照样报几乎平行。"""
+        rng = np.random.default_rng(22)
+        pl = SimPlant(rng)
+        d = pl.A[:, 0] / np.linalg.norm(pl.A[:, 0])
+        pl.A[:, 1] = d * np.linalg.norm(pl.A[:, 1]) + 0.02 * np.linalg.norm(pl.A[:, 1]) * np.array([-d[1], d[0]])
+        with self.assertRaises(ServoError) as cm:
+            make_servo(pl)._probe(pl.measure, 'arm')
+        self.assertIn('几乎平行', str(cm.exception))
+
     def test_probe_fails_if_arm_does_not_move(self):
         rng = np.random.default_rng(8)
         pl = SimPlant(rng, dead_arm=True)
