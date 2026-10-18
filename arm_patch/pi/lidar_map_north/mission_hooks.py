@@ -3591,11 +3591,19 @@ class MissionHooks:
             lim.update(cfg.get('raw_center_reach_deg') or {})
             a1r = cfg.get('a1_range') or (A1_MIN, A1_MAX)
             a1, a2 = home[0] + float(dd[1]), home[1] + float(dd[0])
-            if (abs(float(dd[1])) > float(lim['id1']) or abs(float(dd[0])) > float(lim['id2'])
-                    or not float(a1r[0]) <= a1 <= float(a1r[1]) or not A2_MIN <= a2 <= A2_MAX):
-                self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°，超出范围：只记位置。'
+            # 10-18：离得远(八九十毫米)时按画面估的角度会差一二成：稍微超出范围也先在范围里试着对，看能对到多近
+            over1 = max(0.0, abs(float(dd[1])) - float(lim['id1']), float(a1r[0]) - a1, a1 - float(a1r[1]))
+            over2 = max(0.0, abs(float(dd[0])) - float(lim['id2']), A2_MIN - a2, a2 - A2_MAX)
+            lim_txt = (f'ID1 {float(a1r[0]):.0f}~{float(a1r[1]):.0f}° 且离看的姿态 ±{float(lim["id1"]):.0f}°以内，'
+                       f'ID2 {A2_MIN:.0f}~{A2_MAX:.0f}° 且离看的姿态 ±{float(lim["id2"]):.0f}°以内')
+            if over1 > float(cfg.get('raw_teach_over_id1', 15.0)) or over2 > float(cfg.get('raw_teach_over_id2', 200.0)):
+                self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°(看的姿态 ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)，'
+                         f'超出范围太多(范围：{lim_txt})：手臂不动，只记位置。'
                          f'能够到的话用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
             else:
+                if over1 > 0.0 or over2 > 0.0:
+                    self.log(f'   按画面算要转到 ID1 {a1:.1f}°、ID2 {a2:.1f}°(看的姿态 ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)，'
+                             f'稍微超出范围(范围：{lim_txt})：先在范围里对，看能对到多近')
                 rng = dict(id1=(max(float(a1r[0]) - home[0], -float(lim['id1'])), min(float(a1r[1]) - home[0], float(lim['id1']))),
                            id2=(max(A2_MIN - home[1], -float(lim['id2'])), min(A2_MAX - home[1], float(lim['id2']))))
                 res = self.servo.run('RAW', lambda: v.material_error(int(color), n=2), v.scale('RAW'),
@@ -3607,7 +3615,14 @@ class MissionHooks:
                     if b[0] is not None and b[1] is not None:
                         a = [round(float(b[0]), 2), round(float(b[1]), 2)]
                 else:
-                    self.log(f'   没对上：只记位置。用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
+                    try:
+                        b = self.arm.read_angles()
+                    except ArmAbort:
+                        raise
+                    except ArmError:
+                        b = (None, None)
+                    self.log(f'   没对上(最近还差 {res.err_mm:.1f}mm' + (f'，这时 ID1 {b[0]:.1f}°、ID2 {b[1]:.1f}°' if b[0] is not None and b[1] is not None else '')
+                             + f')：只记位置。用 arm AD 手动摆到物料正上方，再 rteach RAW {n} save')
         self.arm.ap(home[0], home[1])
         d = load_place_adj(path)
         r_ = d.setdefault('RAW_CT', D)

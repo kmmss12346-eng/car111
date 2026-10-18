@@ -2233,6 +2233,57 @@ class RawCenterTeachTests(unittest.TestCase):
             self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完只用 V 挪回停车点
             self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
+    def _center_only(self, w, h, path):
+        """车停在原料区、原料盘停着：只做 rteach RAW center。返回原料盘停的角度。"""
+        w.arrive('RAW')
+        while w.plate_phase()[1]:
+            w.advance(0.1)
+        ph = w.plate_phase()[0]
+        w.plate_phase = lambda t=None: (ph, False)
+        h.act.reset_disp()
+        h.raw_ct_teach_center(path, move=True)
+        return ph
+
+    def test_slot_slightly_beyond_the_estimate_is_still_tried(self):
+        """(10-18 实车 rteach RAW 1 1：按画面算要转到 ID2 -276°，超出 -300 的限位，手臂没动)离得远时按画面估的角度有一二成误差：
+        稍微超出范围就先在范围里试着对，真的够得着就照样记下角度。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=dict(raw_center_reach_deg=dict(id1=60.0, id2=350.0)))
+        h.store.put('RAW', 'arm', 0.85 * (-w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1])))     # 存的手臂对应关系小了 15%：估的角度大了
+        ph = self._center_only(w, h, path)
+        try:
+            for it in w.raw_items:
+                self.assertTrue(h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path), '\n'.join(lines))
+        finally:
+            del w.plate_phase
+        self.assertIn('稍微超出范围', '\n'.join(lines))
+
+    def test_slot_far_beyond_the_range_does_not_move_the_arm(self):
+        """按画面算要转的角度超出范围太多：手臂不动(只记位置)，说清楚现在的角度和范围。"""
+        import tempfile
+        w = self._world(1)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=dict(raw_center_reach_deg=dict(id1=60.0, id2=100.0)))
+        ph = self._center_only(w, h, path)
+        refused = 0
+        try:
+            for it in w.raw_items:
+                n0, l0 = len(w.requests), len(lines)
+                h.raw_ct_teach_slot(self._slot_of(w, it, ph), it['color'], path)
+                if any('超出范围太多' in x for x in lines[l0:]):
+                    refused += 1
+                    moved = [q for q in w.requests[n0:] if q.split()[0] in ('AD', 'AF', 'APN')
+                             or (q.startswith('AP ') and abs(float(q.split()[1]) - w.params['A1G']) > 0.5)]
+                    self.assertEqual(moved, [], '\n'.join(lines[l0:]))
+                    self.assertIn('看的姿态 ID1', '\n'.join(lines[l0:]))
+        finally:
+            del w.plate_phase
+        self.assertGreaterEqual(refused, 1, '\n'.join(lines))
+
     def test_waits_for_the_next_color_in_order(self):
         """要的颜色还没轮到就不夹别的：同一次停下就算 5 号色也在够得着的位上，先等 1 号色。夹的顺序永远是任务码顺序。"""
         import tempfile
