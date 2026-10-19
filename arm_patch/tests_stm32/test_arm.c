@@ -187,7 +187,8 @@ int main(void) {
     /* 下面的顺序测试用固定的一组高度(和默认值无关)，都在最高点 100mm 以内 */
     Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZGRAB", 80); Arm_Param_Set("ZDROP", 60); Arm_Param_Set("ZPLC", 80);
     Arm_Param_Set("ZSTK", 40); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZOBRNG", 0);
-    CHECK(Arm_Param_Set("LFMAX", 150) == 2 && Arm_Param_Set("LFMAX", 118) == 2, "最高点写死 115mm：SET LFMAX 150 被拒绝");
+    CHECK(Arm_Param_Set("LFMAX", 150) == 2 && Arm_Param_Set("LFMAX", 120) == 1, "最高点上限 130mm：SET LFMAX 150 拒绝、120 可以");
+    Arm_Param_Set("LFMAX", 115);
     CHECK(Arm_Param_Set("ZPLC", 1000) == 2 && Arm_Param_Set("NOPE", 1) == 0 && Arm_Param_Set("ZPLC", 90) == 1, "参数范围/名字检查");
     Arm_Param_Set("ZPLC", 80);
 
