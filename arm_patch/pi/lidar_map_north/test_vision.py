@@ -1,8 +1,13 @@
 """vision.py 的测试(用合成图片，不需要摄像头)：python3 test_vision.py
 需要 numpy 和 opencv(树莓派上已经有)。"""
 import math
+import os
+import sys
+import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 try:
     import cv2
@@ -11,7 +16,7 @@ try:
 except ImportError:      # 没装 opencv 就跳过依赖图片的测试
     HAVE_CV = False
 
-from vision import Vision, _robust_mean
+from vision import Camera, Vision, VisionError, _robust_mean, usb_cameras, video_users
 
 
 class FakeCam:
@@ -437,6 +442,316 @@ class LatestFrameTests(unittest.TestCase):
         self.assertEqual(v.cfg['ring_detector'], 'contour')
         self.assertEqual(v.cfg['ring_outer_diam_mm'], 85.0)
         self.assertEqual(v._ring_rmax_range(), (50.0, 300.0))
+
+
+class FakeCap:
+    """假的 cv2.VideoCapture：这个节点在 v4l.devs 里是 'ok' 才有画面('blank' = 打得开、没画面，像 UVC 元数据节点)；不在里面的打不开。"""
+
+    def __init__(self, v4l, dev):
+        self.dev, self.state, self.k = dev, v4l.devs.get(dev), 0
+        self.dead = self.released = False
+
+    def isOpened(self):
+        return self.state is not None
+
+    def set(self, *a):
+        return True
+
+    def grab(self):
+        time.sleep(0.002)
+        return self.state == 'ok' and not self.dead and not self.released
+
+    def retrieve(self):
+        self.k += 1
+        return True, [self.dev, self.k]                     # 一"帧" = [哪个节点拍的, 第几帧]
+
+    def read(self):
+        return self.retrieve() if self.grab() else (False, None)
+
+    def release(self):
+        self.released = True
+
+
+class FakeV4L:
+    """假的 cv2(只有摄像头用到的那几样，不要真的 opencv)：devs = {节点: 'ok' / 'blank'}；opened = 依次开过哪些节点。
+    unplug(节点) = USB 掉线：节点没了，开着它的再也读不到画面。"""
+    CAP_V4L2, CAP_PROP_FOURCC, CAP_PROP_FRAME_WIDTH, CAP_PROP_FRAME_HEIGHT, CAP_PROP_FPS, CAP_PROP_BUFFERSIZE = 200, 6, 3, 4, 5, 38
+
+    def __init__(self, devs):
+        self.devs, self.opened, self.caps = dict(devs), [], []
+
+    @staticmethod
+    def VideoWriter_fourcc(*c):
+        return 0
+
+    def VideoCapture(self, dev, api=None):
+        self.opened.append(dev)
+        self.caps.append(FakeCap(self, dev))
+        return self.caps[-1]
+
+    def unplug(self, dev):
+        self.devs.pop(dev, None)
+        for c in self.caps:
+            c.dead = c.dead or c.dev == dev
+
+
+class UsbCameraTests(unittest.TestCase):
+    """(10-19)实车：USB 摄像头掉线又连上，/dev/video0 没了，回来的是 video1(取画面) + video2(元数据，没画面)；
+    video10 以上是树莓派自己的编解码/ISP。用假的 cv2 和临时文件夹里假的 /dev/v4l/by-id、/sys/class/video4linux，不要真的摄像头。"""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.td, self.logs = td.name, []
+        self.by_id = os.path.join(self.td, 'by-id')
+        self.sysfs = os.path.join(self.td, 'video4linux')            # 先不建：by-id 里没有就什么都找不到
+        os.makedirs(self.by_id)
+
+    def link(self, name, dev):
+        os.symlink(dev, os.path.join(self.by_id, name))
+
+    def usb_back_as_video1(self):
+        """USB 重连以后 udev 建的链接：index0 -> video1(取画面)，index1 -> video2(元数据)。"""
+        self.link('usb-HD_USB_Camera_SN01-video-index0', '/dev/video1')
+        self.link('usb-HD_USB_Camera_SN01-video-index1', '/dev/video2')
+
+    def camera(self, fake, **kw):
+        """用假 cv2(fake)、只在临时文件夹里找 USB 摄像头的 Camera(打开时不真的等)。测完自动关。"""
+        if 'cv2' in sys.modules:
+            self.addCleanup(sys.modules.__setitem__, 'cv2', sys.modules['cv2'])
+        else:
+            self.addCleanup(sys.modules.pop, 'cv2', None)
+        sys.modules['cv2'] = fake                                    # Camera 里 import cv2 拿到的是假的
+        for name, new in (('usb_cameras', lambda: usb_cameras(self.by_id, self.sysfs)), ('video_users', lambda: [])):
+            p = mock.patch(f'vision.{name}', new)
+            p.start()
+            self.addCleanup(p.stop)
+        cam = Camera(kw.pop('device', '/dev/video0'), log=self.logs.append, sleep=lambda s: None, **kw)
+        self.addCleanup(cam.close)
+        return cam
+
+    def test_usb_cameras_from_by_id(self):
+        """by-id：只要 USB 摄像头 index0(取画面)的，同一个节点只算一次，按名字排。"""
+        self.usb_back_as_video1()
+        self.link('usb-HD_USB_Camera_SN01b-video-index0', '/dev/video1')      # 同一个节点两个名字：只算一次
+        self.link('usb-Other_Cam_SN02-video-index0', '/dev/video3')
+        self.link('platform-fe00b840.mailbox-video-index0', '/dev/video10')   # 不是 USB 的：不要
+        self.assertEqual(usb_cameras(self.by_id, self.sysfs), ['/dev/video1', '/dev/video3'])
+        self.assertEqual(usb_cameras(os.path.join(self.td, 'none'), self.sysfs), [])
+
+    def test_usb_cameras_from_sysfs(self):
+        """by-id 没有：扫 /sys/class/video4linux(那次 ls /dev/video* 看到的那些)，只要 USB 上的、index 0 的。"""
+        usb = os.path.join(self.td, 'devices/platform/scb/fd500000.pcie/pci0000:00/0000:01:00.0/usb1/1-1/1-1.3/1-1.3:1.0')
+        soc = os.path.join(self.td, 'devices/platform/soc')
+        nodes = {1: (usb, 0), 2: (usb, 1)}                                      # 摄像头：取画面 + 元数据
+        nodes.update({n: (os.path.join(soc, 'bcm2835-codec'), 0) for n in (10, 11, 12, 18)})
+        nodes.update({n: (os.path.join(soc, 'bcm2835-isp'), n % 2) for n in (13, 14, 15, 16, 20, 21, 22, 23)})
+        nodes.update({n: (os.path.join(soc, 'rpivid'), 0) for n in (19, 31)})
+        for n, (dev, idx) in nodes.items():
+            d = os.path.join(self.sysfs, f'video{n}')
+            os.makedirs(d)
+            os.makedirs(dev, exist_ok=True)
+            os.symlink(dev, os.path.join(d, 'device'))
+            with open(os.path.join(d, 'index'), 'w') as f:
+                f.write(f'{idx}\n')
+        os.makedirs(os.path.join(self.sysfs, 'video5'))                         # 读不到 index 的：跳过
+        self.assertEqual(usb_cameras(self.by_id, self.sysfs), ['/dev/video1'])
+
+    def test_configured_camera_opens_without_searching(self):
+        """配置的 /dev/video0 开得了：和以前一样，不去找别的。"""
+        fake = FakeV4L({'/dev/video0': 'ok', '/dev/video1': 'ok'})
+        self.usb_back_as_video1()
+        cam = self.camera(fake)
+        with mock.patch('vision.usb_cameras') as find:
+            cam.open()
+        find.assert_not_called()
+        self.assertEqual((cam.device, fake.opened), ('/dev/video0', ['/dev/video0']))
+        self.assertEqual(self.logs, ['  摄像头 /dev/video0 已打开 640x480'])
+        self.assertEqual(cam.read()[0], '/dev/video0')
+        cam.close()
+        self.assertTrue(fake.caps[0].released)
+
+    def test_falls_back_to_usb_camera_with_new_number(self):
+        """配置的 /dev/video0 没了(USB 重连以后成了 video1 + video2)：改用 video1；元数据节点、video10 以上都不碰。"""
+        fake = FakeV4L({'/dev/video1': 'ok', '/dev/video2': 'blank', '/dev/video10': 'blank'})
+        self.usb_back_as_video1()
+        cam = self.camera(fake).open()
+        self.assertEqual(cam.device, '/dev/video1')
+        self.assertEqual(fake.opened, ['/dev/video0', '/dev/video1'])
+        self.assertEqual(self.logs, ['  摄像头 /dev/video1 已打开 640x480',
+                                     '  (摄像头 /dev/video0 打不开，改用 /dev/video1：USB 掉线重连以后编号变了)'])
+        self.assertEqual(cam.read()[0], '/dev/video1')
+
+    def test_configured_node_without_frames_falls_back(self):
+        """配置的节点打得开、读不到画面(比如成了元数据节点)：关掉它，也改用 USB 摄像头。"""
+        fake = FakeV4L({'/dev/video0': 'blank', '/dev/video1': 'ok'})
+        self.link('usb-HD_USB_Camera_SN01-video-index0', '/dev/video1')
+        cam = self.camera(fake, threaded=False).open()
+        self.assertEqual(cam.device, '/dev/video1')
+        self.assertTrue(fake.caps[0].released)
+        self.assertEqual(self.logs[-1], '  (摄像头 /dev/video0 打开了但读不到画面，改用 /dev/video1：USB 掉线重连以后编号变了)')
+        self.assertEqual(cam.read()[0], '/dev/video1')
+
+    def test_open_fails_with_what_was_found(self):
+        """哪个都开不了：VisionError 还是"打不开摄像头 /dev/video0"开头，后面说找到了什么、谁开着摄像头。"""
+        cam = self.camera(FakeV4L({}))
+        with self.assertRaises(VisionError) as cm:
+            cam.open()
+        self.assertEqual(str(cm.exception), '打不开摄像头 /dev/video0(没找到 USB 摄像头：USB 没插好？ls /dev/video* 看看)')
+        self.usb_back_as_video1()                                               # USB 摄像头在，可也打不开(被别的程序占着)
+        with mock.patch('vision.video_users', lambda: ['1234「python3 vlive.py」开着 /dev/video1']):
+            with self.assertRaises(VisionError) as cm:
+                cam.open()
+        self.assertEqual(str(cm.exception), '打不开摄像头 /dev/video0(USB 摄像头 /dev/video1 也打不开：可能被别的程序占着；'
+                                            '1234「python3 vlive.py」开着 /dev/video1)')
+        self.assertEqual((cam.device, cam.cap, self.logs), ('/dev/video0', None, []))
+
+    def test_same_node_is_not_tried_twice(self):
+        """找到的 USB 摄像头就是配置的那个(打得开、没画面)：不再开一次。"""
+        fake = FakeV4L({'/dev/video0': 'blank'})
+        self.link('usb-HD_USB_Camera_SN01-video-index0', '/dev/video0')
+        with self.assertRaises(VisionError) as cm:
+            self.camera(fake).open()
+        self.assertEqual(str(cm.exception), '打不开摄像头 /dev/video0(打开了但读不到画面)')
+        self.assertEqual(fake.opened, ['/dev/video0'])
+
+    def test_reopen_after_usb_drop(self):
+        """用着用着 USB 掉线：连着 2 秒读不到画面就重开(3 秒内只试一次；重开不了不抛、只说一次)，摄像头回来(换成 video1)就接着有画面。"""
+        fake = FakeV4L({'/dev/video0': 'ok'})
+        clk = [100.0]
+        cam = self.camera(fake, threaded=False, clock=lambda: clk[0]).open()
+        self.assertEqual(cam.read()[0], '/dev/video0')
+        fake.unplug('/dev/video0')
+        for dt, n_open in ((0.0, 1),                    # 第一次读不到：从这里开始算
+                           (1.5, 1),                    # 才 1.5 秒没画面：不重开
+                           (1.0, 2),                    # 2.5 秒：重开，摄像头还没回来 -> 打不开(不抛)
+                           (2.0, 2),                    # 上次试才 2 秒：不试
+                           (1.5, 3)):                   # 隔了 3 秒多：再试(还是不行，不再说)
+            clk[0] += dt
+            self.assertIsNone(cam.read())
+            self.assertEqual(len(fake.opened), n_open, dt)
+        self.assertTrue(fake.caps[0].released)
+        self.assertEqual(self.logs[1:], ['  摄像头 2 秒没有画面了(USB 掉线？)：重新打开…',
+                                         '  ★ 重开摄像头没成功(每 3 秒再试一次)：打不开摄像头 /dev/video0'
+                                         '(没找到 USB 摄像头：USB 没插好？ls /dev/video* 看看)'])
+        fake.devs.update({'/dev/video1': 'ok', '/dev/video2': 'blank'})        # USB 重连：成了 video1 + video2
+        self.usb_back_as_video1()
+        clk[0] += 3.0
+        self.assertEqual(cam.read()[0], '/dev/video1')                          # 重开好了：这一次就拿到画面
+        self.assertEqual(cam.device, '/dev/video1')
+        self.assertEqual(fake.opened[-2:], ['/dev/video0', '/dev/video1'])
+        self.assertEqual(self.logs[3:], ['  摄像头 /dev/video1 已打开 640x480',
+                                         '  (摄像头 /dev/video0 打不开，改用 /dev/video1：USB 掉线重连以后编号变了)'])
+        clk[0] += 10.0
+        self.assertEqual(cam.read()[0], '/dev/video1')
+        self.assertEqual(len(fake.opened), 5)                                   # 有画面：不再重开
+
+    def test_reopen_with_background_thread(self):
+        """平时的后台线程模式：掉线以后 LatestFrame 一直拿不到新帧，read 等 1 秒没有、发现 2 秒没画面了：停掉旧线程、重开。"""
+        fake = FakeV4L({'/dev/video0': 'ok'})
+        clk = [100.0]
+        cam = self.camera(fake, clock=lambda: clk[0]).open()
+        old = cam._lf
+        self.assertEqual(cam.read()[0], '/dev/video0')
+        fake.unplug('/dev/video0')
+        fake.devs['/dev/video1'] = 'ok'
+        self.usb_back_as_video1()
+        self.assertIsNone(cam.read())                                           # 等 1 秒没有新帧：从这里开始算
+        clk[0] += 2.5
+        self.assertEqual(cam.read()[0], '/dev/video1')
+        self.assertIsNotNone(cam.last_t)
+        self.assertFalse(old.th.is_alive())                                     # 旧线程停了，旧的摄像头关了
+        self.assertTrue(fake.caps[0].released)
+        self.assertTrue(cam._lf.th.is_alive())
+        self.assertEqual((cam.device, self.logs[1]), ('/dev/video1', '  摄像头 2 秒没有画面了(USB 掉线？)：重新打开…'))
+
+    def test_only_one_caller_reopens(self):
+        """后台识别线程和主线程同时要帧：只有一个去重开，抢不到的直接返回 None。"""
+        fake = FakeV4L({'/dev/video0': 'ok'})
+        clk = [100.0]
+        cam = self.camera(fake, threaded=False, clock=lambda: clk[0]).open()
+        fake.unplug('/dev/video0')
+        self.assertIsNone(cam.read())                                           # 从这里开始算没画面
+        clk[0] += 2.5
+        self.assertIsNone(cam.read())                                           # 重开了一次，摄像头还没回来
+        self.assertEqual(len(fake.opened), 2)
+        clk[0] += 5.0
+        with cam._lock:                                                         # 别的线程正在重开：抢不到锁就不等、不重开
+            self.assertIsNone(cam._revive())
+        self.assertEqual(len(fake.opened), 2)
+        fake.devs['/dev/video0'] = 'ok'                                         # 原来的编号回来了
+        got, go = [], threading.Barrier(4)
+
+        def worker():
+            go.wait()
+            got.append(cam.read())
+        ths = [threading.Thread(target=worker) for _ in range(4)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(5.0)
+        self.assertEqual(len(got), 4)
+        self.assertEqual(len(fake.opened), 3)                                   # 四个线程一起要：只重开了一次
+        self.assertTrue(any(fr is not None for fr in got))
+        self.assertEqual(cam.device, '/dev/video0')
+
+    def test_no_reopen_after_close_or_when_off(self):
+        """close 以后、reopen_s=0(不重开，和以前一样)：读不到画面也不会自己去开摄像头。"""
+        clk = [100.0]
+        for reopen_s, closed in ((2.0, True), (0, False)):
+            fake = FakeV4L({'/dev/video0': 'ok'})
+            cam = self.camera(fake, threaded=False, clock=lambda: clk[0], reopen_s=reopen_s).open()
+            fake.unplug('/dev/video0')
+            fake.devs['/dev/video0'] = 'ok'
+            if closed:
+                cam.close()
+            self.assertIsNone(cam.read())
+            clk[0] += 60.0
+            self.assertIsNone(cam.read())
+            self.assertEqual(len(fake.opened), 1, reopen_s)
+
+    def test_long_idle_then_one_miss_does_not_reopen(self):
+        """开车时好几分钟不要帧，回来第一次偶尔没拿到：不算掉线、不重开(要连着读不到 2 秒才重开)。"""
+        fake = FakeV4L({'/dev/video0': 'ok'})
+        clk = [100.0]
+        cam = self.camera(fake, threaded=False, clock=lambda: clk[0]).open()
+        self.assertEqual(cam.read()[0], '/dev/video0')
+        clk[0] += 300.0
+        fake.caps[0].dead = True
+        self.assertIsNone(cam.read())
+        fake.caps[0].dead = False
+        clk[0] += 0.5
+        self.assertEqual(cam.read()[0], '/dev/video0')
+        self.assertEqual(len(fake.opened), 1)
+        self.assertEqual(len(self.logs), 1)
+
+    def test_vision_passes_reopen_setting(self):
+        """vision 配置里 camera.reopen_s 传给 Camera(默认 2 秒，0 = 不重开)。"""
+        got = []
+
+        class Spy:
+            def __init__(self, *a, **kw):
+                got.append(kw)
+
+            def open(self):
+                return self
+        with mock.patch('vision.Camera', Spy):
+            Vision(log=lambda m: None).open()
+            Vision(dict(camera=dict(reopen_s=0)), log=lambda m: None).open()
+        self.assertEqual([kw['reopen_s'] for kw in got], [2.0, 0])
+
+    def test_video_users(self):
+        """谁开着 /dev/video*：看 /proc/<pid>/fd 的链接(拔掉了的节点后面是 (deleted))；目录不对也不抛。"""
+        proc = os.path.join(self.td, 'proc')
+        for pid, cmd, fds in (('1234', b'python3\0vlive.py\0', {'3': '/dev/video0 (deleted)', '4': '/dev/null'}),
+                              ('99', b'bash\0', {'0': '/dev/pts/0'})):
+            os.makedirs(os.path.join(proc, pid, 'fd'))
+            with open(os.path.join(proc, pid, 'cmdline'), 'wb') as f:
+                f.write(cmd)
+            for fd, tgt in fds.items():
+                os.symlink(tgt, os.path.join(proc, pid, 'fd', fd))
+        self.assertEqual(video_users(proc), ['1234「python3 vlive.py」开着 /dev/video0(已拔掉)'])
+        self.assertEqual(video_users(os.path.join(self.td, 'none')), [])
 
 
 class MathTests(unittest.TestCase):

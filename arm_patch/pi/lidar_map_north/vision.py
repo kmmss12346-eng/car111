@@ -8,6 +8,7 @@
 
 做的事：
   - 只开一次摄像头(/dev/video0)，每次读之前先丢掉缓冲里的旧帧，保证拿到的是"现在"的画面
+  - (10-19)/dev/video0 打不开(USB 掉线重连以后摄像头换了编号)就改用插着的 USB 摄像头；用着用着连着 2 秒没画面就关掉重开
   - 多帧取中值，再剔除离群点后取平均，比单帧准
   - 输出"偏差像素" = 目标像素 - 爪子像素，交给 visual_servo
 爪子像素 claw_px 是爪子的轴线在画面里的位置：RAW 用于夹原料盘上的物料，RING 用于对准地上圆环。
@@ -15,6 +16,7 @@
 claw_px.PICK：圆环上方观察时，物料正好在爪子下面，它顶面圆心在画面里的位置(物料顶面比圆环高，和 RING 不是同一个点)。
 粗加工区第一次放下物料以后自动量一次存起来；取回、码垛时圆环白心被物料盖住，就直接把物料顶面对到这个点。
 """
+import glob
 import json
 import math
 import os
@@ -153,10 +155,62 @@ class LatestFrame:
         return not self.th.is_alive()
 
 
+def usb_cameras(by_id='/dev/v4l/by-id', sysfs='/sys/class/video4linux', dev='/dev'):
+    """(10-19)插着的 USB 摄像头取画面的节点 ['/dev/videoN', ...]。USB 掉线重连时旧的节点还被占着，摄像头就换个编号回来
+    (那次 /dev/video0 没了，回来的是 video1 取画面 + video2 元数据(没有画面))。先看 /dev/v4l/by-id/usb-*-video-index0
+    (只有 USB 摄像头有，index0 = 取画面的那个)；一个也没有再扫 /sys/class/video4linux：device 链到 USB 上、index 是 0 的。
+    树莓派自己的编解码/ISP(video10 以上)不是 USB，不会选到。三个目录可以换(测试用)。"""
+    out = []
+    for p in sorted(glob.glob(os.path.join(by_id, 'usb-*-video-index0'))):
+        d = os.path.realpath(p)
+        if d not in out:
+            out.append(d)
+    if out:
+        return out
+    for p in sorted(glob.glob(os.path.join(sysfs, 'video*')), key=lambda s: (len(s), s)):     # video2 排在 video10 前面
+        try:
+            with open(os.path.join(p, 'index'), 'r') as f:
+                idx = f.read().strip()
+        except OSError:
+            continue
+        if idx == '0' and '/usb' in os.path.realpath(os.path.join(p, 'device')):
+            out.append(os.path.join(dev, os.path.basename(p)))
+    return out
+
+
+def video_users(proc='/proc'):
+    """(10-19)哪些程序开着 /dev/video*：['1234「python3 vlive.py」开着 /dev/video0(已拔掉)', ...]，最多列 4 个。
+    只看得到自己这个用户的进程；读不了的跳过，出什么错都只是少列几个，不会抛。"""
+    held = {}
+    try:
+        for fd in glob.glob(os.path.join(proc, '[0-9]*', 'fd', '*')):
+            try:
+                t = os.readlink(fd)
+            except OSError:
+                continue
+            if t.startswith('/dev/video'):
+                held.setdefault(fd.split(os.sep)[-3], set()).add(t.replace(' (deleted)', '(已拔掉)'))
+    except Exception:
+        pass
+    out = []
+    for pid in sorted(held, key=lambda s: (len(s), s))[:4]:
+        try:
+            with open(os.path.join(proc, pid, 'cmdline'), 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+        except Exception:
+            cmd = ''
+        if pid == str(os.getpid()):
+            cmd = '本程序'
+        out.append(f'{pid}「{cmd[:40] or "?"}」开着 {"、".join(sorted(held[pid]))}')
+    return out
+
+
 class Camera:
     supports_after = True               # read(after=, fresh=) 可用
 
-    def __init__(self, device='/dev/video0', width=640, height=480, fps=30, flip=None, flush=2, log=print, threaded=True):
+    def __init__(self, device='/dev/video0', width=640, height=480, fps=30, flip=None, flush=2, log=print, threaded=True,
+                 reopen_s=2.0, sleep=time.sleep, clock=time.monotonic):
+        import threading
         self.device, self.width, self.height, self.fps = device, int(width), int(height), int(fps)
         self.flip = flip            # None 不翻；cv2.flip 的参数：0 上下，1 左右，-1 两个都翻
         self.flush = int(flush)
@@ -165,12 +219,60 @@ class Camera:
         self.threaded = bool(threaded)  # True：后台线程一直读，要帧时直接拿最新的(快，而且一定是新拍的)
         self._lf = None
         self.last_t = None
+        self.reopen_s = float(reopen_s or 0.0)  # (10-19)连着这么多秒读不到画面(USB 掉线？)就关掉重开；0 = 不重开
+        self.reopen_gap_s = 3.0                 #   重开不了：至少隔这么多秒再试
+        self.sleep, self.clock = sleep, clock
+        self._lock = threading.Lock()           # 重开时拿着：后台识别线程和主线程都会要帧，只让一个去重开
+        self._live = False                      # open 过、还没 close(读不到画面才去重开)
+        self._t_fail = None                     # 这一串读不到画面从什么时候开始(读到了就清掉)：按连着读不到算，
+                                                #   不按上次读到画面算(开车时好几分钟不要帧，回来第一次没等到不算掉线)
+        self._t_try, self._t_said = -1e9, -1e9  # 上次试着重开 / 说重开不了 的时刻
 
     def open(self):
+        with self._lock:
+            self._open()
+        return self
+
+    def _open(self):
+        """先开配置的 device(和以前一样)。(10-19)打不开、或者打开了读不到画面：试插着的别的 USB 摄像头(USB 掉线重连以后编号会变)，
+        开得了就用它(self.device 改成它)。都不行抛 VisionError。"""
+        dev0 = self.device
+        cap, why = self._open_dev(dev0)
+        if cap is None:
+            found, bad, same = usb_cameras(), [], os.path.realpath(str(dev0))
+            for d in found:
+                if os.path.realpath(d) == same:
+                    continue                    # 就是刚才那个
+                cap, _ = self._open_dev(d)
+                if cap is not None:
+                    self.device = d
+                    break
+                bad.append(d)
+            if cap is None:
+                say = [] if why == '打不开' else [why]
+                if bad:
+                    say.append(f'USB 摄像头 {"、".join(bad)} 也打不开：可能被别的程序占着')
+                elif not found:
+                    say.append('没找到 USB 摄像头：USB 没插好？ls /dev/video* 看看')
+                elif why == '打不开':
+                    say.append('可能被别的程序占着')
+                say += video_users()
+                raise VisionError(f'打不开摄像头 {dev0}' + (f'({"；".join(say)})' if say else ''))
+        self.cap = cap
+        if self.threaded:
+            self._lf = LatestFrame(cap, 1.0 / max(1, self.fps))
+        self._live = True
+        self.log(f'  摄像头 {self.device} 已打开 {self.width}x{self.height}')
+        if self.device != dev0:
+            self.log(f'  (摄像头 {dev0} {why}，改用 {self.device}：USB 掉线重连以后编号变了)')
+
+    def _open_dev(self, dev):
+        """按设置打开 dev 这一个节点，读几帧试试。返回 (cap, '') 或 (None, '打不开' / '打开了但读不到画面')。"""
         import cv2
-        cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not cap.isOpened():
-            raise VisionError(f'打不开摄像头 {self.device}')
+            cap.release()
+            return None, '打不开'
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
@@ -179,53 +281,103 @@ class Camera:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
-        time.sleep(0.4)
+        self.sleep(0.4)
         good = 0
         for _ in range(10):
             ok, fr = cap.read()
             good += 1 if (ok and fr is not None) else 0
-            time.sleep(0.02)
+            self.sleep(0.02)
         if good == 0:
             cap.release()
-            raise VisionError('摄像头打开了但读不到画面')
-        self.cap = cap
-        if self.threaded:
-            self._lf = LatestFrame(cap, 1.0 / max(1, self.fps))
-        self.log(f'  摄像头 {self.device} 已打开 {self.width}x{self.height}')
-        return self
+            return None, '打开了但读不到画面'
+        return cap, ''
 
     def read(self, after=None, fresh=True):
-        """最新的一帧，读不到返回 None。后台线程模式：fresh=True 保证是 after(默认=现在)之后才拍的。"""
-        if self.cap is None:
-            return None
-        if self._lf is not None:
-            fr, t = self._lf.read(after=after, fresh=fresh)
-            self.last_t = t
-            if fr is not None and self.flip in (-1, 0, 1):
-                import cv2
-                fr = cv2.flip(fr, self.flip)
+        """最新的一帧，读不到返回 None。后台线程模式：fresh=True 保证是 after(默认=现在)之后才拍的。
+        (10-19)连着 reopen_s 秒读不到画面(USB 掉线？)：关掉重开(编号变了也找得到)，重开好了这一次就返回新拍的一帧；
+        重开不了也只是返回 None，不抛。"""
+        fr = self._read(after, fresh)
+        if fr is not None:
+            self._t_fail = None
             return fr
-        for _ in range(self.flush):
-            self.cap.grab()
-        ok, fr = self.cap.read()
-        if not ok or fr is None:
-            return None
-        if self.flip in (-1, 0, 1):
+        now = self.clock()
+        if self._t_fail is None:
+            self._t_fail = now
+        if self._live and self.reopen_s > 0 and now - self._t_fail > self.reopen_s:
+            ok = self._revive()
+            if ok:
+                fr = self._read(after, fresh)
+                if fr is not None:
+                    self._t_fail = None
+            elif ok is None:
+                self.sleep(0.2)                 # 别的线程正在重开 / 刚试过：歇一下，别让一直要帧的地方空转
+        return fr
+
+    def _read(self, after, fresh):
+        if self.threaded:                       # 后台线程模式只从 LatestFrame 拿，不直接碰 cap(后台线程在用它)
+            lf = self._lf                       # 重开时会换掉：先拿到手里
+            if lf is None:
+                return None
+            fr, t = lf.read(after=after, fresh=fresh)
+            self.last_t = t
+        else:
+            with self._lock:                    # 不用后台线程：cap 一次只能一个线程用，也不能和重开撞上
+                cap = self.cap
+                if cap is None:
+                    return None
+                try:
+                    for _ in range(self.flush):
+                        cap.grab()
+                    ok, fr = cap.read()
+                except Exception:               # (10-19)USB 掉线时读帧出错：当没读到(过一会儿会重开)
+                    ok, fr = False, None
+            if not ok:
+                fr = None
+        if fr is not None and self.flip in (-1, 0, 1):
             import cv2
             fr = cv2.flip(fr, self.flip)
         return fr
 
+    def _revive(self):
+        """(10-19)连着 reopen_s 秒读不到画面：关掉重开(和 open 一样，原来的编号打不开就找 USB 摄像头)。
+        返回 True 重开好了 / False 重开不了 / None 没去重开(别的线程正在重开，或者 reopen_gap_s 秒内刚试过)。不会抛。"""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            now, t0 = self.clock(), self._t_fail
+            if not self._live or t0 is None or now - t0 <= self.reopen_s or now - self._t_try < self.reopen_gap_s:
+                return None                     # 关掉了 / 别的线程刚重开好 / 刚试过
+            self._t_try = now
+            loud = now - self._t_said >= 30.0   # 一直重开不了：30 秒才说一次，免得刷屏
+            if loud:
+                self.log(f'  摄像头 {self.reopen_s:g} 秒没有画面了(USB 掉线？)：重新打开…')
+            try:
+                self._close()
+                self._open()
+            except Exception as ex:
+                if loud:
+                    self._t_said = now
+                    self.log(f'  ★ 重开摄像头没成功(每 {self.reopen_gap_s:g} 秒再试一次)：{ex}')
+                return False
+            self._t_said, self._t_fail = -1e9, now        # 重开好了：从现在重新算
+            return True
+        finally:
+            self._lock.release()
+
     def close(self):
-        stopped = True
-        if self._lf is not None:
-            stopped = self._lf.close()      # 先停线程再关摄像头
-            self._lf = None
-        if self.cap is not None:
+        with self._lock:                        # (10-19)别的线程正在重开/读：等它完了再关；关了就不再自己重开
+            self._live = False
+            self._close()
+
+    def _close(self):
+        cap, lf = self.cap, self._lf
+        self.cap = self._lf = None              # 先摘下来，别的线程不会再拿去读
+        stopped = lf.close() if lf is not None else True     # 先停线程再关摄像头
+        if cap is not None:
             if stopped:
-                self.cap.release()
+                cap.release()
             else:
                 self.log('  摄像头读帧卡住了，线程没停下来：先不关摄像头(程序退出时会关)')
-            self.cap = None
 
 
 def circle_material_detector(cfg=None, seed_r=None):
@@ -381,7 +533,7 @@ class Vision:
             cc = self.cfg['camera']
             self.camera = Camera(cc.get('device', '/dev/video0'), cc.get('width', 640), cc.get('height', 480),
                                  cc.get('fps', 30), cc.get('flip'), flush=cc.get('flush', 2), log=self.log,
-                                 threaded=cc.get('threaded', True)).open()
+                                 threaded=cc.get('threaded', True), reopen_s=cc.get('reopen_s', 2.0)).open()
         return self
 
     def close(self):
