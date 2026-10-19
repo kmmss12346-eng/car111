@@ -219,21 +219,22 @@ int main(void) {
     away(); clear();
     CHECK(run("GRAB 2 H") == 1, "A2T：GRAB 2 H");
     {
-        int t1 = at("M1:150.0"), ext = at("M2:-800.0@400"), t2 = at("M1:280.0"), back = at("M2:-862.0@400"), td = at("M1:323.0");
-        CHECK(t1 >= 0 && ext > t1 && t2 > ext && back > t2 && td > back, "转到 A1T1 → 伸到 A2T → 转到 A1T2 → 缩回 A2R → 转到转盘(伸缩按 A2SPD)");
+        int td = at("S1:323.0"), ext = at("S2:-800.0@400"), back = at("S2:-862.0@400");
+        CHECK(td >= 0 && ext > td && back > ext && !has("M1:150.0") && !has("M1:280.0"),
+              "ID1 一口气转到转盘(不停)，路上伸到 A2T、再缩回 A2R(伸缩按 A2SPD)");
     }
     Arm_Param_Set("A1G", 100);                     /* 原料盘在另一边 */
     clear();
     CHECK(run("OBS RAW") == 1, "A2T：OBS RAW");
     {
-        int t2 = at("M1:280.0"), ext = at("M2:-800.0"), t1 = at("M1:150.0"), to = at("M2:-862.0"), sw = at("S1:100.0");
-        CHECK(t2 >= 0 && ext > t2 && t1 > ext && to > t1 && sw > to, "离开转盘反过来：A1T2 → 伸 → A1T1 → 伸缩到 A2E → 转到原料盘");
+        int sw = at("S1:100.0"), ext = at("S2:-800.0"), to = at("S2:-862.0");
+        CHECK(sw >= 0 && ext > sw && to > ext, "离开转盘反过来：ID1 一直转到原料盘，路上伸到 A2T 再到 A2E");
     }
     clear();
     CHECK(run("AFS 2 -900 500") == 1 && has("M2:-900.0@500") && run("AFS 2 -900 0") == -1, "AFS：按给定速度转");
     Arm_Param_Set("A2T", 0); Arm_Param_Set("A1T1", 0); Arm_Param_Set("A1T2", 0); Arm_Param_Set("A2SPD", 0); Arm_Param_Set("A1G", 323);
     away(); clear(); run("GRAB 2 H");
-    CHECK(!has("M2:-800.0") && !has("M1:150.0"), "A2T=0：照旧");
+    CHECK(!has("S2:-800.0") && !has("M2:-800.0"), "A2T=0：照旧");
 
     /* ---- PICK 用地面高度 ZPLC ---- */
     clear();

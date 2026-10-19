@@ -98,8 +98,8 @@ static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
 static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
 static float g_a2r    = -862.0f;   /* A2R    ID2 角度：转盘上方(收起时 ID2 也用这个角度) */
 static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
-/* (10-19 用户：电池盒挡着)转去车上转盘的路：夹起以后伸缩不动转到 A1T1 -> 伸到 A2T -> 伸着转到 A1T2 -> 缩回 A2R -> 转到转盘上方 A1D。
- * 伸缩都在两个圆盘外面，不挡物料。离开转盘反过来走。A2T = 0 不用(照旧)；A1T1/A1T2 = 0 当作不转这一段 */
+/* (10-19 用户：电池盒挡着)转去车上转盘的路：夹起以后 ID1 一直转到转盘上方 A1D，转过 A1T1 时伸到 A2T、转过 A1T2 时缩回 A2R
+ * (ID1 不停)。伸缩都在两个圆盘外面，不挡物料。离开转盘反过来走。A2T = 0 不用(照旧)；A1T1/A1T2 = 0 当作不转这一段 */
 static float g_a1t1   = 0.0f;      /* A1T1   ID1 角度：转到这里开始伸长(已经离开原料盘/圆环那一块) */
 static float g_a2t    = 0.0f;      /* A2T    ID2 角度：伸到这么长转，碰不到电池盒 */
 static float g_a1t2   = 0.0f;      /* A1T2   ID1 角度：转过电池盒，到这里开始缩回(还没到车上转盘正上方) */
@@ -1183,34 +1183,66 @@ static float A2_Spd(void)
     return (g_a2spd > 0.5f) ? g_a2spd : g_aspd;
 }
 
-#define MV(id, a, spd)  do { Servo_Move((id), (a), (spd), g_atolc, SERVO_EXTRA_MS); if (car_abort) return NULL; } while (0)
+/* (10-19 用户：伸缩的时候 ID1 不要停，一直转)ID1 一口气转到 a1_end；转过 at1 时 ID2 开始走到 b1(伸长)，
+ * 转过 at2 时 ID2 开始走到 b2(缩回)。ID1 先到了还没转过的那一段就接着做。升降不动(调用前升到最高) */
+static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2)
+{
+    float a = 0.0f, c, dir, tgt = a1_end, b;
+    uint32_t t0, tmax;
+    uint8_t ok1 = 0, ok2 = 1, ph = 0;
 
-/* 转到车上转盘上方，停在高度 z_end：升到最高 -> 伸缩不动转到 A1T1 -> 伸到 A2T -> 伸着转到 A1T2 -> 缩回 A2R -> 转到 A1D -> 下降 */
+    if (!Servo_ReadAngle(1, &a))  a = at1;
+    dir = (a1_end >= a) ? 1.0f : -1.0f;
+    tmax = Servo_Start(1, &tgt, g_aspd) + SERVO_EXTRA_MS;
+    t0 = HAL_GetTick();
+    while (!car_abort)
+    {
+        HAL_Delay(15);
+        if (!ok1 && Servo_ReadAngle(1, &a) && Servo_Arrived(1, a, g_atolc))  { ok1 = 1; Servo_Hold(1, a); }
+        if (ph == 0 && (ok1 || (a - at1) * dir >= 0.0f))
+        {
+            b = b1;  tmax += Servo_Start(2, &b, A2_Spd());  ph = 1;  ok2 = 0;      /* 转过 A1T1：开始伸长 */
+        }
+        if (ph == 1 && (ok1 ? ok2 : (a - at2) * dir >= 0.0f))
+        {
+            b = b2;  tmax += Servo_Start(2, &b, A2_Spd());  ph = 2;  ok2 = 0;      /* 转过 A1T2：开始缩回 */
+        }
+        if (!ok2 && Servo_ReadAngle(2, &c) && Servo_Arrived(2, c, g_atolc))  { ok2 = 1; Servo_Hold(2, c); }
+        if (ok1 && ok2 && ph == 2)  break;
+        if ((HAL_GetTick() - t0) > tmax + 3000u)  break;
+    }
+    if (car_abort)
+    {
+        if (Servo_ReadAngle(1, &a))  Servo_Hold(1, a);
+        if (Servo_ReadAngle(2, &c))  Servo_Hold(2, c);
+        return NULL;
+    }
+    if (!ok1)  Servo_StopIfStuck(1, a1_end);
+    if (!ok2)  Servo_StopIfStuck(2, b2);
+    return NULL;
+}
+
+/* 转到车上转盘上方，停在高度 z_end：升到最高 -> ID1 一直转到 A1D，路上转过 A1T1 伸到 A2T、转过 A1T2 缩回 A2R -> 下降 */
 static const char *Go_Tray(float z_end)
 {
+    float a;
+
     if (!Tray_Detour())  return Move_Over(g_a1d, g_a2r, 1, z_end);
     GO(Lift_Goto(g_zhi));
-    if (Absf(g_a1t1) > 0.5f)  MV(1, g_a1t1, g_aspd);
-    MV(2, g_a2t, A2_Spd());
-    if (Absf(g_a1t2) > 0.5f)  MV(1, g_a1t2, g_aspd);
-    MV(2, g_a2r, A2_Spd());
-    MV(1, g_a1d, g_aspd);
+    if (!Servo_ReadAngle(1, &a))  a = g_a1d;
+    GO(Sweep(g_a1d, (Absf(g_a1t1) > 0.5f) ? g_a1t1 : a, g_a2t, (Absf(g_a1t2) > 0.5f) ? g_a1t2 : g_a1d, g_a2r));
     return Lift_Goto(z_end);
 }
 
-/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转走：反过来走 A1T2 -> 伸到 A2T -> A1T1 -> 伸缩到 a2_to，再交给 Move_Over 转过去 */
-static const char *Leave_Tray(float a2_to)
+/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转到 (a1_to, a2_to)：反过来，ID1 一直转，转过 A1T2 伸到 A2T、转过 A1T1 伸缩到 a2_to */
+static const char *Leave_Tray(float a1_to, float a2_to)
 {
     float a;
 
     if (!Tray_Detour())  return NULL;
     if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
     GO(Lift_Goto(g_zhi));
-    if (Absf(g_a1t2) > 0.5f)  MV(1, g_a1t2, g_aspd);
-    MV(2, g_a2t, A2_Spd());
-    if (Absf(g_a1t1) > 0.5f)  MV(1, g_a1t1, g_aspd);
-    MV(2, a2_to, A2_Spd());
-    return NULL;
+    return Sweep(a1_to, (Absf(g_a1t2) > 0.5f) ? g_a1t2 : a, g_a2t, (Absf(g_a1t1) > 0.5f) ? g_a1t1 : a1_to, a2_to);
 }
 
 /* 观察姿态：升到最高 -> ID1、ID2 转到工位上方 -> 升降到观察高度。ring=0 原料盘，ring=1 地上圆环。
@@ -1221,7 +1253,7 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     if (e) return e;
 
     if (open_claw)  Claw_O();
-    GO(Leave_Tray(ring ? g_a2p : g_a2e));
+    GO(Leave_Tray(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e));
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
     return NULL;
 }
@@ -2423,7 +2455,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (!ParseF(t[1], &f) || !ParseF(t[2], &g) || !ParseF(t[3], &z))  FAIL("ERR ARG");
         r = Seq_Ready();
         if (r)  FAIL(r);
-        r = Leave_Tray(g);                         /* 从车上转盘那边转走：按 A1T2、A2T、A1T1 绕开电池盒 */
+        r = Leave_Tray(f, g);                      /* 从车上转盘那边转走：ID1 一直转，路上按 A1T2、A1T1 伸缩绕开电池盒 */
         if (r)  FAIL(r);
         r = Move_Over(f, g, 2, z);
         if (r)  FAIL(r);
