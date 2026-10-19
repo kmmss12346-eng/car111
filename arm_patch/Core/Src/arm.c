@@ -98,6 +98,8 @@ static float g_a1p    = 323.0f;    /* A1P    ID1 角度：对准地上圆环 */
 static float g_a2e    = -862.0f;   /* A2E    ID2 角度：伸出夹原料盘上的物料 */
 static float g_a2r    = -862.0f;   /* A2R    ID2 角度：转盘上方(收起时 ID2 也用这个角度) */
 static float g_a2p    = -862.0f;   /* A2P    ID2 角度：伸出到地上圆环 */
+static float g_a2t    = 0.0f;      /* A2T    (10-19 用户：电池盒挡着)转去/离开车上转盘的路上 ID2 先伸到这里(伸长一点绕开电池盒)，
+                                    *        转到转盘上方再缩回 A2R；0 = 不用(照旧缩着转) */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
 static float g_atolc  = 1.0f;      /* ATOLC  大动作离目标多少度以内算到位 */
@@ -162,6 +164,7 @@ static const ArmTun tun[] =
     { "A2E",    &g_a2e,    -5000.0f, 5000.0f },
     { "A2R",    &g_a2r,    -5000.0f, 5000.0f },
     { "A2P",    &g_a2p,    -5000.0f, 5000.0f },
+    { "A2T",    &g_a2t,    -5000.0f, 5000.0f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
     { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
     { "ATOLC",  &g_atolc,   0.2f,    5.0f },
@@ -1162,6 +1165,38 @@ static int Slot_Ok(long slot)
     return slot >= 1 && slot <= 3;
 }
 
+/* (10-19 用户：电池盒挡着)A2T 不是 0：手臂转去车上转盘时，先在最高处把 ID2 伸到 A2T，转到转盘上方再缩回 A2R；
+ * 离开转盘时也一样，先升到最高、ID2 伸到 A2T 再转走。只在 ID2 管伸缩(AEXT=2)时用 */
+static int Tray_Detour(void)
+{
+    return Absf(g_a2t) > 0.5f && Ext_Id() == 2;
+}
+
+/* 转到车上转盘上方，停在高度 z_end */
+static const char *Go_Tray(float z_end)
+{
+    if (!Tray_Detour())  return Move_Over(g_a1d, g_a2r, 1, z_end);
+    GO(Lift_Goto(g_zhi));
+    Servo_Move(2, g_a2t, g_aspd, g_atolc, SERVO_EXTRA_MS);   /* 先伸出去 */
+    if (car_abort) return NULL;
+    GO(Move_Over(g_a1d, g_a2t, 1, g_zhi));         /* 伸着转到转盘那边 */
+    Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);   /* 到了再缩回转盘上方 */
+    if (car_abort) return NULL;
+    return Lift_Goto(z_end);
+}
+
+/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)：先升到最高、ID2 伸到 A2T，再转走 */
+static const char *Leave_Tray(void)
+{
+    float a;
+
+    if (!Tray_Detour())  return NULL;
+    if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
+    GO(Lift_Goto(g_zhi));
+    Servo_Move(2, g_a2t, g_aspd, g_atolc, SERVO_EXTRA_MS);
+    return NULL;
+}
+
 /* 观察姿态：升到最高 -> ID1、ID2 转到工位上方 -> 升降到观察高度。ring=0 原料盘，ring=1 地上圆环。
  * open_claw=1 同时把夹爪张开(夹爪动的时候手臂也在动，不多花时间)。open_claw=0 时夹爪状态保持不变 */
 static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
@@ -1170,6 +1205,7 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     if (e) return e;
 
     if (open_claw)  Claw_O();
+    GO(Leave_Tray());
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
     return NULL;
 }
@@ -1186,7 +1222,7 @@ static const char *Seq_PickHere(uint8_t slot, float z)
     Claw_O();                                      /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
     GO(Lift_Goto(z));                              /* 下降 */
     Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
-    GO(Move_Over(g_a1d, g_a2r, 1, g_zdrop));       /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降) */
+    GO(Go_Tray(g_zdrop));                          /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降；A2T：伸着转过去) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
     Claw_O();      WAIT(g_clwait);                 /* 松开：物料落进转盘 */
     GO(Lift_Goto(g_zhi));
@@ -1202,7 +1238,7 @@ static const char *Seq_Take(uint8_t slot)
 
     TT_Go(slot);
     Claw_O();
-    GO(Move_Over(g_a1d, g_a2r, 1, (g_ovlap > 0.5f) ? g_zdrop + g_ovclr : g_zhi));   /* 转到转盘上方(OVLAP=1：停在槽口上面一点) */
+    GO(Go_Tray((g_ovlap > 0.5f) ? g_zdrop + g_ovclr : g_zhi));   /* 转到转盘上方(OVLAP=1：停在槽口上面一点) */
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
     Claw_C();      WAIT(g_clwait);                 /* 夹起 */
@@ -2362,6 +2398,8 @@ int Arm_Command(const char *cmd, char *err, int errlen)
 
         if (!ParseF(t[1], &f) || !ParseF(t[2], &g) || !ParseF(t[3], &z))  FAIL("ERR ARG");
         r = Seq_Ready();
+        if (r)  FAIL(r);
+        r = Leave_Tray();                          /* 从车上转盘那边转走：先伸到 A2T(电池盒) */
         if (r)  FAIL(r);
         r = Move_Over(f, g, 2, z);
         if (r)  FAIL(r);

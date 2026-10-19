@@ -89,6 +89,10 @@ STEPS = [
     dict(key=('A1D', 'A2R'), kind='pose', title='转盘上方的姿态', setup='turntable',
          text='把爪子移到转盘 1 号位的正上方(爪子中心对准放物料的格子)。\n'
               '用 1 +5 / 2 -5 调，或者输入 u 松开舵机用手摆，摆好回车。'),
+    dict(key='A2T', kind='servo', sid=2, title='转去转盘路上的伸缩 A2T(绕开电池盒)', setup='turntable', needs_fw=True,
+         text='(10-19)电池盒挡着：手臂转去/离开车上转盘的路上，伸缩先伸到这个角度，转到转盘上方再缩回 A2R。\n'
+              '现在手臂在转盘上方：用 2 +50 / 2 -50 把爪子伸到转动时碰不到电池盒的长度，回车保存。\n'
+              '不需要就输入 s 跳过。以后要关掉：run_live 里 set A2T 0。'),
     dict(key='TT1', kind='tt', slot=1, title='转盘 1 号位', setup='turntable',
          text='微调转盘，让 1 号格子的中心正好在爪子下面。觉得高处看不准，可以先 z -40 降低一点再看。'),
     dict(key='TT2', kind='tt', slot=2, title='转盘 2 号位', setup='turntable',
@@ -839,6 +843,10 @@ class Wizard:
         i = start
         try:
             while 0 <= i < len(STEPS):
+                if STEPS[i].get('needs_fw') and STEPS[i]['key'] not in self.P:
+                    self.out(f"(STM32 里没有 {STEPS[i]['key']} 参数，是旧固件：跳过这一步)")
+                    i += 1
+                    continue
                 i += self.step(i)
                 if i < 0:
                     i = 0
