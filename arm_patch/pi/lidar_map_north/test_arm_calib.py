@@ -13,10 +13,10 @@ RANGES = dict(LFMAX=(10, 105), ZHI=(0, 400), ZGRAB=(0, 400), ZDROP=(0, 400), ZPL
               ZOBRAW=(0, 400), ZOBRNG=(0, 400), A1G=(232, 417.6), A1D=(232, 417.6), A1H=(232, 417.6),
               A1P=(232, 417.6), A2E=(-1220, -503.5), A2R=(-1220, -503.5), A2P=(-1220, -503.5),
               CLWO=(500, 2910), CLWC=(500, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
-              AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000))
+              AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000), A1T1=(-720, 720), A1T2=(-720, 720), A2SPD=(0, 1500))
 DEFAULTS = dict(LFMAX=100, ZHI=100, ZGRAB=20, ZDROP=60, ZPLC=0, ZSTK=60, ZOBRAW=100, ZOBRNG=100,
                 A1G=323, A1D=323, A1H=323, A1P=323, A2E=-862, A2R=-862, A2P=-862,
-                CLWO=2090, CLWC=2910, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0)
+                CLWO=2090, CLWC=2910, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0)
 LIM = {1: (232.0, 417.6), 2: (-1220.0, -503.5)}
 
 
@@ -68,6 +68,10 @@ class FakeStm32:
             self.z = max(0.0, min(self.P['LFMAX'], float(p[1])))
             return 'DONE', []
         if v == 'A?':
+            return 'DONE', [f'ANG {p[1]} {self.ang[int(p[1])]:.4f}']
+        if v == 'AFS':
+            self.afs = getattr(self, 'afs', []) + [(int(p[1]), float(p[2]), float(p[3]))]
+            self._servo(int(p[1]), float(p[2]))
             return 'DONE', [f'ANG {p[1]} {self.ang[int(p[1])]:.4f}']
         if v == 'AF':
             self._servo(int(p[1]), float(p[2]))
@@ -130,12 +134,12 @@ FULL = [
     '2800', '',                        # CLWC 直接 2800
     '',                                # ZHI 保持 100
     '1 +10', '2 -20', '',              # 转盘上方：ID1 333、ID2 -882
-    's',                               # A2T(绕开电池盒)跳过
     '-8', '',                          # TT1 2608 -> 2600
     '+12', '',                         # TT2 1708 -> 1720
     's',                               # TT3 跳过
     'c', '-30', '-5', '',              # ZDROP：夹住物料，100 -> 65
     'u', ('hand', 350.2, -700.5),      # 原料盘：松开用手摆
+    's', 's', 's', 's',                # 绕开电池盒 A1T1/A2T/A1T2/A2SPD 跳过
     '-80', '',                         # ZGRAB 100 -> 20
     's',                               # ZOBRAW 跳过
     '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
@@ -160,15 +164,23 @@ class WizardTests(unittest.TestCase):
         self.wiz = Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, **kw)
         return self.wiz.run(start)
 
-    def test_a2t_step_saves_extended_angle(self):
-        """(10-19 用户：电池盒挡着)A2T：手臂在转盘上方，伸缩伸出去一点，回车存成 A2T。"""
-        self.run_wiz(['2 +50', '', 'q'], start=STEP_KEYS.index('A2T'))
-        self.assertAlmostEqual(self.stm.P['A2T'], -812.0, delta=0.5)
+    def test_detour_steps(self):
+        """(10-19 用户：电池盒挡着)A1T1 转到开始伸长的角度、A2T 伸多长、A1T2 开始缩回的角度、A2SPD 速度(演示伸缩)，
+        做完按原路回到原料盘上方。"""
+        self.run_wiz(['1 +20', '', '2 +50', '', '1 +40', '', '400', '', 'q'], start=STEP_KEYS.index('A1T1'))
+        P = self.stm.P
+        self.assertAlmostEqual(P['A1T1'], P['A1G'] + 20, delta=0.5)
+        self.assertAlmostEqual(P['A2T'], P['A2E'] + 50, delta=0.5)
+        self.assertAlmostEqual(P['A1T2'], P['A1T1'] + 40, delta=0.5)
+        self.assertEqual(P['A2SPD'], 400)
+        self.assertEqual([(i, s_) for i, _a, s_ in self.stm.afs], [(2, 400.0), (2, 400.0)])   # 按新速度缩回、伸出给人看
+        self.assertAlmostEqual(self.stm.ang[1], P['A1G'], delta=0.5)                         # 原路回到原料盘上方
 
     def test_a2t_step_skipped_on_old_firmware(self):
         stm = FakeStm32()
-        del stm.P['A2T']
-        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('A2T'))
+        for k in ('A1T1', 'A2T', 'A1T2', 'A2SPD'):
+            del stm.P[k]
+        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('A1T1'))
         self.assertIn('旧固件', '\n'.join(self.lines))
 
     # ---------------- 第一层 / 第二层放置位置(PL1、PL2)：补偿相对"摄像头对准圆环的姿态"

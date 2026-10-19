@@ -89,10 +89,6 @@ STEPS = [
     dict(key=('A1D', 'A2R'), kind='pose', title='转盘上方的姿态', setup='turntable',
          text='把爪子移到转盘 1 号位的正上方(爪子中心对准放物料的格子)。\n'
               '用 1 +5 / 2 -5 调，或者输入 u 松开舵机用手摆，摆好回车。'),
-    dict(key='A2T', kind='servo', sid=2, title='转去转盘路上的伸缩 A2T(绕开电池盒)', setup='turntable', needs_fw=True,
-         text='(10-19)电池盒挡着：手臂转去/离开车上转盘的路上，伸缩先伸到这个角度，转到转盘上方再缩回 A2R。\n'
-              '现在手臂在转盘上方：用 2 +50 / 2 -50 把爪子伸到转动时碰不到电池盒的长度，回车保存。\n'
-              '不需要就输入 s 跳过。以后要关掉：run_live 里 set A2T 0。'),
     dict(key='TT1', kind='tt', slot=1, title='转盘 1 号位', setup='turntable',
          text='微调转盘，让 1 号格子的中心正好在爪子下面。觉得高处看不准，可以先 z -40 降低一点再看。'),
     dict(key='TT2', kind='tt', slot=2, title='转盘 2 号位', setup='turntable',
@@ -106,6 +102,17 @@ STEPS = [
          text='车按比赛时的位置停在原料盘前面，原料盘停着。把爪子移到原料盘上离车最近那一格(那个物料)的正上方：\n'
               '比赛时车就在这一格等，要的颜色转过来就夹(10-18 用户"最近那格"的做法)。用 2 +50 / 2 -50 调伸缩，1 +1 / 1 -1 调左右。\n'
               '之后在 map_merge_live 里 rteach RAW near 颜色号，车轮会按摄像头再细对；齿条伸缩到头了、差一两厘米也没关系，车轮会补。'),
+    # (10-19 用户：电池盒挡着)夹起以后伸缩不动转到 A1T1 -> 伸到 A2T -> 伸着转到 A1T2 -> 缩回 A2R -> 转到车上转盘；伸缩都在两个圆盘外面
+    dict(key='A1T1', kind='servo', sid=1, title='绕开电池盒①：开始伸长的角度 A1T1', setup='raw', needs_fw=True,
+         text='夹起物料以后，伸缩先不动，手臂往车上转盘那边转，转到这个角度开始伸长(要已经离开原料盘那一块)。\n'
+              '用 1 +10 / 1 -10 转到这里，回车保存。不需要绕开电池盒就输入 s 跳过后面几步(以后要关掉：set A2T 0)。'),
+    dict(key='A2T', kind='servo', sid=2, title='绕开电池盒②：伸多长 A2T', setup='detour1', needs_fw=True,
+         text='手臂在开始伸长的角度：用 2 +50 / 2 -50 把爪子伸到转过去碰不到电池盒的长度，回车保存。'),
+    dict(key='A1T2', kind='servo', sid=1, title='绕开电池盒③：开始缩回的角度 A1T2', setup='detour2', needs_fw=True,
+         text='伸着往车上转盘那边转：用 1 +10 / 1 -10 转过电池盒，转到开始缩回的地方(还没到车上转盘正上方)，回车保存。'),
+    dict(key='A2SPD', kind='speed', title='绕开电池盒④：伸长、缩回的速度 A2SPD(度/秒)', setup='detour3', needs_fw=True, back_path=True,
+         text='直接输入数字(例如 400)，或者 +100 / -100：伸缩会按这个速度缩回再伸出给你看。越大越快，0 = 和 ASPD 一样。\n'
+              '满意了回车保存，手臂按原路(伸着转回开始伸长的角度再缩回)回到原料盘上方。'),
     dict(key='ZGRAB', kind='lift', title='在原料盘上夹物料的高度 ZGRAB', setup='raw_down',
          text='爪子张开，用 -10 / -5 / -1 慢慢往下降，降到张开的爪子正好套住物料、夹下去能夹稳的位置。\n'
               '可以输入 c 试夹一下，再 o 张开。爪子不能碰到盘子。'),
@@ -394,6 +401,11 @@ class Wizard:
             self._setup_place(st)
         elif kind == 'stow':
             self.pose(P['A1H'], P['A2R'])
+        elif kind in ('detour1', 'detour2', 'detour3'):
+            a1 = P.get('A1T2' if kind == 'detour3' else 'A1T1', 0.0)
+            a2 = P.get('A2E') if kind == 'detour1' else P.get('A2T', 0.0)
+            if abs(a1) > 0.5 and abs(a2) > 0.5:               # 前面一步跳过了(还是 0)就不动
+                self.pose(a1, a2)
         if kind in ('raw_obs', 'ring_obs'):
             self.lift_to(P['ZOBRAW' if kind == 'raw_obs' else 'ZOBRNG'])
 
@@ -740,9 +752,15 @@ class Wizard:
             if v is None:
                 raise CalError('这一步输入速度数字(例如 800)，或者 +100 / -100')
             want = self.spd + v if line[:1] in '+-' else v
-            want = max(0.0, min(20000.0, want))
+            want = max(0.0, min(1500.0 if st['key'] == 'A2SPD' else 20000.0, want))
             self.do(f'SET {st["key"]} {want:g}', quiet=True)         # 先试，回车才存进配置
             self.spd = want
+            if st['key'] == 'A2SPD':
+                sp = want if want > 0.5 else float(P.get('ASPD', 90.0))
+                if abs(P.get('A2T', 0.0)) > 0.5:
+                    self.do(f'AFS 2 {P["A2R"]:g} {sp:g}')                # 按新速度缩回再伸出
+                    self.do(f'AFS 2 {P["A2T"]:g} {sp:g}')
+                return None
             a, b = (P['CLWO'], P['CLWC']) if st['key'] == 'CLSPD' else (P['CLWC'], P['CLWO'])
             self.claw_to(a)
             self.claw_to(b)                                           # 这一下就是按新速度转的
@@ -799,7 +817,8 @@ class Wizard:
             self.claw_to(self.P['CLWO'])           # 张开，免得一直夹着
         elif k == 'speed':
             self.save({st['key']: float(self.spd)})
-            self.claw_to(self.P['CLWO'])
+            if st['key'] in ('CLSPD', 'CLSPO'):
+                self.claw_to(self.P['CLWO'])
         elif k == 'tt':
             self.save({st['key']: float(self.tt)})
         elif k == 'lift':
@@ -837,6 +856,19 @@ class Wizard:
         return +1
 
     # ------------------------------------------------------------ 整个流程
+    def _detour_back(self):
+        """(10-19)调完绕开电池盒那几步：伸着转回开始伸长的角度 A1T1，再缩回 A2E、回到原料盘上方(不扫到电池盒)。"""
+        P = self.P
+        try:
+            if abs(P.get('A2T', 0.0)) > 0.5 and abs(P.get('A1T1', 0.0)) > 0.5:
+                self.lift_to(P['ZHI'])
+                self.servo_to(2, P['A2T'])
+                self.servo_to(1, P['A1T1'])
+                self.servo_to(2, P['A2E'])
+                self.pose(P['A1G'], P['A2E'])
+        except CalError as e:
+            self.out(f'  !! 回原料盘上方失败：{e}')
+
     def run(self, start=0):
         self.check()
         self.out(HELP)
@@ -847,7 +879,10 @@ class Wizard:
                     self.out(f"(STM32 里没有 {STEPS[i]['key']} 参数，是旧固件：跳过这一步)")
                     i += 1
                     continue
-                i += self.step(i)
+                r = self.step(i)
+                if STEPS[i].get('back_path'):
+                    self._detour_back()
+                i += r
                 if i < 0:
                     i = 0
         except Quit:

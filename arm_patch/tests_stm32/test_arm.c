@@ -214,20 +214,26 @@ int main(void) {
               "GRAB H：转盘→张爪→下降→夹紧→抬起→缩回转向→下降→松开→抬起");
     }
 
-    /* ---- (10-19 用户：电池盒挡着)A2T：转去转盘先伸到 A2T、到了缩回 A2R；从转盘转走也先伸 ---- */
-    Arm_Param_Set("A2T", -800);
+    /* ---- (10-19 用户：电池盒挡着)转去转盘：转到 A1T1 -> 伸到 A2T -> 转到 A1T2 -> 缩回 A2R -> 转到 A1D；离开反过来 ---- */
+    Arm_Param_Set("A1T1", 150); Arm_Param_Set("A2T", -800); Arm_Param_Set("A1T2", 280); Arm_Param_Set("A2SPD", 400);
     away(); clear();
     CHECK(run("GRAB 2 H") == 1, "A2T：GRAB 2 H");
     {
-        int ext = at("M2:-800.0"), turn = at("S1:323.0"), back = at("M2:-862.0");
-        CHECK(ext >= 0 && turn > ext && back > turn, "A2T：先伸到 A2T，再转到转盘，到了缩回 A2R");
+        int t1 = at("M1:150.0"), ext = at("M2:-800.0@400"), t2 = at("M1:280.0"), back = at("M2:-862.0@400"), td = at("M1:323.0");
+        CHECK(t1 >= 0 && ext > t1 && t2 > ext && back > t2 && td > back, "转到 A1T1 → 伸到 A2T → 转到 A1T2 → 缩回 A2R → 转到转盘(伸缩按 A2SPD)");
+    }
+    Arm_Param_Set("A1G", 100);                     /* 原料盘在另一边 */
+    clear();
+    CHECK(run("OBS RAW") == 1, "A2T：OBS RAW");
+    {
+        int t2 = at("M1:280.0"), ext = at("M2:-800.0"), t1 = at("M1:150.0"), to = at("M2:-862.0"), sw = at("S1:100.0");
+        CHECK(t2 >= 0 && ext > t2 && t1 > ext && to > t1 && sw > to, "离开转盘反过来：A1T2 → 伸 → A1T1 → 伸缩到 A2E → 转到原料盘");
     }
     clear();
-    Arm_Param_Set("A1G", 100);                     /* 原料盘在另一边：要转过去 */
-    CHECK(run("OBS RAW") == 1 && at("M2:-800.0") >= 0 && at("M2:-800.0") < at("S1:"), "A2T：从转盘转走先伸到 A2T");
-    Arm_Param_Set("A2T", 0); Arm_Param_Set("A1G", 323);
+    CHECK(run("AFS 2 -900 500") == 1 && has("M2:-900.0@500") && run("AFS 2 -900 0") == -1, "AFS：按给定速度转");
+    Arm_Param_Set("A2T", 0); Arm_Param_Set("A1T1", 0); Arm_Param_Set("A1T2", 0); Arm_Param_Set("A2SPD", 0); Arm_Param_Set("A1G", 323);
     away(); clear(); run("GRAB 2 H");
-    CHECK(!has("M2:-800.0") && !has("M2:-862.0"), "A2T=0：照旧(不多伸缩)");
+    CHECK(!has("M2:-800.0") && !has("M1:150.0"), "A2T=0：照旧");
 
     /* ---- PICK 用地面高度 ZPLC ---- */
     clear();
