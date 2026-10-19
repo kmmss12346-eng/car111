@@ -37,7 +37,7 @@ pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
                              再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
                              比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
-rteach RAW near <颜色号>   (10-18 用户)"最近那格"的做法(齿条不够长、手臂够不全三个停靠位时)：先在 arm_calib 的"原料盘上方的姿态"
+rteach RAW near <颜色号>   (颜色号 1 红 2 黄 3 蓝 4 绿；省赛没有黑、浅蓝)(10-18 用户)"最近那格"的做法(齿条不够长、手臂够不全三个停靠位时)：先在 arm_calib 的"原料盘上方的姿态"
                              把爪子摆到原料盘上离车最近那一格的正上方；车停在原料区、原料盘停着、这一格上是这个颜色的物料。手臂摆到看的姿态
                              不动，车轮慢慢挪(只用 V，车头不转)把这个物料对到爪子正下方，记下原料盘中心的位置、车轮挪了多少。
                              比赛时：车轮把原料盘中心对到这里(爪子就在这一格上方)→ 车不动 → 按任务码顺序，要的颜色转到这一格就直接下爪；
@@ -840,8 +840,8 @@ def _rteach_raw(h, link, parts, path, state, log):
                 h.store.save()
         return _run_async(state, log, go_shift, vision=True)
     if len(sub) == 2 and sub[0] == 'near':
-        if sub[1] not in ('1', '2', '3', '4', '5', '6'):
-            raise ValueError('格式：rteach RAW near 颜色号(1~6，离车最近那一格上的物料的颜色)')
+        if sub[1] not in ('1', '2', '3', '4'):
+            raise ValueError('格式：rteach RAW near 颜色号(1 红 2 黄 3 蓝 4 绿，离车最近那一格上的物料的颜色；省赛没有黑、浅蓝)')
         col_n = int(sub[1])
 
         def go_near():
@@ -870,7 +870,7 @@ def _rteach_raw(h, link, parts, path, state, log):
     ok_n = len(sub) == 2 and sub[0] in ('1', '2', '3')
     if sub[:1] == ['center'] and len(sub) <= 2 and (len(sub) == 1 or sub[1] == 'here'):
         what, move = 'center', len(sub) == 1
-    elif ok_n and sub[1] in ('1', '2', '3', '4', '5', '6'):
+    elif ok_n and sub[1] in ('1', '2', '3', '4'):          # 10-19 用户：省赛没有黑(5)、浅蓝(6)
         what = 'slot'
     elif ok_n and sub[1] in ('save', 'go'):
         what = sub[1]

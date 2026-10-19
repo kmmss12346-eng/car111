@@ -53,6 +53,8 @@ DEFAULTS = dict(
     learn_r=True,                # 没被挡住时记下物料半径，被挡得多时用它
     pp=None,                     # 摄像头光心在画面里的位置(None = 画面中心)。物料离它越远，越能看到物料侧面
     far_side=True,               # 优先用"离光心远的那半圈"边缘拟合：那半圈一定是顶面的边，近的那半圈可能是侧面/底边
+    no_lblue=True,               # (10-19 用户：省赛没有浅蓝、黑)浅蓝不单独认：浅蓝的颜色范围并进蓝色，蓝色不再按饱和度和浅蓝分开
+                                 #   (实车：蓝色物料在爪子正下方显得淡，被判成了浅蓝，蓝色认不出来)。要分浅蓝就设 False
 )
 
 
@@ -154,6 +156,9 @@ class MaterialDetector:
         self.cfg = c
         self.folder = Path(folder) if folder else ROOT
         self.ranges = _ranges()
+        if c.get('no_lblue') and 3 in self.ranges and 6 in self.ranges:
+            self.ranges = dict(self.ranges)
+            self.ranges[3] = list(self.ranges[3]) + [r for r in self.ranges[6] if r not in self.ranges[3]]
         self.r_ref = {}                 # 颜色号 -> 学到的物料半径(像素)
         self._r_hist = {}
         self._claw_static = None
@@ -280,6 +285,8 @@ class MaterialDetector:
         """蓝(3)和浅蓝(6)的范围有重叠：浅蓝更亮、颜色更淡。"""
         if color_id not in (3, 6) or len(hsv_px) == 0:
             return True
+        if color_id == 3 and self.cfg.get('no_lblue'):
+            return True                                       # 不认浅蓝：淡一点的蓝也是蓝
         s = float(np.median(hsv_px[:, 1]))
         try:
             s_light = float(self.ranges[6][0][1][1])          # 浅蓝范围的饱和度上限(wuliao 里是 180)

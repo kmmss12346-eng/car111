@@ -2797,6 +2797,7 @@ class RawNearSlotTests(unittest.TestCase):
         finally:
             del w.plate_phase
         self.assertIn('没看到 GREEN 物料', str(cm.exception))
+        self.assertTrue('画面里认出的是' in str(cm.exception) or '一个也没认出来' in str(cm.exception), str(cm.exception))   # 说清楚看到了什么
         self.assertFalse(os.path.exists(path) and 'RAW_CT' in json.load(open(path, encoding='utf-8')))
 
 

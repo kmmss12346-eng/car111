@@ -230,13 +230,25 @@ class ReviewFixTests(unittest.TestCase):
         self.assertLess(err(r, 330, 290), 3.0)
 
     def test_light_blue_with_high_saturation_is_not_blue(self):
-        d = self.matdet.MaterialDetector(NO_MASK)
+        d = self.matdet.MaterialDetector(dict(NO_MASK, no_lblue=False))     # 要分浅蓝(省赛默认不分)
         hsv = np.uint8([[[100, 165, 225]]])
         bgr = tuple(int(v) for v in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
         im = scene([], claw_top=330)
         cv2.circle(im, (320, 170), 48, bgr, -1, cv2.LINE_AA)
         self.assertIsNotNone(d.detect(im, 6))
         self.assertIsNone(d.detect(im, 3))
+
+    def test_without_light_blue_a_pale_blue_is_blue(self):
+        """(10-19 用户：省赛没有浅蓝、黑)默认不认浅蓝：淡一点的蓝色物料(实车上在爪子正下方被判成了浅蓝)按蓝色认出来；
+        真正的蓝色照样认得出。"""
+        d = self.matdet.MaterialDetector(NO_MASK)
+        for hsv_v in ((100, 165, 225), (100, 120, 250), (110, 220, 150)):
+            bgr = tuple(int(v) for v in cv2.cvtColor(np.uint8([[hsv_v]]), cv2.COLOR_HSV2BGR)[0, 0])
+            im = scene([], claw_top=330)
+            cv2.circle(im, (320, 170), 48, bgr, -1, cv2.LINE_AA)
+            r = d.detect(im, 3)
+            self.assertIsNotNone(r, hsv_v)
+            self.assertLess(err(r, 320, 170), 3.0, hsv_v)
 
     def test_dark_blue_is_not_black(self):
         d = self.matdet.MaterialDetector(NO_MASK)

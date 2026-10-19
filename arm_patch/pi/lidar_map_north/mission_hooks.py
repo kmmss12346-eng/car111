@@ -276,6 +276,7 @@ DEFAULTS = dict(
 
 A2_MIN, A2_MAX = -1210.0, -300.0       # 旧程序(没有 S2MIN/S2MAX 参数)ID2 的限位(10-16 用户：-1210 ~ -300)
 A1_MIN, A1_MAX = 44.0, 244.0           # STM32 里 ID1 的限位(main.c SERVO1_MIN_DEG / SERVO1_MAX_DEG)；配置 a1_range 可以改
+RAW_COLORS = (1, 2, 3, 4)              # (10-19 用户：省赛没有黑、浅蓝)没有任务码时原料区认这几种颜色：红、黄、蓝、绿
 
 BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60mm', 'NOENC': '读不到编码器，当成上次停下的高度(旧程序当成 60mm)',
              'POS': '按上次停的位置认的高度'}
@@ -3606,10 +3607,11 @@ class MissionHooks:
         return True
 
     def _raw_ct_teach_cols(self):
-        """示教时认原料盘中心看哪些颜色：配置里给了就用配置的；有任务码就用第一批的三个颜色；都没有就 6 种颜色都看。"""
+        """示教时认原料盘中心看哪些颜色：配置里给了就用配置的；有任务码就用第一批的三个颜色；都没有就看红、黄、蓝、绿(RAW_COLORS，
+        10-19 用户：省赛没有黑、浅蓝)。"""
         if self.cfg.get('raw_center_colors'):
             return None
-        return sorted({int(it.color) for it in self.plan.items(1)}) if self.plan is not None else [1, 2, 3, 4, 5, 6]
+        return sorted({int(it.color) for it in self.plan.items(1)}) if self.plan is not None else list(RAW_COLORS)
 
     def _raw_center_still(self, n=5, max_s=8.0):
         """(10-18)车停着：连着认 n 帧原料盘中心(和对准时同一个办法：外圈，认不出外圈才用物料)，取中值。返回 (圆心, 半径) 或 None。"""
@@ -3630,7 +3632,7 @@ class MissionHooks:
         return np.median(np.asarray(cs), axis=0), float(np.median(rs))
 
     def _raw_teach_seen_cols(self, cols):
-        """示教时没有任务码、要认 6 种颜色(每帧慢)：先看几帧原料盘上有哪几种颜色，以后只认这几种。返回颜色列表。"""
+        """示教时没有任务码、要认 4 种颜色(每帧慢)：先看几帧原料盘上有哪几种颜色，以后只认这几种。返回颜色列表。"""
         if not cols or len(cols) <= 3:
             return cols
         seen = set()
@@ -3706,14 +3708,16 @@ class MissionHooks:
         return c, rr
 
     def _raw_near_material(self, color, n=3, max_s=8.0):
-        """车、手臂停着：连着认 color 颜色的物料，有 n 帧位置差不多(原料盘停着)就返回这几帧的中值(物料 - 爪子点，像素)；认不出返回 None。"""
+        """车、手臂停着：连着认 color 颜色的物料，有 n 帧位置差不多(原料盘停着)就返回这几帧的中值(物料 - 爪子点，像素)；认不出返回 None。
+        (10-19 实车)用 plate_scan 认：这一帧连同认出的外圈、物料写给 vview.py，示教时能看到认的是哪个。"""
         v = self.vision
         still = float(self.cfg.get('raw_still_px', 6.0))
         qs = []
         t_lim = self.now() + float(max_s)
         while self.now() < t_lim:
             self._check_abort()
-            q = v.material_errors([int(color)]).get(int(color))
+            errs = v.plate_scan([int(color)])[1] if hasattr(v, 'plate_scan') else v.material_errors([int(color)])
+            q = errs.get(int(color))
             if q is None:
                 continue
             q = np.asarray(q, float)[:2]
@@ -3753,7 +3757,12 @@ class MissionHooks:
                 self._raw_center_cols = sorted(set(self._raw_teach_seen_cols(self._raw_center_cols)) | {color})
             q = self._raw_near_material(color)
             if q is None:
-                raise VisionError(f'画面里没看到 {name} 物料(颜色 {color})，没保存：原料盘要停着、{name} 物料放在离车最近的那一格，'
+                look = sorted({int(x) for x in (self._raw_center_cols or RAW_COLORS)} | set(RAW_COLORS))
+                errs = v.material_errors(look)
+                got = [f'{COLOR_NAMES.get(int(k), k)}(离爪子点 {float(np.linalg.norm(np.asarray(e_, float))) / sc:.0f}mm)'
+                       for k, e_ in sorted(errs.items()) if e_ is not None]
+                seen_txt = ('画面里认出的是：' + '、'.join(got)) if got else '画面里红、黄、蓝、绿一个也没认出来'
+                raise VisionError(f'画面里没看到 {name} 物料(颜色 {color})，{seen_txt}；没保存：原料盘要停着、{name} 物料放在离车最近的那一格，'
                                   '爪子要在它上方附近(arm_calib 里"原料盘上方的姿态"那一步摆)。看实时画面：python3 vview.py')
             m = self._raw_center_still(5)
             if m is None:
