@@ -227,8 +227,8 @@ int main(void) {
     clear();
     CHECK(run("OBS RAW") == 1, "A2T：OBS RAW");
     {
-        int sw = at("S1:100.0"), ext = at("S2:-800.0"), to = at("S2:-862.0");
-        CHECK(sw >= 0 && ext > sw && to > ext, "离开转盘反过来：ID1 一直转到原料盘，路上伸到 A2T 再到 A2E");
+        int sw = at("S1:100.0"), to = at("S2:-862.0");
+        CHECK(sw >= 0 && to > sw && !has("S2:-800.0"), "回原料区：ID1 一直转，路上伸缩直接到 A2E(不先伸到 A2T)");
     }
     clear();
     CHECK(run("AFS 2 -900 500") == 1 && has("M2:-900.0@500") && run("AFS 2 -900 0") == -1, "AFS：按给定速度转");

@@ -1234,15 +1234,17 @@ static const char *Go_Tray(float z_end)
     return Lift_Goto(z_end);
 }
 
-/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转到 (a1_to, a2_to)：反过来，ID1 一直转，转过 A1T2 伸到 A2T、转过 A1T1 伸缩到 a2_to */
+/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转到 (a1_to, a2_to)：ID1 一直转，转过 A1T2(离开车上转盘)伸缩直接走到 a2_to
+ * (10-19 用户：回原料区不用先伸长再缩回，转到原料盘上面时伸缩就是最近那格的长度) */
 static const char *Leave_Tray(float a1_to, float a2_to)
 {
-    float a;
+    float a, at;
 
     if (!Tray_Detour())  return NULL;
     if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
     GO(Lift_Goto(g_zhi));
-    return Sweep(a1_to, (Absf(g_a1t2) > 0.5f) ? g_a1t2 : a, g_a2t, (Absf(g_a1t1) > 0.5f) ? g_a1t1 : a1_to, a2_to);
+    at = (Absf(g_a1t2) > 0.5f) ? g_a1t2 : a;
+    return Sweep(a1_to, at, a2_to, at, a2_to);
 }
 
 /* 观察姿态：升到最高 -> ID1、ID2 转到工位上方 -> 升降到观察高度。ring=0 原料盘，ring=1 地上圆环。
