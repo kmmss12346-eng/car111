@@ -7,6 +7,7 @@
 
 方向：0° = 车头正前方，正数往左(雷达装在车左边)，负数往右，±180° = 正后方。
 一个方向上 35cm 以内(near_mm)就有回波 = 被车上/车旁边的东西挡住了，场地里这个方向的障碍物雷达看不到。
+一个回波都没有的方向：可能贴着雷达被挡住(比雷达最近能测的距离还近，比如轮子)，也可能那边很远都没东西。
 另外存一张 lidar_blind.png(车在中间、车头朝上；红点 = 35cm 以内的回波，蓝点 = 远处)，桌面上双击打开看。
 """
 import glob
@@ -40,9 +41,9 @@ def body_rel(xy, c):
     return [rot(x, y * float(c.get('sdk_y_sign', 1)), float(c.get('lidar_yaw_deg', 0))) for x, y in xy]
 
 
-def in_field(rel, c, yaw=None):
-    """按车位换算到场地上，落在场地里(不算车身自己)的点数。yaw=None 用记下的车头。"""
-    yaw = float(c['car_yaw_deg']) if yaw is None else yaw
+def in_field(rel, c):
+    """按记下的车位换算到场地上，落在场地里(不算车身自己)的点数。"""
+    yaw = float(c['car_yaw_deg'])
     lf, ll = float(c.get('lidar_forward_mm', 0)), float(c.get('lidar_left_mm', 0))
     hl, hw = float(c.get('car_length_mm', 290)) / 2 + 120, float(c.get('car_width_mm', 260)) / 2 + 120
     n = 0
@@ -113,13 +114,10 @@ def analyse(view, k, near_mm=NEAR_MM):
     if partly:
         print(f'  挡住一部分的方向：{fmt(partly)}')
     print(f'  {near_mm / 10:.0f}cm 以外有回波的方向(看得到东西)：{fmt(ranges(bins, lambda b: b["far"] >= 0.1 * per_bin), False)}')
-    n_in = in_field(rel_all, c)
-    print(f'  按记下的车位换算，落在场地里的回波 {n_in} 个点')
-    if n_in < 10:
-        yaw0 = float(c.get('car_yaw_deg', 0))
-        best = max(((in_field(rel_all, c, yaw0 + dy), dy) for dy in (-120, -90, -60, 60, 90, 120, 180)), key=lambda t: t[0])
-        if best[0] >= 30:
-            print(f'  ★ 车头按 {(yaw0 + best[1] + 180) % 360 - 180:.0f}° 算有 {best[0]} 个点落在场地里：记下的车头可能不对')
+    none = ranges(bins, lambda b: b['near'] + b['far'] == 0)
+    if none:
+        print(f'  一个回波都没有的方向：{fmt(none, False)}(可能贴着雷达被挡住了(比雷达最近能测的还近)，也可能那边很远都没东西)')
+    print(f'  按记下的车位换算，落在场地里的回波 {in_field(rel_all, c)} 个点')
     return bins, rel_all, per_bin
 
 

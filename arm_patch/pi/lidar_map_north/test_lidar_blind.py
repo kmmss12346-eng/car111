@@ -40,7 +40,7 @@ class LidarBlindTests(unittest.TestCase):
                            dict(config=c)])
         self.assertIn('+0°~+20°(最近 15cm)', out)
         self.assertIn('+80°~+150°(最近 18cm)', out)
-        self.assertIn('车头按 90° 算', out)                   # 第 2 次记成 -90°：全落在场外
+        self.assertIn('一个回波都没有的方向：+150°~+0°、+20°~+30°、+60°~+80°', out)
         self.assertIn('没有存原始帧', out)
 
 
