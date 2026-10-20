@@ -253,6 +253,12 @@ def main():
                 if why=='OK':
                     if k:print(f'  ⚠ 按障碍物余量{base:.0f}mm规划不出来，降到{mg:.0f}mm(看不清的圆柱多留{ex:.0f}mm)才规划出来',flush=True)
                     break
+            if why!='OK' and raw_cfg.get('goal_near_fallback',True):
+                # (10-20 用户：障碍物离停车点太近车跑不到)按最小的余量也开不过去：那个停车点改停在附近开得到的位置，不再整场失败
+                legs2,why2,pl2=plan_mission(dict(mission_cfg(),margin_mm=mg,goal_near_fallback=True),obs,state['plan_start'],mission,start_pivot=state.get('start_pivot'))
+                if why2=='OK':
+                    print(f'  ⚠ 按障碍物余量{mg:.0f}mm也规划不出来({why})：开不过去的停车点改停在附近开得到的位置(下面路线里写了差多少)',flush=True)
+                    legs,why,pl_=legs2,why2,pl2
             return legs,why,pl_,mg,obs
         try:
             legs,why,pl_,mg,obs=attempt(mission)
@@ -904,6 +910,7 @@ def main():
                     print(f"  ({r['x']:.0f},{r['y']:.0f}) 离雷达{r['dist']:.0f}mm  {r['count']}点/{r['frames']}帧  "+('→ 认作障碍物' if not r['why'] else '→ 没认：'+r['why']),flush=True)
             return
         if k=='route':state['plan_start']=None;state['replan_from']=None;plan_route();state['plan_key']=None;redraw();print_route();return
+        if k=='stop':command_stop(parts);return
         if k=='pose' and len(parts)==4:
             if not history.views:raise ValueError('先扫描再设置规划起点')
             state['plan_start']=tuple(float(v) for v in parts[1:]);state['turn_back']=0;redraw();print_route();return
@@ -929,7 +936,52 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race(比赛：屏上选区、按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race(比赛：屏上选区、按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+    def command_stop(parts):
+        """(10-20 用户"这四个停靠位置我需要自己输入选定合适位置")stop = 看四个停车点能不能停；stop 名字 X Y [车头] = 先检查再改。
+        按真实车身(含雷达)查：不压黄色区/工位/原料转盘、不出场地；扫描过就再查障碍物(按真实大小，停车点附近最少留 goal_obstacle_min_margin_mm)。
+        不能停就不改，给出最近能停的位置(stop 名字 X Y force 硬改)；工位/原料盘在车的左边、离得太远这类只提醒。
+        改了存进配置(先备份 .json.bak)，扫描过就马上重新规划，看路线能不能规划出来。"""
+        from route_plan import check_stop,STOP_NAMES,DEFAULT_STOPS
+        stops=raw_cfg.setdefault('stops',{})
+        obs=[(o['x'],o['y'],o['radius']) for o in history.objects]
+        cfg_=mission_cfg()
+        def say(n,p,r):
+            head=f'  {n} ({p[0]:.0f},{p[1]:.0f}) 车头 {p[2]:.0f}°'
+            print(head+('：能停。'+r['gap'] if r['ok'] else '：★ 不能停：'+r['why']),flush=True)
+            for w in r['warn']:print('      ⚠ '+w,flush=True)
+            for q in r['near']:print(f'      最近能停的：({q[0]},{q[1]}) 车头 {q[2]:.0f}°(差 {q[3]}mm)  →  输入 stop {n} {q[0]} {q[1]}',flush=True)
+        if len(parts)==1:
+            print('停车点(车中心 x、y 毫米，车头 0 东 90 北 180 西 -90 南)；'+('按扫描到的障碍物一起查：' if obs else '还没扫描：只查了黄色区/工位/原料转盘/场地边，扫描以后再输入 stop 会连障碍物一起查：'),flush=True)
+            for n in STOP_NAMES:
+                if n not in stops:print(f'  {n}：配置里没有',flush=True);continue
+                p=tuple(float(v) for v in stops[n][:3]);say(n,p,check_stop(cfg_,obs,n,p))
+            print('改停车点：stop 名字 X Y [车头]，例如 stop RAW 1200 2150(车头不写就不变)',flush=True);return
+        n=parts[1].upper()
+        if n not in STOP_NAMES:raise ValueError('格式：stop RAW 1200 2150 [车头]；名字是 QR / RAW / ROUGH / TEMP。只输入 stop 看全部')
+        vals=[a for a in parts[2:] if a.lower()!='force'];force=len(vals)!=len(parts)-2
+        if len(vals) not in (2,3):raise ValueError(f'格式：stop {n} X Y [车头]，例如 stop {n} '+' '.join(f'{v:g}' for v in DEFAULT_STOPS[n][:2]))
+        old=tuple(float(v) for v in (stops.get(n) or DEFAULT_STOPS[n])[:3])
+        x_,y_=float(vals[0]),float(vals[1]);h_=float(vals[2]) if len(vals)==3 else old[2]
+        if not (-200<=x_<=FIELD_MM+200 and -200<=y_<=FIELD_MM+200):raise ValueError(f'({x_:g},{y_:g}) 不在场地里(0~{FIELD_MM})')
+        r=check_stop(cfg_,obs,n,(x_,y_,h_))
+        print(f'检查 {n}'+('(连扫描到的障碍物)' if obs else '(还没扫描，只查固定区域)')+'：',flush=True);say(n,(x_,y_,h_),r)
+        if not r['ok'] and not force:
+            print(f'  没改，{n} 还是 ({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}°。'+('选上面最近能停的位置再输入一次' if r['near'] else '换个位置再输入一次')+f'(确实要这样停：stop {n} {x_:g} {y_:g} {h_:g} force)',flush=True);return
+        if not r['ok']:print('  ★ 按 force 硬改了：规划时会自动挪到最近停得下的位置',flush=True)
+        h_=((h_+180.0)%360.0)-180.0
+        if h_==-180.0:h_=180.0                        # 车头朝西照配置里的写法存 180
+        stops[n]=[int(v) if float(v).is_integer() else round(v,1) for v in (x_,y_,h_)]
+        p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+        if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+        p_.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+        print(f'已改 {n}：({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}° → ({x_:.0f},{y_:.0f}) 车头 {stops[n][2]:.0f}°，存进 {p_.name}(原文件备份为 .json.bak)',flush=True)
+        state['preplan_gen']=state.get('preplan_gen',0)+1
+        state.update(preplan=None,legs=[],path=[],plan_key=None,plan_obj_key=None,home_routes={},legs_partial=False,reason='停车点改了：route 重新规划')
+        if history.views:
+            print('  按这次扫描重新规划：',flush=True)
+            state['plan_start']=None;state['replan_from']=None;plan_route();state['plan_key']=None;redraw();print_route()
+        else:print('  扫描以后规划路线时会用新的停车点(go / race 都是)',flush=True)
     def command_second(parts):
         if len(history.views)!=1:raise ValueError('second 要求已有且仅有第一次扫描')
         if len(parts)<=1:

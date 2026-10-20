@@ -536,6 +536,8 @@ class MissionHooks:
         self.stop_times = []                # 每个停车点用了多久：(停车点, 角色, 第几次, 秒)
         self._items_t = 0.0                 # 这个停车点里做物料一共用了多久
         self._stop_name = None              # 现在在哪个停车点(配置 stops 里的名字)
+        self._stop_shift = {}               # (10-20)导航说的：下次到这个停车点时停的位置比规定的点挪了 (往前mm, 往左mm)
+        self._cur_shift = (0.0, 0.0)        # 这一次停的位置比规定的点挪了多少
         self._prep = {}                     # prepare() 做成了哪几步：'arm' / 'qr' / 'cam'
         self._t_alive = -1e9                # 上一次 keepalive 摆手臂的时刻
         self.holding = None                 # 爪子里现在夹着的物料(从转盘取出来、还没放下)
@@ -593,6 +595,11 @@ class MissionHooks:
         """到停车点后调姿态：目前什么也不做(车位已经由雷达定位好；精确对准在 task 里用摄像头做)。"""
         return None
 
+    def stop_offset(self, stop, fwd, left):
+        """(10-12/10-20)导航说：这次停的位置比规定的停车点往前 fwd、往左 left 毫米(规定的点被障碍物挡住、开不过去、压到工位，规划时挪的)。
+        到了做任务时：地图检查按真正停的位置算；工位对 2 号环横移、往前找，原料区找圆心能挪的范围都放宽这么多。"""
+        self._stop_shift[str(stop)] = (float(fwd), float(left))
+
     def task(self, stop, link, log):
         self.log = log or self.log
         role = role_of(stop, self.cfg.get('stop_aliases'))
@@ -600,6 +607,10 @@ class MissionHooks:
             self.log(f'    (停车点 {stop} 没有对应任务，跳过)')
             return
         self._stop_name = stop
+        self._cur_shift = self._stop_shift.pop(str(stop), (0.0, 0.0))
+        if math.hypot(*self._cur_shift) >= 1.0:
+            self.log(f'    (这次停的位置比规定的停车点往前 {self._cur_shift[0]:+.0f}mm、往左 {self._cur_shift[1]:+.0f}mm：'
+                     '对准时车能挪的范围放宽这么多，地图检查按真正停的位置算)')
         self._ensure(link)
         self.act.reset_disp()                       # 路线把车开到了新的停车点，位移从 0 重新算
         self.learn = {'S': 0.0, 'F': 0.0}
@@ -3174,12 +3185,18 @@ class MissionHooks:
         stops = self.raw_cfg.get('stops') or {}
         al = self.cfg.get('stop_aliases')
         pose = stops.get(self._stop_name) if (self._stop_name and role_of(self._stop_name, al) == role) else None
+        cur = pose is not None
         if pose is None:
             pose = next((v for k, v in stops.items() if role_of(k, al) == role), None)
         try:
-            return float(pose[0]), float(pose[1]), float(pose[2])
+            x, y, h = float(pose[0]), float(pose[1]), float(pose[2])
         except (TypeError, ValueError, IndexError):
             return None
+        f, l = getattr(self, '_cur_shift', (0.0, 0.0)) if cur else (0.0, 0.0)
+        if f or l:                                           # (10-20)这次规划时把停车点挪了：按真正停的位置算
+            a = math.radians(h)
+            x, y = x + f * math.cos(a) - l * math.sin(a), y + f * math.sin(a) + l * math.cos(a)
+        return x, y, h
 
     def _raw_near_box(self, search, J, claw, goalp, rc=(0.0, 0.0)):
         """(10-20)最近那格找/对准原料盘中心时车轮能挪的范围(相对示教时车停的地方)：往原料盘那边 toward、往外 away、前后 along 毫米
@@ -3187,6 +3204,9 @@ class MissionHooks:
         没有就按地图(停车点 -> 原料转盘)；都没有两边都按 toward。再按地图查：车挪到范围边上会出场地、离黄色区/工位/地图上的障碍物太近，
         那边就少挪一点。返回 (lo, hi)：[横移, 前进] 的下限、上限；往原料盘的方向记在 search['toward_vec']、search['toward_axis']。"""
         tw, aw, al = float(search.get('toward', 40.0)), float(search.get('away', 80.0)), float(search.get('along', 120.0))
+        sf, sl = (abs(float(v)) for v in getattr(self, '_cur_shift', (0.0, 0.0)))
+        if sf or sl:                                         # (10-20)规划时停车点挪过：能挪的范围放宽这么多(下面再按地图收)
+            tw, aw, al = tw + sl, aw + sl, al + sf
         u, how = None, ''
         if J is not None and float(np.linalg.norm(claw - goalp)) > 1.0:
             try:
@@ -5764,9 +5784,10 @@ class MissionHooks:
         vmax = float(cfg.get('zone_vel_speed', 15.0))
         vmin = float(cfg.get('zone_vel_min_speed', 5.0))
         smax = float(cfg.get('ring_strafe_max_mm') or 0.0) if not cfg.get('chassis_strafe', False) else 1000.0
-        scap = max(smax, float(cfg.get('zone_s_max_mm', 70.0)))
+        sh_f, sh_l = getattr(self, '_cur_shift', (0.0, 0.0))
+        scap = max(smax, float(cfg.get('zone_s_max_mm', 70.0))) + abs(float(sh_l))   # (10-20)规划时停车点横着挪过：多挪回来这么多
         fmax = float(cfg.get('zone_f_mm', 60.0))
-        seek_mm = float(cfg.get('zone_seek_mm', 200.0))
+        seek_mm = float(cfg.get('zone_seek_mm', 200.0)) + max(0.0, -float(sh_f))     # 停车点往后挪过：往前多找这么多
         seek_v = float(cfg.get('zone_seek_speed', 10.0))
         sp_px = float(cfg.get('ring_spacing_mm') or 150.0) * sc
         gate = max(40.0, 0.4 * sp_px)                         # 每帧只认推算位置这么近以内的(旁边的环隔一个间距)

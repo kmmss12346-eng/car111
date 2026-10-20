@@ -439,6 +439,21 @@ class LiveTests(unittest.TestCase):
         p = car.pose()
         self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'没回到出发位置：{p}')
 
+    def test_stop_command_checks_then_saves(self):
+        # (10-20 用户"这四个停靠位置我需要自己输入")stop RAW 1200 2210：压到原料转盘，不改，给出最近能停的 (1200,2155)；
+        # stop RAW 1200 2155：能停，存进配置文件；之后照常 go 跑完(规划用新的停车点)
+        def said(t):
+            return lambda: t in self.out_text()
+        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'stop'), (said('改停车点：stop'), 'stop RAW 1200 2210'),
+                                    (said('没改'), 'stop RAW 1200 2155'), (said('已改 RAW'), 'go')], screen_zone=None)
+        log = self.log
+        self.assertIn('不能停', log)
+        self.assertIn('stop RAW 1200 2155', log)
+        self.assertIn('已改 RAW：(1200,2100) 车头 180° → (1200,2155) 车头 180°', log)
+        self.assertEqual(self.cfg_after['stops']['RAW'], [1200, 2155, 180])
+        self.assertIn('路线全部走完', log, log[-3000:])
+
     def test_abort_then_quit_does_not_park(self):
         def moving():
             c = WORLD.get('car')

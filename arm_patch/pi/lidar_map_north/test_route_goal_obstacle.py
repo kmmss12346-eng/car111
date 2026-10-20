@@ -158,6 +158,97 @@ class GoalObstacleTests(unittest.TestCase):
         self.assertLess(math.hypot(end[0] - 1200, end[1] - 2100), 0.6)
 
 
+
+class StopInputTests(unittest.TestCase):
+    """(10-20 用户)四个停车点自己输入：改了停车点路线规划不出来报错、障碍物离停车点太近车跑不到指定位置。"""
+
+    def test_stop_on_the_raw_plate_moves_to_the_nearest_free_pose(self):
+        # 用户把 RAW 改成 (1200,2210)：以前"本身车身(含雷达)就会压到原料转盘"整场规划失败；现在改停最近停得下的 (1200,2155)
+        cfg = dict(CFG, stops=dict(STOPS, RAW=[1200, 2210, 180]))
+        legs, why, _ = rp.plan_mission(cfg, [], STOPS['QR'], ['RAW', 'ROUGH'])
+        self.assertEqual(why, 'OK')
+        L = legs[0]
+        self.assertEqual(tuple(L['goal']), (1200.0, 2155.0, 180.0))
+        self.assertEqual(L['goal_shift'], (0.0, 55.0))                     # 往左(离原料盘远) 55mm
+        self.assertEqual(tuple(L['stop_pose']), (1200.0, 2210.0, 180.0))
+        for t in ('压到原料转盘', '(1200,2155)', '往左 55mm', 'stop 命令'):
+            self.assertIn(t, L['note'])
+        self.assertTrue(rp.moves_clear(CFG, [], STOPS['QR'], L['cmds'])[0])
+        end = run([L], STOPS['QR'])[0]
+        self.assertLess(math.hypot(end[0] - 1200, end[1] - 2155), 0.6)
+        self.assertEqual(tuple(legs[1]['start']), (1200.0, 2155.0, 180.0))  # 下一段从真正停的地方出发
+        self.assertIsNone(legs[1]['goal_shift'])
+
+    def test_stop_outside_the_field_moves_in(self):
+        cfg = dict(CFG, stops=dict(STOPS, QR=[2350, 1200, 90]))
+        legs, why, _ = rp.plan_mission(cfg, [], (2100, 600, 90), ['QR'])
+        self.assertEqual(why, 'OK')
+        self.assertEqual(tuple(legs[0]['goal']), (2240.0, 1200.0, 90.0))
+        self.assertIn('出场地', legs[0]['note'])
+
+    def test_unreachable_stop_parks_nearby_instead_of_failing(self):
+        # RAW 两边的车道都被圆柱挡得车身过不去：以前整场"没有可用路线"；run_live 最后一次(goal_near_fallback)改停附近开得到的位置
+        obs = [(1060, 1961, 25), (1432, 2208, 25)]
+        cfg = dict(CFG, margin_mm=20)
+        legs, why, _ = rp.plan_mission(cfg, obs, STOPS['QR'], ['RAW', 'ROUGH'])
+        self.assertNotEqual(why, 'OK')
+        t = time.monotonic()
+        legs, why, pl = rp.plan_mission(dict(cfg, goal_near_fallback=True), obs, STOPS['QR'], ['RAW', 'ROUGH'])
+        self.assertLess(time.monotonic() - t, 15.0)
+        self.assertEqual(why, 'OK')
+        self.assertTrue(getattr(pl, 'near_fallback', False))
+        L = legs[0]
+        f, l = L['goal_shift']
+        self.assertLessEqual(abs(f), rp.GOAL_NEAR_MM)
+        self.assertLessEqual(abs(l), rp.GOAL_NEAR_LATERAL_MM)
+        self.assertGreater(math.hypot(f, l), 1.0)
+        self.assertEqual(tuple(L['stop_pose']), (1200.0, 2100.0, 180.0))
+        self.assertIn('开不过去', L['note'])
+        self.assertIn('任务对准时要补上', L['note'])
+        self.assertTrue(rp.moves_clear(cfg, obs, STOPS['QR'], L['cmds'], margin_mm=MIN)[0])
+        self.assertTrue(rp.moves_clear(cfg, [], STOPS['QR'], L['cmds'])[0])
+        end = run([L], STOPS['QR'])[0]
+        self.assertLess(math.hypot(end[0] - L['goal'][0], end[1] - L['goal'][1]), 0.6)
+        self.assertEqual(legs[1]['stop'], 'ROUGH')
+
+    def test_check_stop(self):
+        r = rp.check_stop(CFG, [], 'RAW', (1200, 2210, 180))
+        self.assertFalse(r['ok'])
+        self.assertIn('压到原料转盘', r['why'])
+        self.assertEqual(r['near'][0][:2], (1200, 2155))
+        r = rp.check_stop(CFG, [], 'RAW', (1200, 2155, 180))
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['warn'], [])
+        for name in rp.STOP_NAMES:
+            r = rp.check_stop(CFG, [], name, STOPS[name])
+            self.assertTrue(r['ok'], (name, r))
+            self.assertEqual(r['warn'], [], name)
+        r = rp.check_stop(CFG, [], 'ROUGH', (1200, 300, 0))           # 离粗加工区只有 20mm(要 30)
+        self.assertFalse(r['ok'])
+        self.assertEqual(r['near'][0][:2], (1200, 310))
+        r = rp.check_stop(CFG, [], 'ROUGH', (1300, 400, 0))           # 停得下，但离工位远了、沿那一排偏了
+        self.assertTrue(r['ok'])
+        self.assertTrue(any('远 60mm' in w for w in r['warn']), r['warn'])
+        self.assertTrue(any('2 号环可能不在摄像头里' in w for w in r['warn']), r['warn'])
+        r = rp.check_stop(CFG, [], 'RAW', (1200, 2100, 0))            # 车头反了：原料盘在车的左边
+        self.assertTrue(any('左边' in w for w in r['warn']), r['warn'])
+        r = rp.check_stop(CFG, [], 'TEMP', (340, 1200, -80))
+        self.assertFalse(r['ok'])
+        self.assertIn('横平竖直', r['why'])
+        r = rp.check_stop(CFG, [], 'QR', (2350, 1200, 90))
+        self.assertFalse(r['ok'])
+        self.assertEqual(r['near'][0][:2], (2240, 1200))
+        ob = obs_beside('TEMP', 'front', 30)                           # 障碍物离车头 30mm：能停(停车点附近按 10mm 放宽)，提醒
+        r = rp.check_stop(CFG, [ob], 'TEMP', STOPS['TEMP'])
+        self.assertTrue(r['ok'])
+        self.assertTrue(any('障碍物' in w for w in r['warn']), r['warn'])
+        ob = obs_beside('TEMP', 'front', -5)                           # 压到车头：不能停，最近能停的往后挪
+        r = rp.check_stop(CFG, [ob], 'TEMP', STOPS['TEMP'])
+        self.assertFalse(r['ok'])
+        self.assertTrue(r['near'])
+        self.assertGreaterEqual(obs_gap(CFG, ob, (r['near'][0][0], r['near'][0][1], -90.0)), MIN - 0.5)
+
+
 class GoalObstacleDriveTests(unittest.TestCase):
     """auto_run 按规划的路线开：停车点旁边有障碍物时车真的停在停车点上；挪了停车点时终端说清楚。"""
 

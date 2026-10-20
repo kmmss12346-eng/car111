@@ -3531,6 +3531,25 @@ class ZoneCalTests(unittest.TestCase):
         far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
         self.assertLess(max(far), 3.0, far)
 
+    def test_shifted_stop_widens_the_strafe_range(self):
+        """(10-20 用户：障碍物离停车点太近)规划时把粗加工区的停车点横着挪了 100mm(导航调 stop_offset 说了)：2 号环对准时车轮
+        多横移回来这 100mm(不只 zone_s_max_mm 70)，三个都放准。不说的话车轮只挪 70mm，剩下的手臂补不够，会放偏、碰倒。"""
+        for side in (100.0, -100.0):
+            w = self._world(2, park={'ROUGH': 20.0}, park_side={'ROUGH': side}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, lines=lines)
+            rec = self._spy(w, h)
+            h.stop_offset('ROUGH', 0.0, side)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('这次停的位置比规定的停车点', text)
+            self.assertGreater(rec['s_max'].get('ROUGH', 0.0), 90.0, rec['s_max'])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+            far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
+            self.assertLess(max(far), 3.0, far)
+            self.assertEqual(h._stop_shift, {})                                     # 用过就清掉(下次到这里没挪就不放宽)
+
     def test_real_car_log_1020(self):
         """10-20 实车：车放偏(沿那一排 44mm、离圆环那一排 57mm)，画面里有个车上的东西一直被认成圆环(大小和圆环一样)，
         存的车轮和画面的对应关系转了 16°。照样只对准 2 号环一次：车轮横着挪过去、边走边修对应关系、不认那个东西，三个都放准；

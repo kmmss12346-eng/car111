@@ -36,10 +36,17 @@ v17(10-10 整合)：
    现在只在停车点附近(goal_relax_radius_mm)对这个障碍物放宽，按真实半径最少留 goal_obstacle_min_margin_mm(默认 10)，
    照样准确停在停车点上(车头还是配置的方向，从哪边开进去都行)；路线其余部分照样按 margin_mm。黄色区/工位/转盘/场地边不放宽。
    真车停在停车点上就碰到障碍物时，才沿车头方向挪到最近放得下的位置，note 和 leg['goal_shift'](往前mm, 往左mm)写清楚差多少。
+
+10-20(用户：四个停车点自己输入；改了停车点路线容易规划不出来报错；障碍物离停车点太近车跑不到指定位置)：
+   停车点本身就压到黄色区/工位/原料转盘/出场地：不再报错，改停到最近按硬余量停得下的位置(goal_fix_max_mm 内)，note 里写清楚。
+   plan_mission 的 cfg 里 goal_near_fallback=True 时(run_live 按最小的障碍物余量也规划不出来以后才用)：某个停车点怎么也开不过去，
+   就在它附近(沿车头方向 goal_near_mm、横着 goal_near_lateral_mm 内)找开得到的位置停，不再整场规划失败。
+   check_stop：run_live 里 stop 命令输入停车点时先检查能不能停，不能停就给出最近能停的几个位置。
 """
 import heapq
 import itertools
 import math
+import time
 
 import numpy as np
 
@@ -66,6 +73,10 @@ GOAL_OBS_MIN_MARGIN_MM = 10      # 停车点旁边的障碍物：真车(含雷�
 GOAL_RELAX_RADIUS_MM = 450       # 停车点附近多大范围内(转轴点离停车点)可以对障碍物放宽余量
 GOAL_SHIFT_MAX_MM = 300          # 停车点真的停不下时，最多挪多远去找放得下的位置
 EPS_MM = 0.05                    # 浮点误差：差这么一点不算不够余量
+GOAL_FIX_MAX_MM = 200            # (10-20)停车点本身压到黄色区/工位/原料转盘/出场地：最多挪这么远去找停得下的位置
+GOAL_NEAR_MM = 300               # (10-20)停车点开不过去：沿车头方向最多挪这么远找开得到的位置
+GOAL_NEAR_LATERAL_MM = 75        #   横着(离工位远/近)最多挪这么远(手臂、2 号环对准还够得着)
+GOAL_NEAR_BUDGET_S = 8.0         #   找附近位置最多花这么多秒
 
 _BIG = 1.0e5
 
@@ -726,6 +737,7 @@ class Planner:
         self.goal_shift_max = max(0.0, float(cfg.get('goal_shift_max_mm', GOAL_SHIFT_MAX_MM)))
         cyl = cfg.get('cylinder_diameter_mm')
         self.obs_real_r = float(cyl) / 2 if cyl else None
+        self.goal_fix_max = max(0.0, float(cfg.get('goal_fix_max_mm', GOAL_FIX_MAX_MM)))
 
     def _ext(self, h):
         """车头方向 h 时，车身外框(含雷达)相对车中心往 西、东、南、北 各伸出多少 mm。"""
@@ -1092,6 +1104,20 @@ class Planner:
                 return p, (u, v), False
         return None, None, False
 
+    def _fix_goal(self, items, goal):
+        """(10-20)停车点本身压到黄色区/工位/原料转盘/出场地：找离它最近(直线距离)、按硬余量停得下的位置(车头不变，5mm 一格)，
+        goal_fix_max_mm 内没有返回 None。"""
+        x, y, yaw = goal
+        mx = self.goal_fix_max
+        n = int(mx // 5)
+        offs = sorted(((i*5.0, j*5.0) for i in range(-n, n+1) for j in range(-n, n+1) if (i or j) and math.hypot(i, j)*5 <= mx),
+                      key=lambda o: (math.hypot(*o), abs(o[0]) + abs(o[1])))
+        for u, v in offs:
+            p = (x + u, y + v, yaw)
+            if self._goal_ok(items, p):
+                return p
+        return None
+
     def _goal_maps(self, items, relaxed, g_items, ox, oy, gp):
         """整段按 items 的表；停车点附近(转轴点离停车点 goal_relax_radius_mm 内)换成 g_items(障碍物放宽)的表。"""
         Mf = self.maps(ox, oy, items if relaxed else None)
@@ -1148,7 +1174,7 @@ class Planner:
         return best, why
 
     # ---------- 单段：准确地从起点走到停车点 ----------
-    def leg(self, start_piv, goal_pose, name):
+    def leg(self, start_piv, goal_pose, name, _fixed=None):
         """start_piv: 起点转轴点 (x, y, yaw)，任意位置(不要求在栅格上)。goal_pose: 停车点车中心 (x, y, yaw)。
         返回 (leg dict, 'OK') 或 (None, 原因)。
         10-12：停车点旁边有障碍物时照样准确停在停车点上(停车点附近只对它放宽到 goal_obstacle_min_margin_mm)；
@@ -1168,6 +1194,7 @@ class Planner:
         # (停车点离障碍物不够的，下面单独处理：只在停车点附近放宽)
         sg = self.pose_eval(start_c, items)
         gg = self.pose_eval((gx, gy, gyaw), items)
+        over = []
         for k, it in enumerate(items):
             low = None
             if sg[k] < it[7] - EPS_MM:
@@ -1175,13 +1202,26 @@ class Planner:
                 notes.append(f'⚠ 起点离{it[0]}只有 {sg[k]:.0f}mm(要 {it[7]:.0f}mm)，离开时按 {max(sg[k], 0):.0f}mm 放宽')
             if gg[k] < it[7] - EPS_MM and it[1] != 'obs':
                 if gg[k] < 0 or (it[1] == 'edge' and it[7] <= 0):
-                    return None, f'停车点 {name}({gx:.0f},{gy:.0f}) 本身' + _what(it, gg[k], False).replace('车身(含雷达)', '车身(含雷达)就')
+                    over.append((gg[k], k))
+                    continue
                 low = gg[k] if low is None else min(low, gg[k])
                 notes.append(f'⚠ 停车点 {name} 本身离{it[0]}只有 {gg[k]:.0f}mm(要 {it[7]:.0f}mm)，'
                              f'这一段只在{it[0]}这里放宽到 {gg[k]:.0f}mm，请把停车点往外挪')
             if low is not None:
                 lst = list(it); lst[7] = min(it[7], low - 0.5); items[k] = tuple(lst)
                 relaxed = True
+        if over:
+            # (10-20 用户：改了停车点路线规划不出来报错)停车点本身就压到区域/出场地：改停到最近停得下的位置，写清楚
+            g0, k0 = min(over)
+            why0 = f'停车点 {name}({gx:.0f},{gy:.0f}) 本身' + _what(items[k0], g0, False).replace('车身(含雷达)', '车身(含雷达)就')
+            p = self._fix_goal(self.items, (gx, gy, gyaw)) if _fixed is None else None
+            if p is None:
+                return None, why0 + (f'，周围 {self.goal_fix_max:.0f}mm 内也找不到停得下车身的位置' if _fixed is None else '')
+            leg, why = self.leg(start_piv, p, name, _fixed=(gx, gy, gyaw))
+            if leg is None:
+                return None, why0 + f'；改停最近停得下的 ({p[0]:.0f},{p[1]:.0f}) 也不行：{why}'
+            return _reshift(leg, (gx, gy, gyaw), f'⚠ {why0}：这次改停在最近停得下的 ({leg["goal"][0]:.0f},{leg["goal"][1]:.0f})'
+                                                  '(比规定的点{off})，请在 run_live 里用 stop 命令改停车点'), 'OK'
         # 停车点旁边的障碍物
         goal = (gx, gy, gyaw)
         g1, bad, rel1 = self._goal_relax(items, goal, 1)
@@ -1311,6 +1351,53 @@ class Planner:
 NO_ROUTE = '找不到路线（车道被障碍物堵死，或按现在的余量车身过不去/没有能转弯的位置）'
 
 
+def _off_txt(fwd, left):
+    return '、'.join(t for t in ((f'往{"前" if fwd > 0 else "后"} {abs(fwd):.0f}mm' if abs(fwd) >= 0.5 else ''),
+                                (f'往{"左" if left > 0 else "右"} {abs(left):.0f}mm' if abs(left) >= 0.5 else '')) if t) or '没挪'
+
+
+def _reshift(leg, stop_pose, note):
+    """这一段其实是去 stop_pose(规定的停车点)的，停在了 leg['goal']：goal_shift 按规定的点算，note 加在前面({off} 换成差多少)。"""
+    x, y, yaw = (float(v) for v in stop_pose[:3])
+    g = leg['goal']
+    a = math.radians(yaw)
+    fwd = (g[0]-x)*math.cos(a) + (g[1]-y)*math.sin(a)
+    left = -(g[0]-x)*math.sin(a) + (g[1]-y)*math.cos(a)
+    out = dict(leg)
+    out['stop_pose'] = (x, y, yaw)
+    out['goal_shift'] = (round(fwd, 1), round(left, 1)) if math.hypot(fwd, left) >= 0.5 else None
+    out['note'] = '；'.join(t for t in (note.replace('{off}', _off_txt(fwd, left)), leg.get('note') or '') if t)
+    return out
+
+
+def _near_leg(planner, start, goal, name, why0, cfg):
+    """(10-20 用户：障碍物离停车点太近，车跑不到指定位置)停车点 goal 怎么也开不过去：在它附近找开得到的位置停。
+    沿车头方向(前后，任务对准的方向)最多 goal_near_mm、横着最多 goal_near_lateral_mm，25mm 一格，离得近的先试(横着挪的按两倍算)；
+    位置本身要按硬余量停得下(障碍物按真实大小至少 goal_obstacle_min_margin_mm)。最多花 goal_near_budget_s 秒。"""
+    x, y, yaw = (float(v) for v in goal[:3])
+    a = math.radians(yaw)
+    fx, fy = math.cos(a), math.sin(a)
+    lx, ly = -fy, fx
+    mx = max(0.0, float(cfg.get('goal_near_mm', GOAL_NEAR_MM)))
+    ml = max(0.0, float(cfg.get('goal_near_lateral_mm', GOAL_NEAR_LATERAL_MM)))
+    budget = float(cfg.get('goal_near_budget_s', GOAL_NEAR_BUDGET_S))
+    nu, nv = int(mx // STEP), int(ml // STEP)
+    cands = sorted((abs(i) + 2.0*abs(j), abs(j), i*STEP, j*STEP) for i in range(-nu, nu+1) for j in range(-nv, nv+1) if i or j)
+    t0 = time.monotonic()
+    for _, _, u, v in cands:
+        if time.monotonic() - t0 > budget:
+            break
+        p = (x + u*fx + v*lx, y + u*fy + v*ly, yaw)
+        if not planner._goal_ok(planner.items, p):
+            continue
+        leg, _why = planner.leg(start, p, name)
+        if leg is None:
+            continue
+        return _reshift(leg, (x, y, yaw), f'⚠ {name} 规定的停车点({x:.0f},{y:.0f})开不过去({why0})：改停在附近开得到的 '
+                                          f'({leg["goal"][0]:.0f},{leg["goal"][1]:.0f})(比规定的点{{off}})，任务对准时要补上'), 'OK'
+    return None, why0
+
+
 def _fold_variants(cmds, h0, rx, ry, limit=10):
     """终点差值 (rx, ry)(世界坐标，转轴点)并进路线里的移动，不另发小移动。
     先试并进最后一条沿 x / y 方向的移动，再试更早的同方向移动，最后才在末尾补一条。返回若干种指令列表。"""
@@ -1413,7 +1500,7 @@ def check_moves(planner, pose, moves):
     return True, 'OK', end
 
 
-def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, planner=None):
+def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, planner=None, near=False):
     """按停车点顺序逐段规划。start_pose/stops 都是车身中心 (x, y, 车头)。
     start_pivot 给定时直接用它当起点转轴点（例如第二站斜着停、原地转回正后的转轴位置）。
     返回 [dict(stop, start, goal, cmds, poses, note, ...)], 说明, planner。位置都换算回车身中心。
@@ -1430,6 +1517,8 @@ def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, plan
         gx, gy, gyaw = (float(v) for v in stops[name][:3])
         heading_index(gyaw)
         leg, why = planner.leg(pose, (gx, gy, gyaw), name)
+        if leg is None and near:
+            leg, why = _near_leg(planner, pose, (gx, gy, gyaw), name, why, cfg)
         if leg is None:
             return legs, f'去 {name} 的路线失败：{why}', planner
         legs.append(leg)
@@ -1474,6 +1563,15 @@ def plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None):
             planner.fallback = (cap is not None and c2.get('strafe_max_mm_per_leg', cap) is None)
             planner.lane_fallback = (lane and bool(obstacles) and not c2['lane_block'])
             return legs, why, planner
+    if cfg.get('goal_near_fallback'):
+        # (10-20)怎么都规划不出来：开不过去的停车点改停在附近开得到的位置(车道不封死，只绕开障碍物本身)
+        c2 = tries[-1]
+        legs, why, planner = _plan_mission(c2, obstacles, start_pose, stop_names, start_pivot, near=True)
+        if why == 'OK':
+            planner.fallback = (cap is not None and c2.get('strafe_max_mm_per_leg', cap) is None)
+            planner.lane_fallback = (lane and bool(obstacles) and not c2['lane_block'])
+            planner.near_fallback = True
+            return legs, why, planner
     legs, why, planner = first
     planner.fallback = False
     planner.lane_fallback = False
@@ -1503,6 +1601,124 @@ def plan_leg(cfg, obstacles, start_pose, goal, start_pivot=None):
     leg = dict(legs[0])
     leg['planner'] = pl
     return leg
+
+
+# ====================================================================================
+# (10-20 用户"这四个停靠位置我需要自己输入选定合适位置")停车点检查
+# ====================================================================================
+STOP_NAMES = ('QR', 'RAW', 'ROUGH', 'TEMP')
+DEFAULT_STOPS = {'QR': (2100.0, 1200.0, 90.0), 'RAW': (1200.0, 2100.0, 180.0), 'ROUGH': (1200.0, 340.0, 0.0),
+                 'TEMP': (340.0, 1200.0, -90.0)}
+STOP_FAR_MM = 40.0               # 离工位/原料盘比原来的停车点远这么多：提醒手臂可能够不着
+STOP_ALONG_MM = 60.0             # 沿工位方向离工位中间(2 号环)这么远：提醒 2 号环可能不在摄像头里
+
+
+def _stop_target(cfg, name):
+    """停车点要对着的东西：(说明, 区域下标的种类, 中心 x, y, 沿那一排能偏多少)。QR 没有。"""
+    if name == 'RAW':
+        a = raw_area(cfg)
+        return '原料盘', 'raw', (a[0] + a[2]) / 2, (a[1] + a[3]) / 2, (a[2] - a[0]) / 2
+    if name in ('ROUGH', 'TEMP'):
+        r = ROUGH_ZONE if name == 'ROUGH' else TEMP_ZONE
+        return ('粗加工区' if name == 'ROUGH' else '暂存区'), 'zone', (r[0] + r[2]) / 2, (r[1] + r[3]) / 2, STOP_ALONG_MM
+    return None
+
+
+def _target_gap(cfg, items, gaps, name):
+    t = _stop_target(cfg, name)
+    if t is None:
+        return None
+    what = t[0] if t[1] == 'raw' else t[0]
+    for it, g in zip(items, gaps):
+        if it[1] == t[1] and (t[1] == 'raw' or it[0] == what):
+            return g
+    return None
+
+
+def check_stop(cfg, obstacles, name, pose):
+    """检查停车点 name 停在 pose(车中心 x, y, 车头°)行不行：
+    车身(含雷达)按硬余量不压黄色区/工位/原料转盘、不出场地；障碍物(扫描到的)按真实大小至少 goal_obstacle_min_margin_mm。
+    还看任务上的事(不挡着存，只提醒)：工位/原料盘要在车的右边(手臂、摄像头那边)，离得比原来的停车点远太多手臂够不着，
+    沿工位方向离 2 号环(工位中间)太远 2 号环可能不在摄像头里。
+    返回 dict(ok, why, warn=[提醒], near=[(x, y, 车头, 离输入的点多少mm)] 不能停时最近能停的几个位置, gap=(最近的区域说明))"""
+    x, y, h = (float(v) for v in pose[:3])
+    out = dict(ok=True, why='', warn=[], near=[], gap='')
+    if abs(wrap180(h - round(h / 90.0) * 90.0)) > 3.0:
+        out.update(ok=False, why=f'车头 {h:g}° 要横平竖直(0 东、90 北、180 西、-90 南)')
+        return out
+    h = wrap180(round(h / 90.0) * 90.0)
+    pl = Planner(dict(cfg, lane_block=False), obstacles or [])
+    items = pl.items
+    gaps = pl.pose_eval((x, y, h), items)
+    bad = None
+    for k, it in enumerate(items):
+        if it[1] == 'obs':
+            g = pl._obs_real_gap(it, gaps[k])
+            short = g < pl.goal_min - EPS_MM
+            txt = f'真车(含雷达)离{it[0]}只有 {g:.0f}mm(最少要 {pl.goal_min:.0f}mm)' if g >= 0 else f'车身(含雷达)会碰到{it[0]}'
+        else:
+            g = gaps[k]
+            short = g < it[7] - EPS_MM
+            txt = _what(it, g, False)
+        if short and (bad is None or g - (pl.goal_min if it[1] == 'obs' else it[7]) < bad[0]):
+            bad = (g - (pl.goal_min if it[1] == 'obs' else it[7]), txt)
+    if bad is not None:
+        out.update(ok=False, why=bad[1])
+        seen = []
+        p = pl._fix_goal(items, (x, y, h))
+        if p is not None:
+            seen.append(p)
+        a = math.radians(h)
+        for ax in ((math.cos(a), math.sin(a)), (-math.sin(a), math.cos(a))):       # 只沿车头方向挪 / 只横着挪
+            d = 5.0
+            while d <= pl.goal_fix_max + EPS_MM:
+                hit = None
+                for sgn in (1.0, -1.0):
+                    q = (x + sgn*d*ax[0], y + sgn*d*ax[1], h)
+                    if pl._goal_ok(items, q):
+                        hit = q
+                        break
+                if hit is not None:
+                    if all(math.hypot(hit[0] - e[0], hit[1] - e[1]) > 2.0 for e in seen):
+                        seen.append(hit)
+                    break
+                d += 5.0
+        out['near'] = sorted(((round(q[0]), round(q[1]), h, round(math.hypot(q[0] - x, q[1] - y)))
+                              for q in seen), key=lambda q: q[3])
+    else:
+        fk = [k for k, it in enumerate(items) if it[1] != 'obs']
+        k2 = min(fk, key=lambda i: gaps[i])
+        out['gap'] = _what(items[k2], gaps[k2], False)
+        for k, it in enumerate(items):
+            if it[1] == 'yellow' and gaps[k] < it[8] - 0.5:
+                out['warn'].append(f'离黄色区只有 {gaps[k]:.0f}mm(希望 {it[8]:.0f}mm 以上)，开进去要贴着黄色区走')
+            if it[1] == 'obs' and gaps[k] < it[7] - EPS_MM:
+                out['warn'].append(f'真车(含雷达)离{it[0]} {pl._obs_real_gap(it, gaps[k]):.0f}mm(路上要留 {it[7]:.0f}mm)：'
+                                   f'停车点附近按 {pl.goal_min:.0f}mm 放宽，能停；开不进去就停在附近开得到的地方')
+    t = _stop_target(cfg, name)
+    if t is not None:
+        what, _kind, cx, cy, along_ok = t
+        a = math.radians(h)
+        fwd = (cx - x)*math.cos(a) + (cy - y)*math.sin(a)
+        left = -(cx - x)*math.sin(a) + (cy - y)*math.cos(a)
+        if left > 0:
+            out['warn'].append(f'{what}在车的左边(车头 {h:g}°)：手臂和摄像头在车的右边，够不着。车头要转 180°')
+        else:
+            g_now = _target_gap(cfg, items, gaps, name)
+            d0 = DEFAULT_STOPS.get(name)
+            g_ref = None
+            if d0 is not None:
+                g_ref = _target_gap(cfg, items, pl.pose_eval(tuple(d0), items), name)
+            if g_now is not None and g_ref is not None and g_now > g_ref + STOP_FAR_MM:
+                out['warn'].append(f'车身离{what} {g_now:.0f}mm，比原来的停车点({d0[0]:.0f},{d0[1]:.0f})远 {g_now - g_ref:.0f}mm：'
+                                   '手臂可能够不着(工位里车最多横着挪 70mm)')
+            if abs(fwd) > along_ok + EPS_MM:
+                out['warn'].append(f'沿{what}那一排离{what}中间{"(2 号环)" if name != "RAW" else ""} {abs(fwd):.0f}mm'
+                                   + ('：原料盘中心在 x 1100~1300 之间，偏太多手臂够不着' if name == 'RAW'
+                                      else '：2 号环可能不在摄像头里(到了会往前慢慢找，最多 200mm)'))
+    if name in DEFAULT_STOPS and abs(wrap180(h - DEFAULT_STOPS[name][2])) > 1.0:
+        out['warn'].append(f'车头 {h:g}° 和原来的停车点({DEFAULT_STOPS[name][2]:g}°)不一样')
+    return out
 
 
 def route_stats(legs, cfg):
