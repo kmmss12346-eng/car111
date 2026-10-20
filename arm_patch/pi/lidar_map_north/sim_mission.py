@@ -3615,6 +3615,23 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(errs[True], 2.5, errs)
         self.assertLess(errs[True], errs[False], errs)
 
+    def test_wheels_not_moving_hands_over_to_the_arm(self):
+        """车轮没走起来(打滑；STM32 照样按发的速度算走了多少)：挪了 zone_stall_s 秒偏差都没小下去就不再磨，手臂补上，照样放好(不干等 40 秒)。"""
+        w = self._world(9, park={'ROUGH': 6.0}, stop_err_mm=0.5)
+        lines = []
+        h = self._make(w, lines=lines)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        w.vel_stuck = True
+        w.arrive('ROUGH', 1)
+        h.task('ROUGH', w.link, lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('偏差都没小下去', text)
+        self.assertIn('手臂补(车不动)', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        i = text.find('车轮边走边对准 2 号环')
+        self.assertGreater(i, 0)
+
     def test_side_commands(self):
         """去原料区先 SIDE RAW、到工位先 SIDE RING(STM32 按这一边的绕电池盒参数走)；旧程序不认 SIDE 也照常跑。"""
         w = self._world(8)

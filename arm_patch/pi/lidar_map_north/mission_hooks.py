@@ -276,6 +276,7 @@ DEFAULTS = dict(
     zone_lost_s=3.0,                    #   对准时连着几秒认不出 2 号环算跟丢了：停下重新找(停着找 2 倍这么久)
     zone_look_s=10.0,                   #   一开始停着找 2 号环最多多少秒(车没动，找不到多半是认不出：暂存区第二批 2 号环被物料盖住时改认物料)
     zone_settle_s=0.15,                 #   停车以后过这么久拍的才算"停着拍的"(刚停下车可能还在晃)
+    zone_stall_s=6.0,                   #   车轮挪了这么多秒偏差都没小下去(打滑、没走起来、在容差边上来回)：不再磨，剩下的手臂补
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
@@ -5725,6 +5726,7 @@ class MissionHooks:
         gate = max(40.0, 0.4 * sp_px)                         # 每帧只认推算位置这么近以内的(旁边的环隔一个间距)
         lost_s = float(cfg.get('zone_lost_s', 3.0))
         settle = float(cfg.get('zone_settle_s', 0.15) or 0.0)
+        stall_s = float(cfg.get('zone_stall_s', 6.0) or 0.0)
         t_dead = self.now() + float(cfg.get('zone_find_s', 40.0))
         d0 = act.disp
         f2 = self.ring_f.get((zone, 2))
@@ -5779,7 +5781,8 @@ class MissionHooks:
             e0 = float(np.linalg.norm(c - goalp)) / sc
             self.log(f'    车轮边走边对准 2 号环(只发 V 速度，不转车头；最快 {vmax:g}mm/s，越近越慢)：现在偏 {e0:.1f}mm；'
                      f'能挪 横移 {lo[0]:+.0f}~{hi[0]:+.0f}mm、沿那一排 {lo[1]:+.0f}~{hi[1]:+.0f}mm(相对停车点)')
-            t_meas, rest, done, edge, lost = self.now(), [], False, False, False
+            t_meas, rest, done, edge, lost, stalled = self.now(), [], False, False, False, False
+            best, t_best = e0, self.now()                     # 偏差最小到过多少、什么时候(车轮没走起来就别一直磨)
             t_log, frames, seen_n = self.now(), 0, 0
             e_start, t_start, em = e0, self.now(), e0
             while self.now() < t_dead:
@@ -5814,9 +5817,15 @@ class MissionHooks:
                     c, p_c = f
                     t_meas, rest = self.now(), []
                     e_start, t_start = float(np.linalg.norm(c - goalp)) / sc, self.now()
+                    best, t_best = e_start, self.now()
                     continue
                 e = c + J @ (drv.est() - p_c) - goalp
                 em = float(np.linalg.norm(e)) / sc
+                if rp is not None and em < best - 0.5:
+                    best, t_best = em, self.now()
+                if stall_s > 0 and self.now() - t_best > stall_s:
+                    stalled = True                            # 挪了这么久偏差都没小下去：剩下的手臂补
+                    break
                 d = -np.linalg.solve(J, e)                    # 还要走多少 [横移, 前进] 毫米
                 a_now = drv.pos()
                 dr = np.minimum(np.maximum(a_now + d, lo), hi) - a_now     # 能走的那一部分(横移、沿那一排都限着)
@@ -5859,7 +5868,8 @@ class MissionHooks:
             out['err_mm'] = em
             d_ = drv.pos()
             self.log(f'    车轮停在 横移 {d_[0]:+.0f}mm、前进 {d_[1]:+.0f}mm(相对停车点)：2 号环还偏 {em:.1f}mm' +
-                     ('' if done else ('(横移/前后到头了，剩下的手臂补)' if edge else ('' if lost else '(到时间了，剩下的手臂补)'))))
+                     ('' if done else ('(横移/前后到头了，剩下的手臂补)' if edge else ('' if lost else
+                      (f'(★ 车轮挪了 {stall_s:g} 秒偏差都没小下去：打滑/没走起来？剩下的手臂补)' if stalled else '(到时间了，剩下的手臂补)')))))
             if done:
                 out['ok'] = True
                 return out
