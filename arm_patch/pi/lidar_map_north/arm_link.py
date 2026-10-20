@@ -191,8 +191,22 @@ class ArmLink:
             self.log(f'    (ZONE {arg} 失败：{reply})')
         return bool(ok)
 
-    def claw(self, open_):
-        self.do('CLAW O' if open_ else 'CLAW C')
+    def claw(self, open_, where=None):
+        """夹爪张开/夹紧。(10-20 用户)张开分三个角度：where='RAW' 原料盘上方(参数 CLWOR)、'TRAY' 车上转盘上方(CLWOT)、
+        其他(None)= CLWO。STM32 是旧程序(不认 CLAW OR / CLAW OT)：照旧 CLAW O。"""
+        if not open_:
+            self.do('CLAW C')
+            return
+        cmd = {'RAW': 'CLAW OR', 'TRAY': 'CLAW OT'}.get(str(where or '').upper())
+        if cmd and getattr(self, '_claw3', True):
+            ok, reply, _ = self.request(cmd)
+            if ok:
+                return
+            if not ('ERR ARG' in reply or unknown_cmd(reply)):
+                raise ArmError(f'{cmd} 失败：{reply}')
+            self._claw3 = False
+            self.log('    (STM32 是旧程序，不认 CLAW OR / CLAW OT：夹爪照旧按 CLWO 张开。刷新的 arm.c 以后原料盘、车上转盘上方张开各用各的角度)')
+        self.do('CLAW O')
 
     def tt(self, slot):
         self.do(f'TT {int(slot)}')

@@ -168,6 +168,8 @@ class SimWorld:
         self.side = None                                       # (10-20)SIDE RAW/RING：手臂在哪边干活(固件按这一边的绕电池盒参数走)
         self.take_sides = []                                   # 每次 TAKE(从车上转盘取物料去圆环)时 (工位, side)
         self.side_fw = True                                    # STM32 认识 SIDE(新程序)
+        self.claw3_fw = True                                   # STM32 认识 CLAW OR / CLAW OT(10-20 夹爪三个张开角度)
+        self.claw_log = []                                     # 每次张开爪子：(用的指令 O/OR/OT, 那一刻夹着物料没有)
         self.link = SimLink(self)
         self.vision = SimVision(self)
 
@@ -518,10 +520,20 @@ class SimWorld:
                 self.screen[parts[1]] = text.split(' ', 2)[2]
             return True, 'DONE', info
         if verb == 'CLAW':
-            if parts[1] == 'O':
+            if parts[1] in ('OR', 'OT') and not self.claw3_fw:
+                return False, 'ERR ARG', info                     # 旧程序：当成脉宽数字，解析不了
+            if parts[1] in ('O', 'OR', 'OT'):
+                self.claw_log.append((parts[1], self.held is not None))
                 self._open_claw()
-            else:
+            elif parts[1] == 'C':
                 self.claw_open = False
+            else:                                                  # CLAW <微秒>：离张开近就算张开
+                us = float(parts[1])
+                if abs(us - P.get('CLWO', 2090.0)) < abs(us - P.get('CLWC', 2910.0)):
+                    self.claw_log.append(('US', self.held is not None))
+                    self._open_claw()
+                else:
+                    self.claw_open = False
             self._claw_wait()
             return True, 'DONE', info
         if verb == 'TT':
@@ -3774,6 +3786,7 @@ class ZoneCalTests(unittest.TestCase):
         self.assertTrue(any(abs(float(q.split()[2]) - w.params['R2T']) < 1e-3 for q in aps), aps[-8:])
         self.assertEqual(h.stats.place_ok, 2, text[-3000:])                     # 放回去的那个这次不放，另外两个照样放
         self.assertIn('已放回转盘', text)
+        self.assertIn(('OT', True), w.claw_log)                                  # (10-20)放回转盘松开用车上转盘上方的张开角度
 
 
 if __name__ == '__main__':

@@ -665,5 +665,32 @@ class ArmLinkTests(unittest.TestCase):
         self.assertEqual(ArmLink(link2, log=lambda m: None).park(), (False, 'ERR NOZERO'))
 
 
+    def test_claw_open_angle_by_place(self):
+        """(10-20 用户)夹爪张开三个角度：claw(True, 'RAW') = CLAW OR(原料盘上方)、'TRAY' = CLAW OT(车上转盘上方)、其他 CLAW O。
+        旧程序不认 OR/OT(当成脉宽数字解析失败回 ERR ARG)：退回 CLAW O，说一次，以后直接发 CLAW O。"""
+        class Link:
+            def __init__(self, new):
+                self.new, self.sent = new, []
+
+            def request(self, text, timeout, collect=False):
+                self.sent.append(text)
+                ok = text in ('CLAW O', 'CLAW C') or (self.new and text in ('CLAW OR', 'CLAW OT'))
+                out = (ok, 'DONE' if ok else 'ERR ARG', [])
+                return out if collect else out[:2]
+        link = Link(True)
+        a = ArmLink(link, log=lambda m: None)
+        a.claw(True, where='RAW')
+        a.claw(True, where='TRAY')
+        a.claw(True)
+        a.claw(False)
+        self.assertEqual(link.sent, ['CLAW OR', 'CLAW OT', 'CLAW O', 'CLAW C'])
+        old, lines = Link(False), []
+        a = ArmLink(old, log=lines.append)
+        a.claw(True, where='TRAY')
+        a.claw(True, where='RAW')
+        self.assertEqual(old.sent, ['CLAW OT', 'CLAW O', 'CLAW O'])
+        self.assertEqual(sum('旧程序' in l for l in lines), 1, lines)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

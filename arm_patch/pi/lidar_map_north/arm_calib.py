@@ -73,8 +73,10 @@ STEPS = [
     dict(key='AEXT', kind='choice', title='哪个舵机管前后伸缩', setup='high',
          text='输入 1 = ID1 管伸缩(ID2 管旋转)；输入 2 = ID2 管伸缩(ID1 管旋转)。\n'
               '不确定就先输入 w1 或 w2：那个舵机会来回动 5 度，看它是伸缩还是旋转。'),
-    dict(key='CLWO', kind='claw', title='夹爪张开', setup='high',
-         text='调到爪子张开得足够大、能从上面套住物料，又不会碰到旁边的东西。'),
+    dict(key='CLWO', kind='claw', title='夹爪张开(地上圆环那边和其他地方)', setup='high',
+         text='调到爪子张开得足够大、能从上面套住物料，又不会碰到旁边的东西。\n'
+              '这是地上圆环那边(放下、取回之前)和其他地方张开用的。原料盘上方、车上转盘上方张开的大小后面单独调(CLWOR、CLWOT 两步)，'
+              '那两步跳过就和这个一样。'),
     dict(key='CLWC', kind='claw', title='夹爪夹紧', setup='high',
          text='拿一个物料放在两个爪子中间，调到刚好夹稳(用手拽不下来)。\n'
               '不要比需要的更紧：夹得太紧，夹爪舵机会一直使劲顶着，很快发烫。'),
@@ -98,6 +100,11 @@ STEPS = [
     dict(key='ZDROP', kind='lift', title='往转盘里放 / 从转盘里取的高度 ZDROP', setup='turntable_down',
          text='先输入 c 让爪子夹住一个物料，再用 -10 / -5 / -1 慢慢往下降，\n'
               '降到物料底部离转盘格子大约 2~5mm(松开就落进去)。从转盘里取物料时也用这个高度，爪子要能夹住格子里的物料。'),
+    # (10-20 用户)夹爪张开分三个角度：车上转盘上方 CLWOT、原料盘上方 CLWOR、其他地方 CLWO。CLWOT/CLWOR 存 0 = 和 CLWO 一样
+    dict(key='CLWOT', kind='claw', title='夹爪在车上转盘上方张开 CLWOT(松开放进转盘、从转盘里取之前)', setup='tray_open_down',
+         needs_fw=True,
+         text='手臂在转盘 1 号格上方、降到了 ZDROP。调爪子张开的大小：松开时物料能落进格子，张着下去也能套住格子里的物料，\n'
+              '又不会碰到格子边。用 +50 / -50 调；c = 夹住看看，o = 回到正在调的张开。满意了回车。不用单独调(和 CLWO 一样)就输入 s。'),
     dict(key=('A1G', 'A2E'), kind='pose', title='原料盘上方的姿态', setup='raw',
          text='车按比赛时的位置停在原料盘前面，原料盘停着。把爪子移到原料盘上离车最近那一格(那个物料)的正上方：\n'
               '比赛时车就在这一格等，要的颜色转过来就夹(10-18 用户"最近那格"的做法)。用 2 +50 / 2 -50 调伸缩，1 +1 / 1 -1 调左右。\n'
@@ -116,6 +123,9 @@ STEPS = [
     dict(key='ZGRAB', kind='lift', title='在原料盘上夹物料的高度 ZGRAB', setup='raw_down',
          text='爪子张开，用 -10 / -5 / -1 慢慢往下降，降到张开的爪子正好套住物料、夹下去能夹稳的位置。\n'
               '可以输入 c 试夹一下，再 o 张开。爪子不能碰到盘子。'),
+    dict(key='CLWOR', kind='claw', title='夹爪在原料盘上方张开 CLWOR(夹原料之前)', setup='raw_open_down', needs_fw=True,
+         text='手臂在原料盘上方、降到了 ZGRAB。调爪子张开的大小：要能套住物料，又不会碰到旁边的物料和盘子。\n'
+              '用 +50 / -50 调；c = 夹住看看，o = 回到正在调的张开。满意了回车。不用单独调(和 CLWO 一样)就输入 s。'),
     dict(key='ZOBRAW', kind='lift', title='摄像头看原料盘的高度 ZOBRAW', setup='raw_obs', optional=True,
          text='摄像头对准原料盘时手臂停的高度，要能从画面里看到整个物料。\n'
               '已经用 vcal 标定过摄像头的话不要改它，输入 s 跳过(改了要重新 vcal)。'),
@@ -157,8 +167,9 @@ STEPS = [
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
-CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'CLWOR': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
 REMOVED_STEPS = ('PL1', 'PL2')          # (10-20 用户"把 28、29 步的补偿去掉")以前的第一层/第二层放置补偿，比赛时也不再用
+OPEN_KEYS = ('CLWO', 'CLWOR', 'CLWOT')  # 夹爪张开的三个角度(10-20)：其他地方 / 原料盘上方 / 车上转盘上方
 RING_TEACH_FILE = 'ring_teach.json'     # 和 mission_cfg.ring_teach_file 一样：R1/R3 两步把 1、3 号环比 2 号环多转多少存在这里
 VIEW_LOG = '/tmp/vlive_wizard.log'
 
@@ -241,6 +252,7 @@ class Wizard:
         self.spd = 0.0                   # 夹爪速度那两步正在试的值
         self.saved = {}                  # 这次保存过的
         self.claw = None                 # 夹爪现在的脉宽(只知道发过去的值)
+        self.tune = None                 # 调夹爪那几步正在调的脉宽(中途 c 夹住看看、o 回来，不会丢)
         self.tt = None                   # 转盘现在的脉宽
         self.released = False            # 舵机松开了(用手摆)
         self.z_cmd = None                # 最后一次让升降去的高度(一样就不重复发)
@@ -313,6 +325,20 @@ class Wizard:
             self.claw = us
         return us
 
+    def claw_val(self, key):
+        """参数 key 的夹爪脉宽；CLWOR / CLWOT 存的 0(没单独调)= CLWO。"""
+        v = float(self.P.get(key, 0.0) or 0.0)
+        return v if (key not in ('CLWOR', 'CLWOT') or v >= CLAW_RANGE[0]) else float(self.P['CLWO'])
+
+    def open_us(self, st=None):
+        """(10-20)这一步张开爪子用哪个角度：原料盘那几步 CLWOR、车上转盘那几步 CLWOT、其他 CLWO。"""
+        kind = (st or {}).get('setup', '')
+        if kind.startswith('raw'):
+            return self.claw_val('CLWOR')
+        if kind.startswith(('turntable', 'tray')):
+            return self.claw_val('CLWOT')
+        return float(self.P['CLWO'])
+
     def tt_to(self, us):
         us = int(round(max(TT_RANGE[0], min(TT_RANGE[1], us))))
         if us != self.tt:
@@ -369,6 +395,8 @@ class Wizard:
             raise CalError('升降现在位置不明(LIFT? 回 0)：先在 map_merge_live 里看 arm LIFT ENC?，或者重新上电让它自动回到 60mm。')
         self.out(f'STM32 连接正常。升降现在 {z:g}mm，最高 {P.get("LFMAX", 100):g}mm。')
         self.out('夹爪 CLWO={CLWO:g}/CLWC={CLWC:g}  转盘 TT1={TT1:g} TT2={TT2:g} TT3={TT3:g}  伸缩舵机 AEXT={AEXT:g}'.format(**P))
+        if 'CLWOR' in P and 'CLWOT' in P:
+            self.out('夹爪张开：原料盘上方 CLWOR={:g}  车上转盘上方 CLWOT={:g}(0 = 和 CLWO 一样)'.format(P['CLWOR'], P['CLWOT']))
 
     # ------------------------------------------------------------ 每一步开始前摆好
     def _setup(self, st):
@@ -383,8 +411,17 @@ class Wizard:
             slot = st.get('slot', 1)
             self.tt_to(P[f'TT{slot}'])
         elif kind in ('raw', 'raw_down', 'raw_obs'):
-            self.claw_to(P['CLWO'])
+            self.claw_to(self.claw_val('CLWOR'))
             self.pose(P['A1G'], P['A2E'])
+        elif kind == 'raw_open_down':                         # (10-20)CLWOR：在原料盘上方降到 ZGRAB 调张开
+            self.pose(P['A1G'], P['A2E'])
+            self.claw_to(self.claw_val(st['key']))
+            self.lift_to(P['ZGRAB'])
+        elif kind == 'tray_open_down':                        # (10-20)CLWOT：在车上转盘 1 号格上方降到 ZDROP 调张开
+            self.pose(P['A1D'], P['A2R'])
+            self.tt_to(P['TT1'])
+            self.claw_to(self.claw_val(st['key']))
+            self.lift_to(P['ZDROP'])
         elif kind in ('ring', 'ring_down', 'ring_obs'):
             o = self._ring_teach_now(st['ring']) if st['kind'] == 'ringpose' else None
             if o:                                          # 1、3 号环存过：从存过的位置开始(对就直接回车)
@@ -423,7 +460,10 @@ class Wizard:
         if k == 'servo':
             return f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   (原来 {st["key"]}={P[st["key"]]:g})'
         if k == 'claw':
-            return f'夹爪 {self.claw}us   (原来 {st["key"]}={P[st["key"]]:g})'
+            was = (f'原来 {st["key"]}=0，和 CLWO={P["CLWO"]:g} 一样' if st['key'] in ('CLWOR', 'CLWOT') and P[st['key']] < CLAW_RANGE[0]
+                   else f'原来 {st["key"]}={P[st["key"]]:g}')
+            now = '' if self.claw == self.tune else f'，夹爪现在在 {self.claw}us(' + ('o' if st['key'] in OPEN_KEYS else 'c') + ' 回到正在调的)'
+            return f'{st["key"]} {self.tune:g}us{now}   ({was})'
         if k == 'speed':
             return f'{st["key"]}={self.spd:g} 微秒/秒(0 = 一下子到)   (原来 {P.get(st["key"], 0):g})'
         if k == 'tt':
@@ -441,8 +481,8 @@ class Wizard:
         try:
             if k == 'lift' and self.z is not None and abs(self.z - P[st['key']]) > 0.05:
                 return f'{st["key"]}={self.z:g}'
-            if k == 'claw' and self.claw is not None and abs(self.claw - P[st['key']]) > 0.5:
-                return f'{st["key"]}={self.claw:g}'
+            if k == 'claw' and self.tune is not None and abs(self.tune - self.claw_val(st['key'])) > 0.5:
+                return f'{st["key"]}={self.tune:g}'
             if k == 'speed' and abs(self.spd - P.get(st['key'], 0.0)) > 0.5:
                 return f'{st["key"]}={self.spd:g}'
             if k == 'tt' and self.tt is not None and abs(self.tt - P[st['key']]) > 0.5:
@@ -576,7 +616,7 @@ class Wizard:
         if k in ('pose', 'servo', 'ringpose'):
             self._read_servos()
         if k == 'claw':
-            self.claw_to(P[st['key']])
+            self.tune = self.claw_to(self.claw_val(st['key']))
         if k == 'speed':
             if st['key'] not in P:
                 self.out(f'  STM32 里还没有 {st["key"]} 这个参数(是旧程序)：先烧录新的 arm.c，这一步跳过。')
@@ -629,11 +669,11 @@ class Wizard:
         if line in ('h', '?', 'help'):
             self.out(HELP)
             return None
-        if line == 'o':
-            self.claw_to(P['CLWO'] if st['key'] != 'CLWO' else self.claw)
+        if line == 'o':                                   # 调张开那几步：回到正在调的；其他步：按这一步的地方张开(原料盘/转盘/其他)
+            self.claw_to(self.tune if (k == 'claw' and st['key'] in OPEN_KEYS) else self.open_us(st))
             return None
         if line == 'c':
-            self.claw_to(P['CLWC'] if st['key'] != 'CLWC' else self.claw)
+            self.claw_to(self.tune if (k == 'claw' and st['key'] == 'CLWC') else P['CLWC'])
             return None
         if line == 'u':
             self.release()
@@ -713,8 +753,11 @@ class Wizard:
         elif axis == 'z':
             self.z = self.lift_to(self.z + v if rel else v)
         elif axis == 'c':
-            want = (self.claw or P['CLWO']) + v if rel else v
+            base = self.tune if (k == 'claw' and self.tune is not None) else (self.claw or P['CLWO'])
+            want = base + v if rel else v
             got = self.claw_to(want)
+            if k == 'claw':
+                self.tune = got
             if abs(got - want) > 0.5:
                 self.out(f'  夹爪到限位了({CLAW_RANGE[0]}~{CLAW_RANGE[1]}us，main.c 里 CLAW_MIN_US / CLAW_MAX_US)')
         elif axis == 't':
@@ -730,8 +773,12 @@ class Wizard:
             self.save({'AEXT': self.P['AEXT']})
             return +1
         if k == 'claw':
-            self.save({st['key']: float(self.claw)})
-            self.claw_to(self.P['CLWO'])           # 张开，免得一直夹着
+            v = float(self.tune)
+            if st['key'] in ('CLWOR', 'CLWOT') and float(self.P.get(st['key'], 0.0)) < CLAW_RANGE[0] and abs(v - self.P['CLWO']) <= 0.5:
+                self.out(f'  没改：{st["key"]} 还是 0(和 CLWO 一样)')
+            else:
+                self.save({st['key']: v})
+            self.claw_to(self.open_us(st))         # 张开，免得一直夹着
         elif k == 'speed':
             self.save({st['key']: float(self.spd)})
             if st['key'] in ('CLSPD', 'CLSPO'):
@@ -768,7 +815,7 @@ class Wizard:
             self._read_servos()
             self.pose(self.cur[1], self.cur[2])     # 用手摆的：让舵机重新出力，停在摆好的位置
         if st['setup'].endswith('_down'):
-            self.claw_to(self.P['CLWO'])           # 往下降的那几步：松开(物料留在转盘/盘子/地上)，再抬起来
+            self.claw_to(self.open_us(st))         # 往下降的那几步：松开(物料留在转盘/盘子/地上)，再抬起来
             self.lift_to(self.P['ZHI'])
         return +1
 

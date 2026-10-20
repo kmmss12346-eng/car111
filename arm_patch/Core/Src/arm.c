@@ -4,7 +4,8 @@
  *   升降      Emm 步进电机 ID5(和轮子 1~4 号同一路 UART4，皮带升降)
  *   前后伸缩  飞特总线舵机 ID2      (main.c 里的 Servo_Move / Servo_Start，限位在那里)
  *   整臂旋转  飞特总线舵机 ID1      (同上)。哪个舵机管伸缩由参数 AEXT 决定(默认 2 = ID2 伸缩)
- *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Set；张开/夹紧的脉宽是参数 CLWO / CLWC)
+ *   夹爪      PA2  TIM2 通道 3      (main.c 里的 Claw_Set；张开/夹紧的脉宽是参数 CLWO / CLWC；
+ *                                   原料盘上方、车上转盘上方张开另有 CLWOR / CLWOT，0 = 和 CLWO 一样)
  *   转盘      PB3  TIM2 通道 2      (main.c 里的 Turntable_Set；三个位置的脉宽是参数 TT1 / TT2 / TT3)
  *   扫码模块  UART5 (PC12/PD2)   GM65，出厂 9600 8N1
  *   串口屏    USART2(PD5/PD6)    淘晶驰 TJC4832T135，出厂 9600
@@ -129,6 +130,9 @@ static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许�
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
 static float g_clwo   = 2090.0f;   /* CLWO   夹爪张开的脉宽(微秒) */
 static float g_clwc   = 2910.0f;   /* CLWC   夹爪夹紧的脉宽(微秒)。太紧了舵机一直使劲会发烫：调到刚好夹稳 */
+static float g_clwor  = 0.0f;      /* CLWOR  (10-20 用户)在原料盘上方张开的脉宽(夹原料之前张开)；0 = 和 CLWO 一样 */
+static float g_clwot  = 0.0f;      /* CLWOT  (10-20 用户)在车上转盘上方张开的脉宽(松开放进转盘、从转盘里取之前张开)；0 = 和 CLWO 一样。
+                                    *        CLWO 是其他地方(地上圆环放下、取回之前、OBS RING O 等)张开的脉宽 */
 static float g_tt1    = 2608.0f;   /* TT1    转盘 1 号位的脉宽(微秒) */
 static float g_tt2    = 1708.0f;   /* TT2    转盘 2 号位 */
 static float g_tt3    = 808.0f;    /* TT3    转盘 3 号位 */
@@ -200,6 +204,8 @@ static const ArmTun tun[] =
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
     { "CLWO",   &g_clwo,    500.0f,  2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
     { "CLWC",   &g_clwc,    500.0f,  2910.0f },
+    { "CLWOR",  &g_clwor,   0.0f,    2910.0f },  /* 0 = 用 CLWO；不是 0 就要在夹爪限位 500 ~ 2910 里面 */
+    { "CLWOT",  &g_clwot,   0.0f,    2910.0f },
     { "TT1",    &g_tt1,     500.0f,  2608.0f },  /* 范围 = main.c 里转盘的限位 TURNTABLE_MIN_US ~ TURNTABLE_MAX_US */
     { "TT2",    &g_tt2,     500.0f,  2608.0f },
     { "TT3",    &g_tt3,     500.0f,  2608.0f },
@@ -225,6 +231,10 @@ int Arm_Param_Set(const char *name, float v)
             if (v < tun[i].lo || v > tun[i].hi)
             {
                 return 2;
+            }
+            if ((tun[i].p == &g_clwor || tun[i].p == &g_clwot) && v > 0.5f && v < 500.0f)
+            {
+                return 2;                          /* 0 = 和 CLWO 一样；其他要在夹爪限位里面 */
             }
             if ((tun[i].p == &g_s1min && v >= g_s1max) || (tun[i].p == &g_s1max && v <= g_s1min) ||
                 (tun[i].p == &g_s2min && v >= g_s2max) || (tun[i].p == &g_s2max && v <= g_s2min))
@@ -1076,6 +1086,16 @@ static void Claw_O(void)
     Claw_Move((uint32_t)g_clwo);
 }
 
+/* (10-20 用户)夹爪张开分三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他地方 CLWO。CLWOR / CLWOT 是 0(没调)就用 CLWO */
+#define CLAW_AT_RAW   1
+#define CLAW_AT_TRAY  2
+static void Claw_OAt(uint8_t where)
+{
+    float us = (where == CLAW_AT_RAW) ? g_clwor : ((where == CLAW_AT_TRAY) ? g_clwot : 0.0f);
+
+    Claw_Move((uint32_t)((us >= 500.0f) ? us : g_clwo));
+}
+
 static void Claw_C(void)
 {
     Claw_Move((uint32_t)g_clwc);
@@ -1289,27 +1309,32 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     if (e) return e;
 
     g_side = ring;                                 /* (10-20)之后去/离开车上转盘按这一边的绕电池盒参数走 */
-    if (open_claw)  Claw_O();
+    if (open_claw)
+    {
+        if (ring)  Claw_O();
+        else       Claw_OAt(CLAW_AT_RAW);         /* (10-20)原料盘上方张开用 CLWOR */
+    }
     GO(Leave_Tray(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e));
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
     return NULL;
 }
 
 /* 手臂已经(用摄像头)对准了物料：下降夹紧 -> 抬起 -> 缩回并转到转盘上方 -> 下降 -> 转盘到位后松开 -> 抬起。
- * z = 夹取高度。结束时手臂停在转盘上方的最高处 */
-static const char *Seq_PickHere(uint8_t slot, float z)
+ * z = 夹取高度，ring = 1 是地上圆环(取回)、0 是原料盘。结束时手臂停在转盘上方的最高处 */
+static const char *Seq_PickHere(uint8_t slot, float z, uint8_t ring)
 {
     const char *e = Seq_Ready();
     if (e) return e;
     if (!Slot_Ok(slot))  return "ERR ARG";
 
     TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
-    Claw_O();                                      /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
+    if (ring)  Claw_O();                           /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
+    else       Claw_OAt(CLAW_AT_RAW);              /* (10-20)原料盘上方张开用 CLWOR */
     GO(Lift_Goto(z));                              /* 下降 */
     Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
     GO(Go_Tray(g_zdrop));                          /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降；A2T：伸着转过去) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
-    Claw_O();      WAIT(g_clwait);                 /* 松开：物料落进转盘 */
+    Claw_OAt(CLAW_AT_TRAY); WAIT(g_clwait);        /* 松开：物料落进转盘((10-20)车上转盘上方张开用 CLWOT) */
     GO(Lift_Goto(g_zhi));
     return NULL;
 }
@@ -1324,6 +1349,7 @@ static const char *Seq_Take(uint8_t slot)
     TT_Go(slot);
     Claw_O();
     GO(Go_Tray((g_ovlap > 0.5f) ? g_zdrop + g_ovclr : g_zhi));   /* 转到转盘上方(OVLAP=1：停在槽口上面一点) */
+    Claw_OAt(CLAW_AT_TRAY);                        /* (10-20)到了转盘上方：张开换成 CLWOT(没调就还是 CLWO，不动) */
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
     Claw_C();      WAIT(g_clwait);                 /* 夹起 */
@@ -2252,10 +2278,12 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     }
     v = t[0];
 
-    /* ---- 夹爪：CLAW O / CLAW C / CLAW <微秒> ---- */
+    /* ---- 夹爪：CLAW O / CLAW OR(原料盘上方张开) / CLAW OT(车上转盘上方张开) / CLAW C / CLAW <微秒> ---- */
     if (strcmp(v, "CLAW") == 0 && n == 2)
     {
         if (strcmp(t[1], "O") == 0)       Claw_O();
+        else if (strcmp(t[1], "OR") == 0) Claw_OAt(CLAW_AT_RAW);
+        else if (strcmp(t[1], "OT") == 0) Claw_OAt(CLAW_AT_TRAY);
         else if (strcmp(t[1], "C") == 0)  Claw_C();
         else
         {
@@ -2539,7 +2567,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             if (r)  FAIL(r);
             if (car_abort)  return 1;
         }
-        r = Seq_PickHere((uint8_t)slot, ring ? g_zplc : g_zgrab);
+        r = Seq_PickHere((uint8_t)slot, ring ? g_zplc : g_zgrab, ring);
         if (r)  FAIL(r);
         return 1;
     }

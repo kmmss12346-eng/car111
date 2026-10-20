@@ -1141,11 +1141,11 @@ def _vclaw(h, link, kind, color, log):
         pts = []
         for k in range(2):                              # 夹正、松开、升回去测；做两遍，两遍要一致
             log(f'{"①②"[k]} 降到 ZGRAB={P["ZGRAB"]:g} 夹一下把{name}色物料夹正，松开，升回 ZOBRAW={P["ZOBRAW"]:g} 测圆心')
-            h.arm.do('CLAW O')
+            h.arm.claw(True, where='RAW')               # (10-20)原料盘上方张开用 CLWOR(和比赛时夹原料一样)
             h.arm.do(f'LIFT {P["ZGRAB"]:g}')
             h.arm.do('CLAW C')
             h.sleep(0.5)
-            h.arm.do('CLAW O')
+            h.arm.claw(True, where='RAW')
             h.sleep(0.3)
             h.arm.do(f'LIFT {P["ZOBRAW"]:g}')
             h.sleep(0.4)

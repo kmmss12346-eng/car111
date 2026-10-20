@@ -379,6 +379,33 @@ int main(void) {
     clear(); run("TT 2"); run("TT 1");
     CHECK(has("ttus1650;") && has("tt1;"), "TT 2 用 TT2 的脉宽");
     Arm_Param_Set("CLWO", 2090); Arm_Param_Set("CLWC", 2910); Arm_Param_Set("TT2", 1708);
+    /* (10-20 用户)夹爪张开三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他地方 CLWO；CLWOR/CLWOT = 0 就用 CLWO */
+    CHECK(Arm_Param_Set("CLWOR", 300) == 2 && Arm_Param_Set("CLWOT", 3000) == 2 && Arm_Param_Set("CLWOR", 0) == 1,
+          "CLWOR/CLWOT：0 = 用 CLWO，其他要在夹爪限位 500~2910 里面");
+    away(); clear(); run("GRAB 2 H"); run("CLAW OR"); run("CLAW OT");
+    CHECK(!has("claw") && at("O;") >= 0, "CLWOR/CLWOT 没调(0)：GRAB 张开、松开、CLAW OR/OT 都和以前一样用 CLWO");
+    CHECK(Arm_Param_Set("CLWOR", 1500) == 1 && Arm_Param_Set("CLWOT", 1700) == 1, "CLWOR/CLWOT 可以设");
+    clear(); run("CLAW OR"); run("CLAW OT"); run("CLAW O");
+    CHECK(at("claw1500;") >= 0 && at("claw1500;") < at("claw1700;") && at("claw1700;") < at("O;"), "CLAW OR / CLAW OT / CLAW O");
+    away(); clear(); run("OBS RAW O");
+    CHECK(has("claw1500;") && !has("O;"), "OBS RAW O：原料盘上方张开用 CLWOR");
+    away(); clear(); run("OBS RING O");
+    CHECK(has("O;") && !has("claw1500;") && !has("claw1700;"), "OBS RING O：圆环那边张开用 CLWO");
+    away(); clear(); run("GRAB 2 H");
+    {
+        int open0 = at("claw1500;"), close = at("C;"), rel = at("claw1700;");
+        CHECK(open0 >= 0 && open0 < close && close < rel && !has("O;"), "GRAB H：下爪前张开用 CLWOR，松开放进转盘用 CLWOT");
+    }
+    away(); clear(); run("PICK 1 H");
+    CHECK(at("O;") >= 0 && at("O;") < at("C;") && at("C;") < at("claw1700;") && !has("claw1500;"), "PICK H(圆环取回)：下爪前用 CLWO，放进转盘用 CLWOT");
+    away(); clear(); run("TAKE 3");
+    {
+        const char *q = strstr(ev, "claw1700;");
+        CHECK(q && at("C;") > (int)(q - ev) && at("L+4800;") > (int)(q - ev), "TAKE：到转盘上方换成 CLWOT 再下去夹");
+    }
+    clear(); run("DROP");
+    CHECK(has("O;") && !has("claw1700;") && !has("claw1500;"), "DROP：地上圆环松开用 CLWO");
+    Arm_Param_Set("CLWOR", 0); Arm_Param_Set("CLWOT", 0);
 
     /* ---- 急停：升降停下并要求重新回零 ---- */
     clear();

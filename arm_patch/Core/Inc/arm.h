@@ -4,6 +4,7 @@
  *
  *  夹爪 / 转盘 / 升降
  *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开(参数 CLWO) / 夹紧(参数 CLWC) / 直接给脉宽
+ *   CLAW OR | CLAW OT                     (10-20)原料盘上方张开(CLWOR) / 车上转盘上方张开(CLWOT)，0 = 和 CLWO 一样
  *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位(参数 TT1/TT2/TT3) / 直接给脉宽
  *   LIFT ZERO                              把"现在的高度"记为 0 (升降最低点)
  *   LIFT HOME                              让 ID5 驱动器自己回零(需先在驱动器里配好回零方式)

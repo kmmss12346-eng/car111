@@ -12,12 +12,12 @@ from arm_calib import Wizard, CalError, STEPS, STEP_KEYS
 RANGES = dict(LFMAX=(10, 105), ZHI=(0, 400), ZGRAB=(0, 400), ZDROP=(0, 400), ZPLC=(0, 400), ZSTK=(0, 400),
               ZOBRAW=(0, 400), ZOBRNG=(0, 400), A1G=(232, 417.6), A1D=(232, 417.6), A1H=(232, 417.6),
               A1P=(232, 417.6), A2E=(-1220, -503.5), A2R=(-1220, -503.5), A2P=(-1220, -503.5),
-              CLWO=(500, 2910), CLWC=(500, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
+              CLWO=(500, 2910), CLWC=(500, 2910), CLWOR=(0, 2910), CLWOT=(0, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
               AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000), A1T1=(-720, 720), A1T2=(-720, 720), A2SPD=(0, 1500),
               R1T1=(-720, 720), R2T=(-5000, 5000), R1T2=(-720, 720), R2SPD=(0, 1500))
 DEFAULTS = dict(LFMAX=100, ZHI=100, ZGRAB=20, ZDROP=60, ZPLC=0, ZSTK=60, ZOBRAW=100, ZOBRNG=100,
                 A1G=323, A1D=323, A1H=323, A1P=323, A2E=-862, A2R=-862, A2P=-862,
-                CLWO=2090, CLWC=2910, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0,
+                CLWO=2090, CLWC=2910, CLWOR=0, CLWOT=0, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0,
                 R1T1=0, R2T=0, R1T2=0, R2SPD=0)
 LIM = {1: (232.0, 417.6), 2: (-1220.0, -503.5)}
 
@@ -140,9 +140,11 @@ FULL = [
     '+12', '',                         # TT2 1708 -> 1720
     's',                               # TT3 跳过
     'c', '-30', '-5', '',              # ZDROP：夹住物料，100 -> 65
+    '-100', '',                        # CLWOT：车上转盘上方张开，从 CLWO(2040)调到 1940
     'u', ('hand', 350.2, -700.5),      # 原料盘：松开用手摆
     's', 's', 's', 's',                # 绕开电池盒 A1T1/A2T/A1T2/A2SPD 跳过
     '-80', '',                         # ZGRAB 100 -> 20
+    's',                               # CLWOR 跳过(和 CLWO 一样)
     's',                               # ZOBRAW 跳过
     '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
     's', 's',                          # 1、3 号环 R1/R3 跳过
@@ -257,13 +259,14 @@ class WizardTests(unittest.TestCase):
 
     def test_full_run_saves_everything(self):
         saved = self.run_wiz(FULL)
-        want = dict(AEXT=2, CLWO=2040, CLWC=2800, ZHI=100, A1D=333, A2R=-882, TT1=2600, TT2=1720, ZDROP=65,
+        want = dict(AEXT=2, CLWO=2040, CLWC=2800, CLWOT=1940, ZHI=100, A1D=333, A2R=-882, TT1=2600, TT2=1720, ZDROP=65,
                     A1G=350.2, A2E=-700.5, ZGRAB=20, A1P=323, A2P=-760, ZPLC=5, ZSTK=65, A1H=343, ARMOK=1)
         for k, v in want.items():
             self.assertAlmostEqual(saved[k], v, places=3, msg=k)
             self.assertAlmostEqual(self.stm.P[k], v, places=3, msg='STM32 ' + k)
         self.assertNotIn('TT3', saved)
         self.assertNotIn('ZOBRAW', saved)
+        self.assertNotIn('CLWOR', saved)                                  # 跳过：还是 0(和 CLWO 一样)
         self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.cfg), 'place_adj.json')))   # (10-20)不再量放置补偿
         sp = load(self.cfg)['stm32_params']
         for k, v in want.items():
@@ -432,6 +435,50 @@ class WizardTests(unittest.TestCase):
         saved = wiz.run()
         self.assertEqual(saved['AEXT'], 1)
         self.assertEqual(stm.P['AEXT'], 1)
+
+    # ---------------- (10-20 用户)夹爪张开三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他 CLWO
+    def test_tray_open_step_tunes_at_zdrop_and_keeps_value_through_c_and_o(self):
+        saved = self.run_wiz(['-200', 'c', 'o', '', 'q'], start=STEP_KEYS.index('CLWOT'))
+        self.assertEqual(saved['CLWOT'], 1890)                             # 从 CLWO 2090 开始调
+        self.assertEqual(self.stm.P['CLWOT'], 1890)
+        claws = [c for c in self.stm.sent if c.startswith('CLAW ')]
+        self.assertEqual(claws[-3:], ['CLAW 2910', 'CLAW 1890'] + claws[-1:])   # c 夹住看看，o 回到正在调的
+        i = self.stm.sent.index('CLAW 1890')
+        lifts = [c for c in self.stm.sent[:i] if c.startswith('LIFT ')]
+        self.assertEqual(lifts[-1], 'LIFT 60')                             # 降到 ZDROP 调
+        self.assertIn('AP 323 -862', self.stm.sent[:i])                    # 转盘上方的姿态
+        self.assertEqual(self.stm.z, 100)                                  # 回车以后抬回 ZHI
+        self.assertEqual(claws[-1], 'CLAW 2090')                           # 下一步到原料盘上方：CLWOR 没调 = CLWO
+
+    def test_raw_open_step_unchanged_stays_zero(self):
+        saved = self.run_wiz(['', 'q'], start=STEP_KEYS.index('CLWOR'))
+        self.assertNotIn('CLWOR', saved)                                   # 没改：还是 0(和 CLWO 一样)
+        self.assertEqual(self.stm.P['CLWOR'], 0)
+        self.assertTrue(any('没改' in l for l in self.lines), self.lines)
+        self.assertTrue(any('LIFT 20' == c for c in self.stm.sent), self.stm.sent)   # 在原料盘上方降到 ZGRAB 调
+
+    def test_open_angles_follow_the_place(self):
+        """原料盘那几步张开用 CLWOR，车上转盘那几步用 CLWOT，其他地方用 CLWO；没调(0)就是 CLWO。"""
+        stm = FakeStm32()
+        stm.P['CLWOR'], stm.P['CLWOT'] = 1500, 1700
+        self.run_wiz(['c', 'o', 'q', 'q'], stm=stm, start=STEP_KEYS.index('TT1'))
+        self.assertEqual([c for c in stm.sent if c.startswith('CLAW ')][-2:], ['CLAW 2910', 'CLAW 1700'])
+        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('A1G'))
+        self.assertEqual(stm.claw, 1500)                                   # 原料盘上方：CLWOR
+        self.run_wiz(['c', 'o', 'q', 'q'], stm=stm, start=STEP_KEYS.index('A1P'))
+        self.assertEqual([c for c in stm.sent if c.startswith('CLAW ')][-1], 'CLAW 2090')   # 圆环那边：CLWO
+        self.run_wiz(['c', '-5', '', 'q'], stm=stm, start=STEP_KEYS.index('ZDROP'))
+        self.assertEqual(stm.claw, 1700)                                   # 放进转盘松开：CLWOT
+
+    def test_open_angle_steps_skipped_on_old_firmware(self):
+        stm = FakeStm32()
+        for k in ('CLWOR', 'CLWOT'):
+            del stm.P[k]
+        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('CLWOT'))
+        self.assertTrue(any('CLWOT' in l and '旧固件' in l for l in self.lines), self.lines)
+        self.run_wiz(['', '', 'q'], stm=stm, start=STEP_KEYS.index('ZGRAB'))
+        self.assertTrue(any('CLWOR' in l and '旧固件' in l for l in self.lines), self.lines)
+        self.assertEqual(stm.claw, 2090)                                   # 没有 CLWOR：原料盘上方照旧 CLWO
 
 
 class HelperTests(unittest.TestCase):

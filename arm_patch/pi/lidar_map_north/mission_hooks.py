@@ -1134,7 +1134,7 @@ class MissionHooks:
             self._to_tray_detour(P)
             self.arm.tt(item.slot)
             self.arm.lift(float(P['ZDROP']))
-            self.arm.claw(True)
+            self.arm.claw(True, where='TRAY')                  # (10-20)车上转盘上方张开用 CLWOT
             self.arm.lift(float(P['ZHI']))
         except ArmAbort as ex:
             raise Abort(str(ex))
