@@ -489,7 +489,7 @@ def main():
             except Abort:raise
             except Exception as e:
                 print('  站点扫描失败：',e,'，按原路线继续。',flush=True);return None
-            r=relocalize(est,int(raw_cfg.get('reloc_frames',8)),frames_data=m.raw_frames) if SIM is None else None
+            r=relocalize(est,int(raw_cfg.get('reloc_frames',4)),frames_data=m.raw_frames) if SIM is None else None
             if r and r.get('ok'):
                 p=r['pose']
                 if math.hypot(p[0]-est[0],p[1]-est[1])>10 or abs(r['dyaw'])>0.5:

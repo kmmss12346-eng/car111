@@ -840,6 +840,7 @@ class Vision:
         hh, ww = fr.shape[:2]
         ang = np.radians(np.arange(0.0, 360.0, 5.0))
         best, best_k = None, None
+        info = self.last_seek = dict(tried=0, near=None)     # 认不出时日志里说最像的那个差在哪(实车上调 min_edge 等用)
         for h in list(hints)[:int(sk.get('max_seeds', 120))]:
             r0 = float(h[2]) if len(h) > 2 and h[2] else r_last
             if not r0:
@@ -854,9 +855,12 @@ class Vision:
             except (T.TurntableDetectionError, cv2.error, np.linalg.LinAlgError, ValueError):
                 continue
             cx, cy, rr = (float(x) for x in model)
+            info['tried'] += 1
             if not (cfg.minimum_radius_px <= rr <= cfg.maximum_radius_px) or abs(rr - r0) > 0.25 * r0:
                 continue
             if arc < min_arc or rms > max_rms or edge < min_edge:
+                if info['near'] is None or arc > info['near'][0]:
+                    info['near'] = (float(arc), float(rms), float(edge))   # 圆弧最长的那个：露出多少度、残差、边缘强度
                 continue
             k = (0.35 * min(1.0, arc / 180.0) + 0.5 * max(0.0, 1.0 - rms / (1.5 * max_rms)) + 0.15 * min(1.0, edge / 20.0))
             if best_k is None or k > best_k:

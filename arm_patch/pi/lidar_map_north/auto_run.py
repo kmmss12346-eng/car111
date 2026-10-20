@@ -894,7 +894,7 @@ class _Drive:
         rs = g('reloc_stops')
         self.reloc_stops = None if rs is None else {str(s).upper() for s in rs}
         self.reloc_on = bool(g('reloc_enabled', True)) and hasattr(ctx, 'relocalize')
-        self.reloc_frames = int(g('reloc_frames', 8))
+        self.reloc_frames = int(g('reloc_frames', 4))   # (10-20 用户嫌每个停车点定位太花时间)8 -> 4 帧：一帧 600 多个点，4 帧也比 ICP 用的 reloc_points(600)多
         self.fine = int(g('reloc_slow_rpm', 60))
         self.slow_below = float(g('slow_below_mm', 60))
         self.home_short = float(g('home_short_mm', 15))
@@ -1289,16 +1289,20 @@ class _Drive:
             if self.travel < self.min_travel and not up.startswith('PREHOME'):
                 self.log(f'    (上次定位以后才走了 {self.travel:.0f}mm，不到 reloc_min_travel_mm={self.min_travel:.0f}，这里不定位)')
             else:
+                t_r = time.monotonic()
                 meas = self._count(_reloc(self.ctx, self.nav.real(), self.reloc_frames))
+                meas['wall'] = time.monotonic() - t_r
         if meas is not None:
+            took = f"，一共用时 {meas['wall']:.1f} 秒" if meas.get('wall') is not None else ''
             if meas.get('ok'):
                 self.travel = 0.0
                 p = meas['pose']
                 self.log(f"    ◆ 雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°，比推算的偏 "
                          f"x{meas.get('dx', 0):+.0f} y{meas.get('dy', 0):+.0f}mm 车头{meas.get('dyaw', 0):+.1f}°"
-                         f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒）")
+                         f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒"
+                         f"{'，测了两次' if meas.get('n_meas', 1) > 1 else ''}{took}）")
             else:
-                self.log(f"    ◆ 雷达定位没成功：{meas.get('why')}。按推算的位置走。")
+                self.log(f"    ◆ 雷达定位没成功：{meas.get('why')}。按推算的位置走{took.replace('，', '(', 1) + ')' if took else ''}。")
         return meas
 
     def _next_axis(self):

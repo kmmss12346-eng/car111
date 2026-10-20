@@ -2716,7 +2716,11 @@ class MissionHooks:
                     vv = clampv(d * 1.5, vsearch)
                     send(float(vv[0]), float(vv[1]), run_s=float(np.linalg.norm(d)) / max(1e-6, float(np.linalg.norm(vv))))
             send(0.0, 0.0)
-            self.log(f'    ★ 找了 {float(sk.get("find_s", 90.0)):.0f} 秒还是认不出原料盘中心(一帧里最多看到 {most} 个物料；外圈也没认出来)')
+            ls = getattr(v, 'last_seek', None) or {}
+            nr = ls.get('near')
+            self.log(f'    ★ 找了 {float(sk.get("find_s", 90.0)):.0f} 秒还是认不出原料盘中心(一帧里最多看到 {most} 个物料；外圈也没认出来'
+                     + (f'；最像外圈的一段：露出 {nr[0]:.0f}°(要 90°)、残差 {nr[1]:.1f} 像素(要 4 以内)、边缘强度 {nr[2]:.0f}(要 12 以上)'
+                        if nr else '') + ')')
             return None
 
         hist, most = [], 0
