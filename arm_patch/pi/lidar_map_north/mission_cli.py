@@ -37,6 +37,8 @@ pcal show / pcal clear     看 / 清掉量过的补偿(存在 place_adj.json)
 rteach ROUGH|TEMP 2|1|3    (10-14)示教：车停在这个区 2 号环正前方。先 rteach ROUGH 2(手臂摆到看圆环的姿态、对准 2 号环、记下角度)；
                              再 arm AD 1 ±几度 把手臂大概转到 1 号环上方，rteach ROUGH 1(对准最近的圆环，记下和 2 号环差多少度)；3 号环一样。
                              比赛时(zone_reach=arm)车只对准 2 号环一次，1、3 号环按这里记的角度直接转过去放/取。rteach show / rteach clear
+                             (10-20 起推荐改在 arm_calib 里调：python3 arm_calib.py --from A1P，2 号环、1 号环、3 号环三步，粗加工区、暂存区共用；
+                             调过的比赛时 1、3 号环直接按角度放、不再用摄像头对，2 号环车轮连续慢慢对准一次，之后车不动)
 rteach RAW near <颜色号>   (颜色号 1 红 2 黄 3 蓝 4 绿；省赛没有黑、浅蓝)(10-18 用户)"最近那格"的做法(齿条不够长、手臂够不全三个停靠位时)：先在 arm_calib 的"原料盘上方的姿态"
                              把爪子摆到原料盘上离车最近那一格的正上方；车停在原料区、原料盘停着、这一格上是这个颜色的物料。手臂摆到看的姿态
                              不动，车轮慢慢挪(只用 V，车头不转)把这个物料对到爪子正下方，记下原料盘中心的位置、车轮挪了多少。
@@ -817,6 +819,20 @@ def _zone_preflight(h, zone, batch, force, log):
                                                else '码垛时下面的物料把白心盖住，认不到物料就认不出圆环'))
     if h.store is not None and h.store.get('RING', 'arm') is None:
         log('   第一次对圆环：会先小幅动几下手臂(和底盘)，测出动作和画面的对应关系，存下来以后直接用')
+    # (10-20 用户)1、3 号环在 arm_calib 里调：调过就只对准 2 号环一次，之后车不动
+    from mission_hooks import load_place_adj
+    t = (load_place_adj(h.cfg.get('ring_teach_file')) or {}).get(zone) or {}
+    if str(h.cfg.get('zone_reach') or '').lower() == 'arm' and all(k in t for k in ('1', '3')):
+        if str(t.get('src') or '') == 'arm_calib':
+            sm = h.cfg.get('zone_smooth', True) and h.store is not None and h.store.get('RING', 'ch') is not None \
+                and not h.store.synth('RING')
+            log('   1、3 号环按 arm_calib 调的角度：车只把 2 号环对准一次' + ('(车轮连续慢慢走，只发 V)' if sm else '') +
+                '，之后车不动，只转手臂过去放、取' +
+                ('' if sm else '。★ 还没有 vcal RING 量过的车轮和画面的对应关系：2 号环这次一步一步挪着对准(顺便测)'))
+        else:
+            log('   1、3 号环按以前 rteach 示教的角度(转过去以后还用摄像头再对一次)；建议在 arm_calib 里重新调：python3 arm_calib.py --from A1P')
+    elif str(h.cfg.get('zone_reach') or '').lower() == 'arm' and not h.cfg.get('zone_arm_geom'):
+        log('   ★★ 还没在 arm_calib 里调 1、3 号环：这次一个环一个环挪车对准(慢)。调法：q 退出 run_live，python3 arm_calib.py --from A1P')
     log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
 
 
@@ -944,6 +960,7 @@ def _rteach(h, link, zone, ring, path, log):
         rings = [[round(r[0] - cu, 1), round(r[1] - cv_, 1)] for r in (h.vision.ring_list() or [])]
     except Exception:
         rings = []
+    z['src'] = 'rteach'                                  # (10-20)不是 arm_calib 调的：比赛时 1、3 号环转过去以后还用摄像头再对一次
     if ring == 2:
         z['p2'] = [round(a1, 2), round(a2, 2)]
         z['seen2'] = [e for e in rings if math.hypot(e[0], e[1]) > 40.0]   # 对准 2 号环时画面里另外两个环在哪(比赛时和它比，补车停偏、车身斜)

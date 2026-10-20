@@ -504,3 +504,34 @@ git_log.txt                ← 分支最近 120 条提交记录
 - 停车点定位日志多了"一共用时 X 秒"、"测了两次"(修正量 >50mm 会再测一次)。下次看实车日志再决定还能省哪(比如 QR 站点扫描 12 帧)。
 - 想过"到工位时雷达在后台拍、和手臂摆姿势同时做"：工位车轮横移最多 ±20mm(`ring_strafe_max_mm`)，必须先定位修正再做任务；只有原料区能并行，一次省 1 秒左右，没做。
 - **车上配置里如果写了 `reloc_frames` 就按配置的**(map_config_*.json 是车上的文件，不能覆盖)。
+
+### 12.17 10-20 工位(粗加工区/暂存区)：2 号环车轮连续对准一次，之后车不动；1、3 号环按 arm_calib 调的角度只转手臂
+- **用户：**"对准二号环之后车保持不动……只动机械臂去放置物料"；"对准 1 号 3 号我可以自己去对准，加到 arm_calib.py 的校准过程中"；
+  "粗加工区和暂存区的位置是一样的，不需要重复对准"；"从车上转盘放到工位，手上有物料，转过去的位置应该和原料区不一样，怕挡到电池盒"；
+  "怎么实现车缓慢对准 2 号环，可以借鉴原料区的代码"；"一定要一次改好"。用户的照片 + 路线：两个区都是 1 号环在车头前方(同一边)，一份标定两个区共用。
+- **固件 arm.c(提交 1f7d247)：**新参数 R1T1/R2T/R1T2/R2SPD = 车上转盘 <-> 地上圆环这条路单独一组绕电池盒(意思同原料区 A1T1/A2T/A1T2/A2SPD)。
+  `g_side`(OBS RAW/RING、GRAB=原料盘、PICK=圆环、PLACE=圆环、新指令 `SIDE RAW|RING` 设)；`Detour_Get`：在圆环那边且 R2T≠0 用圆环那组，否则原料区那组；
+  `Leave_Tray` 圆环那组：转过 R1T2 伸到 R2T(要去的比 R2T 还长就直接到)，转过 R1T1 再到目标长度；`Sweep` 多一个 ID2 速度参数。arm.h 加了 SIDE 的说明。
+- **arm_calib.py：**A1P/A2P 那步改成"2 号环"(车停在比赛的停车点远近)；后面加 R1、R3(kind='ringpose'：爪子摆到 1/3 号环正上方，存"比 A1P/A2P 多转多少"
+  到 ring_teach.json 的 ROUGH 和 TEMP，`src='arm_calib'`，删掉旧的 e1/e3；以前存过就从存过的位置开始)；再加 R1T1/R2T/R1T2/R2SPD(夹着物料调，做完按原路回 2 号环上方)。
+  旧固件没有 R1T1 等参数就跳过那四步。test_arm_calib 37 个。
+- **mission_hooks.py：**
+  - `_teach(zone)` 多返回 `cal`(src=arm_calib)。没调过：★★ 大声提醒去 arm_calib 调，照旧一个环一个环挪车对准(`zone_arm_geom` 默认改成 False，不再按环距算)；rteach 示教的照旧(转过去还用摄像头再对)。
+  - `_p2_align`：align_by 是 wheels 且 `zone_smooth`(默认开)：`_ring2_smooth` —— 手臂先精确回 A1P/A2P(`zone_obs_fine`，OBS 大动作只到 1° 内，差 1° 到 1、3 号环偏 2mm 多)，
+    车轮只发 V(新的 `_VelDrive`：V? 量走了多少、到范围边上不再往外走、识别放后台线程每 0.15 秒续 V)；每帧按车走了多少推 2 号环在画面哪(看三个环时记的 `ring_uv`)，
+    只认推算位置 0.4 个环距以内的；偏多少 mm 就每秒走多少(最快 `zone_vel_speed` 15、最慢 5)；到容差停下，停稳 `zone_settle_s` 后拍 3 帧取平均再决定(容差 = tol_mm.RING)；
+    横移限 ±`ring_strafe_max_mm`(相对停车点)、沿那一排 `ring_f[2]`±`zone_f_mm`(60)；到边上了/到时间了还差：只动手臂补(`servo.run allow_chassis=False`，`_arm_only_kw`)；
+    跟丢 `zone_lost_s`(3)秒停下重新找；一开始停着找 `zone_look_s`(10)秒找不到：暂存区第二批 2 号环被盖住就改 `_align_covered`(物料顶面/外圈)一步一步对，
+    否则这一趟这个区 `_p2_failed`(不再试)，照旧一个环一个环对准。没有 RING 'ch' J、或只测过前后(synth)、或越走越偏：返回 'noj' 照旧一步一步(servo.run，会测 J)；不认 V：'nofw' 同上。
+  - `_place_item_arm`：cal 时 1、3 号环 = p2 + 调的角度(+ PL1/PL2 补偿)，**不再用摄像头对、不挪车**；`_cal_target` 按真限位(不收余量)查，超出 `zone_cal_over_deg`(ID1 2°、ID2 40°)以内按限位放，再多这个环不放(物料留车上)。
+  - 取回：放下时记了 `arm=True` 且车没动 → 直接按放下的角度取(以前就有)。
+  - `_zone_start` 发 `SIDE RING`，`_raw` 发 `SIDE RAW`(旧程序 ERR CMD 以后不再发)；`_put_back`(夹着物料放回转盘)按绕电池盒的角度分段 AP(`_to_tray_detour`)。
+  - `_zone_back`：这一趟车只用 V 动过(`_zone_v_only`)就只用 V 挪回停车点；发过 S/F(照旧挪车对准过)就照旧 S/F。
+  - `ring_offset_mm.TEMP` 改成和 ROUGH 一样(1 号 +150)：只在没有 RING ch J 时用。
+- **mission_cli.py：**mtest 开始前说这个区 1、3 号环调没调、2 号环能不能连续对；`rteach ROUGH|TEMP` 写 `src='rteach'`(不会顶着旧的 arm_calib 标记)。
+- **模拟器：**`SIDE` 指令、`take_sides`；ZoneCalTests(11 个：整场两批车只对 2 号环一次之后不动、停偏 45mm+离远 30mm 手臂补、跟丢再找、旧固件、没调过、超限位、
+  没 vcal RING、第二批 2 号环盖住、OBS 误差、SIDE、放回转盘绕电池盒)；RawFrameThreadTests 加 2 号环真实时间后台线程续 V。模拟误差平均 0.55mm/最大 0.98mm。
+- **测试：**466 单元(3 跳过) + 118 模拟全过。
+- **要留意：**① R1/R3 是相对 A1P/A2P 的，停车点离圆环那一排的远近要和调的时候一样(横移到头手臂补伸缩时，1、3 号环会偏 0.46×补的毫米数)；
+  ② ID1 有齿轮间隙：调 R1/R3 时从 2 号环转过去，比赛时从车上转盘转过去，方向不一样可能差一点——实车放偏了先看是不是总偏同一边；
+  ③ R1T1 要选在从 2 号环往车上转盘转、1 号/3 号环那边都碰不到电池盒的地方。

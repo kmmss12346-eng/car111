@@ -29,7 +29,7 @@ from vision import VisionError
 from task_plan import parse_code, role_of
 
 DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03, APN=0.02)
-_KEEP_TRK = ('APN', 'A?', 'GET', 'SET', 'SCR', 'SCMD', 'QR', 'QR?', 'LIFT?', 'PING', 'ZONE', 'ZONE?')   # 这些指令不动舵机
+_KEEP_TRK = ('APN', 'A?', 'GET', 'SET', 'SCR', 'SCMD', 'QR', 'QR?', 'LIFT?', 'PING', 'ZONE', 'ZONE?', 'SIDE')   # 这些指令不动舵机
 MEASURE_S = 0.35
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
@@ -165,6 +165,9 @@ class SimWorld:
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         # 小幅 AP(对准时的一步)额外多花的秒数：模拟里一步只按转速算(零点几秒)，10-12 用户实车上手臂对准一步要好几秒(等舵机到位、回读……)
         self.ap_fine_extra_s = float(ap_fine_extra_s)
+        self.side = None                                       # (10-20)SIDE RAW/RING：手臂在哪边干活(固件按这一边的绕电池盒参数走)
+        self.take_sides = []                                   # 每次 TAKE(从车上转盘取物料去圆环)时 (工位, side)
+        self.side_fw = True                                    # STM32 认识 SIDE(新程序)
         self.link = SimLink(self)
         self.vision = SimVision(self)
 
@@ -454,6 +457,13 @@ class SimWorld:
 
         if verb == 'PING':
             return True, 'PONG', info
+        if verb == 'SIDE':
+            if not self.side_fw:
+                return False, 'ERR CMD', info
+            if len(parts) != 2 or parts[1] not in ('RAW', 'RING'):
+                return False, 'ERR ARG', info
+            self.side = parts[1]
+            return True, 'DONE', info
         if verb == 'HOME':
             self.homed += 1                                      # 现在的车头方向记为要保持的方向
             self.stale_turn_deg = 0.0
@@ -568,6 +578,7 @@ class SimWorld:
                 return False, 'ERR NOZERO', info
         if verb == 'OBS':
             ring = parts[1] == 'RING'
+            self.side = 'RING' if ring else 'RAW'              # 和 arm.c 一样：OBS 也设 g_side
             self.a1_ref = P['A1P'] if ring else P['A1G']
             self.a2_ref = P['A2P'] if ring else P['A2E']
             if len(parts) == 3:
@@ -581,6 +592,7 @@ class SimWorld:
             return True, 'DONE', info
         if verb in ('GRAB', 'PICK'):
             slot = int(parts[1])
+            self.side = 'RING' if verb == 'PICK' else 'RAW'    # 和 arm.c 一样：PICK = 圆环那边，GRAB = 原料盘
             if len(parts) != 3 or parts[2] != 'H':
                 return False, 'ERR ARG', info
             self._open_claw()                                      # arm.c 下降前先张开爪子
@@ -617,6 +629,7 @@ class SimWorld:
             return True, 'DONE', info
         if verb == 'TAKE':
             slot = int(parts[1])
+            self.take_sides.append((self.zone, self.side))
             self._open_claw()                                      # arm.c 一开始就张开爪子
             self.held = self.tray[slot]
             self.tray[slot] = None
@@ -2169,6 +2182,68 @@ class RawFrameThreadTests(unittest.TestCase):
         self.assertAlmostEqual(car.disp['S'], float(car.where()[0]), delta=0.5)        # V 走过的距离记进 disp
         self.assertAlmostEqual(car.disp['F'], float(car.where()[1]), delta=0.5)
 
+    class RingCam:
+        """(10-20)假摄像头看地上圆环：拍照那一刻车在哪，2 号环就在画面哪里；认一帧要 frame_s 秒(真实时间)。"""
+
+        def __init__(self, car, J, c0, frame_s=0.5):
+            self.car, self.J, self.c0, self.frame_s = car, np.asarray(J, float), np.asarray(c0, float), frame_s
+            self.rng = np.random.default_rng(5)
+            self.live_goal = None
+            self.cfg = {}
+
+        def scale(self, kind):
+            return 1.46
+
+        def claw(self, kind):
+            return (320.0, 240.0)
+
+        def bounds(self, kind, inset=8.0):
+            return ((-280.0, -200.0), (280.0, 200.0))
+
+        def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
+            c = self.c0 + self.J @ self.car.where() + self.rng.normal(0, 0.8, 2)
+            time.sleep(self.frame_s)
+            if expect is not None and max_px and math.hypot(c[0] - expect[0], c[1] - expect[1]) > max_px:
+                return None
+            return float(c[0]), float(c[1])
+
+    class Arm:
+        def __init__(self):
+            self.P = dict(A1P=470.0, A2P=-780.0, ZOBRNG=0.0, ZHI=0.0)
+
+        def params(self, refresh=False):
+            return self.P
+
+        def read_angles(self, tries=6):
+            return self.P['A1P'], self.P['A2P']
+
+        def ap(self, a1, a2):
+            raise AssertionError('手臂在 A1P/A2P 上：不该再转')
+
+    def test_ring2_keeps_moving_while_a_frame_is_slow(self):
+        """(10-20)工位对准 2 号环：认一帧 0.5 秒时识别在后台线程，这边每 0.15 秒续一次 V，车一直在走；只发 V(不发 S/F)，对准到容差以内。"""
+        sc = 1.46
+        th = math.radians(-20.0)
+        J = sc * np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]]) @ np.diag([1.0, -1.0])
+        car = self.Car()
+        cam = self.RingCam(car, J, (320.0 + 14.0, 240.0 + 9.0), frame_s=0.5)
+        lines = []
+        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, place_adj_file='', zone_lost_s=4.0)}, log=lines.append, vision=cam,
+                         now=time.monotonic, sleep=time.sleep)
+        h.act, h.store, h.arm = car, self.Store(), self.Arm()
+        h.store.put('RING', 'ch', J)
+        out = h._ring2_smooth('ROUGH')
+        text = '\n'.join(lines)
+        self.assertIsInstance(out, dict, text)
+        self.assertTrue(out['ok'], (out, text))
+        c_true = cam.c0 + J @ car.where()
+        self.assertLess(float(np.linalg.norm(c_true - np.array([320.0, 240.0]))) / sc, 2.0, text)
+        gaps = [b[0] - a[0] for a, b in zip(car.sent, car.sent[1:]) if abs(a[1]) + abs(a[2]) > 1e-9]
+        self.assertTrue(gaps, text)
+        self.assertLess(max(gaps), 0.35, (max(gaps), text))                           # 车在走的时候一直续着，没有停下来过
+        self.assertAlmostEqual(car.disp['S'], float(car.where()[0]), delta=0.5)
+        self.assertAlmostEqual(car.disp['F'], float(car.where()[1]), delta=0.5)
+
 
 class RawCenterTeachTests(unittest.TestCase):
     """(10-18 用户)原料区：手臂摆到看原料盘的姿态不动，车轮边走边看把原料盘中心对到示教时的位置；对准以后车不再动，
@@ -3307,6 +3382,277 @@ class ZoneArmGeomTests(unittest.TestCase):
         n0 = len(lines)
         self.assertIsNotNone(h._p2_align('ROUGH'))
         self.assertIn('对准 2 号环以后车挪过了：回到 2 号环重新对准', '\n'.join(lines[n0:]))
+
+
+class ZoneCalTests(unittest.TestCase):
+    """(10-20 用户)arm_calib 里调过 1、3 号环(ring_teach.json src=arm_calib，两个区共用一份)：每个工位车轮连续慢慢对准 2 号环一次
+    (只发 V，不转车头；横移不超过 ±ring_strafe_max_mm，还差的手臂伸缩补)，之后车一下都不动(只有做完挪回停车点)；
+    1、3 号环按调的角度直接转过去放、取，不再用摄像头对，也绝不挪车。"""
+    CODE = MissionSimTests.CODE
+
+    @staticmethod
+    def _world(seed, **kw):
+        w = SimWorld(seed=seed, code=ZoneCalTests.CODE, arm_r_mm=300.0, **kw)
+        w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])            # 用户的照片：暂存区也是 1 号环在车头前方(和粗加工区一样)
+        return w
+
+    @staticmethod
+    def _deltas(w):
+        """手臂在 A1P/A2P、爪子正对 2 号环时，转到 1、3 号环要多转多少(按模拟里手臂的真几何算：相当于在 arm_calib 里调准了)。"""
+        R = w.arm_r
+        out = {}
+        for k in (1, 3):
+            t = w.ring_tan['ROUGH'][k]
+            ph = math.degrees(math.atan2(t, R))
+            out[str(k)] = [round(ph * (1.0 if w.k1 >= 0 else -1.0), 2), round((math.hypot(R, t) - R) / w.k2, 2)]
+        return out
+
+    def _make(self, w, extra=None, lines=None, cal=True, arm_j=True):
+        cfg = dict(align_by=ZONE_WHEELS, a1_range=[0.0, 720.0])
+        cfg.update(extra or {})
+        h = make(w, cfg, log=(lines.append if lines is not None else (lambda m: None)))
+        h._ensure(w.link)
+        if arm_j:
+            h.store.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        h.store.put('RING', 'ch', w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0]))     # 做过 vcal RING(车轮)
+        if cal:
+            d = self._deltas(w)
+            P = w.params
+            z = dict(d, src='arm_calib', p2=[P['A1P'], P['A2P']])
+            h._teach_all = {'ROUGH': dict(z), 'TEMP': dict(z)}
+        return h
+
+    def _spy(self, w, h):
+        """记下：工位里每条底盘 S/F 指令(那时 2 号环对准过没有)；V 有速度时 2 号环对准过没有；横移最远到哪(车真的走到的)。"""
+        rec = dict(moves=[], vel_after=[], s_max={}, vel_n=0, back=False)
+        om, ov, ob = h.act.chassis_move, h.act.vel, h._zone_back
+
+        def back(zone):                                             # 工位做完挪回停车点(这时车本来就要动)
+            rec['back'] = True
+            try:
+                return ob(zone)
+            finally:
+                rec['back'] = False
+        h._zone_back = back
+
+        def cm(sv, f, speed=None):
+            rec['moves'].append((w.zone, w.zone in h._p2, round(float(sv)), round(float(f))))
+            return om(sv, f, speed=speed) if speed else om(sv, f)
+
+        def vel(vs, vf):
+            if w.zone in ('ROUGH', 'TEMP') and (abs(vs) > 1e-9 or abs(vf) > 1e-9):
+                rec['vel_n'] += 1
+                if w.zone in h._p2 and not rec['back']:
+                    rec['vel_after'].append((w.zone, vs, vf))
+            r = ov(vs, vf)
+            if w.zone in ('ROUGH', 'TEMP'):
+                rec['s_max'][w.zone] = max(rec['s_max'].get(w.zone, 0.0), abs(w.off_s))
+            return r
+        h.act.chassis_move, h.act.vel = cm, vel
+        return rec
+
+    def _ok(self, w, h, text):
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-4000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-4000:])
+        self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
+        self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
+
+    def test_full_course_ring2_once_then_car_still(self):
+        """整场两批：每个工位只在 2 号环用 V 连续对准一次，之后车不动(没有 S/F，也没有 V)；1、3 号环按调的角度放，取回直接按放下的角度取；
+        12 个都放准；去圆环的 TAKE 都按圆环那边(SIDE RING)绕电池盒。"""
+        errs = []
+        for seed in range(3):
+            w = self._world(seed)
+            lines = []
+            h = self._make(w, lines=lines)
+            rec = self._spy(w, h)
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._ok(w, h, text)
+            self.assertIn('车轮边走边对准 2 号环', text)
+            self.assertIn('按 arm_calib 调的角度只转手臂', text)
+            self.assertNotIn('只动手臂对准', text)                         # 1、3 号环不再用摄像头对
+            for bad in ('照旧一个环一个环', '照旧挪车对准', '一步一步挪着对准'):
+                self.assertNotIn(bad, text)                                # 没有任何挪车对准的退路
+            self.assertIn('车没动、只转手臂放的，不再对准', text)
+            zone_moves = [m for m in rec['moves'] if m[0] in ('ROUGH', 'TEMP')]
+            self.assertEqual(zone_moves, [])                               # 工位里一条 S/F 都没有(对准、挪回停车点都只用 V)
+            self.assertIn('车轮挪回停车点(只用 V，不转车头)', text)
+            self.assertEqual(rec['vel_after'], [], text[-3000:])           # 对准 2 号环以后车轮不再走
+            self.assertGreater(rec['vel_n'], 0)
+            for z in ('ROUGH', 'TEMP'):
+                self.assertLessEqual(rec['s_max'].get(z, 0.0), h.cfg['ring_strafe_max_mm'] + 0.5, rec['s_max'])
+            self.assertTrue(w.take_sides and all(s == 'RING' for z, s in w.take_sides if z in ('ROUGH', 'TEMP')), w.take_sides)
+            self.assertLess(abs(h.act.disp['S']) + abs(h.act.disp['F']), 1.0)
+            errs += [e for (_, _, _, e, _st) in w.placed]
+        errs = np.array(errs)
+        print(f'\n  [工位按 arm_calib 调的角度放 3 组] 放置真实误差 平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
+        self.assertLess(errs.mean(), 2.0)
+        self.assertLess(errs.max(), 3.5)
+
+    def test_parked_off_along_and_too_far_from_the_row(self):
+        """车停得沿那一排偏了 45mm、离圆环那一排远了 30mm(横移最多 20mm)：车轮挪 45mm、横移到 20mm 为止，剩下 10mm 手臂伸缩补；照样放好。"""
+        w = self._world(2, park={'ROUGH': 45.0}, park_side={'ROUGH': 30.0}, stop_err_mm=0.5)
+        lines = []
+        h = self._make(w, lines=lines)
+        rec = self._spy(w, h)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('手臂补(车不动)', text)
+        self.assertLessEqual(rec['s_max'].get('ROUGH', 0.0), 20.5, rec['s_max'])
+        self.assertEqual(rec['vel_after'], [])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
+        self.assertLess(max(far), 7.5, far)                                # 至少还在 3 环以内(手臂补了伸缩，1、3 号环会偏一点)
+
+    def test_ring2_lost_for_a_while_is_found_again(self):
+        """对准时有几秒认不出 2 号环(被挡住/反光)：停下重新找，找到了接着对准。"""
+        w = self._world(4, park={'ROUGH': 30.0})
+        lines = []
+        h = self._make(w, lines=lines)
+        orig = w.vision.ring_px
+        st = dict(n=0)
+
+        def flaky(n=None, expect=None, any_size=False, max_px=None):
+            st['n'] += 1
+            if 8 <= st['n'] < 50:
+                w.advance(_frames_dt(n))
+                return None
+            return orig(n, expect, any_size, max_px)
+        w.vision.ring_px = flaky
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('跟丢了', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
+    def test_old_firmware_without_v_steps_like_before(self):
+        """STM32 是旧程序(不认 V)：2 号环照旧一步一步挪着对准；1、3 号环照样按调的角度只转手臂。"""
+        w = self._world(1)
+        w.vel_fw = False
+        lines = []
+        h = self._make(w, lines=lines)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('不认 V', text)
+        self.assertIn('按 arm_calib 调的角度只转手臂', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+
+    def test_uncalibrated_zone_says_so_loudly_and_aligns_each_ring(self):
+        """没在 arm_calib 里调过 1、3 号环：大声提醒怎么调，照旧一个环一个环挪车对准，照样放好。"""
+        w = self._world(0)
+        lines = []
+        h = self._make(w, lines=lines, cal=False)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('★★ ROUGH 还没在 arm_calib 里调 1、3 号环', text)
+        self.assertIn('arm_calib.py --from A1P', text)
+        self.assertNotIn('只转手臂', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+
+    def test_ring_out_of_limits_is_skipped_and_the_car_does_not_move(self):
+        """1、3 号环按调的角度超出 ID1 限位太多：这个环不放(物料留在车上)，车也不挪去对准；2 号环照样放。"""
+        w = self._world(3)
+        a1p = w.params['A1P']
+        lines = []
+        h = self._make(w, dict(a1_range=[a1p - 10.0, a1p + 10.0]), lines=lines)     # 转 26.6° 够不着
+        rec = self._spy(w, h)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('超出限位', text)
+        self.assertIn('这个环不放(车不挪', text)
+        self.assertEqual(rec['vel_after'], [])
+        self.assertTrue(all(m[1] for m in rec['moves'] if m[0] == 'ROUGH'), rec['moves'])
+        self.assertEqual((h.stats.place_ok, h.stats.place_total), (1, 3), text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
+
+    def test_without_wheel_calibration_steps_and_measures(self):
+        """没做过 vcal RING(车轮和画面的对应关系)：2 号环照旧一步一步挪着对准(顺便测)；下一个工位就能连续慢慢对。"""
+        w = self._world(5)
+        lines = []
+        h = self._make(w, lines=lines)
+        h.store.drop('RING', 'ch')
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('还没有 vcal RING 量过的车轮和画面的对应关系', text)
+        self.assertEqual(h.stats.place_ok, 6, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
+    def test_covered_ring2_in_batch2_falls_back_to_the_material(self):
+        """暂存区第二批：2 号环被第一批的物料盖住、车轮连续对准时认不出圆环：停着找一会儿(不干等 40 秒)，改按物料/圆环外圈一步一步对准，
+        照样码垛；1、3 号环还是按调的角度只转手臂。"""
+        w = self._world(7)
+        lines = []
+        h = self._make(w, lines=lines)
+        orig = w.vision.ring_px
+
+        def ring_px(n=None, expect=None, any_size=False, max_px=None):
+            if w.zone == 'TEMP' and h.on_ring.get(('TEMP', 2)):
+                w.advance(_frames_dt(n))
+                return None                                         # 白心被盖住：这个认法认不出
+            return orig(n, expect, any_size, max_px)
+        w.vision.ring_px = ring_px
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('2 号环上放着第一批的物料(白心盖住了)', text)
+        self._ok(w, h, text)
+        i = text.rfind('▶ TEMP 放')
+        self.assertIn('按 arm_calib 调的角度只转手臂', text[i - 3000:])
+
+    def test_obs_error_is_removed_before_aligning(self):
+        """OBS 大动作到位差 1°(ATOLC)：对准 2 号环前手臂先精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)，1、3 号环才放得准。"""
+        errs = {}
+        for fine in (True, False):
+            e = []
+            for seed in range(3):
+                w = self._world(seed)
+                w.obs_err_deg = 1.0
+                h = self._make(w, dict(zone_obs_fine=fine))
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+                e += [x for (z, k, _c, x, _st) in w.placed if z == 'ROUGH' and k in (1, 3)]
+            errs[fine] = max(e)
+        self.assertLess(errs[True], 2.5, errs)
+        self.assertLess(errs[True], errs[False], errs)
+
+    def test_side_commands(self):
+        """去原料区先 SIDE RAW、到工位先 SIDE RING(STM32 按这一边的绕电池盒参数走)；旧程序不认 SIDE 也照常跑。"""
+        w = self._world(8)
+        h = self._make(w)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+        self.assertIn('SIDE RAW', w.requests)
+        self.assertIn('SIDE RING', w.requests)
+        self.assertLess(w.requests.index('SIDE RAW'), w.requests.index('SIDE RING'))
+        w = self._world(8)
+        w.side_fw = False
+        h = self._make(w)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+        self.assertEqual(h.stats.place_ok, 3)
+        self.assertEqual(sum(1 for q in w.requests if q.startswith('SIDE')), 1)    # 回过一次 ERR CMD 以后不再发
+
+    def test_put_back_goes_around_the_battery_box(self):
+        """取了物料以后放不下去(下降出错)：放回转盘时按圆环那组绕电池盒的角度分段转回去(伸到 R2T 转过电池盒)，物料放回转盘槽。"""
+        from arm_link import ArmError
+        w = self._world(6)
+        w.params.update(R1T1=w.params['A1P'] - 10.0, R2T=w.params['A2R'] + 200.0, R1T2=w.params['A1D'] + 10.0, AEXT=2.0)
+        lines = []
+        h = self._make(w, lines=lines)
+        od, st = h._drop, dict(n=0)
+
+        def bad_drop(stack):
+            st['n'] += 1
+            if st['n'] == 1:
+                raise ArmError('LIFT 100.0 失败：ERR TIMEOUT')
+            return od(stack)
+        h._drop = bad_drop
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('按圆环那组绕电池盒的角度分段转回转盘', text)
+        self.assertEqual((w.loose, w.collisions), (0, 0), text[-3000:])
+        aps = [q for q in w.requests if q.startswith('AP ')]
+        self.assertTrue(any(abs(float(q.split()[2]) - w.params['R2T']) < 1e-3 for q in aps), aps[-8:])
+        self.assertEqual(h.stats.place_ok, 2, text[-3000:])                     # 放回去的那个这次不放，另外两个照样放
+        self.assertIn('已放回转盘', text)
 
 
 if __name__ == '__main__':
