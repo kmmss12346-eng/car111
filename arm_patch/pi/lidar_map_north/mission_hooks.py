@@ -6243,7 +6243,7 @@ class MissionHooks:
             a1, a2 = p2
             self.log('    环2：就在对准的这个环，不再对准')
         elif T.get('cal'):
-            # (10-20 用户)arm_calib 调过：直接按调的角度转过去(加上 PL1/PL2 的放置补偿)，不再用摄像头对，也绝不挪车
+            # (10-20 用户)arm_calib 调过：直接按调的角度转过去(放置补偿默认不加，见 place_comp_on)，不再用摄像头对，也绝不挪车
             d1, d2 = T[ring]
             tgt = self._cal_target(ring, p2[0] + d1, p2[1] + d2)
             if tgt is None:

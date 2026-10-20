@@ -26,7 +26,7 @@
 - **启停区 1**：和区 2 上下对称，车在两个区里**都是车头朝北**摆。`auto_run.zone_pose`：(x, y, h) -> (x, 2400-y, 180-h)；
   第二站动作换区时"前进"和"顺时针"取反（区 2：左 42、前 83、顺 60；区 1：左 42、后 83、逆 60）；PREHOME 在启停区靠场地里面那一侧。
   （以前按"绕场地中心转 90°、区 1 车头朝西"算，用户实测扫描、规划全错。）
-- 放置补偿 `place_adj.json`（RING=第一层平放，STACK=第二层码垛，[dID1, dID2] 度）：由 `arm_calib.py` 第 PL1/PL2 步，或 run_live 里 `pcal 1/2` 量出来；任务里加在摄像头对准以后的姿态上。
+- 放置补偿 `place_adj.json`（RING=第一层平放，STACK=第二层码垛，[dID1, dID2] 度）：由 `arm_calib.py` 第 PL1/PL2 步，或 run_live 里 `pcal 1/2` 量出来；任务里加在摄像头对准以后的姿态上。**（10-20 用户"把 28、29 步的补偿去掉"：arm_calib 的 PL1/PL2 已删，`mission_cfg.place_comp_on` 默认 false，place_adj.json 和 place_shift_mm 比赛时都不加）**
 - 任务码：run_live 里直接输入 `652+312+526+231` 等于 `mcode …`；`qr` 读到码会自动设好。另一个对话加了 `qr_fixed_code` / USB 扫码器独立进程读码。**用户 10-12：不要备用码**(qr_fallback_code 已删，apply_mission_config 会把它从配置里删掉)。
 
 ## 3. 最近的改动（按时间，详见 git log）

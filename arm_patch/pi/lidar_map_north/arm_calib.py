@@ -29,7 +29,7 @@
 以后每次启动 map_merge_live 都会自动把这些值发给 STM32，不用重新烧录。
 
     python3 arm_calib.py --from ZGRAB    从某一步开始(只重调其中几项时用)
-    python3 arm_calib.py --from PL1      只调第一层/第二层的放置位置(PL1、PL2 两步做完输入 q 退出)
+    python3 arm_calib.py --from A1P      只重调圆环那几步(2 号环、1 号环、3 号环上方的姿态……)
     python3 arm_calib.py --config xxx.json --port /dev/serial0
 
 需要 STM32 里是带 CLWO/TT1/AEXT 参数的新程序(2026-10-08 以后的 arm.c)。
@@ -148,16 +148,6 @@ STEPS = [
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
          text='在已经放好的物料上面再放一个时的高度，一般 = ZPLC + 物料高度(60mm)。\n'
               '可以在圆环里放一个物料，夹着第二个物料往下降到刚好叠上去。'),
-    dict(key='PL1', kind='place', adj='RING', z='ZPLC', title='第一层(平放)的放置位置', setup='place',
-         text='车停在圆环旁边(和比赛时一样)，圆环上空着。程序先让空爪子用摄像头对准圆环(和比赛时一样)，\n'
-              '再降到离地约 8mm。把一个物料塞进张开的爪子里，输入 c 夹住。\n'
-              '用 1 +0.5 / 1 -0.5(沿圆环那一排)、2 +10 / 2 -10(离圆环远/近)把物料挪到圆环正中，回车保存并放下。\n'
-              '存的是"夹着物料放准时，手臂比摄像头对准圆环的姿态多转了多少"，以后每次平放都按它补(弥补爪子夹物料的偏差)。\n'
-              '不需要就输入 s 跳过。'),
-    dict(key='PL2', kind='place', adj='STACK', z='ZSTK', title='第二层(码垛)的放置位置', setup='place',
-         text='车别动。刚做完 PL1 的话，它放下的物料就是下面那层；单独做这一步时，圆环先空着让摄像头对准，程序会再叫你把下面那层放进圆环正中。\n'
-              '爪子停在下面那个物料上方约 8mm：把第二个物料塞进爪子里，输入 c 夹住，用 1 ± / 2 ± 把它挪到下面那个物料的正上方，\n'
-              '回车保存并放下。以后每次码垛都按它补。不需要就输入 s 跳过。'),
     dict(key='ZOBRNG', kind='lift', title='摄像头看圆环的高度 ZOBRNG', setup='ring_obs', optional=True,
          text='摄像头对准地上圆环时手臂停的高度。已经用 vcal 标定过的话输入 s 跳过。'),
     dict(key='A1H', kind='servo', sid=1, title='收起待命的姿态(ID1)', setup='stow',
@@ -165,12 +155,10 @@ STEPS = [
               '这一步只调 ID1(ID2 用转盘上方那一步的角度)。'),
 ]
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
-PLACE_HOVER_MM = 8.0          # 第一层/第二层放置位置那两步：物料停在离地(离下面那个物料)这么高
-PLACE_ADJ_FILE = 'place_adj.json'   # 和 mission_cfg.place_adj_file 一样(run_live 里 pcal 也写这个文件)
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
-CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring',
-             'PL1': 'ring', 'PL2': 'ring'}
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
+REMOVED_STEPS = ('PL1', 'PL2')          # (10-20 用户"把 28、29 步的补偿去掉")以前的第一层/第二层放置补偿，比赛时也不再用
 RING_TEACH_FILE = 'ring_teach.json'     # 和 mission_cfg.ring_teach_file 一样：R1/R3 两步把 1、3 号环比 2 号环多转多少存在这里
 VIEW_LOG = '/tmp/vlive_wizard.log'
 
@@ -237,32 +225,10 @@ class SerialLink:
             pass
 
 
-class _WizArm:
-    """给 visual_servo 用的手臂：只转 ID1/ID2(AP，回读实际转了多少)，标定时不动底盘。"""
-
-    def __init__(self, wiz):
-        self.w = wiz
-
-    def arm_move(self, d_id2, d_id1):
-        a1, a2 = self.w.angle(1), self.w.angle(2)
-        self.w.pose(a1 + d_id1, a2 + d_id2)
-        b1, b2 = self.w.angle(1), self.w.angle(2)
-        return (b2 - a2, b1 - a1)
-
-    def chassis_move(self, s_mm, f_mm, speed=None):
-        raise CalError('标定向导里不动底盘')
-
-
 class Wizard:
-    def __init__(self, link, cfg_path, inp=input, out=print, view=False, popen=None, vision=None, store=None, sleep=time.sleep):
+    def __init__(self, link, cfg_path, inp=input, out=print, view=False, popen=None, sleep=time.sleep):
         self.link = link
-        self._vision_arg = vision        # None = 放置位置那两步要用时打开摄像头；False = 不用摄像头；其他 = 用这个(测试)
-        self._store_arg = store          # 手臂和画面的对应关系(servo_cal.json)；None = 按配置里的文件
         self.sleep = sleep
-        self._place_ref = None           # 这次运行里摄像头对准圆环时的 (ID1, ID2)：第一层、第二层的补偿都相对它算
-        self._ref = None                 # 当前放置那一步用的起点 (ID1, ID2)
-        self._ref_cam = False            # 起点是不是摄像头对准的(否则是 A1P/A2P)
-        self._place_lower = False        # 这次运行里 PL1 已经在圆环上放下了一个物料(PL2 的下面那层)
         self.view = view                 # 摄像头那几步自动打开 vlive.py 的窗口
         self._popen = popen or subprocess.Popen
         self._viewer = None              # vlive.py 进程
@@ -425,8 +391,6 @@ class Wizard:
                 self.pose(P['A1P'] + o[0], P['A2P'] + o[1])
             else:
                 self.pose(P['A1P'], P['A2P'])
-        elif kind == 'place':
-            self._setup_place(st)
         elif kind == 'stow':
             self.pose(P['A1H'], P['A2R'])
         elif kind in ('detour1', 'detour2', 'detour3'):
@@ -451,12 +415,6 @@ class Wizard:
         if k == 'pose':
             n1, n2 = st['key']
             return f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   (原来 {n1}={P[n1]:g} {n2}={P[n2]:g})'
-        if k == 'place':
-            r = self._ref or (P['A1P'], P['A2P'])
-            d1, d2 = self.cur[1] - r[0], self.cur[2] - r[1]
-            o = self._place_adj_now(st)
-            what = '摄像头对准圆环的姿态' if self._ref_cam else '圆环上方的姿态(A1P/A2P)'
-            return f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   比{what}多转 ID1 {d1:+.2f}° ID2 {d2:+.2f}°   (原来存的 {o[0]:+.2f} {o[1]:+.2f})'
         if k == 'ringpose':
             d1, d2 = self.cur[1] - P['A1P'], self.cur[2] - P['A2P']
             o = self._ring_teach_now(st['ring'])
@@ -550,115 +508,6 @@ class Wizard:
             pass
         self.out(f'  (摄像头画面关了{("：" + why) if why else ""}。输入 v 再打开)')
 
-    def _setup_place(self, st):
-        """第一层/第二层放置位置那两步的起点：
-        空爪在观察高度先用摄像头对准圆环(和比赛时一样)，记下这时的 ID1、ID2；补偿量 = 夹着物料放准时比它多转了多少。
-        比赛时也是先让摄像头对准、再加补偿，所以两边的起点一样，车停的位置、爪子点(vclaw RING)准不准都不影响补偿。
-        PL1 刚做过(车没动)：PL2 沿用 PL1 时对准的姿态，PL1 放下的物料就是下面那层。
-        用不了摄像头(不是在树莓派上、摄像头被占、认不到圆环)：退回按"圆环上方的姿态" A1P/A2P 算(车要和那一步停在同一个位置)。"""
-        P = self.P
-        stack = st['adj'] == 'STACK'
-        if stack and self._place_ref is not None:
-            ref, cam = self._place_ref, True
-            self.out('  沿用上一步(PL1)摄像头对准圆环的姿态(车没动过)')
-        else:
-            if stack and not self._place_lower:
-                self.out('  先让摄像头看清圆环：圆环里先空着(下面那层等对准以后再放)')
-            self.claw_to(P['CLWO'])
-            self.pose(P['A1P'], P['A2P'])
-            if 'ZOBRNG' in P:
-                self.lift_to(P['ZOBRNG'])
-            ref = self._cam_align()
-            cam = ref is not None
-            if cam:
-                self._place_ref = ref
-            else:
-                ref = (P['A1P'], P['A2P'])
-                self.out('  ★ 这次没用摄像头对准：补偿按"圆环上方的姿态"(A1P/A2P)算。车要和那一步停在同一个位置、那一步爪子要正对圆环中心，'
-                         '不然补偿不准。最好在树莓派桌面的终端里运行向导(先退出 map_merge_live，摄像头才空着)')
-            self.lift_to(P['ZHI'])                          # 转舵机之前先抬高
-            if stack and cam and not self._place_lower:
-                try:
-                    self.inp('  现在把一个物料放到圆环正中，当下面那层。放好按回车> ')
-                except EOFError:
-                    raise Quit()
-        self._ref, self._ref_cam = ref, cam
-        adj = self._place_adj_now(st)
-        self.pose(ref[0] + adj[0], ref[1] + adj[1])        # 从上次存的位置开始(没存过就是对准的姿态)
-        self.claw_to(P['CLWO'])
-        self.lift_to(P[st['z']] + PLACE_HOVER_MM)
-
-    def _cam_align(self):
-        """空爪在观察高度，摄像头对准圆环(用 visual_servo，和比赛时一样只动手臂)。返回对准时的 (ID1, ID2)；做不成返回 None。"""
-        P = self.P
-        if self._vision_arg is False:
-            return None
-        mode = self._view_mode if (self._viewer is not None and self._viewer.poll() is None) else None
-        self._view_close()                                  # 摄像头同一时间只能被一个程序打开
-        vis = res = None
-        try:
-            vis = self._open_vision()
-            from visual_servo import VisualServo
-            cfg = {}
-            if 'ATOL' in P:
-                ms = float(P['ATOL']) + 0.05                # 比舵机到位误差还小的一步动不了
-                cfg['min_step_deg'] = dict(id1=ms, id2=ms)
-            sv = VisualServo(_WizArm(self), self._open_store(), cfg=cfg, log=self.out, sleep=self.sleep)
-            self.out('  空爪用摄像头对准圆环(和比赛时一样)……')
-            self.sleep(0.3)
-            sc = float(vis.scale('RING'))
-            vc = getattr(vis, 'cfg', None)
-            if isinstance(vc, dict) and not vc.get('ring_rmax_cal') and vis.ring_error(n=3) is not None:
-                r = getattr(vis, 'last_ring_rmax', None)                 # 没做 vclaw RING：按认到的圆环大小算每毫米多少像素
-                if r:
-                    sc = 2.0 * float(r) / float(vc.get('ring_outer_diam_mm') or 95.0)
-            res = sv.run('RING', lambda: vis.ring_error(n=3), sc, 0.8, allow_chassis=False, max_iter=6,
-                         label='对准圆环', bounds=vis.bounds('RING'), confirm=True, filt=True)
-        except Quit:
-            raise
-        except Exception as e:
-            self.out(f'  ★ 摄像头对准圆环没做成：{e}')
-        finally:
-            if vis is not None and self._vision_arg is None:
-                try:
-                    vis.close()
-                except Exception:
-                    pass
-            if mode:
-                self._view_open(mode)
-        if res is None:
-            return None
-        if not (res.ok or res.err_mm <= 1.5):
-            self.out(f'  ★ 摄像头没对准圆环：{res.reason or "还差 %.1fmm" % res.err_mm}')
-            return None
-        a1, a2 = self.angle(1), self.angle(2)
-        self.out(f'  摄像头对准圆环了(还差 {res.err_mm:.1f}mm)：ID1={a1:g}° ID2={a2:g}°'
-                 f'(比圆环上方的姿态 A1P/A2P 多 {a1 - P["A1P"]:+.2f}° / {a2 - P["A2P"]:+.2f}°)')
-        return a1, a2
-
-    def _open_vision(self):
-        if self._vision_arg not in (None, False):
-            return self._vision_arg
-        from vlive import load_vision_cfg
-        from vision import Vision
-        v = Vision(load_vision_cfg(self.cfg_path), log=lambda m: None)
-        v.open()
-        return v
-
-    def _open_store(self):
-        """手臂和画面的对应关系 J(和 map_merge_live 用同一个 servo_cal.json；没有的话对准时会先小幅动几下测)。"""
-        if self._store_arg is not None:
-            return self._store_arg
-        from visual_servo import JacStore
-        name = 'servo_cal.json'
-        try:
-            mc = json.loads(self.cfg_path.read_text(encoding='utf-8')).get('mission_cfg') or {}
-            name = mc.get('servo_cal_file') or name
-        except Exception:
-            pass
-        p = Path(name).expanduser()
-        return JacStore(str(p if p.is_absolute() else ROOT / p))
-
     def _ring_teach_path(self):
         name = RING_TEACH_FILE
         try:
@@ -689,17 +538,6 @@ class Wizard:
                 self.pose(P['A1P'], P['A2P'])
         except CalError as e:
             self.out(f'  !! 回 2 号环上方失败：{e}')
-
-    def _place_adj_path(self):
-        return (self.cfg_path.parent if self.cfg_path is not None else ROOT) / PLACE_ADJ_FILE
-
-    def _place_adj_now(self, st):
-        try:
-            d = json.loads(self._place_adj_path().read_text(encoding='utf-8'))
-            v = d.get(st['adj']) or [0.0, 0.0]
-            return float(v[0]), float(v[1])
-        except Exception:
-            return 0.0, 0.0
 
     def _read_servos(self):
         """读两个舵机现在的角度。读不到(总线接触不好)：按刚才发的姿态算，不让整个向导停下。"""
@@ -735,7 +573,7 @@ class Wizard:
             self.z = P['ZHI']
         self.cur = {1: None, 2: None}
         self._q_warned = False
-        if k in ('pose', 'servo', 'place', 'ringpose'):
+        if k in ('pose', 'servo', 'ringpose'):
             self._read_servos()
         if k == 'claw':
             self.claw_to(P[st['key']])
@@ -926,23 +764,6 @@ class Wizard:
             path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
             self.saved[st['key']] = (round(d1, 2), round(d2, 2))
             self.out(f'  已保存：{st["ring"]} 号环比 2 号环多转 ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path.name}，粗加工区、暂存区共用)')
-        elif k == 'place':
-            self._read_servos()
-            r = self._ref or (self.P['A1P'], self.P['A2P'])
-            d1, d2 = self.cur[1] - r[0], self.cur[2] - r[1]
-            path = self._place_adj_path()
-            try:
-                d = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-            except Exception:
-                d = {}
-            d[st['adj']] = [round(d1, 2), round(d2, 2)]
-            path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
-            self.saved[st['key']] = (round(d1, 2), round(d2, 2))
-            self.out(f'  已保存：{st["title"]}补偿 ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path.name})')
-            self.lift_to(self.P[st['z']])                  # 放下去、松开、抬起来
-            self.claw_to(self.P['CLWO'])
-            self.lift_to(self.P['ZHI'])
-            self._place_lower = True                       # 圆环上留着物料：PL2 的下面那层
         if self.released:
             self._read_servos()
             self.pose(self.cur[1], self.cur[2])     # 用手摆的：让舵机重新出力，停在摆好的位置
@@ -997,8 +818,6 @@ class Wizard:
             self.out('这次保存的参数：' + '  '.join(f'{k}=' + ('/'.join(f'{x:g}' for x in v) if isinstance(v, tuple) else f'{v:g}') for k, v in self.saved.items()))
             if self.cfg_path is not None and any(not isinstance(v, tuple) for v in self.saved.values()):
                 self.out(f'已写进 {self.cfg_path}(原文件备份为 .json.bak)，以后 map_merge_live 启动会自动发给 STM32。')
-            if any(isinstance(v, tuple) for k, v in self.saved.items() if k in ('PL1', 'PL2')):
-                self.out(f'放置补偿存在 {self._place_adj_path()}：比赛时摄像头对准圆环以后自动按它补(第一层 PL1、第二层 PL2 各用各的)。')
             if any(k in self.saved for k in ('R1', 'R3')):
                 self.out(f'1、3 号环的角度存在 {self._ring_teach_path()}：比赛时车对准 2 号环以后不动，手臂直接按它转过去放、取'
                          '(粗加工区、暂存区共用)。重开 run_live 生效。')
@@ -1030,6 +849,10 @@ def main(argv=None):
     start = 0
     if args.start:
         key = args.start.upper()
+        if key in REMOVED_STEPS:
+            print(f'{key}(放置补偿)这一步已经去掉了：比赛时按摄像头对准的位置(1、3 号环按 R1/R3 调的角度)直接放，不再加补偿。'
+                  '要重调圆环那几步：python3 arm_calib.py --from A1P')
+            return 1
         if key not in STEP_KEYS:
             print('--from 可以用：' + ' '.join(STEP_KEYS))
             return 1

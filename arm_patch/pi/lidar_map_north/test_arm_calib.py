@@ -149,8 +149,6 @@ FULL = [
     's', 's', 's', 's',                # 去圆环绕开电池盒 R1T1/R2T/R1T2/R2SPD 跳过
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
-    'c', '1 +0.5', '2 -10', '',        # PL1：第一层放置补偿 ID1 +0.5、ID2 -10
-    's',                               # PL2 跳过
     's',                               # ZOBRNG 跳过
     '+20', '',                         # A1H 323 -> 343
     'y',                               # 打开 ARMOK
@@ -163,7 +161,6 @@ class WizardTests(unittest.TestCase):
         self.cfg = cfg if cfg is not None else make_cfg()
         self.lines = []
         self.inp = Script(self.stm, items)
-        kw.setdefault('vision', False)                                    # 测试里不开真的摄像头
         kw.setdefault('sleep', lambda s: None)
         self.wiz = Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, **kw)
         return self.wiz.run(start)
@@ -258,90 +255,6 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(out.count('旧固件'), 4)
         self.assertIn('ZPLC', out)
 
-    # ---------------- 第一层 / 第二层放置位置(PL1、PL2)：补偿相对"摄像头对准圆环的姿态"
-    TRUE = (324.2, -880.0)                     # 摄像头里圆环正对爪子点时 ID1、ID2 的角度(车停得和 A1P 那一步不一样)
-
-    def _cam(self):
-        import numpy as np
-        from visual_servo import JacStore
-        stm = FakeStm32()
-        J = np.array([[0.0, -3.8], [0.26, 0.0]])                          # 列：ID2 每度、ID1 每度 画面动多少像素
-
-        class FakeVision:
-            def ring_error(self, n=None, max_px=None):
-                d = np.array([stm.ang[2] - WizardTests.TRUE[1], stm.ang[1] - WizardTests.TRUE[0]])
-                p = J @ d
-                return float(p[0]), float(p[1])
-
-            def scale(self, kind):
-                return 1.46
-
-            def bounds(self, kind, inset=8.0):
-                return ((-300.0, -220.0), (300.0, 220.0))
-
-            def close(self):
-                pass
-        store = JacStore(None)
-        store.put('RING', 'arm', J)
-        return stm, FakeVision(), store
-
-    def _err_mm_at(self, vis, a1, a2):
-        import math
-        self.stm.ang[1], self.stm.ang[2] = a1, a2
-        p = vis.ring_error()
-        return math.hypot(*p) / 1.46
-
-    def test_place_steps_measure_from_the_camera_alignment(self):
-        """PL1、PL2：空爪先用摄像头对准圆环(和比赛时一样)，补偿 = 夹着物料对正时比这个姿态多转多少；PL2 沿用 PL1 的对准，
-        PL1 放下的物料就是下面那层(不用再问)。车停得和 A1P 那一步不一样也不影响。"""
-        stm, vis, store = self._cam()
-        saved = self.run_wiz(['c', '1 +0.5', '2 -10', '',              # PL1
-                              'c', '1 -0.3', '',                       # PL2
-                              'q'], stm=stm, start=STEP_KEYS.index('PL1'), vision=vis, store=store)
-        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
-        self.assertEqual(adj, {'RING': [0.5, -10.0], 'STACK': [-0.3, 0.0]}, self.lines)
-        self.assertEqual(saved['PL1'], (0.5, -10.0))
-        ref = self.wiz._place_ref
-        self.assertIsNotNone(ref, self.lines)
-        self.assertLess(self._err_mm_at(vis, *ref), 1.0)                 # 对准的姿态就是圆环正对爪子点的地方
-        self.assertGreater(abs(ref[0] - 323.0), 0.5)                      # 不是 A1P(车停得不一样)
-        self.assertTrue(any('摄像头对准圆环了' in l for l in self.lines), self.lines)
-        self.assertTrue(any('沿用上一步(PL1)' in l for l in self.lines), self.lines)
-        self.assertFalse(any('当下面那层' in p for p in self.inp.prompts), self.inp.prompts)
-
-    def test_pl2_alone_aligns_first_then_asks_for_the_lower_material(self):
-        """单独做 PL2：圆环先空着让摄像头对准，再叫你把下面那层放进圆环正中。"""
-        stm, vis, store = self._cam()
-        self.run_wiz(['', 'c', '2 +5', '', 'q'], stm=stm, start=STEP_KEYS.index('PL2'), vision=vis, store=store)
-        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
-        self.assertEqual(adj, {'STACK': [0.0, 5.0]}, self.lines)
-        self.assertTrue(any('当下面那层' in p for p in self.inp.prompts), self.inp.prompts)
-        self.assertTrue(any('圆环里先空着' in l for l in self.lines), self.lines)
-
-    def test_place_step_without_camera_falls_back_to_a1p(self):
-        """用不了摄像头：按 A1P/A2P 算，并且说清楚这样要注意什么。"""
-        self.run_wiz(['c', '1 +0.5', '', 'q'], start=STEP_KEYS.index('PL1'))
-        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
-        self.assertEqual(adj, {'RING': [0.5, 0.0]})
-        self.assertTrue(any('这次没用摄像头对准' in l for l in self.lines), self.lines)
-
-    def test_camera_failure_falls_back(self):
-        """摄像头打不开、认不到圆环：不卡住，退回按 A1P/A2P 算。"""
-        class Broken:
-            def ring_error(self, n=None, max_px=None):
-                return None
-
-            def scale(self, kind):
-                return 1.46
-
-            def bounds(self, kind, inset=8.0):
-                return ((-300.0, -220.0), (300.0, 220.0))
-        self.run_wiz(['c', '2 -4', '', 'q'], start=STEP_KEYS.index('PL1'), vision=Broken())
-        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
-        self.assertEqual(adj, {'RING': [0.0, -4.0]})
-        self.assertTrue(any('没对准圆环' in l or '没做成' in l for l in self.lines), self.lines)
-        self.assertTrue(any('这次没用摄像头对准' in l for l in self.lines), self.lines)
-
     def test_full_run_saves_everything(self):
         saved = self.run_wiz(FULL)
         want = dict(AEXT=2, CLWO=2040, CLWC=2800, ZHI=100, A1D=333, A2R=-882, TT1=2600, TT2=1720, ZDROP=65,
@@ -351,10 +264,7 @@ class WizardTests(unittest.TestCase):
             self.assertAlmostEqual(self.stm.P[k], v, places=3, msg='STM32 ' + k)
         self.assertNotIn('TT3', saved)
         self.assertNotIn('ZOBRAW', saved)
-        self.assertEqual(saved['PL1'], (0.5, -10))                        # 放置补偿存进 place_adj.json
-        self.assertNotIn('PL2', saved)
-        adj = load(os.path.join(os.path.dirname(self.cfg), 'place_adj.json'))
-        self.assertEqual(adj, {'RING': [0.5, -10]})
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.cfg), 'place_adj.json')))   # (10-20)不再量放置补偿
         sp = load(self.cfg)['stm32_params']
         for k, v in want.items():
             self.assertAlmostEqual(sp[k], v, places=3, msg='配置 ' + k)
@@ -545,6 +455,18 @@ class HelperTests(unittest.TestCase):
 
     def test_main_bad_from(self):
         self.assertEqual(arm_calib.main(['--from', 'NOPE', '--config', '/nonexistent.json']), 1)
+
+    def test_place_compensation_steps_are_gone(self):
+        """(10-20 用户"把 28、29 步的补偿去掉")没有 PL1/PL2 了；--from PL1 说清楚去掉了、该从哪调。"""
+        self.assertNotIn('PL1', STEP_KEYS)
+        self.assertNotIn('PL2', STEP_KEYS)
+        self.assertFalse(any(s['kind'] == 'place' for s in STEPS))
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(arm_calib.main(['--from', 'PL1', '--config', '/nonexistent.json']), 1)
+        self.assertIn('已经去掉了', buf.getvalue())
+        self.assertIn('--from A1P', buf.getvalue())
 
 
 if __name__ == '__main__':
