@@ -267,8 +267,11 @@ DEFAULTS = dict(
     zone_smooth=True,                   # 对准 2 号环(align_by 是 wheels 时)：像原料区一样车轮连续慢慢走(只发 V 速度，不转车头)，边走边每帧认 2 号环，
                                         #   越近越慢，停着看几帧确认对准；跟丢了停下重新找。要 STM32 认 V、vcal RING 量过车轮和画面的对应关系
                                         #   (横移、前进两列都实测过)；不然照旧一步一步挪(servo.run)
-    zone_f_mm=60.0,                     #   沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心；没看清就以停车点为中心)。
-                                        #   横移(离圆环远/近)离停车点不超过 ±ring_strafe_max_mm(规则：车不能压进工位)，还差的由手臂伸缩补
+    zone_f_mm=60.0,                     #   沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心；没看清就以停车点为中心)
+    zone_s_max_mm=70.0,                 #   (10-20)横移：挪到"对上 2 号环时车该在的远近"(= arm_calib 调 2 号环时车离圆环那一排的远近)，最多比那里再靠近
+                                        #   工位 ring_strafe_max_mm；离停车点最多这么多毫米；按地图查过不压工位。还差的手臂伸缩补
+    zone_seek_mm=200.0,                 #   (10-20 用户"找不到环不要后退，往前慢慢去找")停着找不到 2 号环：沿车头往前最多挪这么多毫米找(按地图查过)
+    zone_seek_speed=10.0,               #   往前找的速度(毫米/秒)
     zone_vel_speed=15.0,                #   车轮最快多少毫米/秒(偏多少毫米就每秒走多少，越近越慢)
     zone_vel_min_speed=5.0,             #   最慢多少毫米/秒(太慢电机按 0 转/分算会不动)
     zone_vel_tol_mm=None,               #   车轮对到多少毫米以内算对准(停着拍 3 帧取平均)；None = tol_mm.RING
@@ -279,7 +282,10 @@ DEFAULTS = dict(
     zone_stall_s=6.0,                   #   车轮挪了这么多秒偏差都没小下去(打滑、没走起来、在容差边上来回)：不再磨，剩下的手臂补
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
+    zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
     place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
+    place_comp_on=False,                # (10-20 用户"把 28、29 步的补偿去掉")放置补偿(place_adj.json 里的 PL1/PL2、pcal 量的，还有 place_shift_mm)都不用：
+                                        #   按摄像头对准的位置(1、3 号环按 arm_calib 调的角度)直接放。True = 照以前加补偿
     chassis_fine_rpm=100,               # 视觉微调时底盘前后挪的速度(转/分)
     # 粗加工区 / 暂存区：
     ring_survey=True,                   # 到工位先用摄像头一次看清三个圆环，算出到 1、2、3 号环底盘各要前后挪多少，直接开过去(不靠估计的 150mm)
@@ -5426,16 +5432,30 @@ class MissionHooks:
         """zone_reach='arm'：{环号: (dID1, dID2)}(相对 2 号环对准时的角度)。1、3 号环调过(arm_calib 的 R1、R3，或者以前的 rteach)就是调的；
         'cal' = True：(10-20)是 arm_calib 调的(车对准 2 号环以后不动，1、3 号环直接按它转过去，不再用摄像头对、不挪车)。
         (10-19)没调过、zone_arm_geom 时 1、3 是 None(对准 2 号环以后按环距算，见 _zone_geom)。不能只动手臂返回 None(大声提醒去 arm_calib 调)。"""
-        if str(self.cfg.get('zone_reach') or '').lower() != 'arm':
-            return None
         if not hasattr(self, '_teach_all'):
             self._teach_all = load_place_adj(self.cfg.get('ring_teach_file'))
         t = (self._teach_all or {}).get(zone) or {}
         warned = self.__dict__.setdefault('_teach_warned', set())
+        if str(self.cfg.get('zone_reach') or '').lower() != 'arm':
+            if not (str(t.get('src') or '') == 'arm_calib' and '1' in t and '3' in t):
+                return None
+            said = self.__dict__.setdefault('_reach_said', set())
+            if zone not in said:                                 # (10-20)车上配置是老写法：arm_calib 调过就按新做法
+                said.add(zone)
+                self.log(f'    (配置里 zone_reach 不是 arm，但 {zone} 的 1、3 号环在 arm_calib 里调过：按新做法，只对准 2 号环)')
         try:
             out = {1: (float(t['1'][0]), float(t['1'][1])), 2: (0.0, 0.0), 3: (float(t['3'][0]), float(t['3'][1]))}
             out['e'] = {k: t.get('e' + str(k)) for k in (1, 3)}
             out['cal'] = str(t.get('src') or '') == 'arm_calib'
+            mind = float(self.cfg.get('zone_cal_min_deg', 5.0))
+            small = [k for k in (1, 3) if abs(out[k][0]) < mind]
+            if small:                                            # (10-20)环距 150mm 要转二三十度：差不到 5° 多半是没调就回车了(存成 0)
+                if zone not in warned:
+                    warned.add(zone)
+                    self.log(f'    ★★ {zone} 存的' + '、'.join(f' {k} 号环' for k in small) + ' 角度和 2 号环几乎一样(ID1 只差 ' +
+                             '、'.join(f'{out[k][0]:+.1f}°' for k in small) + ')：多半是没调就回车了。这次当没调，照旧一个环一个环挪车对准；'
+                             '在 arm_calib 里重调：python3 arm_calib.py --from A1P')
+                return None
             if zone not in warned:
                 warned.add(zone)
                 if out['cal']:
@@ -5616,8 +5636,12 @@ class MissionHooks:
         return b1, b2
 
     def _p2_align(self, zone):
-        """车在 2 号环前：对准 2 号环一次(只动车轮或按 align_by)，记下这时 ID1/ID2 的角度。对不准返回 None。
-        (10-19)对准以后车又挪过(中间有个环够不着、照旧挪车对准了)：1、3 号环按 2 号环的角度算就不对了，回到 2 号环重新对准。"""
+        """车在 2 号环前：对准 2 号环一次，记下这时 ID1/ID2 的角度。对不准返回 None。
+        (10-20 用户"工位就像原料区对圆盘那样只定位 2 号环这个点，车不要乱跑")arm_calib 调过 1、3 号环的区(cal)：只用车轮连续慢慢对准
+        (_ring2_smooth，align_by 写的什么都这样)；对不上就是对不上(调用的地方这个区这次不放)，不再退回一步一步挪、更不一个环一个环挪车。
+        只有连续对准做不了(STM32 不认 V、没做过 vcal RING)、或者暂存区第二批 2 号环被物料盖住认不出时，2 号环才一步一步对(也只对 2 号环)。
+        没调过的区：align_by 是 wheels 时也先连续对准，不行再一步一步对准；还不行照旧一个环一个环对准。
+        (10-19)对准以后车又挪过：回到 2 号环重新对准。"""
         p2 = self._p2.get(zone)
         if p2 is not None:
             at = self._p2_at.get(zone)
@@ -5629,43 +5653,57 @@ class MissionHooks:
         if zone in self._p2_failed:
             return None                                  # 这一趟已经没对准过：不再花时间试
         cfg = self.cfg
+        T = self._teach(zone)
+        cal = bool(T and T.get('cal'))
         wheels = self._by_wheels(zone)
+        if cal and not wheels and zone not in self.__dict__.setdefault('_cal_wheels_said', set()):
+            self._cal_wheels_said.add(zone)
+            self.log(f'    (配置里 align_by.{zone} 是手臂对准，但 1、3 号环在 arm_calib 里调过：2 号环按车轮连续慢慢对准)')
         sm = None
-        if wheels and cfg.get('zone_smooth', True):
+        if (wheels or cal) and cfg.get('zone_smooth', True):
             self._obs_fixed()
-            sm = self._ring2_smooth(zone)               # (10-20 用户)像原料区一样车轮连续慢慢对准
+            sm = self._ring2_smooth(zone)               # (10-20 用户)像原料区对圆盘一样车轮连续慢慢对准
             if sm == 'nofw':
-                self.log('    (STM32 是旧程序，不认 V：2 号环照旧一步一步挪着对准。刷新的 main.c / chassis.c 才能连续慢慢对)')
+                self.log('    (STM32 是旧程序，不认 V：2 号环一步一步挪着对准。刷新的 main.c / chassis.c 才能连续慢慢对)')
                 sm = None
             elif sm == 'noj':
+                sm = None
+            elif sm == 'diverge':
+                if cal:
+                    self.log('    ★ 2 号环没对准：车轮走的方向和画面里圆环动的方向对不上(车轮和画面的对应关系不对)。这个区这次不放；'
+                             '车停在工位停车点做一次 vcal RING 再试')
+                    self._p2_failed.add(zone)
+                    return None
                 sm = None
         if isinstance(sm, dict) and not sm.get('ok') and sm.get('unseen') and self.on_ring.get((zone, 2)):
             self.log('    2 号环上放着第一批的物料(白心盖住了)，车轮连续对准时认不出圆环：改按物料顶面/圆环外圈一步一步对准')
             sm = None
         if sm is not None:
             if not sm.get('ok'):
-                self.log(f'    ★ 2 号环没对准({sm.get("why") or "还差 %.1fmm" % (sm.get("err_mm") or 0.0)})：这个区照旧一个环一个环挪车对准')
+                self.log(f'    ★ 2 号环没对准({sm.get("why") or "还差 %.1fmm" % (sm.get("err_mm") or 0.0)})：' +
+                         ('这个区这次不放(调过 1、3 号环的区不再一个环一个环挪车对准)' if cal else '这个区照旧一个环一个环挪车对准'))
                 self._p2_failed.add(zone)
                 return None
             self.log(f'    2 号环对准结果：还差 {sm["err_mm"]:.1f}mm({sm.get("how") or "车轮"})')
             self._zone_v_only = True
         else:
             self._goto_ring(zone, 2)
-            if wheels:
+            if wheels or cal:
                 self._obs_fixed()
             else:
                 self._obs_ring()
-            kw = self._wheels_kw() if wheels else self._zone_servo_kw()
+            kw = self._wheels_kw() if (wheels or cal) else self._zone_servo_kw()
             low = (self.on_ring.get((zone, 2)) or [None])[-1]
             if low is not None:                          # 暂存区第二批：2 号环上放着第一批的物料(白心被盖住)：认物料顶面/圆环外圈
-                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=wheels)
+                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal))
             else:
                 res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
                                      allow_chassis=True, label=f'{zone}对准2号环', bounds=self.vision.bounds('RING'), confirm=False, **kw)
             self.log(f'    2 号环对准结果：{res}')
-            acc = self._wheels_accept('RING') if wheels else cfg['accept_mm']['RING']
+            acc = self._wheels_accept('RING') if (wheels or cal) else cfg['accept_mm']['RING']
             if res is None or not (res.ok or res.err_mm <= acc):
-                self.log('    ★ 2 号环对不准：这个区照旧一个环一个环对准')
+                self.log('    ★ 2 号环对不准：' + ('这个区这次不放(调过 1、3 号环的区不再一个环一个环挪车对准)' if cal
+                                                else '这个区照旧一个环一个环对准'))
                 self._p2_failed.add(zone)
                 return None
         a1, a2 = self.arm.read_angles()
@@ -5674,34 +5712,39 @@ class MissionHooks:
         self._p2[zone] = (a1, a2)
         self._p2_at[zone] = (float(self.act.disp['S']), float(self.act.disp['F']))
         self._learn_from(zone, 2)
-        T = self._teach(zone)
-        cal = bool(T and T.get('cal'))
         self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环只转手臂过去(' +
                  ('按 arm_calib 调的角度' if cal else '示教的、或者按环距算的') + ')，车不再动')
         self._teach_fix[zone] = self._teach_photo(zone) if not cal else {1: (0.0, 0.0), 3: (0.0, 0.0)}
         return self._p2[zone]
 
     def _ring2_smooth(self, zone):
-        """(10-20 用户"像原料区那样车慢慢对准 2 号环，对准以后车就不动了")只动车轮对准 2 号环：手臂停在看圆环的姿态(A1P/A2P)不动，
-        车轮连续慢慢走，只发 V 速度(不转车头)。每帧按车走了多少推 2 号环在画面里哪儿，只认推算位置附近的那个(不会去追旁边的环)；
-        偏多少毫米就每秒走多少(越近越慢)，到了容差停下，停着拍 3 帧取平均确认，差一点再挪一点。
-        能挪的范围：横移(离圆环远/近)离停车点不超过 ±ring_strafe_max_mm(规则：车不能压进工位)；沿那一排 ±zone_f_mm(以看三个环时算出的
-        2 号环位置为中心)。横移到头了还差的(车停得离圆环太远/太近)：手臂补(只动手臂，车不动)。连着 zone_lost_s 秒认不出(跟丢了)：
-        停下重新找；一共最多 zone_find_s 秒。
-        返回 dict(ok=, err_mm=, why=, how=)；STM32 不认 V 返回 'nofw'；没有 vcal RING 量的车轮和画面的对应关系(或者只测过前后)返回 'noj'。"""
+        """(10-20 用户"工位就像原料区对圆盘那样定位 2 号环这个点，车不要乱跑；找不到环不要后退，往前慢慢去找")只动车轮对准 2 号环：
+        手臂停在看圆环的姿态(精确回到 A1P/A2P)不动，车轮连续慢慢走，只发 V 速度(不转车头)。
+          ① 找：停着按看三个环时记下的位置找 2 号环；找不到不后退，沿车头往前慢慢挪着找(zone_seek_speed，最多 zone_seek_mm，按地图查过
+             不出场地、不碰障碍物)，画面里出现圆环就停下重新看清三个环、认出哪个是 2 号；
+          ② 认环：每帧按车走了多少推 2 号环在画面里哪儿，只认推算位置附近、大小和到工位时看到的三个环一样(±25%)的；车走了它在画面里
+             却不动的东西(车上的：爪子、电池盒……)记下来，以后都不认；
+          ③ 对：偏多少毫米就每秒走多少(越近越慢)，到容差停下，停稳拍 3 帧取平均确认，差一点再挪一点；边走边按实际走的修正车轮和画面的
+             对应关系(存的那份是别的手臂角度量的，画面会整体转一点)；
+          ④ 能挪的范围：横移挪到"对上 2 号环时车该在的远近"(就是 arm_calib 调 2 号环时车离圆环那一排的远近 = 比赛停车点)，
+             最多比那里再靠近工位 ring_strafe_max_mm，离停车点最多 zone_s_max_mm，按地图查过不压工位；沿那一排 ±zone_f_mm(以看三个环时
+             算出的 2 号环位置为中心)。车轮到头了/挪了 zone_stall_s 秒没进展：剩下的手臂补(只动手臂，车不动)。
+          跟丢了(zone_lost_s 秒)：停下重新找(还找不到就往前慢慢找)；一共最多 zone_find_s 秒。
+        返回 dict(ok=, err_mm=, why=, how=, unseen=)；STM32 不认 V 返回 'nofw'；没有 vcal RING 量的车轮和画面的对应关系(或者只测过前后)
+        返回 'noj'；车轮走的方向和画面动的方向对不上(修不过来)返回 'diverge'。"""
         cfg, v, act, store = self.cfg, self.vision, self.act, self.store
         if act is None or not hasattr(act, 'vel') or getattr(act, '_no_vel', False):
             return 'nofw'
         J = store.get('RING', 'ch') if store is not None else None
         sc = float(v.scale('RING'))
         if J is None or (hasattr(store, 'synth') and store.synth('RING')):
-            self.log('    (还没有 vcal RING 量过的车轮和画面的对应关系(横移、前进两列)：2 号环照旧一步一步挪着对准，'
+            self.log('    (还没有 vcal RING 量过的车轮和画面的对应关系(横移、前进两列)：2 号环一步一步挪着对准，'
                      '对准时会顺便测；做一次 vcal RING 以后就能连续慢慢对)')
             return 'noj'
-        J = np.asarray(J, float)
-        bad = self._raw_J_bad(J, sc)
+        J0 = np.asarray(J, float)
+        bad = self._raw_J_bad(J0, sc)
         if bad:
-            self.log(f'    (存的车轮和画面的对应关系不合理：{bad}：2 号环照旧一步一步挪着对准)')
+            self.log(f'    (存的车轮和画面的对应关系不合理：{bad}：2 号环一步一步挪着对准)')
             return 'noj'
         P = self.arm.params() or {}
         if cfg.get('zone_obs_fine', True) and 'A1P' in P and 'A2P' in P:
@@ -5721,88 +5764,300 @@ class MissionHooks:
         vmax = float(cfg.get('zone_vel_speed', 15.0))
         vmin = float(cfg.get('zone_vel_min_speed', 5.0))
         smax = float(cfg.get('ring_strafe_max_mm') or 0.0) if not cfg.get('chassis_strafe', False) else 1000.0
+        scap = max(smax, float(cfg.get('zone_s_max_mm', 70.0)))
         fmax = float(cfg.get('zone_f_mm', 60.0))
+        seek_mm = float(cfg.get('zone_seek_mm', 200.0))
+        seek_v = float(cfg.get('zone_seek_speed', 10.0))
         sp_px = float(cfg.get('ring_spacing_mm') or 150.0) * sc
         gate = max(40.0, 0.4 * sp_px)                         # 每帧只认推算位置这么近以内的(旁边的环隔一个间距)
         lost_s = float(cfg.get('zone_lost_s', 3.0))
         settle = float(cfg.get('zone_settle_s', 0.15) or 0.0)
         stall_s = float(cfg.get('zone_stall_s', 6.0) or 0.0)
-        t_dead = self.now() + float(cfg.get('zone_find_s', 40.0))
+        look_s = float(cfg.get('zone_look_s', 10.0))
+        dl = [self.now() + float(cfg.get('zone_find_s', 40.0))]   # 找 + 对准的截止时刻(往前找时会延长)
         d0 = act.disp
         f2 = self.ring_f.get((zone, 2))
         fc = float(f2) if f2 is not None else float(d0['F'])
-        lo, hi = np.array([-smax, fc - fmax]), np.array([smax, fc + fmax])   # 底盘位移(相对停车点)能到的范围
+        lo, hi = np.array([-scap, fc - fmax]), np.array([scap, fc + fmax])   # 底盘位移(相对停车点)能到的范围；横移找到环以后再收
         drv = _VelDrive(self, lo, hi, float(cfg.get('raw_vel_keep_s', 0.15)), bool(cfg.get('raw_frame_thread', True)))
         if not drv.start():
             return 'nofw'
-        uv = (self.ring_uv or {}).get((zone, 2))
-        c0 = None
-        if uv is not None:                                    # 看三个环时 2 号环在画面里的位置(车挪过的话按挪了多少推)
-            c0 = np.asarray(uv[:2], float) + J @ (drv.base - np.asarray(uv[2:4], float))
+        pose0 = self._stop_pose(zone)
+        obs = self._map_obstacles()
+        Jc = [J0.copy()]                                      # 现在用的车轮和画面的对应关系(边走边修)
+        static, seen, trk = [], [], []                        # 车上不动的假圆环；最近认到的 (像素, 拍时车走了多少)；认准的 2 号环
+        note = dict(size=0, static=0, jfix_at=None, jlog=False, slip=False)
         out = dict(ok=False, err_mm=None, why='', how='车轮')
         try:
             v.live_goal = (float(goalp[0]), float(goalp[1]))
         except Exception:
             pass
 
-        def look(ex, gmax):
-            return v.ring_px(n=1, expect=(float(ex[0]), float(ex[1])), max_px=float(gmax))
+        def r_ref():
+            r = getattr(self, '_ring_rmed', None)            # 到工位时看到的三个环的大小(像素，最外圈半径)
+            if not r and isinstance(getattr(v, 'cfg', None), dict):
+                r = v.cfg.get('ring_rmax_cal')               # vclaw RING 量过的
+            return float(r) if r else None
 
-        def find(guess, look_s):
-            """停着找 2 号环(最多 look_s 秒)：guess = 推算的位置(没有就找离爪子点最近的那个)。连着两帧差不多才算。
+        def c0_from_survey():
+            uv = (self.ring_uv or {}).get((zone, 2))
+            if uv is None:
+                return None
+            return np.asarray(uv[:2], float) + Jc[0] @ (drv.pos() - np.asarray(uv[2:4], float))
+
+        def look(ex, gmax):
+            rp = v.ring_px(n=1, expect=(float(ex[0]), float(ex[1])), max_px=float(gmax))
+            if rp is None:
+                return None
+            return np.asarray(rp, float), getattr(v, 'last_ring_rmax', None)
+
+        def accept(res, pc):
+            """认到的这个能不能当 2 号环：大小要和到工位时看到的三个环差不多；车走了它在画面里却不动的(车上的东西)不算。"""
+            if res is None:
+                return None
+            rp, rr = res
+            r0 = r_ref()
+            if r0 and rr and not 0.75 <= float(rr) / r0 <= 1.33:
+                note['size'] += 1
+                return None
+            if any(float(np.linalg.norm(rp - s)) <= 12.0 for s in static):
+                note['static'] += 1
+                return None
+            pcv = np.asarray(pc, float)
+            for rq, pq in seen[-30:]:
+                if float(np.linalg.norm(Jc[0] @ (pcv - pq))) >= 25.0 and float(np.linalg.norm(rp - rq)) <= 8.0:
+                    what = fixed_or_slip(rp)                  # 车走了它在画面里不动：车上的东西？还是车轮根本没走？
+                    if what == 'fixed':
+                        static.append(rp.copy())
+                        note['static'] += 1
+                        self.log(f'    ★ 画面 ({rp[0]:.0f},{rp[1]:.0f}) 有个像圆环的东西，车走了它在画面里一点不动(别的圆环都跟着车动了)：'
+                                 '是车上的东西(爪子、电池盒……)，以后不认它')
+                    elif what == 'slip':
+                        note['slip'] = True
+                    return None
+            seen.append((rp.copy(), pcv.copy()))
+            del seen[:-60]
+            return rp
+
+        def fixed_or_slip(rp):
+            """认到的东西车走了它在画面里却不动：看一眼整幅画面，到工位时看到的那几个环跟着车动了 = 它是车上的东西('fixed')；
+            那几个环也都没动 = 车轮根本没走起来('slip'，打滑)；看不出来返回 None(这一帧先不认它)。"""
+            uv_all = [u for u in ((self.ring_uv or {}).get((zone, k)) for k in (1, 2, 3)) if u is not None]
+            if not uv_all:
+                return None
+            try:
+                rings, pc2 = drv.frame(lambda: v.ring_list(n=1))
+            except VisionError:
+                return None
+            pts = [np.asarray(r[:2], float) for r in (rings or []) if float(np.linalg.norm(np.asarray(r[:2], float) - rp)) > 15.0]
+            moved = unmoved = 0
+            for u in uv_all:
+                u0, pu = np.asarray(u[:2], float), np.asarray(u[2:4], float)
+                shift = Jc[0] @ (drv.base + np.asarray(pc2, float) - pu)      # 从看三个环到现在，车走了这么多，环该在画面里挪这么多
+                if float(np.linalg.norm(shift)) < 25.0:
+                    continue
+                if any(float(np.linalg.norm(q - (u0 + shift))) <= 15.0 for q in pts):
+                    moved += 1
+                elif any(float(np.linalg.norm(q - u0)) <= 15.0 for q in pts):
+                    unmoved += 1
+            if moved > 0 and moved >= unmoved:
+                return 'fixed'
+            if unmoved > 0:
+                return 'slip'
+            return None
+
+        def jfix():
+            """边走边修车轮和画面的对应关系：拿认准的 2 号环(拍时车走了多少 -> 画面里在哪)拟合一个转角 + 比例(摄像头装在手臂上，
+            存的那份量的时候手臂角度/高度不一样，画面整体转一点、大小差一点)。车走了 15mm 以上才修；修不合理(转 35° 以上)不用。"""
+            if len(trk) < 4:
+                return False
+            Pm = np.array([q[0] for q in trk], float)
+            if float(np.ptp(Pm[:, 0]) + np.ptp(Pm[:, 1])) < 15.0:
+                return False
+            X = (J0 @ Pm.T).T
+            Y = np.array([q[1] for q in trk], float)
+            X, Y = X - X.mean(axis=0), Y - Y.mean(axis=0)
+            sxx = float((X * X).sum())
+            if sxx < 1e-6:
+                return False
+            a = float((X * Y).sum()) / sxx
+            b = float((X[:, 0] * Y[:, 1] - X[:, 1] * Y[:, 0]).sum()) / sxx
+            R = np.array([[a, -b], [b, a]])
+            rms = float(np.sqrt(((Y - (R @ X.T).T) ** 2).sum(axis=1).mean()))
+            k, ang = math.hypot(a, b), math.degrees(math.atan2(b, a))
+            if not (0.7 <= k <= 1.4 and abs(ang) <= 35.0) or rms > 8.0:
+                return False
+            Jc[0] = R @ J0
+            note['jfix_at'] = (ang, k)
+            if not note['jlog'] and (abs(ang) >= 3.0 or abs(k - 1.0) >= 0.05):
+                note['jlog'] = True
+                self.log(f'    (车轮和画面的对应关系按车实际走的修正：画面转了 {ang:+.0f}°、大小 ×{k:.2f}；存的那份可能是手臂角度不一样时量的)')
+            return True
+
+        def s_range(c_, p_):
+            """横移能挪的范围：以"对上 2 号环时车该在的横移位置"(= arm_calib 调 2 号环时车离圆环那一排的远近)为中心 ±ring_strafe_max_mm，
+            离停车点最多 ±zone_s_max_mm；按地图查过：车身离工位/场地边太近的那边少挪。"""
+            e_ = c_ + Jc[0] @ (drv.est() - p_) - goalp
+            need = drv.pos() - np.linalg.solve(Jc[0], e_)    # 对上 2 号环时车该在哪(底盘位移)
+            s_t = float(need[0])
+            l_, h_ = max(-scap, s_t - smax), min(scap, s_t + smax)
+            if pose0 is not None:
+                s_ok = max(-scap, min(scap, s_t))
+                for _k in range(60):
+                    if self._body_clear(pose0, (s_ok, float(need[1])), obs)[0]:
+                        break
+                    s_ok = s_ok - math.copysign(min(5.0, abs(s_ok)), s_ok)
+                    if abs(s_ok) < 1e-6:
+                        break
+                if abs(s_ok - s_t) > 0.5:                     # 横移到 s_t 车身会离工位/场地边太近：最多挪到 s_ok
+                    if s_t < 0:
+                        l_ = max(l_, s_ok)
+                        h_ = max(h_, l_)
+                    else:
+                        h_ = min(h_, s_ok)
+                        l_ = min(l_, h_)
+            drv.lo[0], drv.hi[0] = l_, h_
+            return s_t, l_, h_
+
+        def find(guess, t_look):
+            """停着找 2 号环(最多 t_look 秒)：guess = 推算的位置(没有就找离爪子点最近的那个)。连着两帧差不多才算。
             返回 (像素, 拍时车走了多少)；到时间返回 None。"""
             drv.send(0.0, 0.0)
+            pc = drv.meas()
             hist, t0 = [], self.now()
-            while self.now() < min(t_dead, t0 + look_s):
+            while self.now() < min(dl[0], t0 + t_look):
                 self._check_abort()
                 if guess is not None:
                     g = gate if self.now() - t0 < 1.5 else 0.45 * sp_px      # 推算的地方附近没有：放宽一点(还是不到半个间距)
-                    rp = look(guess, g)
+                    rp = accept(look(guess, g), pc)
                 else:
-                    rp = look(goalp, self.ring_gate_px or 0.6 * sp_px)
+                    rp = accept(look(goalp, self.ring_gate_px or 0.6 * sp_px), pc)
                 if rp is not None:
-                    hist.append(np.asarray(rp, float))
+                    hist.append(rp)
                     if len(hist) >= 2 and float(np.linalg.norm(hist[-1] - hist[-2])) <= 6.0:
-                        return (hist[-1] + hist[-2]) / 2.0, drv.meas()
+                        return (hist[-1] + hist[-2]) / 2.0, pc
                     guess = hist[-1]
             return None
+
+        def creep():
+            """(10-20 用户"找不到环不要后退，要往前慢慢去找")停着找不到 2 号环：沿车头往前慢慢挪(每秒 zone_seek_speed mm)，边挪边看画面里
+            有没有圆环(大小和到工位时看到的一样、不是车上的东西)；看到了就停下，重新看清三个环、认出哪个是 2 号，再找它。
+            往前最多 zone_seek_mm，按地图查过不出场地、不碰障碍物。找到返回 (像素, 拍时车走了多少)；没找到返回 None。"""
+            if seek_mm <= 0 or seek_v <= 0:
+                return None
+            r0 = r_ref()
+
+            def rings_now():
+                rr_, pc_ = drv.frame(lambda: v.ring_list(n=1))
+                return [r for r in (rr_ or [])
+                        if (not r0 or 0.75 <= float(r[2]) / r0 <= 1.33)
+                        and not any(float(np.linalg.norm(np.asarray(r[:2], float) - s)) <= 12.0 for s in static)]
+            drv.send(0.0, 0.0)
+            if len(rings_now()) >= 2:                         # 画面里就看得到几个环：不是没看到，是认不出 2 号环，往前挪也没用
+                self.log('    画面里看得到圆环，但在该在的地方认不出 2 号环(被挡住/盖住了？)')
+                return None
+            f0 = float(drv.pos()[1])
+            f_end = f0 + seek_mm
+            drv.hi[1] = max(drv.hi[1], f_end)
+            self.log(f'    ★ 停着看不到 2 号环：不后退，沿车头往前慢慢挪着找(每秒 {seek_v:g}mm，最多往前 {seek_mm:.0f}mm)')
+            why = f'往前找了 {seek_mm:.0f}mm 也没看清圆环'
+            t_end = self.now() + seek_mm / seek_v + 10.0      # 往前找单独算时间
+            got = None
+            while self.now() < t_end:
+                self._check_abort()
+                fpos = float(drv.pos()[1])
+                if fpos >= f_end - 0.5:
+                    break
+                if pose0 is not None and not self._body_clear(pose0, (float(drv.pos()[0]), fpos + 20.0), obs)[0]:
+                    why = f'往前 {fpos - f0:.0f}mm 再走车身会碰到东西(按地图)，没看清圆环'
+                    break
+                drv.send(0.0, seek_v, run_s=min(1.0, (f_end - fpos) / seek_v))
+                ok_r = rings_now()
+                if len(ok_r) >= 2:                            # 看到两个以上才停：从后面开过来先看到的是边上那个环，一个认不出是几号
+                    got = ok_r
+                    break
+            if got is None:
+                drv.send(0.0, 0.0)
+                if not rings_now():                           # 走到头了一个环都没看到
+                    self.log(f'    ★ {why}')
+                    return None
+            drv.finish()                                      # 停下，走过的记进 disp
+            ok_r = got or rings_now()
+            # 一开始一个环都看不到、往前挪着才看到：整排环都在前面，最先进画面的是这一排后面那头的环(1 号或 3 号)，
+            # 从后往前第二个就是 2 号环(不按"爪子下面那个是 2 号"认：从后面开过来时爪子下面的是头上那个)
+            jf = Jc[0][:, 1]                                  # 车往前 1mm，地上的东西在画面里动多少
+            fwd = -jf / max(float(np.linalg.norm(jf)), 1e-9)  # 画面里"车前方"(前面的环在这个方向)
+            pts = sorted((np.asarray(r[:2], float) for r in ok_r), key=lambda q: float((q - claw) @ fwd))
+            pick = pts[1] if len(pts) >= 2 else pts[0]
+            self.log(f'    往前挪了 {float(drv.pos()[1]) - f0:.0f}mm 看到 {len(pts)} 个圆环：从后往前第' +
+                     ('二个' if len(pts) >= 2 else '一个(只看到一个，当它是 2 号)') + f'是 2 号环，画面 ({pick[0]:.0f},{pick[1]:.0f})')
+            r_seen = [float(r[2]) for r in ok_r]
+            if r_seen and not getattr(self, '_ring_rmed', None):
+                self._ring_rmed = float(np.median(r_seen))
+            a_now = drv.pos()
+            d2 = -np.linalg.solve(Jc[0], pick - goalp)        # 对上它车还要走多少 [横移, 前进]
+            self.ring_f[(zone, 2)] = float(a_now[1] + d2[1])
+            for k_, q_ in ((2, pick),) + (((3 if (self._ring1_dir(zone) or 1.0) > 0 else 1, pts[0]),) if len(pts) >= 2 else ()):
+                self.ring_uv[(zone, k_)] = (float(q_[0]), float(q_[1]), float(a_now[0]), float(a_now[1]))
+            drv.lo[1] = min(float(a_now[1] + d2[1]) - fmax, float(a_now[1]))
+            drv.hi[1] = max(float(a_now[1] + d2[1]) + fmax, float(a_now[1]))
+            dl[0] = max(dl[0], self.now() + float(cfg.get('zone_find_s', 40.0)))   # 往前找花的时间不算进对准的时间
+            return find(pick, look_s)
 
         def clampv(d, lim):
             n = float(np.linalg.norm(d))
             return d if n <= lim else d * (lim / n)
         try:
-            look_s = float(cfg.get('zone_look_s', 10.0))
-            f = find(c0, look_s)
+            g0 = c0_from_survey()
+            f = find(g0, look_s if g0 is not None else min(look_s, 3.0))   # 看三个环时没看到 2 号环：不干等，早点往前找
+            if f is None:
+                f = creep()
             if f is None:
                 drv.finish()
-                out['why'], out['unseen'] = f'停着看了 {look_s:.0f} 秒都认不出 2 号环', True
+                out['why'], out['unseen'] = '停着找、往前慢慢找都没认出 2 号环', True
                 return out
             c, p_c = f
+            trk.append((np.asarray(p_c, float).copy(), np.asarray(c, float).copy()))
             e0 = float(np.linalg.norm(c - goalp)) / sc
+            s_t, l_s, h_s = s_range(c, p_c)
             self.log(f'    车轮边走边对准 2 号环(只发 V 速度，不转车头；最快 {vmax:g}mm/s，越近越慢)：现在偏 {e0:.1f}mm；'
-                     f'能挪 横移 {lo[0]:+.0f}~{hi[0]:+.0f}mm、沿那一排 {lo[1]:+.0f}~{hi[1]:+.0f}mm(相对停车点)')
+                     f'横移能挪 {l_s:+.0f}~{h_s:+.0f}mm(对上时车该在 {s_t:+.0f}mm：和 arm_calib 调 2 号环时离圆环那一排一样远)、'
+                     f'沿那一排 {drv.lo[1]:+.0f}~{drv.hi[1]:+.0f}mm(相对停车点)')
+            if abs(s_t) > smax + 5.0:
+                self.log(f'    ★ 车离圆环那一排的远近和调 2 号环的时候差了约 {abs(s_t):.0f}mm(车停偏了)：车轮横着挪过去'
+                         + (f'(最多 {scap:.0f}mm)' if abs(s_t) > scap else ''))
             t_meas, rest, done, edge, lost, stalled = self.now(), [], False, False, False, False
             best, t_best = e0, self.now()                     # 偏差最小到过多少、什么时候(车轮没走起来就别一直磨)
             t_log, frames, seen_n = self.now(), 0, 0
             e_start, t_start, em = e0, self.now(), e0
-            while self.now() < t_dead:
+            p_fix = np.asarray(p_c, float).copy()             # 上次修对应关系时车在哪
+            while self.now() < dl[0]:
                 self._check_abort()
                 still = float(np.linalg.norm(drv.cmd)) < 1e-9 and self.now() >= drv.t_stop + settle   # 停稳了
-                pred = c + J @ (drv.est() - p_c)
-                rp, pc = drv.frame(lambda: look(pred, gate))
+                pred = c + Jc[0] @ (drv.est() - p_c)
+                res, pc = drv.frame(lambda: look(pred, gate))
+                rp = accept(res, pc)
                 frames += 1
+                if note['slip']:
+                    self.log('    ★ 车轮好像没走起来(打滑？)：车按 V 走了，画面里的圆环一个都没动')
+                    stalled = True
+                    break
                 still = still and float(np.linalg.norm(drv.cmd)) < 1e-9
-                cp = c + J @ (pc - p_c)                       # 拍这一帧时 2 号环按车走了多少应该在这里
+                cp = c + Jc[0] @ (pc - p_c)                   # 拍这一帧时 2 号环按车走了多少应该在这里
                 if rp is not None:
-                    rp = np.asarray(rp, float)
                     t_meas = self.now()
                     seen_n += 1
+                    trk.append((np.asarray(pc, float).copy(), rp.copy()))
+                    del trk[:-40]
                     if still:
                         rest.append(rp)                       # 停着拍的：几帧取平均(去掉一帧一帧的抖动)
                         c = np.mean(rest[-3:], axis=0)
                     else:
                         rest = []
                         c = 0.3 * cp + 0.7 * rp
+                    if float(np.linalg.norm(np.asarray(pc, float) - p_fix)) >= 10.0 and jfix():
+                        p_fix = np.asarray(pc, float).copy()
+                        s_t, l_s, h_s = s_range(c, pc)
                 else:
                     c = cp
                     if not still:
@@ -5810,25 +6065,28 @@ class MissionHooks:
                 p_c = pc
                 if self.now() - t_meas > lost_s:
                     self.log(f'    ★ 连着 {lost_s:g} 秒认不出 2 号环(跟丢了)：停下重新找')
-                    f = find(c + J @ (drv.est() - p_c), 2.0 * lost_s)
+                    f = find(c + Jc[0] @ (drv.est() - p_c), 2.0 * lost_s)
                     if f is None:
-                        out['why'], lost = '跟丢了，重新找也没找到', True
+                        f = creep()
+                    if f is None:
+                        out['why'], lost = '跟丢了，重新找、往前慢慢找都没找到', True
                         break
                     c, p_c = f
                     t_meas, rest = self.now(), []
                     e_start, t_start = float(np.linalg.norm(c - goalp)) / sc, self.now()
                     best, t_best = e_start, self.now()
+                    s_t, l_s, h_s = s_range(c, p_c)
                     continue
-                e = c + J @ (drv.est() - p_c) - goalp
+                e = c + Jc[0] @ (drv.est() - p_c) - goalp
                 em = float(np.linalg.norm(e)) / sc
                 if rp is not None and em < best - 0.5:
                     best, t_best = em, self.now()
                 if stall_s > 0 and self.now() - t_best > stall_s:
                     stalled = True                            # 挪了这么久偏差都没小下去：剩下的手臂补
                     break
-                d = -np.linalg.solve(J, e)                    # 还要走多少 [横移, 前进] 毫米
+                d = -np.linalg.solve(Jc[0], e)                # 还要走多少 [横移, 前进] 毫米
                 a_now = drv.pos()
-                dr = np.minimum(np.maximum(a_now + d, lo), hi) - a_now     # 能走的那一部分(横移、沿那一排都限着)
+                dr = np.minimum(np.maximum(a_now + d, drv.lo), drv.hi) - a_now   # 能走的那一部分(横移、沿那一排都限着)
                 if still and len(rest) >= 3:
                     if em <= tol:
                         done = True                           # 停着 3 帧平均在容差内：对准了
@@ -5852,30 +6110,39 @@ class MissionHooks:
                     drv.send(float(vv[0]), float(vv[1]), run_s=max(0.1, float(np.linalg.norm(dr)) / max(nv, 1e-6)))
                     if still:
                         rest = []
-                if self.now() - t_start > 3.0 and em > e_start + 8.0:
-                    self.log(f'    ★ 越走越偏({e_start:.0f}mm → {em:.0f}mm)：车轮和画面的对应关系不对(摄像头动过？)，'
-                             '改成一步一步挪着对准(会重新测)；之后重新 vcal RING')
+                if self.now() - t_start > 3.0 and em > e_start + 8.0 and not jfix():
+                    self.log(f'    ★ 越走越偏({e_start:.0f}mm → {em:.0f}mm)，按车实际走的也修不过来：车轮和画面的对应关系不对')
                     drv.finish()
-                    return 'noj'
+                    return 'diverge'
                 if self.now() - t_log >= 1.0:
                     dt = self.now() - t_log
-                    self.log(f'      {frames / dt:.1f} 帧/秒(认出 {seen_n})  2 号环还偏 {em:.1f}mm  车轮 横移 {drv.cmd[0]:+.0f}、'
-                             f'前进 {drv.cmd[1]:+.0f}mm/s  {drv.timing()}')
+                    self.log(f'      {frames / dt:.1f} 帧/秒(认出 {seen_n}' +
+                             (f'，大小不对 {note["size"]}' if note['size'] else '') +
+                             (f'，车上的东西 {note["static"]}' if note['static'] else '') +
+                             f')  2 号环还偏 {em:.1f}mm  车轮 横移 {drv.cmd[0]:+.0f}、前进 {drv.cmd[1]:+.0f}mm/s  {drv.timing()}')
                     t_log, frames, seen_n = self.now(), 0, 0
+                    note['size'] = note['static'] = 0
             drv.finish()
-            c = c + J @ (drv.p - p_c)
+            c = c + Jc[0] @ (drv.p - p_c)
             em = float(np.linalg.norm(c - goalp)) / sc
             out['err_mm'] = em
             d_ = drv.pos()
             self.log(f'    车轮停在 横移 {d_[0]:+.0f}mm、前进 {d_[1]:+.0f}mm(相对停车点)：2 号环还偏 {em:.1f}mm' +
                      ('' if done else ('(横移/前后到头了，剩下的手臂补)' if edge else ('' if lost else
                       (f'(★ 车轮挪了 {stall_s:g} 秒偏差都没小下去：打滑/没走起来？剩下的手臂补)' if stalled else '(到时间了，剩下的手臂补)')))))
+            ja = note['jfix_at']
+            if done and ja is not None and (abs(ja[0]) >= 3.0 or abs(ja[1] - 1.0) >= 0.05) and store is not None:
+                store.put('RING', 'ch', Jc[0])                # 修正过的对应关系存下来(下次到工位直接用)
+                if hasattr(store, 'set_synth'):
+                    store.set_synth('RING', False)
+                if hasattr(store, 'save'):
+                    store.save()
             if done:
                 out['ok'] = True
                 return out
             if lost:
                 return out
-            # 车轮到头了/到时间了：只动手臂补剩下的(车不动)
+            # 车轮到头了/到时间了/没进展：只动手臂补剩下的(车不动)
             if store.get('RING', 'arm') is None:
                 out['ok'] = em <= acc
                 out['why'] = '' if out['ok'] else f'车轮对不上还差 {em:.1f}mm，又没量过手臂和画面的对应关系(vcal RING arm)补不了'
@@ -5902,7 +6169,7 @@ class MissionHooks:
                 except ArmError:
                     b2 = None
                 if b2 is not None and abs(b2 - float(P.get('A2P', b2))) > 25.0:
-                    self.log(f'    ★ 车离圆环那一排远/近了，横移到头(±{smax:g}mm)，手臂伸缩补了 ID2 {b2 - float(P["A2P"]):+.0f}°：'
+                    self.log(f'    ★ 手臂伸缩补了 ID2 {b2 - float(P["A2P"]):+.0f}°(车离圆环那一排的远近和调 2 号环时不一样)：'
                              '1、3 号环可能偏几毫米；停车点离圆环那一排的远近要和 arm_calib 调的时候一样')
             return out
         except BaseException:
@@ -5954,16 +6221,23 @@ class MissionHooks:
         用摄像头对准这个环再放(zone_arm_fine；码垛时下面的环被物料盖着，按第一批对准时量的角度放)。
         返回 True/False；不能只动手臂放(2 号环对不准、这个环算不出来/超出手臂能到的范围、按环距算的又看不到环)返回 None(调用的人照旧挪车对准)。"""
         key = 'STACK' if stack else 'RING'
+        cal = bool(T.get('cal'))
         try:
             p2 = self._p2_align(zone)
         except ArmAbort:
             raise
         except (ArmError, VisionError) as ex:
-            self.log(f'    ★ 对准 2 号环出错：{ex}：照旧一个环一个环对准')
+            self.log(f'    ★ 对准 2 号环出错：{ex}' + ('' if cal else '：照旧一个环一个环对准'))
             self._p2_failed.add(zone)
-            return None
+            p2 = None
         if p2 is None:
-            return None
+            if not cal:
+                return None
+            # (10-20 用户"车不要乱跑")调过 1、3 号环的区：2 号环没对准就不放，不再一个环一个环挪车对准
+            self.log(f'    ★ {zone} 2 号环没对准：{item.color_name}这次不放(留在车上)')
+            self.stats.place(False)
+            self._show_stats()
+            return False
         ring = int(ring)
         if ring == 2:
             a1, a2 = p2
@@ -6076,6 +6350,7 @@ class MissionHooks:
         self.ring_f = {}
         self.ring_px = {}
         self.ring_uv = {}
+        self._ring_rmed = None
         self._p2.pop(zone, None)                  # 车重新开到这个区：2 号环要重新对准
         self._p2_failed.discard(zone)
         self._zone_v_only = False                 # (10-20)这一趟车只用 V 动过(2 号环车轮连续对准，之后不动)：挪回停车点也只用 V
@@ -6151,7 +6426,7 @@ class MissionHooks:
             self.store.save()
         return jf, True
 
-    def _survey(self, zone):
+    def _survey(self, zone, obs=True):
         """手臂摆到圆环上方(空爪)，一次看清画面里的圆环，按排列认出 1、2、3 号，算出每个环正对爪子时底盘的前后位置(self.ring_f)。
         画面里看到三个：直接认；两个：哪一头能看到却没有环，那一头就是这一排的尽头(圆环上放着物料时不这样认，可能只是没认出来)；
         两个隔了两个间距：中间那个没认出来，补上；一个、或者认不准：当作离爪子近的是 2 号(车停在 2 号环前面)。
@@ -6159,7 +6434,8 @@ class MissionHooks:
         顺便用圆环间距算出每毫米多少像素(没做 vclaw RING 时用它)。"""
         import numpy as np
         v, cfg = self.vision, self.cfg
-        self.arm.obs('RING', open_claw=True)
+        if obs:                                                  # (10-20)obs=False：手臂已经在看圆环的姿态(往前找环时停下重看)
+            self.arm.obs('RING', open_claw=True)
         self._a2_hint = (self.arm.params() or {}).get('A2P')
         self._a1_hint = (self.arm.params() or {}).get('A1P')
         self._ring_ready = self._at_obs = True
@@ -6167,6 +6443,7 @@ class MissionHooks:
         if not rings:
             self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
             return
+        self._ring_rmed = float(np.median([r[2] for r in rings]))   # (10-20)圆环在画面里多大(最外圈半径)：对准 2 号环时只认这么大的
         jf, measured = self._jac_f(rings)
         if jf is None:
             self.log('    ★ 测不出底盘前后挪和画面的关系：按配置里的圆环间距走')
@@ -6515,6 +6792,8 @@ class MissionHooks:
     def _place_shift_px(self):
         """place_shift_mm 换成画面里的像素偏移(对准时要让"圆环 - 爪子点"等于它)。用底盘 J：车往前走 1mm 地上的东西在画面里动 J[:,1]；
         要放的点往前挪 d(车往前走 d 才对准)，对准时"圆环 - 爪子点"就该是 J[:,1]·d。没有底盘 J 或者挪 0 返回 None。"""
+        if not self.cfg.get('place_comp_on', False):
+            return None                                          # (10-20 用户)放置补偿都不用
         if getattr(self, '_pcal_raw', False) or self.place_adj('RING') is not None:   # pcal 量的时候要按摄像头原样对准；量过就不用这个估计值
             return None
         sh = self.cfg.get('place_shift_mm') or {}
@@ -6631,7 +6910,16 @@ class MissionHooks:
 
     def place_adj(self, key):
         """pcal 实测的放置补偿：摄像头对准以后，ID1、ID2 再多转多少度物料才正好落在圆环(RING=第一层)/下面那个物料(STACK=第二层)正中。
-        没量过返回 None。"""
+        没量过返回 None。(10-20 用户"28、29 步的补偿去掉")place_comp_on 关着(默认)：一律不用，返回 None。"""
+        if not self.cfg.get('place_comp_on', False):
+            if not getattr(self, '_adj_off_said', False):
+                self._adj_off_said = True
+                old = load_place_adj(self.cfg.get('place_adj_file'))
+                if old:
+                    self.log('    (放置补偿不用了：' + '  '.join(f'{"第一层" if k == "RING" else "第二层"} ID1 {v[0]:+.2f}°、ID2 {v[1]:+.2f}°'
+                                                     for k, v in old.items() if isinstance(v, (list, tuple)) and len(v) >= 2) +
+                             ' 存着也不加，按对准的位置直接放)')
+            return None
         if not hasattr(self, '_adj'):
             self._adj = load_place_adj(self.cfg.get('place_adj_file'))
         v = self._adj.get(key)

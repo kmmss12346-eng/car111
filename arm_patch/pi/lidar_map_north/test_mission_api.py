@@ -613,7 +613,7 @@ class PlaceShiftTests(unittest.TestCase):
         d = w.scale['RING'] * (w.Rcam @ np.array([0.0, -20.0]))      # 配置里的爪子点错了：对准后实际落点偏前 20mm
         tc = w.vision.TRUE_CLAW
         w.vision.cfg['claw_px']['RING'] = [tc[0] + float(d[0]), tc[1] + float(d[1])]
-        h, lines = hooks(w, dict(place_shift_mm=dict(F=shift, S=0.0)))
+        h, lines = hooks(w, dict(place_shift_mm=dict(F=shift, S=0.0), place_comp_on=True))
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
         flat = [e for z, k, c, e, st in w.placed if not st]
         return w, flat, '\n'.join(lines)

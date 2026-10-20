@@ -718,9 +718,14 @@ class SimVision:
         c = self.claw('RAW')
         return (c[0] + float(e[0]), c[1] + float(e[1]))
 
+    fake_rings = ()                     # (10-20 实车)车上固定不动、却被认成圆环的东西 [(u, v, 半径像素)]：只在一帧一帧认(ring_px/ring_error)时出现，
+                                        #   ring_list(好几帧对上、大小一样才算)里没有。实车日志：车挪了 166mm 它在画面里还在 (221,260)
+
     def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
         if expect is not None:                            # 和真的 Vision 一样：离 expect 最近的那个(不是离爪子最近的)
             rings = self.ring_list(n)
+            if self.w.zone in ('ROUGH', 'TEMP'):
+                rings = list(rings) + [tuple(float(x) for x in fr) for fr in self.fake_rings]
             if not rings:
                 return None
             best = min(rings, key=lambda r: (r[0] - expect[0]) ** 2 + (r[1] - expect[1]) ** 2)
@@ -898,8 +903,13 @@ class SimVision:
         c = w.claw()
         k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
         e = self._off('RING', w.pixel_error(w.ring_center(k), 'RING', _frames_dt(n), n))
-        if e is not None and max_px and math.hypot(e[0] + self.claw('RING')[0] - self.TRUE_CLAW[0],
-                                                     e[1] + self.claw('RING')[1] - self.TRUE_CLAW[1]) > max_px:
+        cl = self.claw('RING')
+        for fr in self.fake_rings:                            # 车上那个东西离爪子点更近：认成它(和实车一样)
+            ef = (float(fr[0]) - cl[0], float(fr[1]) - cl[1])
+            if e is None or math.hypot(*ef) < math.hypot(e[0] + cl[0] - self.TRUE_CLAW[0], e[1] + cl[1] - self.TRUE_CLAW[1]):
+                e = ef
+        if e is not None and max_px and math.hypot(e[0] + cl[0] - self.TRUE_CLAW[0],
+                                                     e[1] + cl[1] - self.TRUE_CLAW[1]) > max_px:
             return None                                       # 离爪子点太远：不是要对的那个环
         return e
 
@@ -3491,20 +3501,114 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(errs.max(), 3.5)
 
     def test_parked_off_along_and_too_far_from_the_row(self):
-        """车停得沿那一排偏了 45mm、离圆环那一排远了 30mm(横移最多 20mm)：车轮挪 45mm、横移到 20mm 为止，剩下 10mm 手臂伸缩补；照样放好。"""
+        """车停得沿那一排偏了 45mm、离圆环那一排远了 30mm：车轮横着挪到 arm_calib 调 2 号环时的远近(30mm，以前只许 20mm)，
+        沿那一排挪 45mm，不用手臂补；1、3 号环也放得准。"""
         w = self._world(2, park={'ROUGH': 45.0}, park_side={'ROUGH': 30.0}, stop_err_mm=0.5)
         lines = []
         h = self._make(w, lines=lines)
         rec = self._spy(w, h)
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
         text = '\n'.join(lines)
-        self.assertIn('手臂补(车不动)', text)
-        self.assertLessEqual(rec['s_max'].get('ROUGH', 0.0), 20.5, rec['s_max'])
+        self.assertIn('车轮横着挪过去', text)
+        self.assertNotIn('手臂补(车不动)', text)
+        self.assertGreater(rec['s_max'].get('ROUGH', 0.0), 25.0, rec['s_max'])
+        self.assertLessEqual(rec['s_max'].get('ROUGH', 0.0), 33.0, rec['s_max'])
         self.assertEqual(rec['vel_after'], [])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
         self.assertEqual(h.stats.place_ok, 3, text[-3000:])
         far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
-        self.assertLess(max(far), 7.5, far)                                # 至少还在 3 环以内(手臂补了伸缩，1、3 号环会偏一点)
+        self.assertLess(max(far), 3.0, far)
+
+    def test_real_car_log_1020(self):
+        """10-20 实车：车放偏(沿那一排 44mm、离圆环那一排 57mm)，画面里有个车上的东西一直被认成圆环(大小和圆环一样)，
+        存的车轮和画面的对应关系转了 16°。照样只对准 2 号环一次：车轮横着挪过去、边走边修对应关系、不认那个东西，三个都放准；
+        不退回一步一步挪、不一个环一个环挪车。"""
+        for seed, side in ((11, 57.0), (12, -57.0)):
+            w = self._world(seed, park={'ROUGH': 44.0}, park_side={'ROUGH': side}, stop_err_mm=0.5)
+            w.vision.fake_rings = [(320.0 - 116.0, 240.0 - 23.0, 48.25 * w.scale['RING'])]
+            lines = []
+            h = self._make(w, lines=lines)
+            th = math.radians(16.0)
+            R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+            h.store.put('RING', 'ch', R @ (w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0])))
+            rec = self._spy(w, h)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+            text = '\n'.join(lines)
+            for bad in ('照旧一个环一个环', '照旧挪车对准', '一步一步挪着对准', '越走越偏'):
+                self.assertNotIn(bad, text, (side, text[-4000:]))
+            self.assertIn('按车实际走的修正', text, side)
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual(h.stats.place_ok, 3, (side, text[-4000:]))
+            self.assertEqual(rec['vel_after'], [])
+            self.assertGreater(rec['s_max'].get('ROUGH', 0.0), 45.0, rec['s_max'])
+            far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
+            self.assertLess(max(far), 3.5, (side, far))
+
+    def test_fake_ring_of_another_size_is_never_used(self):
+        """车上那个东西大小和圆环不一样：一帧都不认它，照样放好。"""
+        w = self._world(13, park={'ROUGH': 30.0}, stop_err_mm=0.5)
+        w.vision.fake_rings = [(320.0 - 60.0, 240.0 - 10.0, 30.0)]
+        lines = []
+        h = self._make(w, lines=lines)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        self.assertNotIn('车上的东西', text)
+        self.assertLess(max(e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH'), 3.0)
+
+    def test_ring2_out_of_view_creeps_forward_not_back(self):
+        """(10-20 用户"找不到环不要后退，往前慢慢去找")车停在整排圆环后面 360mm，画面里一个环都看不到：不后退，往前慢慢挪着找，
+        看到两个环就停下，从后往前第二个是 2 号环(爪子下面那个是 3 号，不能当成 2 号)，再对准；三个都放对环。"""
+        w = self._world(14, park={'ROUGH': -360.0}, stop_err_mm=0.5, cam_deg=90.0)
+        lines = []
+        h = self._make(w, dict(ring_order={'ROUGH': w.ring_order('ROUGH'), 'TEMP': w.ring_order('TEMP')}), lines=lines)
+        trace = []
+        ov = h.act.vel
+
+        def vel(vs, vf):
+            r = ov(vs, vf)
+            if w.zone == 'ROUGH' and 'ROUGH' not in h._p2:
+                trace.append(w.off_f)
+            return r
+        h.act.vel = vel
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('往前慢慢挪着找', text)
+        self.assertIn('从后往前第二个是 2 号环', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-4000:])
+        self.assertEqual(sorted((k, c) for (z, k, c, _e, _st) in w.placed if z == 'ROUGH'), [(1, 1), (2, 5), (3, 6)], w.placed)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        top = -1e9
+        for f in trace:                                              # 找、对准的时候一直往前，没有往后退(最多对准时修一两毫米)
+            top = max(top, f)
+            self.assertGreater(f, top - 3.0, trace)
+
+    def test_ring2_never_found_places_nothing_and_does_not_wander(self):
+        """怎么都认不出 2 号环(往前找 200mm 也没有)：这个区这次不放，不退回一个环一个环挪车对准，物料都留在车上。"""
+        w = self._world(15)
+        lines = []
+        h = self._make(w, lines=lines)
+        orig_list, orig_px = w.vision.ring_list, w.vision.ring_px
+
+        def ring_list(n=None):
+            return [] if w.zone == 'ROUGH' else orig_list(n)
+
+        def ring_px(n=None, expect=None, any_size=False, max_px=None):
+            if w.zone == 'ROUGH':
+                w.advance(_frames_dt(n))
+                return None
+            return orig_px(n, expect, any_size, max_px)
+        w.vision.ring_list, w.vision.ring_px = ring_list, ring_px
+        rec = self._spy(w, h)
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('往前慢慢挪着找', text)
+        self.assertIn('这个区这次不放', text)
+        for bad in ('照旧一个环一个环', '照旧挪车对准', '底盘挪到环'):
+            self.assertNotIn(bad, text)
+        self.assertEqual((h.stats.place_ok, h.stats.place_total), (0, 3), text[-3000:])
+        self.assertEqual(sorted(c for c in w.tray.values() if c), [1, 5, 6])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
     def test_ring2_lost_for_a_while_is_found_again(self):
         """对准时有几秒认不出 2 号环(被挡住/反光)：停下重新找，找到了接着对准。"""

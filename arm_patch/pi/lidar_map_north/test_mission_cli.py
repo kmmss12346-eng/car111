@@ -1097,7 +1097,7 @@ class PcalTests(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, 'place_adj.json')
         self.w = SimWorld(seed=21, code='156+123+516+231')
-        self.h = make(self.w, dict(place_adj_file=self.path))
+        self.h = make(self.w, dict(place_adj_file=self.path, place_comp_on=True))
         mission_cli._S['hooks'] = self.h
         self.lines, self.state = [], {}
         self.log = self.lines.append
@@ -1125,6 +1125,18 @@ class PcalTests(unittest.TestCase):
         self.assertEqual(len(self.w.placed), 1)
         self.assertEqual(self.h.place_adj('RING'), (d['RING'][0], d['RING'][1]))
         self.assertIsNone(self.h._place_shift_px())                 # 量过补偿就不再用估计的 place_shift_mm
+
+    def test_saved_compensation_is_ignored_by_default(self):
+        """10-20 用户"把 28、29 步的补偿去掉"：place_comp_on 默认关，place_adj.json 里存的(arm_calib PL1/PL2、pcal 量的)和 place_shift_mm 都不用。"""
+        from mission_hooks import save_place_adj
+        save_place_adj(self.path, 'RING', 4.6, -86.0)
+        lines = []
+        h = make(self.w, dict(place_adj_file=self.path, place_shift_mm=dict(F=-20.0, S=0.0)), log=lines.append)
+        self.assertIsNone(h.place_adj('RING'))
+        self.assertIsNone(h.place_adj('STACK'))
+        self.assertIsNone(h._place_shift_px())
+        self.assertIn('放置补偿不用了', '\n'.join(lines))
+        self.assertEqual(self.h.place_adj('RING'), (4.6, -86.0))     # 打开 place_comp_on 才照以前加
 
     def test_pcal_cancel_puts_it_back(self):
         self.run_cli('pcal', 'pcal 1')

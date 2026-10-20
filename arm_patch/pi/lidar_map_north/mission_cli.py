@@ -822,16 +822,25 @@ def _zone_preflight(h, zone, batch, force, log):
     # (10-20 用户)1、3 号环在 arm_calib 里调：调过就只对准 2 号环一次，之后车不动
     from mission_hooks import load_place_adj
     t = (load_place_adj(h.cfg.get('ring_teach_file')) or {}).get(zone) or {}
-    if str(h.cfg.get('zone_reach') or '').lower() == 'arm' and all(k in t for k in ('1', '3')):
-        if str(t.get('src') or '') == 'arm_calib':
-            sm = h.cfg.get('zone_smooth', True) and h.store is not None and h.store.get('RING', 'ch') is not None \
-                and not h.store.synth('RING')
-            log('   1、3 号环按 arm_calib 调的角度：车只把 2 号环对准一次' + ('(车轮连续慢慢走，只发 V)' if sm else '') +
-                '，之后车不动，只转手臂过去放、取' +
-                ('' if sm else '。★ 还没有 vcal RING 量过的车轮和画面的对应关系：2 号环这次一步一步挪着对准(顺便测)'))
-        else:
-            log('   1、3 号环按以前 rteach 示教的角度(转过去以后还用摄像头再对一次)；建议在 arm_calib 里重新调：python3 arm_calib.py --from A1P')
-    elif str(h.cfg.get('zone_reach') or '').lower() == 'arm' and not h.cfg.get('zone_arm_geom'):
+    arm = str(h.cfg.get('zone_reach') or '').lower() == 'arm'
+    both = all(k in t for k in ('1', '3'))
+    cal = both and str(t.get('src') or '') == 'arm_calib'      # arm_calib 调过：配置里 zone_reach 不是 arm 也按新做法(和比赛时一样)
+    try:
+        small = [k for k in ('1', '3') if both and abs(float(t[k][0])) < float(h.cfg.get('zone_cal_min_deg', 5.0))]
+    except (TypeError, ValueError, IndexError):
+        small = ['1']
+    if (cal or (arm and both)) and small:
+        log('   ★★ 存的 ' + '、'.join(f'{k} 号环' for k in small) + ' 角度和 2 号环几乎一样(多半是没调就回车了)：这次当没调，一个环一个环挪车对准。'
+            '重调：q 退出 run_live，python3 arm_calib.py --from A1P')
+    elif cal:
+        sm = h.cfg.get('zone_smooth', True) and h.store is not None and h.store.get('RING', 'ch') is not None \
+            and not h.store.synth('RING')
+        log('   1、3 号环按 arm_calib 调的角度：车只把 2 号环对准一次' + ('(车轮连续慢慢走，只发 V)' if sm else '') +
+            '，之后车不动，只转手臂过去放、取；2 号环没对准这个区就不放(不再一个环一个环挪车)' +
+            ('' if sm else '。★ 还没有 vcal RING 量过的车轮和画面的对应关系：2 号环这次一步一步挪着对准(顺便测)'))
+    elif arm and both:
+        log('   1、3 号环按以前 rteach 示教的角度(转过去以后还用摄像头再对一次)；建议在 arm_calib 里重新调：python3 arm_calib.py --from A1P')
+    elif arm and not h.cfg.get('zone_arm_geom'):
         log('   ★★ 还没在 arm_calib 里调 1、3 号环：这次一个环一个环挪车对准(慢)。调法：q 退出 run_live，python3 arm_calib.py --from A1P')
     log('   急停：abort。另开终端 python3 vview.py 可以看摄像头画面')
 
@@ -1316,6 +1325,9 @@ def _pcal(h, link, parts, state, log):
             h.holding = None
             _PC.clear()
             log('放好了。量一下物料中心离圆环中心多少；不满意就再 pcal 一次(会覆盖)')
+            if not h.cfg.get('place_comp_on', False):
+                log('  注意：放置补偿现在是关着的(mission_cfg 里 place_comp_on=false，10-20 起默认不加)，比赛、mtest 不会用这个补偿；'
+                    '要用就在配置的 mission_cfg 里加 "place_comp_on": true')
         return _run_async(state, log, fin)
     if sub not in ('1', '2'):
         raise ValueError('格式：pcal 1 [槽号](第一层) / pcal 2 [槽号](第二层码垛) / pcal save / pcal cancel / pcal show / pcal clear')
