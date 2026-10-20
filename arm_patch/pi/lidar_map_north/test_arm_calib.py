@@ -13,10 +13,12 @@ RANGES = dict(LFMAX=(10, 105), ZHI=(0, 400), ZGRAB=(0, 400), ZDROP=(0, 400), ZPL
               ZOBRAW=(0, 400), ZOBRNG=(0, 400), A1G=(232, 417.6), A1D=(232, 417.6), A1H=(232, 417.6),
               A1P=(232, 417.6), A2E=(-1220, -503.5), A2R=(-1220, -503.5), A2P=(-1220, -503.5),
               CLWO=(500, 2910), CLWC=(500, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
-              AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000), A1T1=(-720, 720), A1T2=(-720, 720), A2SPD=(0, 1500))
+              AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000), A1T1=(-720, 720), A1T2=(-720, 720), A2SPD=(0, 1500),
+              R1T1=(-720, 720), R2T=(-5000, 5000), R1T2=(-720, 720), R2SPD=(0, 1500))
 DEFAULTS = dict(LFMAX=100, ZHI=100, ZGRAB=20, ZDROP=60, ZPLC=0, ZSTK=60, ZOBRAW=100, ZOBRNG=100,
                 A1G=323, A1D=323, A1H=323, A1P=323, A2E=-862, A2R=-862, A2P=-862,
-                CLWO=2090, CLWC=2910, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0)
+                CLWO=2090, CLWC=2910, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0,
+                R1T1=0, R2T=0, R1T2=0, R2SPD=0)
 LIM = {1: (232.0, 417.6), 2: (-1220.0, -503.5)}
 
 
@@ -143,6 +145,8 @@ FULL = [
     '-80', '',                         # ZGRAB 100 -> 20
     's',                               # ZOBRAW 跳过
     '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
+    's', 's',                          # 1、3 号环 R1/R3 跳过
+    's', 's', 's', 's',                # 去圆环绕开电池盒 R1T1/R2T/R1T2/R2SPD 跳过
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
     'c', '1 +0.5', '2 -10', '',        # PL1：第一层放置补偿 ID1 +0.5、ID2 -10
@@ -182,6 +186,77 @@ class WizardTests(unittest.TestCase):
             del stm.P[k]
         self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('A1T1'))
         self.assertIn('旧固件', '\n'.join(self.lines))
+
+    # ---------------- (10-20 用户)1、3 号环：车不动只转手臂；存比 2 号环(A1P/A2P)多转多少，粗加工区、暂存区共用
+    def test_ring_poses_saved_for_both_zones(self):
+        cfg = make_cfg()
+        path = os.path.join(os.path.dirname(cfg), 'ring_teach.json')
+        with open(path, 'w', encoding='utf-8') as f:                       # 以前 rteach 存的：原料区的不动，1 号环摄像头记的作废
+            json.dump({'RAW': {'1': [5, 6]}, 'ROUGH': {'1': [1.0, 2.0], 'e1': [10, 20], 'src': 'rteach'}}, f)
+        saved = self.run_wiz(['1 +11', '2 -32', '',                         # R1：从以前存的 +1/+2 开始调
+                              '1 -12.5', '2 +20', '',                       # R3：没存过，从 2 号环上方开始
+                              'q'], cfg=cfg, start=STEP_KEYS.index('R1'))
+        d = load(path)
+        self.assertEqual(d['RAW'], {'1': [5, 6]})
+        for zone in ('ROUGH', 'TEMP'):
+            self.assertEqual(d[zone]['1'], [12.0, -30.0], zone)
+            self.assertEqual(d[zone]['3'], [-12.5, 20.0], zone)
+            self.assertEqual(d[zone]['src'], 'arm_calib')
+            self.assertEqual(d[zone]['p2'], [323.0, -862.0])
+            self.assertNotIn('e1', d[zone])
+        self.assertEqual(saved['R1'], (12.0, -30.0))
+        self.assertEqual(saved['R3'], (-12.5, 20.0))
+        i = self.stm.sent.index('AF 2 -892')                               # R1 调完，R3 开始前手臂回到 2 号环上方
+        self.assertIn('AP 323 -862', self.stm.sent[i:])
+        self.assertNotIn('A1P', load(cfg)['stm32_params'])                 # 1、3 号环不改 STM32 参数
+        out = '\n'.join(self.lines)
+        self.assertIn('还没存过', out)
+        self.assertIn('1、3 号环的角度存在', out)
+        self.assertIn('AP 324 -860', self.stm.sent)
+        saved = self.run_wiz(['q'], cfg=cfg, start=STEP_KEYS.index('R1'))  # 再进来：手臂直接到存过的位置，没改直接 q 不啰嗦
+        self.assertIn('AP 335 -892', self.stm.sent)
+        self.assertIn('原来存的 +12.00 -30.00', '\n'.join(self.lines))
+        self.assertFalse(any('还没保存' in l for l in self.lines), self.lines)
+        self.assertEqual(saved, {})
+
+    def test_ring_pose_unsaved_change_warns_on_quit(self):
+        saved = self.run_wiz(['1 +5', 'q', 'q'], start=STEP_KEYS.index('R1'))
+        self.assertTrue(any('还没保存' in l and 'R1' in l for l in self.lines), self.lines)
+        self.assertNotIn('R1', saved)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.cfg), 'ring_teach.json')))
+
+    def test_ring_detour_steps(self):
+        """(10-20 用户：夹着物料去圆环怕刮到电池盒)R1T1 / R2T / R1T2 / R2SPD 从 2 号环上方开始调，做完按原路回到 2 号环上方。"""
+        self.run_wiz(['c', '1 +20', '', '2 +50', '', '1 +40', '', '400', '', 'q'], start=STEP_KEYS.index('R1T1'))
+        P = self.stm.P
+        self.assertAlmostEqual(P['R1T1'], P['A1P'] + 20, delta=0.5)
+        self.assertAlmostEqual(P['R2T'], P['A2P'] + 50, delta=0.5)
+        self.assertAlmostEqual(P['R1T2'], P['R1T1'] + 40, delta=0.5)
+        self.assertEqual(P['R2SPD'], 400)
+        self.assertEqual(P['A2T'], 0)                                      # 原料区那组不动
+        self.assertEqual([(i, s_) for i, _a, s_ in self.stm.afs], [(2, 400.0), (2, 400.0)])
+        sent = self.stm.sent
+        i = sent.index('SET R2SPD 400', sent.index('AFS 2 -812 400'))
+        back = [c for c in sent[i:] if c.startswith(('AF ', 'AP '))]
+        self.assertEqual(back[:4], ['AF 2 -812', 'AF 1 343', 'AF 2 -862', 'AP 323 -862'])   # 伸着转回去，再缩回
+        self.assertEqual(self.stm.claw, 2910)                              # 物料一直夹着(下一步 ZPLC 要用)
+        sp = load(self.cfg)['stm32_params']
+        self.assertEqual(sp['R2SPD'], 400)
+
+    def test_ring_detour_speed_zero_demo_uses_a2spd(self):
+        stm = FakeStm32()
+        stm.P.update(R1T1=343.0, R2T=-812.0, R1T2=383.0, A2SPD=300.0)
+        self.run_wiz(['0', 'q', 'q'], stm=stm, start=STEP_KEYS.index('R2SPD'))
+        self.assertEqual([(i, s_) for i, _a, s_ in stm.afs], [(2, 300.0), (2, 300.0)])
+
+    def test_ring_detour_skipped_on_old_firmware(self):
+        stm = FakeStm32()
+        for k in ('R1T1', 'R2T', 'R1T2', 'R2SPD'):
+            del stm.P[k]
+        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('R1T1'))
+        out = '\n'.join(self.lines)
+        self.assertEqual(out.count('旧固件'), 4)
+        self.assertIn('ZPLC', out)
 
     # ---------------- 第一层 / 第二层放置位置(PL1、PL2)：补偿相对"摄像头对准圆环的姿态"
     TRUE = (324.2, -880.0)                     # 摄像头里圆环正对爪子点时 ID1、ID2 的角度(车停得和 A1P 那一步不一样)

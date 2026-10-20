@@ -104,6 +104,14 @@ static float g_a1t1   = 0.0f;      /* A1T1   ID1 角度：转到这里开始伸�
 static float g_a2t    = 0.0f;      /* A2T    ID2 角度：伸到这么长转，碰不到电池盒 */
 static float g_a1t2   = 0.0f;      /* A1T2   ID1 角度：转过电池盒，到这里开始缩回(还没到车上转盘正上方) */
 static float g_a2spd  = 0.0f;      /* A2SPD  这几段伸长、缩回的速度(度/秒)；0 = 用 ASPD */
+/* (10-20 用户：夹着物料去地上圆环也怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组，意思和上面 A1T1~A2SPD 一样：
+ * 从圆环往车上转盘转，转过 R1T1 伸到 R2T、转过 R1T2 缩回 A2R；离开车上转盘反过来走(转过 R1T2 伸到 R2T，
+ * 转过 R1T1 再伸缩到圆环那边要的长度)。R2T = 0 = 这一组没调，照旧走原料区那组 */
+static float g_r1t1   = 0.0f;      /* R1T1   ID1 角度：从圆环往车上转盘转，到这里开始伸长 */
+static float g_r2t    = 0.0f;      /* R2T    ID2 角度：伸到这么长转，碰不到电池盒 */
+static float g_r1t2   = 0.0f;      /* R1T2   ID1 角度：转过电池盒，到这里开始缩回(还没到车上转盘正上方) */
+static float g_r2spd  = 0.0f;      /* R2SPD  这一组伸长、缩回的速度(度/秒)；0 = 和 A2SPD 一样 */
+static uint8_t g_side = 0;         /* 手臂在哪边干活：0 = 原料盘，1 = 地上圆环(OBS RAW/RING、GRAB、PICK、PLACE、SIDE 指令设) */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
 static float g_atolc  = 1.0f;      /* ATOLC  大动作离目标多少度以内算到位 */
@@ -172,6 +180,10 @@ static const ArmTun tun[] =
     { "A2T",    &g_a2t,    -5000.0f, 5000.0f },
     { "A1T2",   &g_a1t2,   -720.0f,  720.0f },
     { "A2SPD",  &g_a2spd,   0.0f,    1500.0f },
+    { "R1T1",   &g_r1t1,   -720.0f,  720.0f },
+    { "R2T",    &g_r2t,    -5000.0f, 5000.0f },
+    { "R1T2",   &g_r1t2,   -720.0f,  720.0f },
+    { "R2SPD",  &g_r2spd,   0.0f,    1500.0f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
     { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
     { "ATOLC",  &g_atolc,   0.2f,    5.0f },
@@ -1172,20 +1184,35 @@ static int Slot_Ok(long slot)
     return slot >= 1 && slot <= 3;
 }
 
-/* (10-19 用户：电池盒挡着)A2T 不是 0 时转去/离开车上转盘按 A1T1、A2T、A1T2 分段走(只在 ID2 管伸缩 AEXT=2 时) */
-static int Tray_Detour(void)
-{
-    return Absf(g_a2t) > 0.5f && Ext_Id() == 2;
-}
-
 static float A2_Spd(void)
 {
     return (g_a2spd > 0.5f) ? g_a2spd : g_aspd;
 }
 
+/* 去/离开车上转盘绕开电池盒用哪一组：t1 = 靠原料盘/圆环那头开始伸长的 ID1 角度，ext = 伸多长，t2 = 靠车上转盘那头开始缩回的角度，
+ * spd = 伸缩速度。(10-20)手臂在圆环那边(g_side)、圆环那组调过(R2T 不是 0)用圆环那组，不然用原料区那组(A2T 不是 0)。
+ * 返回 0 = 不绕(照旧直接转)，1 = 原料区那组，2 = 圆环那组。只在 ID2 管伸缩(AEXT=2)时绕 */
+typedef struct { float t1, ext, t2, spd; } Detour;
+
+static int Detour_Get(Detour *d)
+{
+    if (Ext_Id() != 2)  return 0;
+    if (g_side && Absf(g_r2t) > 0.5f)
+    {
+        d->t1 = g_r1t1;  d->ext = g_r2t;  d->t2 = g_r1t2;  d->spd = (g_r2spd > 0.5f) ? g_r2spd : A2_Spd();
+        return 2;
+    }
+    if (Absf(g_a2t) > 0.5f)
+    {
+        d->t1 = g_a1t1;  d->ext = g_a2t;  d->t2 = g_a1t2;  d->spd = A2_Spd();
+        return 1;
+    }
+    return 0;
+}
+
 /* (10-19 用户：伸缩的时候 ID1 不要停，一直转)ID1 一口气转到 a1_end；转过 at1 时 ID2 开始走到 b1(伸长)，
- * 转过 at2 时 ID2 开始走到 b2(缩回)。ID1 先到了还没转过的那一段就接着做。升降不动(调用前升到最高) */
-static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2)
+ * 转过 at2 时 ID2 开始走到 b2(缩回)。ID1 先到了还没转过的那一段就接着做。升降不动(调用前升到最高)。spd2 = ID2 的速度 */
+static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2, float spd2)
 {
     float a = 0.0f, c, dir, tgt = a1_end, b;
     uint32_t t0, tmax;
@@ -1201,11 +1228,11 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2)
         if (!ok1 && Servo_ReadAngle(1, &a) && Servo_Arrived(1, a, g_atolc))  { ok1 = 1; Servo_Hold(1, a); }
         if (ph == 0 && (ok1 || (a - at1) * dir >= 0.0f))
         {
-            b = b1;  tmax += Servo_Start(2, &b, A2_Spd());  ph = 1;  ok2 = 0;      /* 转过 A1T1：开始伸长 */
+            b = b1;  tmax += Servo_Start(2, &b, spd2);  ph = 1;  ok2 = 0;          /* 转过 A1T1：开始伸长 */
         }
         if (ph == 1 && (ok1 ? ok2 : (a - at2) * dir >= 0.0f))
         {
-            b = b2;  tmax += Servo_Start(2, &b, A2_Spd());  ph = 2;  ok2 = 0;      /* 转过 A1T2：开始缩回 */
+            b = b2;  tmax += Servo_Start(2, &b, spd2);  ph = 2;  ok2 = 0;          /* 转过 A1T2：开始缩回 */
         }
         if (!ok2 && Servo_ReadAngle(2, &c) && Servo_Arrived(2, c, g_atolc))  { ok2 = 1; Servo_Hold(2, c); }
         if (ok1 && ok2 && ph == 2)  break;
@@ -1222,29 +1249,36 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2)
     return NULL;
 }
 
-/* 转到车上转盘上方，停在高度 z_end：升到最高 -> ID1 一直转到 A1D，路上转过 A1T1 伸到 A2T、转过 A1T2 缩回 A2R -> 下降 */
+/* 转到车上转盘上方，停在高度 z_end：升到最高 -> ID1 一直转到 A1D，路上转过 A1T1(R1T1) 伸到 A2T(R2T)、转过 A1T2(R1T2) 缩回 A2R -> 下降 */
 static const char *Go_Tray(float z_end)
 {
     float a;
+    Detour d;
 
-    if (!Tray_Detour())  return Move_Over(g_a1d, g_a2r, 1, z_end);
+    if (!Detour_Get(&d))  return Move_Over(g_a1d, g_a2r, 1, z_end);
     GO(Lift_Goto(g_zhi));
     if (!Servo_ReadAngle(1, &a))  a = g_a1d;
-    GO(Sweep(g_a1d, (Absf(g_a1t1) > 0.5f) ? g_a1t1 : a, g_a2t, (Absf(g_a1t2) > 0.5f) ? g_a1t2 : g_a1d, g_a2r));
+    GO(Sweep(g_a1d, (Absf(d.t1) > 0.5f) ? d.t1 : a, d.ext, (Absf(d.t2) > 0.5f) ? d.t2 : g_a1d, g_a2r, d.spd));
     return Lift_Goto(z_end);
 }
 
-/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转到 (a1_to, a2_to)：ID1 一直转，转过 A1T2(离开车上转盘)伸缩直接走到 a2_to
- * (10-19 用户：回原料区不用先伸长再缩回，转到原料盘上面时伸缩就是最近那格的长度) */
+/* 手臂在车上转盘上方(ID1 离 A1D 不到 15°)要转到 (a1_to, a2_to)：ID1 一直转。
+ * 原料区那组：转过 A1T2(离开车上转盘)伸缩直接走到 a2_to(10-19 用户：回原料区不用先伸长再缩回，转到原料盘上面时伸缩就是最近那格的长度)；
+ * (10-20)圆环那组：转过 R1T2 先伸到 R2T(要去的长度比 R2T 还长就直接伸到它)，转过 R1T1(过了电池盒)再伸缩到 a2_to */
 static const char *Leave_Tray(float a1_to, float a2_to)
 {
-    float a, at;
+    float a, at, at1, b1;
+    Detour d;
+    int k = Detour_Get(&d);
 
-    if (!Tray_Detour())  return NULL;
+    if (!k)  return NULL;
     if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
     GO(Lift_Goto(g_zhi));
-    at = (Absf(g_a1t2) > 0.5f) ? g_a1t2 : a;
-    return Sweep(a1_to, at, a2_to, at, a2_to);
+    at = (Absf(d.t2) > 0.5f) ? d.t2 : a;
+    if (k == 1)  return Sweep(a1_to, at, a2_to, at, a2_to, d.spd);
+    at1 = (Absf(d.t1) > 0.5f) ? d.t1 : a1_to;
+    b1 = ((a2_to - g_a2r) * (d.ext - g_a2r) > 0.0f && Absf(a2_to - g_a2r) >= Absf(d.ext - g_a2r)) ? a2_to : d.ext;
+    return Sweep(a1_to, at, b1, at1, a2_to, d.spd);
 }
 
 /* 观察姿态：升到最高 -> ID1、ID2 转到工位上方 -> 升降到观察高度。ring=0 原料盘，ring=1 地上圆环。
@@ -1254,6 +1288,7 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     const char *e = Seq_Ready();
     if (e) return e;
 
+    g_side = ring;                                 /* (10-20)之后去/离开车上转盘按这一边的绕电池盒参数走 */
     if (open_claw)  Claw_O();
     GO(Leave_Tray(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e));
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
@@ -2497,6 +2532,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             if (strcmp(t[2], "H") != 0)  FAIL("ERR ARG");
             here = 1;
         }
+        g_side = ring;                             /* (10-20)夹起来转去车上转盘：按这一边的绕电池盒参数走 */
         if (!here)
         {
             r = Seq_Obs(ring, 1);
@@ -2505,6 +2541,15 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         }
         r = Seq_PickHere((uint8_t)slot, ring ? g_zplc : g_zgrab);
         if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- (10-20)SIDE RAW|RING：手臂接下来在哪边干活(去/离开车上转盘按这一边的绕电池盒参数走)。OBS/GRAB/PICK/PLACE 也会设 ---- */
+    if (strcmp(v, "SIDE") == 0 && n == 2)
+    {
+        if (strcmp(t[1], "RAW") == 0)        g_side = 0;
+        else if (strcmp(t[1], "RING") == 0)  g_side = 1;
+        else                                 FAIL("ERR ARG");
         return 1;
     }
 
@@ -2543,6 +2588,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             if (strcmp(t[2], "S") != 0)  FAIL("ERR ARG");
             stack = 1;
         }
+        g_side = 1;                                /* (10-20)在圆环那边干活 */
         r = Seq_Take((uint8_t)slot);
         if (r)  FAIL(r);
         if (car_abort)  return 1;

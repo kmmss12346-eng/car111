@@ -119,8 +119,30 @@ STEPS = [
     dict(key='ZOBRAW', kind='lift', title='摄像头看原料盘的高度 ZOBRAW', setup='raw_obs', optional=True,
          text='摄像头对准原料盘时手臂停的高度，要能从画面里看到整个物料。\n'
               '已经用 vcal 标定过摄像头的话不要改它，输入 s 跳过(改了要重新 vcal)。'),
-    dict(key=('A1P', 'A2P'), kind='pose', title='地上圆环上方的姿态', setup='ring',
-         text='车按比赛时的位置停在圆环旁边，把爪子移到圆环中心的正上方。'),
+    dict(key=('A1P', 'A2P'), kind='pose', title='地上圆环上方的姿态(2 号环)', setup='ring',
+         text='车按比赛时的位置停在 2 号环旁边(车身离工位色块的远近和比赛时停车点一样)，把爪子移到 2 号环中心的正上方。\n'
+              '比赛时车轮先把 2 号环对到这里；接下来两步调 1、3 号环，这期间车别动。'),
+    # (10-20 用户)1、3 号环：车不动，只转手臂过去。存的是比 2 号环(A1P/A2P)多转多少，粗加工区、暂存区共用(两个区圆环一样摆)
+    dict(key='R1', kind='ringpose', ring=1, title='1 号环上方的姿态(比 2 号环多转多少)', setup='ring',
+         text='车别动(上一步爪子在 2 号环正上方)。把爪子移到 1 号环中心的正上方：1 +5 / 1 -5 转、2 +50 / 2 -50 伸缩，\n'
+              '或者 u 松开舵机用手摆，摆好回车。存的是比 2 号环多转了多少度，粗加工区、暂存区都用它。\n'
+              '比赛时车只对准 2 号环一次，1、3 号环按这里的角度直接转过去放、取，车不动。高处看不准可以先 z -40 降低一点再看。\n'
+              '以前存过的话手臂先转到存过的位置，对就直接回车。要重调：python3 arm_calib.py --from A1P，先看爪子正对 2 号环再做这两步。'),
+    dict(key='R3', kind='ringpose', ring=3, title='3 号环上方的姿态(比 2 号环多转多少)', setup='ring',
+         text='车别动。手臂转到了 2 号环上方(以前存过 3 号环就是存过的位置)：把爪子移到 3 号环中心的正上方(和上一步一样调)，摆好回车。'),
+    # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)
+    dict(key='R1T1', kind='servo', sid=1, title='去圆环绕开电池盒①：开始伸长的角度 R1T1', setup='rdetour0', needs_fw=True,
+         text='车上转盘 <-> 地上圆环这条路单独调(夹着物料转过去怕刮到电池盒)。先 o 张开、把一个物料塞进爪子，c 夹住。\n'
+              '手臂在 2 号环上方(最高处)：用 1 +10 / 1 -10 往车上转盘那边转，转到开始伸长的角度(物料还没碰到电池盒)，回车保存。\n'
+              '不用单独调(和原料区那组一样就行)：输入 s 跳过这四步(以后要关掉：set R2T 0)。'),
+    dict(key='R2T', kind='servo', sid=2, title='去圆环绕开电池盒②：伸多长 R2T', setup='rdetour1', needs_fw=True,
+         text='手臂在开始伸长的角度：用 2 +50 / 2 -50 把爪子(连同物料)伸到转过去碰不到电池盒的长度，回车保存。'),
+    dict(key='R1T2', kind='servo', sid=1, title='去圆环绕开电池盒③：开始缩回的角度 R1T2', setup='rdetour2', needs_fw=True,
+         text='伸着往车上转盘那边转：用 1 +10 / 1 -10 转过电池盒，转到开始缩回的地方(还没到车上转盘正上方)，回车保存。'),
+    dict(key='R2SPD', kind='speed', title='去圆环绕开电池盒④：伸长、缩回的速度 R2SPD(度/秒)', setup='rdetour3', needs_fw=True,
+         back_path='ring',
+         text='直接输入数字(例如 400)，或者 +100 / -100：伸缩会按这个速度缩回再伸出给你看。越大越快，0 = 和 A2SPD 一样。\n'
+              '满意了回车保存，手臂按原路(伸着转回开始伸长的角度，再到 2 号环上方)回去。物料还夹着，下一步用得上。'),
     dict(key='ZPLC', kind='lift', title='往地上放物料的高度 ZPLC', setup='ring_down',
          text='先输入 c 夹住一个物料，用 -10 / -5 / -1 慢慢往下降，降到物料底部刚好碰到地面(圆环里)。'),
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
@@ -147,7 +169,9 @@ PLACE_HOVER_MM = 8.0          # 第一层/第二层放置位置那两步：物�
 PLACE_ADJ_FILE = 'place_adj.json'   # 和 mission_cfg.place_adj_file 一样(run_live 里 pcal 也写这个文件)
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
-CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring', 'PL1': 'ring', 'PL2': 'ring'}
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring',
+             'PL1': 'ring', 'PL2': 'ring'}
+RING_TEACH_FILE = 'ring_teach.json'     # 和 mission_cfg.ring_teach_file 一样：R1/R3 两步把 1、3 号环比 2 号环多转多少存在这里
 VIEW_LOG = '/tmp/vlive_wizard.log'
 
 
@@ -396,7 +420,11 @@ class Wizard:
             self.claw_to(P['CLWO'])
             self.pose(P['A1G'], P['A2E'])
         elif kind in ('ring', 'ring_down', 'ring_obs'):
-            self.pose(P['A1P'], P['A2P'])
+            o = self._ring_teach_now(st['ring']) if st['kind'] == 'ringpose' else None
+            if o:                                          # 1、3 号环存过：从存过的位置开始(对就直接回车)
+                self.pose(P['A1P'] + o[0], P['A2P'] + o[1])
+            else:
+                self.pose(P['A1P'], P['A2P'])
         elif kind == 'place':
             self._setup_place(st)
         elif kind == 'stow':
@@ -405,6 +433,13 @@ class Wizard:
             a1 = P.get('A1T2' if kind == 'detour3' else 'A1T1', 0.0)
             a2 = P.get('A2E') if kind == 'detour1' else P.get('A2T', 0.0)
             if abs(a1) > 0.5 and abs(a2) > 0.5:               # 前面一步跳过了(还是 0)就不动
+                self.pose(a1, a2)
+        elif kind == 'rdetour0':                               # (10-20)圆环那组：从 2 号环上方开始(夹爪不动：夹着物料调)
+            self.pose(P['A1P'], P['A2P'])
+        elif kind in ('rdetour1', 'rdetour2', 'rdetour3'):
+            a1 = P.get('R1T2' if kind == 'rdetour3' else 'R1T1', 0.0)
+            a2 = P.get('A2P') if kind == 'rdetour1' else P.get('R2T', 0.0)
+            if abs(a1) > 0.5 and abs(a2) > 0.5:
                 self.pose(a1, a2)
         if kind in ('raw_obs', 'ring_obs'):
             self.lift_to(P['ZOBRAW' if kind == 'raw_obs' else 'ZOBRNG'])
@@ -422,6 +457,11 @@ class Wizard:
             o = self._place_adj_now(st)
             what = '摄像头对准圆环的姿态' if self._ref_cam else '圆环上方的姿态(A1P/A2P)'
             return f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   比{what}多转 ID1 {d1:+.2f}° ID2 {d2:+.2f}°   (原来存的 {o[0]:+.2f} {o[1]:+.2f})'
+        if k == 'ringpose':
+            d1, d2 = self.cur[1] - P['A1P'], self.cur[2] - P['A2P']
+            o = self._ring_teach_now(st['ring'])
+            return (f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   比 2 号环(A1P/A2P)多转 ID1 {d1:+.2f}° ID2 {d2:+.2f}°' +
+                    (f'   (原来存的 {o[0]:+.2f} {o[1]:+.2f})' if o else '   (还没存过)'))
         if k == 'servo':
             return f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   (原来 {st["key"]}={P[st["key"]]:g})'
         if k == 'claw':
@@ -457,6 +497,11 @@ class Wizard:
                 a = self.cur[st['sid']]
                 if a is not None and abs(a - P[st['key']]) > 0.2:
                     return f'{st["key"]}={a:g}'
+            if k == 'ringpose':
+                o = self._ring_teach_now(st['ring'])
+                d1, d2 = self.cur[1] - P['A1P'], self.cur[2] - P['A2P']
+                if o is None or abs(d1 - o[0]) > 0.2 or abs(d2 - o[1]) > 0.2:
+                    return f'{st["key"]}(ID1 {d1:+.2f}° ID2 {d2:+.2f}°)'
         except (KeyError, TypeError):
             return None
         return None
@@ -614,6 +659,37 @@ class Wizard:
         p = Path(name).expanduser()
         return JacStore(str(p if p.is_absolute() else ROOT / p))
 
+    def _ring_teach_path(self):
+        name = RING_TEACH_FILE
+        try:
+            mc = json.loads(self.cfg_path.read_text(encoding='utf-8')).get('mission_cfg') or {}
+            name = mc.get('ring_teach_file') or name
+        except Exception:
+            pass
+        p = Path(name).expanduser()
+        return p if p.is_absolute() else (self.cfg_path.parent if self.cfg_path is not None else ROOT) / p
+
+    def _ring_teach_now(self, ring):
+        """ring_teach.json 里存的 ring 号环比 2 号环多转多少 (dID1, dID2)(粗加工区的，两个区存的一样)；没存过返回 None。"""
+        try:
+            v = json.loads(self._ring_teach_path().read_text(encoding='utf-8'))['ROUGH'][str(ring)]
+            return float(v[0]), float(v[1])
+        except Exception:
+            return None
+
+    def _ring_detour_back(self):
+        """(10-20)调完圆环那组绕电池盒：伸着转回开始伸长的角度 R1T1，再到 2 号环上方 A1P/A2P(不扫到电池盒)。"""
+        P = self.P
+        try:
+            if abs(P.get('R2T', 0.0)) > 0.5 and abs(P.get('R1T1', 0.0)) > 0.5:
+                self.lift_to(P['ZHI'])
+                self.servo_to(2, P['R2T'])
+                self.servo_to(1, P['R1T1'])
+                self.servo_to(2, P['A2P'])
+                self.pose(P['A1P'], P['A2P'])
+        except CalError as e:
+            self.out(f'  !! 回 2 号环上方失败：{e}')
+
     def _place_adj_path(self):
         return (self.cfg_path.parent if self.cfg_path is not None else ROOT) / PLACE_ADJ_FILE
 
@@ -659,7 +735,7 @@ class Wizard:
             self.z = P['ZHI']
         self.cur = {1: None, 2: None}
         self._q_warned = False
-        if k in ('pose', 'servo', 'place'):
+        if k in ('pose', 'servo', 'place', 'ringpose'):
             self._read_servos()
         if k == 'claw':
             self.claw_to(P[st['key']])
@@ -752,14 +828,17 @@ class Wizard:
             if v is None:
                 raise CalError('这一步输入速度数字(例如 800)，或者 +100 / -100')
             want = self.spd + v if line[:1] in '+-' else v
-            want = max(0.0, min(1500.0 if st['key'] == 'A2SPD' else 20000.0, want))
+            want = max(0.0, min(1500.0 if st['key'] in ('A2SPD', 'R2SPD') else 20000.0, want))
             self.do(f'SET {st["key"]} {want:g}', quiet=True)         # 先试，回车才存进配置
             self.spd = want
-            if st['key'] == 'A2SPD':
-                sp = want if want > 0.5 else float(P.get('ASPD', 90.0))
-                if abs(P.get('A2T', 0.0)) > 0.5:
+            if st['key'] in ('A2SPD', 'R2SPD'):
+                ext = 'A2T' if st['key'] == 'A2SPD' else 'R2T'
+                sp = want if want > 0.5 else (float(P.get('A2SPD', 0.0)) if st['key'] == 'R2SPD' else 0.0)
+                if sp <= 0.5:
+                    sp = float(P.get('ASPD', 90.0))
+                if abs(P.get(ext, 0.0)) > 0.5:
                     self.do(f'AFS 2 {P["A2R"]:g} {sp:g}')                # 按新速度缩回再伸出
-                    self.do(f'AFS 2 {P["A2T"]:g} {sp:g}')
+                    self.do(f'AFS 2 {P[ext]:g} {sp:g}')
                 return None
             a, b = (P['CLWO'], P['CLWC']) if st['key'] == 'CLSPD' else (P['CLWC'], P['CLWO'])
             self.claw_to(a)
@@ -830,6 +909,23 @@ class Wizard:
         elif k == 'servo':
             self._read_servos()
             self.save({st['key']: self.cur[st['sid']]})
+        elif k == 'ringpose':
+            self._read_servos()
+            d1, d2 = self.cur[1] - self.P['A1P'], self.cur[2] - self.P['A2P']
+            path = self._ring_teach_path()
+            try:
+                d = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            except Exception:
+                d = {}
+            for zone in ('ROUGH', 'TEMP'):                 # 两个区圆环一样摆：共用
+                z = d.setdefault(zone, {})
+                z[str(st['ring'])] = [round(d1, 2), round(d2, 2)]
+                z.pop('e' + str(st['ring']), None)         # 以前 rteach(摄像头)记的"画面里在哪"对不上了
+                z['src'] = 'arm_calib'
+                z['p2'] = [round(self.P['A1P'], 2), round(self.P['A2P'], 2)]
+            path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
+            self.saved[st['key']] = (round(d1, 2), round(d2, 2))
+            self.out(f'  已保存：{st["ring"]} 号环比 2 号环多转 ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path.name}，粗加工区、暂存区共用)')
         elif k == 'place':
             self._read_servos()
             r = self._ref or (self.P['A1P'], self.P['A2P'])
@@ -880,7 +976,9 @@ class Wizard:
                     i += 1
                     continue
                 r = self.step(i)
-                if STEPS[i].get('back_path'):
+                if STEPS[i].get('back_path') == 'ring':
+                    self._ring_detour_back()
+                elif STEPS[i].get('back_path'):
                     self._detour_back()
                 i += r
                 if i < 0:
@@ -899,8 +997,11 @@ class Wizard:
             self.out('这次保存的参数：' + '  '.join(f'{k}=' + ('/'.join(f'{x:g}' for x in v) if isinstance(v, tuple) else f'{v:g}') for k, v in self.saved.items()))
             if self.cfg_path is not None and any(not isinstance(v, tuple) for v in self.saved.values()):
                 self.out(f'已写进 {self.cfg_path}(原文件备份为 .json.bak)，以后 map_merge_live 启动会自动发给 STM32。')
-            if any(isinstance(v, tuple) for v in self.saved.values()):
+            if any(isinstance(v, tuple) for k, v in self.saved.items() if k in ('PL1', 'PL2')):
                 self.out(f'放置补偿存在 {self._place_adj_path()}：比赛时摄像头对准圆环以后自动按它补(第一层 PL1、第二层 PL2 各用各的)。')
+            if any(k in self.saved for k in ('R1', 'R3')):
+                self.out(f'1、3 号环的角度存在 {self._ring_teach_path()}：比赛时车对准 2 号环以后不动，手臂直接按它转过去放、取'
+                         '(粗加工区、暂存区共用)。重开 run_live 生效。')
             self.out('回到正常使用：bash run_live.sh')
         if i >= len(STEPS) and self.P.get('ARMOK', 0) < 0.5:
             try:
