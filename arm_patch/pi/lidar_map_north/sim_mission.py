@@ -67,7 +67,8 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0):
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0,
+                 arm_r_mm=None):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -117,6 +118,11 @@ class SimWorld:
         self.Rcam = np.array([[c, -s], [s, c]]) @ np.diag([1.0, refl])
         self.k2 = 0.175 * self.rng.choice([-1.0, 1.0])        # ID2 每度动多少毫米(径向)
         self.k1 = 2.6 * self.rng.choice([-1.0, 1.0])          # ID1 每度动多少毫米(切向)
+        # (10-19)arm_r_mm：手臂按真车的样子算——绕转轴转(ID1) + 齿条伸缩(ID2)，转轴在爪子往里 arm_r_mm 处(None = 按直线算)
+        self.arm_r = float(arm_r_mm) if arm_r_mm else None
+        if self.arm_r:
+            self.k2 = abs(self.k2)                                          # ID2 正转往外伸
+            self.k1 = math.copysign(self.arm_r * math.pi / 180.0, self.k1)  # ID1 转 1 度爪子走的弧长
         self.scale = dict(RAW=4.36, RING=1.46, PICK=1.46 * 1.3)   # RING：现场画面里圆环间距 150mm ≈ 219 像素；PICK：物料顶面(比地面近，像素/毫米大)
         self.f_gain = float(f_gain)                            # 底盘前后实际走的距离 = 指令 × 这个(测"走得不准")
         self.park = dict(park or {})                           # 工位 -> 车停的位置沿圆环那一排偏了多少毫米(测"车没停在 2 号环")
@@ -326,14 +332,26 @@ class SimWorld:
         return np.array([[c, -s], [s, c]])
 
     def _cam(self, zone=None):
-        """工位坐标系里的偏差 -> 画面里的方向(摄像头装在车上，跟着车身一起转)。"""
-        return self.Rcam @ self._rot(zone).T
+        """工位坐标系里的偏差 -> 画面里的方向(摄像头装在车上，跟着车身一起转)。
+        (10-19)arm_r_mm(真车的手臂)：摄像头装在爪子上，ID1 转多少画面也跟着转多少。"""
+        rc = self.Rcam
+        if self.arm_r and self.a1_ref is not None:
+            ph = math.radians(self.a1 - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            c, s = math.cos(ph), math.sin(ph)
+            rc = rc @ np.array([[c, s], [-s, c]])               # 画面看到的 = 世界反着转 ph
+        return rc @ self._rot(zone).T
 
     def claw(self):
         """爪子在工位坐标系里的位置(rad, tan)。车身斜了(tilt)：手臂和底盘的动作都按车身的方向走。"""
         if self.a1_ref is None:
             return np.array([0.0, 0.0])
-        d = np.array([self.k2 * (self.a2 - self.a2_ref) - self.off_s, self.k1 * (self.a1 - self.a1_ref) + self.off_f])
+        if self.arm_r:
+            r = self.arm_r + self.k2 * (self.a2 - self.a2_ref)
+            ph = math.radians(self.a1 - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            arm = np.array([-self.arm_r + r * math.cos(ph), r * math.sin(ph)])
+        else:
+            arm = np.array([self.k2 * (self.a2 - self.a2_ref), self.k1 * (self.a1 - self.a1_ref)])
+        d = arm + np.array([-self.off_s, self.off_f])
         return self.stop_err + self._rot() @ d
 
     def ring_center(self, k):
@@ -904,7 +922,8 @@ ARM_ALIGN = dict(RAW='arm', ROUGH='arm', TEMP='arm')     # 手臂对准(10-12 �
 LEGACY = dict(raw_any_order=False, raw_wheels_first=False, wheels_first=False, take_first=False,
               zone_filter=True, ring_precorrect=True, tilt_precorrect=True, return_bias=True, zone_frames=2, zone_gain=1.0,
               survey_frames=3, raw_max_iter=3, raw_grab_max_mm=5.0, raw_force_grab=False, full_course=False,
-              align_by=ARM_ALIGN, raw_follow=False, raw_center=False)   # 这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
+              align_by=ARM_ALIGN, raw_follow=False, raw_center=False,
+              zone_arm_geom=False)   # (10-19)工位没示教时按环距只动手臂放 1、3 号环：这些测试写的时候还没有(新做法见 ZoneArmGeomTests)；这些测试写的时候工位、原料区都是手臂对准；工位用的是新做法(原料区：修 3 次、偏 5mm 以内才夹；10-11 比赛默认修 1 次、30mm 以内就夹)；10-10 晚默认换回 1010i 的做法(见 test_1010i_defaults_*)
 LIVE_DEFAULTS = dict(raw_any_order=True, raw_wheels_first=False, wheels_first=True, take_first=True, zone_filter=True,
                      raw_center=False)   # 这些整场模拟的原料盘是以前的样子(爪子停在物料旁边)，不对准原料盘中心；对准中心的见 RawFollowTests
 
@@ -2983,6 +3002,121 @@ def _demo(fast, batches=2, extra=None):
     print(f'操作用时估计 {w.t:.0f} 秒(不含路线行驶；{"提速参数" if fast else "默认速度参数"}；只做第一批)' if batches == 1 else
           f'操作用时估计 {w.t:.0f} 秒(不含路线行驶；{"提速参数" if fast else "默认速度参数"})')
     print('各指令耗时：', time_report(w))
+
+
+class ZoneArmGeomTests(unittest.TestCase):
+    """(10-19 用户)粗加工区/暂存区：车只在 2 号环前对准一次，1、3 号环按环距(150mm，三个环的位置是知道的)算手臂转多少，
+    只动手臂、车不动(不用示教)；转过去以后空爪只动手臂用摄像头对准一次再放；第一批量到的角度第二批直接用。
+    arm_r_mm：手臂按真车的样子算(绕转轴转 + 齿条伸缩)，转 1、3 号环时 ID2 也要伸长一截。"""
+    CODE = MissionSimTests.CODE
+
+    def _make(self, w, extra=None, lines=None, arm_j=True):
+        cfg = dict(zone_arm_geom=True, align_by=ZONE_WHEELS, a1_range=[0.0, 720.0])
+        cfg.update(extra or {})
+        h = make(w, cfg, log=(lines.append if lines is not None else (lambda m: None)))
+        h._ensure(w.link)
+        if arm_j:                                                   # 做过 vcal RING arm(手臂和画面的对应关系)
+            h.store.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        h.store.put('RING', 'ch', w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0]))     # 做过 vcal RING(车轮)
+        return h
+
+    def _spy_moves(self, w, h):
+        """记下工位里每次底盘挪动时：哪个工位、2 号环对准过没有(对准过以后只该在做完挪回停车点时挪)。"""
+        rec = []
+        om = h.act.chassis_move
+
+        def cm(sv, f, speed=None):
+            rec.append((w.zone, w.zone in h._p2, round(float(sv)), round(float(f))))
+            return om(sv, f, speed=speed) if speed else om(sv, f)
+        h.act.chassis_move = cm
+        return rec
+
+    def _ok(self, w, h, text):
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-4000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-4000:])
+        self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
+        self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
+
+    def test_real_arm_rings_1_3_by_arm_only(self):
+        """真车样子的手臂(转轴离爪子 300mm)：每个工位车只对准 2 号环，1、3 号环只转手臂(ID1 约 27°、ID2 伸长约 35mm)，
+        对准 2 号环以后车不再挪(只有做完挪回停车点)；12 个都放准；第二批按第一批量到的角度转。"""
+        errs = []
+        for seed in range(3):
+            w = SimWorld(seed=seed, code=self.CODE, arm_r_mm=300.0)
+            lines = []
+            h = self._make(w, lines=lines)
+            rec = self._spy_moves(w, h)
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._ok(w, h, text)
+            self.assertIn('按环距 +150mm 算只转手臂', text)
+            self.assertIn('按环距 -150mm 算只转手臂', text)
+            self.assertIn('只动手臂对准：Result(ok=True', text)
+            self.assertIn('按第一批对准时量的角度只转手臂', text)                 # 第二批
+            self.assertNotIn('照旧挪车对准', text)
+            self.assertIn('车没动、只转手臂放的，不再对准', text)                  # 取回时直接按放下时的角度取
+            after = [m for m in rec if m[0] in ('ROUGH', 'TEMP') and m[1]]
+            self.assertLessEqual(len(after), 4, after)                         # 4 次工位，每次只在做完时挪回停车点
+            errs += [e for (_, _, _, e, _st) in w.placed]
+        errs = np.array(errs)
+        print(f'\n  [工位只动手臂放 1、3 号环 3 组] 放置真实误差 平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
+        self.assertLess(errs.mean(), 2.0)
+        self.assertLess(errs.max(), 4.0)
+
+    def test_polar_estimate_lands_on_the_ring_by_itself(self):
+        """不用摄像头再对(zone_arm_fine=False)：按转轴几何算的角度直接放，1、3 号环也落在 1 环里(差不到 3mm)；
+        按直线算(linear)转 27° 时爪子会偏 30mm 以上(所以真车默认 polar，而且转过去以后还要用摄像头再对一次)。"""
+        for model, ok in (('polar', True), ('linear', False)):
+            w = SimWorld(seed=1, code=self.CODE, arm_r_mm=300.0)
+            lines = []
+            h = self._make(w, dict(zone_arm_fine=False, zone_arm_model=model), lines=lines)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+            far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH' and k in (1, 3)]
+            text = '\n'.join(lines)
+            if ok:
+                self.assertEqual((len(far), w.collisions), (2, 0), text[-3000:])
+                self.assertLess(max(far), 3.0, far)
+            else:
+                self.assertTrue(w.collisions > 0 or (far and max(far) > 20.0), (far, w.collisions))
+
+    def test_without_arm_calibration_falls_back_with_a_hint(self):
+        """没做过 vcal RING arm(不知道手臂转一度画面动多少)：算不了，照旧一个环一个环挪车对准，日志里说要做什么。"""
+        w = SimWorld(seed=2, code=self.CODE, arm_r_mm=300.0)
+        lines = []
+        h = self._make(w, lines=lines, arm_j=False)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self._ok(w, h, text)
+        self.assertIn('做一次 vcal RING arm', text)
+        self.assertNotIn('只转手臂', text)
+
+    def test_ring_out_of_reach_moves_the_car_and_realigns_ring2(self):
+        """1、3 号环要转的角度超出 ID1 的限位：这个环照旧挪车对准；车挪过以后回到 2 号环重新对准再放(不按旧角度放歪)。"""
+        w = SimWorld(seed=3, code=self.CODE, arm_r_mm=300.0)
+        a1p = w.params['A1P']
+        lines = []
+        h = self._make(w, dict(a1_range=[a1p - 20.0, a1p + 20.0]), lines=lines)     # 转 27° 就够不着了
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self._ok(w, h, text)
+        self.assertIn('超出手臂能到的范围', text)
+        self.assertIn('照旧挪车对准', text)
+
+    def test_moving_the_car_after_ring2_forces_realign(self):
+        """对准 2 号环以后车被挪过(例如中间一个环挪车对准了)：再按 2 号环的角度放之前先回到 2 号环重新对准。"""
+        w = SimWorld(seed=4, code=self.CODE, arm_r_mm=300.0)
+        lines = []
+        h = self._make(w, lines=lines)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        w.arrive('ROUGH', 1)
+        h._zone_start('ROUGH', h.plan.items(1))
+        p2 = h._p2_align('ROUGH')
+        self.assertIsNotNone(p2)
+        self.assertIs(h._p2_align('ROUGH'), p2)                        # 车没动：直接用
+        h.act.chassis_move(0, 40)
+        n0 = len(lines)
+        self.assertIsNotNone(h._p2_align('ROUGH'))
+        self.assertIn('对准 2 号环以后车挪过了：回到 2 号环重新对准', '\n'.join(lines[n0:]))
 
 
 if __name__ == '__main__':

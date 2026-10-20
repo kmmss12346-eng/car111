@@ -241,6 +241,13 @@ DEFAULTS = dict(
     zone_reach='arm',                   # (10-14 用户)粗加工区/暂存区：车只在 2 号环前对准一次，1、3 号环按示教(rteach)的手臂角度直接转过去放/取，不再一个一个对准；
                                         #   没示教过(ring_teach.json 里没有这个区的 1、3 号)就照旧一个环一个环对准。'wheels' = 照旧
     ring_teach_file='ring_teach.json',  # rteach 示教的 1、3 号环手臂姿态(相对 2 号环对准时的 ID1/ID2 角度差)
+    zone_arm_geom=True,                 # (10-19 用户：三个环的距离是知道的)没示教 1、3 号环：车对准 2 号环以后，按环距 ring_spacing_mm 和手臂的
+                                        #   转轴几何(vcal RING 量的手臂 J、底盘 J)算出转到 1、3 号环的 ID1/ID2，只动手臂、车不动。False = 照旧一个一个对准
+    zone_arm_model='polar',             #   'polar' = 手臂绕转轴转(ID1) + 齿条伸缩(ID2)；'linear' = 按手臂 J 直线算(转得少时两种差不多)
+    zone_a2_out=1,                      #   ID2 正转是往外伸(1)还是往里缩(-1)
+    zone_arm_fine=True,                 # (10-19)1、3 号环：手臂按示教/算的角度转过去以后，空爪只动手臂(车不动)用摄像头对准这个环再去取物料放下
+    zone_a1_margin_deg=5.0,             #   转过去的角度离 ID1 限位至少这么多度(补偿摩擦多给的角度被限位截掉)，不然这个环照旧挪车对准
+    zone_a2_margin_deg=15.0,            #   离 ID2 限位至少这么多度
     place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
     chassis_fine_rpm=100,               # 视觉微调时底盘前后挪的速度(转/分)
     # 粗加工区 / 暂存区：
@@ -382,6 +389,9 @@ class MissionHooks:
         self.on_ring = {}                   # (区, 圆环号) -> [Item, ...](从下到上)
         self._teach_fix = {}                # (10-14)区 -> {环号: (dID1, dID2)} 拍照补的
         self._p2 = {}                       # (10-14)区 -> 2 号环对准时的 ID1/ID2 角度(zone_reach='arm')
+        self._zone_learn = {}               # (10-19)区 -> {环号: (dID1, dID2)}：只动手臂对准 1、3 号环时量到的(相对 2 号环)，第二批直接用
+        self._zone_geom_why = {}            # (10-19)区 -> 这一趟为什么不能按环距算(None = 能)：到工位时定下，中途量到对应关系也不换做法
+        self._p2_at = {}                    # (10-19)区 -> 对准 2 号环时车在哪(底盘位移 S、F)：车挪过就要重新对准
         self.pose_at = {}                   # (区, 转盘槽位) -> 放下那一刻的 底盘位移 S/F 和手臂角度 a1/a2，取回时直接回到这里
         self.learn = {'S': 0.0, 'F': 0.0}   # 这个工位里前一个圆环对准时发现的停车误差(底盘位移里扣掉圆环间距后剩下的)，带到下一个圆环
         self.disabled = None                # 不为 None = 整轮不做夹放，原因在里面
@@ -4401,9 +4411,13 @@ class MissionHooks:
         wheels = self._by_wheels(zone)
         acc = self._wheels_accept('PICK') if wheels else cfg['accept_mm']['PICK']
         try:
+            # (10-19)只有车没动、只转手臂放下的(_place_item_arm)，车还在那时的位置，才按记下的角度直接取；挪车放的照旧对准(车挪一次差几毫米)
+            rec0, d0 = self.pose_at.get((zone, item.slot)), self.act.disp
+            direct = bool(rec0 and rec0.get('arm') and self._p2.get(zone) is not None
+                          and abs(float(rec0['S']) - float(d0['S'])) < 2.0 and abs(float(rec0['F']) - float(d0['F'])) < 2.0)
             recorded = self._goto_recorded(zone, item)
-            if recorded and self._teach(zone) is not None and self._p2.get(zone) is not None:
-                self.log('    按放下时的角度直接取(示教模式，不再对准)')
+            if recorded and direct:
+                self.log('    按放下时的角度直接取(车没动、只转手臂放的，不再对准)')
                 if self.nogo:
                     return True
                 self._ring_ready = self._at_obs = False
@@ -4727,7 +4741,8 @@ class MissionHooks:
 
     # ------------------------------------------------------------------ (10-14 用户)只在 2 号环前对准一次，1、3 号环按示教转手臂
     def _teach(self, zone):
-        """zone_reach='arm' 而且示教过这个区的 1、3 号环：{环号: (dID1, dID2)}(相对 2 号环对准时的角度)；否则 None。"""
+        """zone_reach='arm'：{环号: (dID1, dID2)}(相对 2 号环对准时的角度)。1、3 号环示教过(rteach)就是示教的；
+        (10-19)没示教过、zone_arm_geom 时是 None(对准 2 号环以后按环距算，见 _zone_geom)。不能只动手臂返回 None。"""
         if str(self.cfg.get('zone_reach') or '').lower() != 'arm':
             return None
         if not hasattr(self, '_teach_all'):
@@ -4738,17 +4753,167 @@ class MissionHooks:
             out['e'] = {k: t.get('e' + str(k)) for k in (1, 3)}
             return out
         except (KeyError, TypeError, ValueError, IndexError):
-            warned = self.__dict__.setdefault('_teach_warned', set())
+            pass
+        warned = self.__dict__.setdefault('_teach_warned', set())
+        if zone in self._zone_geom_why:
+            why = self._zone_geom_why[zone]
+        else:
+            why = self._zone_geom_missing() if self.cfg.get('zone_arm_geom', True) else 'zone_arm_geom 关着'
+        if why is None:
             if zone not in warned:
                 warned.add(zone)
-                self.log(f'    ({zone} 还没示教 1、3 号环的手臂姿态(rteach {zone} 2/1/3)：这次照旧一个环一个环对准)')
+                self.log(f'    ({zone} 没示教 1、3 号环：对准 2 号环以后按环距 {float(self.cfg.get("ring_spacing_mm") or 150.0):g}mm '
+                         '算手臂转多少，只动手臂、车不动)')
+            return {1: None, 2: (0.0, 0.0), 3: None, 'e': {}}
+        if zone not in warned:
+            warned.add(zone)
+            self.log(f'    ({zone} 还没示教 1、3 号环的手臂姿态(rteach {zone} 2/1/3)，也没法按环距算({why})：这次照旧一个环一个环对准)')
+        return None
+
+    def _zone_geom_missing(self):
+        """按环距算 1、3 号环要用的对应关系有没有：有返回 None，没有返回原因。"""
+        st = self.store
+        if st is None or st.get('RING', 'arm') is None:
+            return '没量过手臂和画面的对应关系：做一次 vcal RING arm'
+        if st.get('RING', 'ch') is None:
+            return '没量过车轮和画面的对应关系：做一次 vcal RING'
+        return None
+
+    def _zone_limits(self):
+        """只动手臂转去 1、3 号环时 ID1、ID2 能到的范围(绝对角度)：限位(配置 a1_range 优先)往里收 zone_a1/a2_margin_deg。"""
+        (l1, h1), (l2, h2) = self._arm_limits()
+        a1r = self.cfg.get('a1_range')
+        if a1r:
+            l1, h1 = float(a1r[0]), float(a1r[1])
+        m1, m2 = float(self.cfg.get('zone_a1_margin_deg', 5.0)), float(self.cfg.get('zone_a2_margin_deg', 15.0))
+        return (float(l1) + m1, float(h1) - m1), (float(l2) + m2, float(h2) - m2)
+
+    def _zone_offset(self, zone, ring):
+        """ring 号环在 2 号环沿车头哪里(毫米，正 = 前方)：到工位时看清过三个环就按看到的，不然按环距(_ring_nominal)。"""
+        f, f2 = self.ring_f.get((zone, int(ring))), self.ring_f.get((zone, 2))
+        if f is not None and f2 is not None:
+            return float(f) - float(f2)
+        return float(self._ring_nominal(zone, ring))
+
+    def _zone_geom(self, zone, ring, p2):
+        """(10-19 用户：三个环的距离是知道的)没示教 1、3 号环：车对准 2 号环以后(手臂在 p2)，算只动手臂转到 ring 号环要转的 (dID1, dID2)。
+        用 vcal RING 量的对应关系(都是"目标在画面里动多少像素")：手臂 J 两列 = ID2、ID1 每度，底盘 J 第二列 = 车往前 1mm。
+          这个环在画面里离爪子点 = 车往前时画面动的方向(底盘J前进列) × 沿车头的距离 × 每毫米多少像素，反过来
+          (车往前开这么多它才到爪子下面)；
+          polar：手臂是绕转轴转(ID1) + 齿条伸缩(ID2)：爪子往外伸的方向 = ID2 那一列反过来，转轴在爪子往里 R 像素处
+          (R = ID1 每度动的像素 × 180/π)；算出转到那个环要转多少度、伸缩多少。linear：按手臂 J 直接解(转得少时两种一样)。
+        摄像头装在爪子上跟着手臂转，算的时候把对准 2 号环那一刻的画面当成平面图，不影响。算不出来返回 None。"""
+        st = self.store
+        Ja = st.get('RING', 'arm') if st is not None else None
+        Jc = st.get('RING', 'ch') if st is not None else None
+        if Ja is None or Jc is None:
             return None
+        Ja, Jc = np.asarray(Ja, float), np.asarray(Jc, float)
+        off = self._zone_offset(zone, ring)
+        jf = Jc[:, 1]
+        nf = float(np.linalg.norm(jf))
+        if nf < 1e-6:
+            return None
+        # 底盘 J 只拿来定"车往前时画面往哪边动"：它的大小对准时会被一点点改(实测漂过 8%)，距离按画面比例(每毫米多少像素)算
+        T = -jf / nf * float(self.vision.scale('RING')) * off   # 这个环现在在画面里离爪子点多少像素
+        if str(self.cfg.get('zone_arm_model') or 'polar').lower() == 'linear':
+            try:
+                d = -np.linalg.solve(Ja, T)                  # [ID2, ID1]
+            except np.linalg.LinAlgError:
+                return None
+            return float(d[1]), float(d[0])
+        a, b = Ja[:, 0], Ja[:, 1]
+        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        if na < 1e-6 or nb < 1e-6:
+            return None
+        out = 1.0 if float(self.cfg.get('zone_a2_out', 1) or 1) >= 0 else -1.0
+        o = -a / na * out                                    # 爪子往外伸时在画面里往哪边走(目标往反方向动)
+        t = -b                                               # ID1 正转时爪子在画面里往哪边走
+        sgn = 1.0 if float(o[0] * t[1] - o[1] * t[0]) >= 0.0 else -1.0
+        R = nb * 180.0 / math.pi                             # 转轴离爪子多少像素
+        w = T + R * o                                        # 转轴 -> 这个环
+        Rn = float(np.linalg.norm(w))
+        phi = math.atan2(float(o[0] * w[1] - o[1] * w[0]), float(o @ w))
+        return sgn * math.degrees(phi), (Rn - R) / na * out
+
+    def _zone_target(self, zone, ring, p2, T):
+        """只动手臂转去 ring 号环的 (ID1, ID2, 来源)：这一轮前面只动手臂对准过(第一批) > 示教 > 按环距算。超出手臂能到的范围、算不出来返回 None。"""
+        learned = (self._zone_learn.get(zone) or {}).get(int(ring))
+        if learned is not None:
+            d1, d2, src, how = float(learned[0]), float(learned[1]), 'learn', '按第一批对准时量的角度'
+        elif T.get(int(ring)) is not None:
+            d1, d2 = T[int(ring)]
+            f1, f2 = (self._teach_fix.get(zone) or {}).get(int(ring), (0.0, 0.0))
+            d1, d2, src, how = d1 + f1, d2 + f2, 'teach', '按示教'
+        else:
+            g = self._zone_geom(zone, ring, p2)
+            if g is None:
+                self.log(f'    环{ring}：按环距算不出手臂要转多少({self._zone_geom_missing() or "对应关系不对"})：这个环照旧挪车对准')
+                return None
+            d1, d2 = g
+            src, how = 'geom', f'按环距 {self._zone_offset(zone, ring):+.0f}mm 算'
+        a1, a2 = p2[0] + d1, p2[1] + d2
+        (l1, h1), (l2, h2) = self._zone_limits()
+        if not (l1 <= a1 <= h1 and l2 <= a2 <= h2):
+            self.log(f'    环{ring}：{how}要转到 ID1 {a1:.1f}°、ID2 {a2:.0f}°，超出手臂能到的范围(ID1 {l1:.0f}~{h1:.0f}°、'
+                     f'ID2 {l2:.0f}~{h2:.0f}°)：这个环照旧挪车对准')
+            return None
+        self.log(f'    环{ring}：{how}只转手臂(ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，车不动')
+        return a1, a2, src
+
+    def _arm_only_kw(self, a1, a2):
+        """(10-19)只动手臂对准(车不动)给 servo.run 的参数：手臂能偏的范围按限位(往里收余量)、最多偏 arm_limit_deg；
+        只用存着的 J(按环距算还要用它)，不探测、不改。"""
+        cfg = self.cfg
+        (l1, h1), (l2, h2) = self._zone_limits()
+        lim = (self.servo.cfg.get('arm_limit_deg') or {}) if self.servo is not None else {}
+        c1, c2 = float(lim.get('id1', 12.0)), float(lim.get('id2', 250.0))
+        kw = dict(wheels_only=False, filt=bool(cfg.get('zone_filter', True)), fixed_j=True,
+                  arm_range={'id1': (max(l1 - a1, -c1), min(h1 - a1, c1)), 'id2': (max(l2 - a2, -c2), min(h2 - a2, c2))})
+        if cfg.get('align_max_iter'):
+            kw['max_iter'] = int(cfg['align_max_iter'])
+        if cfg.get('zone_timeout_s'):
+            kw['timeout_s'] = float(cfg['zone_timeout_s'])
+        return kw
+
+    def _zone_arm_fine(self, zone, ring, a1, a2, covered=None):
+        """(10-19)空爪转到 ring 号环上方 (a1, a2)，只动手臂(车不动)用摄像头对准这个环；covered = 码垛：环上已经有这个颜色的物料，
+        对准它(_align_covered)。返回对准以后的 (ID1, ID2)；看不到/对不准返回 None。"""
+        cfg = self.cfg
+        P = self.arm.params() or {}
+        self._ring_ready = self._at_obs = False
+        if P.get('ZOBRNG') is not None:
+            self.arm.apz(a1, a2, float(P['ZOBRNG']))          # 边转边降到看圆环的高度(比放好的物料高，扫过去碰不到)
+        else:
+            self.arm.ap(a1, a2)
+        self._ring_ready = True                               # 张着爪停在圆环上方的观察高度
+        kw = self._arm_only_kw(a1, a2)
+        if covered is not None:
+            res, _how = self._align_covered(covered, 'STACK', f'{zone}环{ring}码垛只动手臂', confirm=False, arm_kw=kw)
+            acc = cfg['accept_mm']['STACK']
+        else:
+            res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'], allow_chassis=False,
+                                 label=f'{zone}环{ring}只动手臂', bounds=self.vision.bounds('RING'), confirm=False, **kw)
+            acc = cfg['accept_mm']['RING']
+        self.log(f'    环{ring} 只动手臂对准：{res}')
+        if res is None or not (res.ok or res.err_mm <= acc):
+            return None
+        b1, b2 = self.arm.read_angles()
+        if b1 is None or b2 is None:
+            return None
+        return b1, b2
 
     def _p2_align(self, zone):
-        """车在 2 号环前：对准 2 号环一次(只动车轮或按 align_by)，记下这时 ID1/ID2 的角度。对不准返回 None。"""
+        """车在 2 号环前：对准 2 号环一次(只动车轮或按 align_by)，记下这时 ID1/ID2 的角度。对不准返回 None。
+        (10-19)对准以后车又挪过(中间有个环够不着、照旧挪车对准了)：1、3 号环按 2 号环的角度算就不对了，回到 2 号环重新对准。"""
         p2 = self._p2.get(zone)
         if p2 is not None:
-            return p2
+            at = self._p2_at.get(zone)
+            d = self.act.disp
+            if at is None or (abs(float(d['S']) - at[0]) < 1.0 and abs(float(d['F']) - at[1]) < 1.0):
+                return p2
+            self.log('    对准 2 号环以后车挪过了：回到 2 号环重新对准')
+            self._p2.pop(zone, None)
         cfg = self.cfg
         wheels = self._by_wheels(zone)
         self._goto_ring(zone, 2)
@@ -4768,7 +4933,8 @@ class MissionHooks:
         if a1 is None or a2 is None:
             return None
         self._p2[zone] = (a1, a2)
-        self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环按示教的角度直接转过去，车不再动')
+        self._p2_at[zone] = (float(self.act.disp['S']), float(self.act.disp['F']))
+        self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环只转手臂过去(示教的、或者按环距算的)，车不再动')
         self._teach_fix[zone] = self._teach_photo(zone)
         return self._p2[zone]
 
@@ -4805,7 +4971,9 @@ class MissionHooks:
         return fix
 
     def _place_item_arm(self, item, zone, ring, stack, label, T):
-        """zone_reach='arm'：按示教的角度放。返回 True/False；2 号环对不准等情况返回 None(调用的人照旧对准)。"""
+        """zone_reach='arm'：车只在 2 号环前对准一次，1、3 号环按示教/环距算的角度只转手臂过去；(10-19)转过去以后空爪只动手臂
+        用摄像头对准这个环再放(zone_arm_fine；码垛时下面的环被物料盖着，按第一批对准时量的角度放)。
+        返回 True/False；不能只动手臂放(2 号环对不准、这个环算不出来/超出手臂能到的范围、按环距算的又看不到环)返回 None(调用的人照旧挪车对准)。"""
         key = 'STACK' if stack else 'RING'
         try:
             p2 = self._p2_align(zone)
@@ -4816,13 +4984,34 @@ class MissionHooks:
             return None
         if p2 is None:
             return None
-        d1, d2 = T[int(ring)]
-        f1, f2 = (self._teach_fix.get(zone) or {}).get(int(ring), (0.0, 0.0))
-        d1, d2 = d1 + f1, d2 + f2
-        a1, a2 = p2[0] + d1, p2[1] + d2
-        self.log(f'    环{ring}：按示教直接转过去(ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，不再对准')
+        ring = int(ring)
+        if ring == 2:
+            a1, a2 = p2
+            self.log('    环2：就在对准的这个环，不再对准')
+        else:
+            try:
+                tgt = self._zone_target(zone, ring, p2, T)
+                if tgt is None:
+                    return None
+                a1, a2, src = tgt
+                if self.cfg.get('zone_arm_fine', True) and not self.nogo:
+                    fine = self._zone_arm_fine(zone, ring, a1, a2, covered=item.color if stack else None)
+                    if fine is not None:
+                        a1, a2 = fine
+                        if not stack:                       # 码垛对准的是下面物料的顶面(和圆环不是同一个点)：不当成这个环的角度记
+                            self._zone_learn.setdefault(zone, {})[ring] = (a1 - p2[0], a2 - p2[1])
+                    elif src == 'geom':
+                        self.log(f'    ★ 环{ring} 按环距算的位置上只动手臂没对准：这个环照旧挪车对准')
+                        return None
+                    else:
+                        self.log(f'    ★ 环{ring} 只动手臂没对准：按{"示教" if src == "teach" else "第一批对准时"}的角度放')
+            except ArmAbort:
+                raise
+            except (ArmError, VisionError) as ex:
+                self.log(f'    ★ 只动手臂转到环{ring} 出错：{ex}：这个环照旧挪车对准')
+                return None
         d = self.act.disp
-        self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2)
+        self.pose_at[(zone, item.slot)] = dict(S=d['S'], F=d['F'], a1=a1, a2=a2, arm=True)   # arm：车没动、只转手臂放的
         if self.nogo:
             self.arm.ap(a1, a2)
             self.log('    (nogo：转到了，不取物料、不放)')
@@ -4882,6 +5071,7 @@ class MissionHooks:
         self.ring_f = {}
         self.ring_px = {}
         self._p2.pop(zone, None)                  # 车重新开到这个区：2 号环要重新对准
+        self._zone_geom_why[zone] = self._zone_geom_missing() if self.cfg.get('zone_arm_geom', True) else 'zone_arm_geom 关着'
         self._zone_s_ref = None
         self.ring_gate_px = None
         self._tf_off = False
@@ -5469,11 +5659,11 @@ class MissionHooks:
         self.arm.lift(zhi)
 
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
-    def _align_covered(self, color, key, label, confirm, wheels=False):
+    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None):
         """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
         1 claw_px.PICK 量过、认得到这个颜色的物料：把物料顶面对到 PICK 点(最准，不用认圆环)
         2 否则认圆环(vclaw RING 量过圆环大小时，白心被盖住也能认最外圈)
-        wheels=True：只动车轮(手臂不动)。
+        wheels=True：只动车轮(手臂不动)。arm_kw：(10-19)只动手臂、车不动(这些是给 servo.run 的参数，见 _arm_only_kw)。
         返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
         v, cfg = self.vision, self.cfg
         tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
@@ -5481,11 +5671,14 @@ class MissionHooks:
             acc = self._wheels_accept(key)
         n = cfg.get('zone_frames') or None
         kwf = self._wheels_kw if wheels else self._zone_servo_kw
+        allow = True
+        if arm_kw is not None:
+            kwf, allow = (lambda: dict(arm_kw)), False
         if int(color) in PICK_COLORS and hasattr(v, 'has_pick') and v.has_pick():
             e = v.pick_error(color, n=n)
             if e is not None:
                 self._seed_pick_jac(wheels=wheels)
-                res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color, n=n)), v.scale('PICK'), tol, allow_chassis=True,
+                res = self.servo.run('PICK', _first(e, lambda: v.pick_error(color, n=n)), v.scale('PICK'), tol, allow_chassis=allow,
                                      label=label, bounds=v.bounds('PICK'), confirm=confirm, **kwf())
                 if res.ok or res.err_mm <= acc:
                     return res, '物料'
@@ -5496,7 +5689,7 @@ class MissionHooks:
         e = measure()
         if e is None:
             return None, None
-        return self.servo.run('RING', _first(e, measure), v.scale('RING'), tol, allow_chassis=True, label=label,
+        return self.servo.run('RING', _first(e, measure), v.scale('RING'), tol, allow_chassis=allow, label=label,
                               bounds=v.bounds('RING'), confirm=confirm, **kwf()), '圆环'
 
     def _seed_pick_jac(self, wheels=False):

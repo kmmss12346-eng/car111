@@ -525,6 +525,7 @@ class CliTests(unittest.TestCase):
         self._zone_setup('ROUGH')
         path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
         self.h.cfg['ring_teach_file'] = path
+        self.h.cfg['a1_range'] = [0.0, 720.0]                 # 模拟里的角度(470° 左右)不在真车的 ID1 限位里
         self.run_cli('rteach', 'rteach ROUGH 2')
         w = self.w
         t = w.ring_tan['ROUGH']
@@ -539,8 +540,9 @@ class CliTests(unittest.TestCase):
         self.run_cli('mtest', 'mtest ROUGH 1 force')
         text = '\n'.join(self.lines)
         self.assertIn('2 号环对准了', text, text)
-        self.assertEqual(text.count('按示教直接转过去'), 3, text)
-        self.assertNotIn('照旧一个环一个环对准', text, text)
+        self.assertIn('环2：就在对准的这个环', text, text)
+        self.assertEqual(text.count('按示教只转手臂'), 2, text)       # (10-19)转过去以后再只动手臂对准一次
+        self.assertNotIn('照旧', text, text)
         self.assertEqual((w.air, w.collisions), (0, 0), text)
         placed = [p for p in w.placed if p[0] == 'ROUGH']
         self.assertEqual(len(placed), 3, text)
