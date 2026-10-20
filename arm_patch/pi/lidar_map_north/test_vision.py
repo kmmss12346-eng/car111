@@ -382,6 +382,80 @@ class PickTests(unittest.TestCase):
         self.assertEqual(out.shape, img.shape)
 
 
+def plate_scene(cx, cy, R=276, orbit=201, seed=0):
+    """(10-20)原料盘：白色圆盘(外圈半径 R 像素，边上一圈深色)放在灰色地面上，盘上画两圈线、三个物料(红蓝绿)；
+    圆心 (cx, cy) 可以在画面外(车停偏了)。实车示教时圆心在画面 (340, 471)，差不多在下边上。"""
+    rng = np.random.default_rng(seed)
+    img = np.full((480, 640, 3), (95, 105, 110), np.uint8)
+    img = (img.astype(np.int16) + rng.normal(0, 6, img.shape)).clip(0, 255).astype(np.uint8)
+    cv2.circle(img, (int(cx), int(cy)), int(R), (235, 235, 235), -1, lineType=cv2.LINE_AA)
+    cv2.circle(img, (int(cx), int(cy)), int(R), (60, 60, 60), 3, lineType=cv2.LINE_AA)
+    for r in (int(orbit * 0.5), int(orbit)):
+        cv2.circle(img, (int(cx), int(cy)), r, (150, 150, 150), 1, lineType=cv2.LINE_AA)
+    for ang, col in ((90, (255, 80, 30)), (210, (40, 40, 220)), (330, (40, 180, 40))):
+        a = math.radians(ang)
+        cv2.circle(img, (int(cx + orbit * math.cos(a)), int(cy - orbit * math.sin(a))), 49, col, -1, lineType=cv2.LINE_AA)
+    return (img.astype(np.int16) + rng.normal(0, 2, img.shape)).clip(0, 255).astype(np.uint8)
+
+
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
+class PlateSeekTests(unittest.TestCase):
+    """(10-20 用户"偏差大一点也要一直识别")车停偏了，原料盘圆心跑出画面：粗找(Hough)要求圆心在画面里，认不出；
+    给了 hints 就按露出来的那段外圈投票算圆心，再沿径向找边拟合(圆心在画面外也行)。"""
+
+    def _v(self, img):
+        v = quiet_vision(camera=FakeCam(img))
+        v.cfg['live_view'] = None
+        return v
+
+    def test_center_inside_frame_found_as_before(self):
+        v = self._v(plate_scene(340, 471))
+        pl, _ = v.plate_scan([])
+        self.assertIsNotNone(pl)
+        self.assertLess(math.hypot(pl['c_now'][0] - 340, pl['c_now'][1] - 471), 3.0)
+        self.assertFalse(pl.get('seek'))
+
+    def test_center_off_frame_found_by_vote_then_tracked(self):
+        for cx, cy in ((340, 560), (340, 640), (-60, 250), (-150, 250), (700, 300), (150, 600)):
+            img = plate_scene(cx, cy, seed=cx + cy)
+            v = self._v(img)
+            pl, _ = v.plate_scan([])
+            self.assertIsNone(pl, (cx, cy))                         # 照原来的办法认不出
+            pl, _ = v.plate_scan([], hints=[(340.0, 471.0, 270.0)])   # 猜的圆心离真的很远也行(按投票)
+            self.assertIsNotNone(pl, (cx, cy))
+            self.assertTrue(pl.get('seek'))
+            self.assertLess(math.hypot(pl['c_now'][0] - cx, pl['c_now'][1] - cy), 4.0, (cx, cy, pl['c_now']))
+            self.assertLess(abs(pl['r_now'] - 276), 6.0)
+            pl2, _ = v.plate_scan([])                                # 认出来以后照原来的办法跟得住(圆心在画面外)
+            self.assertIsNotNone(pl2, (cx, cy))
+            self.assertLess(math.hypot(pl2['c_now'][0] - cx, pl2['c_now'][1] - cy), 4.0)
+
+    def test_little_arc_gives_coarse_center_only(self):
+        """外圈只露出一小段(圆心在画面下边外 210 像素)：拟合不准，只报大概的圆心(coarse)，够知道往哪边挪。"""
+        v = self._v(plate_scene(340, 690, seed=7))
+        pl, _ = v.plate_scan([], hints=[(340.0, 471.0, 270.0)])
+        self.assertIsNotNone(pl)
+        self.assertTrue(pl.get('coarse'))
+        self.assertLess(math.hypot(pl['c_now'][0] - 340, pl['c_now'][1] - 690), 15.0)
+
+    def test_no_plate_nothing_found(self):
+        """画面里没有原料盘(只有地面)：不会把地面纹理认成外圈。"""
+        v = self._v(plate_scene(-2000, -2000, seed=3))
+        pl, _ = v.plate_scan([], hints=[(340.0, 471.0, 270.0)])
+        self.assertIsNone(pl)
+
+    def test_wrong_guess_rejected(self):
+        """猜的圆心错了(那里没有圆)：_plate_seek 不会拟合到地面纹理上(边不清楚)；猜得差不多就找得到。"""
+        img = plate_scene(340, 660, seed=5)
+        v = self._v(img)
+        tt = v._turntable()
+        fit = v._plate_seek(tt, img, [(292.0, 316.0, 276.0), (383.0, 312.0, 276.0)])
+        self.assertIsNone(fit)
+        fit = v._plate_seek(tt, img, [(330.0, 640.0, 276.0)])
+        self.assertIsNotNone(fit)
+        self.assertLess(math.hypot(fit.center_x_px - 340, fit.center_y_px - 660), 4.0)
+
+
 class LatestFrameTests(unittest.TestCase):
     def test_fresh_frames_and_close(self):
         from vision import LatestFrame

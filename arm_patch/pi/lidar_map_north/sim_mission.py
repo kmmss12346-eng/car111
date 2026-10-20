@@ -747,8 +747,25 @@ class SimVision:
 
     outer_on = True                     # (10-16)假摄像头也能认原料盘外圆(plate_scan)；False = 只能靠物料位置算圆心
 
-    def plate_scan(self, colors):
-        """和真的 Vision.plate_scan 一样：同一帧里的原料盘外圆 + 物料。原料盘外圆很大，总看得到一段弧。"""
+    W_PX, H_PX = 640, 480               # 画面大小(TRUE_CLAW 在正中间)
+
+    def _arc_in_frame(self, c, r):
+        """圆心 c(画面里的真位置)、半径 r 的圆，露在画面里最长的一段连续圆弧(度)。"""
+        a = np.radians(np.arange(0.0, 360.0, 2.0))
+        x, y = c[0] + r * np.cos(a), c[1] + r * np.sin(a)
+        vis = (x >= 3) & (x < self.W_PX - 3) & (y >= 3) & (y < self.H_PX - 3)
+        if vis.all():
+            return 360.0
+        best = cur = 0
+        for v in np.concatenate([vis, vis]):
+            cur = cur + 1 if v else 0
+            best = max(best, cur)
+        return 2.0 * min(best, len(a))
+
+    def plate_scan(self, colors, hints=None):
+        """和真的 Vision.plate_scan 一样：同一帧里的原料盘外圆 + 物料。
+        (10-20)和真的 turntable_detector 一样：粗找要圆心在画面里；认出过以后每帧在上次的圆心附近(45 像素以内)跟，圆心出了画面也跟得住；
+        跟丢了要给 hints(猜的圆心，离真的 45 像素以内)才找得回来。都要露在画面里的圆弧有 90° 以上。"""
         w = self.w
         pc = None
         hist = self.__dict__.setdefault('_pc_hist', [])
@@ -757,15 +774,35 @@ class SimVision:
             o = self._off('RAW', e)
             cl = self.claw('RAW')
             now = (cl[0] + o[0], cl[1] + o[1])
-            if abs(e[0]) > 330 or abs(e[1]) > 260:
-                now = None                                     # 原料盘跑出画面了(车转了一大圈)：外圈也认不出
+            rr = w.scale['RAW'] * (w.plate_r + 60.0)
+            true_c = (self.TRUE_CLAW[0] + float(e[0]), self.TRUE_CLAW[1] + float(e[1]))
+            inside = 0.0 <= true_c[0] < self.W_PX and 0.0 <= true_c[1] < self.H_PX
+            seed = self.__dict__.get('_tt_seed')
+            tracked = seed is not None and math.hypot(seed[0] - now[0], seed[1] - now[1]) <= 45.0
+            hinted = any(math.hypot(float(h[0]) - now[0], float(h[1]) - now[1]) <= 45.0
+                         and (len(h) < 3 or not h[2] or abs(float(h[2]) - rr) <= 0.25 * float(h[2])) for h in (hints or []))
+            # 和真的 _plate_vote 一样：给了 hints 就按外圈半径投票找圆心(半径要知道个大概：差 30 像素以内)
+            r0 = next((float(h[2]) for h in (hints or []) if len(h) > 2 and h[2]), None) or self.__dict__.get('_rim_seen')
+            voted = hints is not None and r0 is not None and abs(r0 - rr) <= 30.0
+            arc = self._arc_in_frame(true_c, rr)
+            coarse = None
+            if arc < 90.0 or not (inside or tracked or hinted or voted):
+                if voted and arc >= 45.0:
+                    coarse = (now[0] + float(w.rng.normal(0, 6.0)), now[1] + float(w.rng.normal(0, 6.0)))
+                now = None                                     # 原料盘跑出画面了 / 圆心在画面外又没跟着、没猜对：外圈认不出
             if now is not None:
                 hist.append(now)
                 del hist[:-3]                                  # 和 turntable_detector 一样：报的是最近 3 帧的中值(车在走时落后一两帧)
                 med = (float(np.median([q[0] for q in hist])), float(np.median([q[1] for q in hist])))
-                rr = w.scale['RAW'] * (w.plate_r + 60.0)
                 pc = dict(c=med, r=rr, stable=len(hist) >= 3, rms=1.0, c_now=now, r_now=rr)
-        if pc is None:
+                if not (inside or tracked):
+                    pc['seek'] = True
+                self.seek_hits = getattr(self, 'seek_hits', 0) + (0 if (inside or tracked) else 1)
+                self._rim_seen = rr
+            self._tt_seed = now
+            if coarse is not None:
+                pc = dict(c=coarse, r=float(r0), stable=False, rms=float('inf'), c_now=coarse, r_now=float(r0), coarse=True)
+        if pc is None or pc.get('coarse'):
             hist.clear()
         out = self.material_errors(colors)
         if w.frame_extra_s:
@@ -2796,6 +2833,134 @@ class RawNearSlotTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             h.raw_ct_shift(path)
         self.assertIn('最近那格', str(cm.exception))
+
+    def _far_run(self, seed, side=0.0, park=0.0, cfg=None, hook=None, raw=None):
+        """示教一次；比赛时车停偏了(side：离原料盘近了多少 mm，负 = 停远了；park：沿原料盘边前后偏了多少)，跑 QR、RAW。
+        hook(w, h) 在示教以后、比赛以前调用。返回 (w, h, 日志, 比赛前底盘指令条数)。"""
+        import tempfile
+        w = self._world(seed)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg)
+        if raw:
+            h.raw_cfg.update(raw)
+        self._teach(w, h, path)
+        w.park_side, w.park = {'RAW': float(side)}, {'RAW': float(park)}
+        if hook is not None:
+            hook(w, h)
+        lines.clear()
+        n0 = len(w.moves)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        return w, h, '\n'.join(lines), n0
+
+    def _blank(self, h, hide, w=None):
+        """hide() 为真时这一帧什么都认不出(外圈、物料都看不到；认一帧照样花时间)。"""
+        real = h._raw_center_frame
+
+        def frame(*a):
+            if hide():
+                h._rc_pts, h._rc_coarse = [], None
+                if w is not None:
+                    w.advance(0.25)
+                return None, None, 0
+            return real(*a)
+        h._raw_center_frame = frame
+
+    def test_far_stop_center_off_frame_found_by_rim(self):
+        """(10-20 用户"偏差大一点也要一直识别对准，不要写死先左后右挪着看，按偏差算")车停得离原料盘远了 5~10cm：
+        原料盘中心跑出画面(照原来的办法认不出外圈)：按露出来的那段外圈算出圆心，直接算出车该挪多少(往原料盘那边超过 40mm 也挪：
+        对准的地方就是示教时车停的地方)，对准以后三个都夹到；不按写死的路线挪着找，车轮只用 V。"""
+        for side in (-50.0, -100.0):
+            hits = 0
+            for seed in (1, 2, 5):
+                w, h, text, n0 = self._far_run(seed, side=side)
+                self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+                self.assertIn('能挪的范围放大', text)
+                self.assertNotIn('车轮边走边找', text)                  # 以前写死的 raw_center_search_mm 路线
+                self.assertNotIn('一处一处看', text)                    # 看得到外圈：不用挪着找
+                self.assertNotIn('越走越偏', text)
+                self.assertEqual([m for m in w.moves[n0:] if m[2] == 'RAW' and m[0] in ('S', 'F')], [], text[-3000:])
+                hits += getattr(h.vision, 'seek_hits', 0)
+            if side <= -100.0:
+                self.assertGreater(hits, 0)                            # 圆心在画面外：靠露出来的那段外圈认出来的
+
+    def test_stop_off_along_the_plate(self):
+        """车沿原料盘边前后停偏了 10cm(前后能挪 ±120mm)：照样认出、对准，三个都夹到。"""
+        for park in (100.0, -100.0):
+            for seed in (1, 5):
+                w, h, text, _n0 = self._far_run(seed, park=park)
+                self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+                self.assertIn('对准了(还差', text)
+
+    def test_lost_while_aligning_searches_again(self):
+        """对准到一半连着 6 秒什么都认不出(被挡住了)：不干等到时间放弃，停下重新找，认出来接着对准，三个都夹到。"""
+        for seed in (1, 2):
+            st = {}
+
+            def hook(w, h, st=st):
+                real = h._raw_center_align
+
+                def align(*a, **k):                                    # 比赛时第一次对准：开始 2 秒以后(已经在对准了)挡住 6 秒
+                    st.setdefault('t', w.t + 2.0)
+                    return real(*a, **k)
+                h._raw_center_align = align
+                self._blank(h, lambda: 't' in st and st['t'] <= w.t <= st['t'] + 6.0, w)
+            w, h, text, _n0 = self._far_run(seed, side=-40.0, hook=hook)
+            self.assertIn('跟丢了', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_nothing_visible_searches_from_near_to_far(self):
+        """外圈、物料一点都看不到(车往外停偏太多)：原地看几秒，再在能挪的范围里从近到远一处一处看(往原料盘那边的先看)，
+        车往原料盘那边挪了 25mm 才看得到；看到了就按偏差算着对准，三个都夹到。"""
+        for seed in (1, 5):
+            def hook(w, h):
+                self._blank(h, lambda: w.off_s > -25.0, w)            # 模拟里车往原料盘那边挪 = off_s 变小
+            w, h, text, _n0 = self._far_run(seed, side=-60.0, hook=hook)
+            self.assertIn('一处一处看', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_one_material_points_the_way(self):
+        """外圈认不出、只看到最近那格上的一个物料(原料盘停着)：按示教时那一格到圆心的位置推出圆心在哪，车轮直接往那边挪，
+        挪过去外圈认出来了再对准；三个都夹到。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                vis = h.vision
+                orig = vis.plate_scan
+
+                def scan(colors, hints=None):                          # 车离对准的地方还远(超过 20mm)：外圈认不出
+                    pc, out = orig(colors, hints)
+                    far = abs(w.off_s - (-60.0 + h._raw_ct()['shift'][0])) > 20.0 if h._raw_ct() else False
+                    return (None if far else pc), out
+                vis.plate_scan = scan
+            w, h, text, _n0 = self._far_run(seed, side=-60.0, hook=hook)
+            self.assertIn('只看到一个物料', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_near_box_from_map(self):
+        """能挪的范围按地图查：停车点离场地北边近(原料盘在北边)，往原料盘那边少挪一点；前后没东西挡着照旧 ±120mm；
+        往外 80mm。没有车轮和画面的对应关系时按地图(停车点 -> 原料转盘)定哪边是原料盘。"""
+        w = self._world(1)
+        lines = []
+        h = make(w, dict(raw_center=True), log=lines.append,
+                 raw=dict(stops={'RAW_STOP': [1200.0, 2200.0, 180.0]}, car_width_mm=260.0, lidar_overhang_mm=45.0))
+        h._ensure(w.link)
+        sk = h._raw_near_search(dict(c=[300.0, 400.0], r=170.0, slots={}, near=None))
+        claw = np.array(h.vision.claw('RAW'), float)
+        lo, hi = h._raw_near_box(sk, None, claw, claw + np.array([0.0, 150.0]), rc=(0.0, 0.0))
+        # 车头朝西(180°)：左边(横移 +)是南，原料盘在北 -> 往原料盘那边是横移 -
+        self.assertEqual(sk['toward_axis'], 0)
+        self.assertEqual(sk['toward_vec'][0], -1.0)
+        self.assertAlmostEqual(hi[0], 80.0)                            # 往外(南)80mm
+        self.assertAlmostEqual(lo[1], -120.0)
+        self.assertAlmostEqual(hi[1], 120.0)
+        self.assertAlmostEqual(lo[0], -40.0)                           # 车北边在 2330，再往北 40 是 2370(离边 30mm，刚好)
+        h2 = make(w, dict(raw_center=True), log=lines.append,
+                  raw=dict(stops={'RAW_STOP': [1200.0, 2230.0, 180.0]}, car_width_mm=260.0, lidar_overhang_mm=45.0))
+        h2._ensure(w.link)
+        sk2 = h2._raw_near_search(dict(c=[300.0, 400.0], r=170.0, slots={}, near=None))
+        lo2, hi2 = h2._raw_near_box(sk2, None, claw, claw + np.array([0.0, 150.0]), rc=(0.0, 0.0))
+        self.assertAlmostEqual(lo2[0], -10.0)                          # 停车点往北 30mm：往北只能挪 10mm
+        self.assertIn('会出场地', '\n'.join(lines))
 
     def test_material_not_on_near_slot_is_not_saved(self):
         """最近那一格上不是这个颜色(看不到这个颜色的物料，或者它不在爪子附近)：不保存，说清楚原因。"""

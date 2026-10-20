@@ -707,35 +707,31 @@ class Vision:
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
         return out
 
-    def plate_scan(self, colors):
+    def plate_scan(self, colors, hints=None):
         """(10-16 用户：照抄开源方案)同一帧里：原料盘(转盘)外圆 + 这几个颜色的物料。
         返回 (外圆 dict(c=(x, y), r=半径, stable=是否连续几帧稳定, rms=拟合残差, c_now=(x, y), r_now=半径) 或 None, {颜色: 偏差像素 或 None})。
         c、r 是最近几帧的中值(车停着时更稳)；c_now、r_now 只是这一帧(10-18：车在走时用它，中值会落后一两帧)。
         这一帧连同认出来的外圆、物料写给 vview.py 实时看(live_goal = 要对到的点，画成紫色菱形)。
         外圆用 turntable_detector.py(开源方案原样)：粗 Hough 找大圆 -> 沿径向采样边缘精修；锁定以后每帧只做局部精修(快)。
-        参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。"""
+        参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。
+        hints = [(x, y) 或 (x, y, 半径), ...]：(10-20)这一帧照原来的办法认不出外圆时(粗找要求圆心在画面里，车停偏了圆心就跑出画面)，
+        按露出来的那段外圈投票算圆心在哪(_plate_vote，圆心在画面外也算得出)，连同这几个猜的圆心沿径向找外圈的边(_plate_seek)，
+        找到就用它，以后每帧在它附近跟(圆心在画面外也跟得住)；外圆里多了 seek=True。外圈露出来的太少、拟合不准，只有投票明显：
+        报个大概的圆心，外圆里多了 coarse=True(只够知道往哪边挪)。hints=[] 也算(只投票)。
+        每次花的时间记在 self.last_scan_ms(物料、外圆各多少毫秒)。"""
         det = self._material_det()
+        t0 = time.perf_counter()
         fr = self._frame()
+        t1 = time.perf_counter()
         out = {}
         cu, cv_ = self.claw('RAW')
         for c in colors:
             p = det(fr, int(c)) if fr is not None else None
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        t2 = time.perf_counter()
         plate = None
         if fr is not None and self.cfg.get('turntable_on', True):
-            tt = getattr(self, '_tt', None)
-            if tt is None:
-                import turntable_detector as T
-                doc = T.build_default_turntable_detector_document()
-                doc['coarse_search'].update(image_scale=0.29, minimum_radius_px=200.0, maximum_radius_px=420.0,
-                                            canny_threshold=24.0, accumulator_threshold=26.0)
-                doc['refinement'].update(radial_search_half_width_px=53.0, minimum_visible_arc_deg=90.0, maximum_fit_rms_px=6.6,
-                                         local_recheck_rms_above_px=1.6)
-                doc['stability'].update(window_frames=3, maximum_center_jitter_px=10.0)
-                for k, v in (self.cfg.get('turntable') or {}).items():
-                    if isinstance(v, dict) and k in doc:
-                        doc[k].update(v)
-                tt = self._tt = T.TurntableDetector(T.turntable_config_from_document(doc))
+            tt = self._turntable()
             try:
                 r = tt.detect(fr)
             except Exception:
@@ -747,10 +743,128 @@ class Vision:
                 if now is not None and getattr(now, 'detected', True):
                     plate['c_now'] = (float(now.center_x_px), float(now.center_y_px))
                     plate['r_now'] = float(now.radius_px)
+            elif hints is not None:
+                r0 = next((float(h[2]) for h in hints if len(h) > 2 and h[2]), None) or getattr(self, '_rim_r', None)
+                votes = self._plate_vote(fr, r0) if r0 else []
+                fit = self._plate_seek(tt, fr, list(hints) + [(x, y, r0) for x, y, _v in votes[:3]])
+                if fit is not None:
+                    res = tt._accepted(time.perf_counter(), fit, 'reacquired')      # 记成跟踪的种子：下一帧在这附近局部精修
+                    plate = dict(c=(float(res.center_x_px), float(res.center_y_px)), r=float(res.radius_px), stable=bool(res.stable),
+                                 rms=float(res.fit_rms_px), c_now=(float(fit.center_x_px), float(fit.center_y_px)),
+                                 r_now=float(fit.radius_px), seek=True)
+                elif votes and votes[0][2] >= float((self.cfg.get('turntable_seek') or {}).get('vote_min', 4.0)) \
+                        and votes[0][2] >= 3.0 * (votes[1][2] if len(votes) > 1 else 0.0):
+                    # 外圈露出来的太少，拟合不准：只报个大概的圆心(coarse)，够往那边挪了；挪近了露出来的多了再精确认
+                    x, y, _v = votes[0]
+                    plate = dict(c=(float(x), float(y)), r=float(r0), stable=False, rms=float('inf'), c_now=(float(x), float(y)),
+                                 r_now=float(r0), coarse=True)
+            if plate is not None and not plate.get('coarse'):
+                self._rim_r = float(plate.get('r_now', plate['r']))
+        t3 = time.perf_counter()
         if fr is not None:
             pts = [(cu + q[0], cv_ + q[1]) for q in out.values() if q is not None]
             self._publish(fr, 'RAW', None if plate is None else plate.get('c_now', plate['c']), color_id='plate', plate=plate, pts=pts)
+        self.last_scan_ms = dict(frame=1000.0 * (t1 - t0), mat=1000.0 * (t2 - t1), rim=1000.0 * (t3 - t2),
+                                 show=1000.0 * (time.perf_counter() - t3), n=len(colors))
         return plate, out
+
+    def _turntable(self):
+        tt = getattr(self, '_tt', None)
+        if tt is None:
+            import turntable_detector as T
+            doc = T.build_default_turntable_detector_document()
+            doc['coarse_search'].update(image_scale=0.29, minimum_radius_px=200.0, maximum_radius_px=420.0,
+                                        canny_threshold=24.0, accumulator_threshold=26.0)
+            doc['refinement'].update(radial_search_half_width_px=53.0, minimum_visible_arc_deg=90.0, maximum_fit_rms_px=6.6,
+                                     local_recheck_rms_above_px=1.6)
+            doc['stability'].update(window_frames=3, maximum_center_jitter_px=10.0)
+            for k, v in (self.cfg.get('turntable') or {}).items():
+                if isinstance(v, dict) and k in doc:
+                    doc[k].update(v)
+            tt = self._tt = T.TurntableDetector(T.turntable_config_from_document(doc))
+        return tt
+
+    def _plate_vote(self, fr, r_px, scale=0.29, k=4):
+        """(10-20)外圈半径知道(r_px)：缩小的画面里每个边缘点沿梯度方向往两边各走一个半径投一票，外圈露出来的那段弧的票都投在圆心上
+        (圆心在画面外也行，投票的格子比画面大)。返回票最多的几个 [(x, y, 票数), ...](原画面像素，票多的在前)。
+        车停偏了、圆心跑出画面时用：粗找(Hough)要求圆心在画面里，这里不用。"""
+        import cv2
+        import numpy as np
+        small = cv2.resize(fr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (7, 7), 1.5)
+        edges = cv2.Canny(gray, 12, 24)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        ys, xs = np.nonzero(edges)
+        if len(xs) < 20:
+            return []
+        g = np.hypot(gx[ys, xs], gy[ys, xs]) + 1e-6
+        ux, uy = gx[ys, xs] / g, gy[ys, xs] / g
+        h, w = gray.shape
+        R = float(r_px) * scale
+        P = int(round(1.2 * R))
+        acc = np.zeros((h + 2 * P, w + 2 * P), np.float32)
+        wgt = np.minimum(g / 20.0, 1.0).astype(np.float32)          # 边越清楚票越重(地面纹理的边弱)
+        for dr in (-6.0, -3.0, 0.0, 3.0, 6.0):                     # 半径差一点也投得上(缩小的画面里 ±6 像素 ≈ 原画面 ±20)
+            for sg in (1.0, -1.0):
+                ix = np.round(xs + sg * (R + dr) * ux).astype(np.int32) + P
+                iy = np.round(ys + sg * (R + dr) * uy).astype(np.int32) + P
+                ok = (ix >= 0) & (ix < acc.shape[1]) & (iy >= 0) & (iy < acc.shape[0])
+                np.add.at(acc, (iy[ok], ix[ok]), wgt[ok])
+        acc = cv2.GaussianBlur(acc, (0, 0), 1.5)
+        out = []
+        sep = max(3, int(0.3 * R))
+        for _ in range(k):
+            iy, ix = np.unravel_index(int(np.argmax(acc)), acc.shape)
+            v = float(acc[iy, ix])
+            if v <= 0:
+                break
+            out.append(((ix - P) / scale, (iy - P) / scale, v))
+            acc[max(0, iy - sep):iy + sep + 1, max(0, ix - sep):ix + sep + 1] = 0
+        return out
+
+    def _plate_seek(self, tt, fr, hints):
+        """(10-20)按猜的圆心找外圆：每个猜的圆心(半径没给就用上次认出的外圆半径)沿 180 条径向射线找边、鲁棒拟合圆
+        (和 turntable_detector 局部跟踪一样的办法，圆心在画面外也行，只要露出来的圆弧够长)。
+        猜错的圆心会拟合到地面纹理上：再要求边够清楚(外圈是白盘子的边，边缘强度高；纹理拟合出来的圆边缘弱)、残差小、半径和猜的差不多。
+        都不行返回 None；有好几个取最像的(圆弧长、残差小、边清楚)。配置 turntable_seek：min_edge、max_rms、min_arc_deg、max_seeds。"""
+        import turntable_detector as T
+        import cv2
+        import numpy as np
+        cfg = tt.config
+        sk = self.cfg.get('turntable_seek') or {}
+        min_edge = float(sk.get('min_edge', 12.0))
+        max_rms = float(sk.get('max_rms', 4.0))
+        min_arc = float(sk.get('min_arc_deg', cfg.minimum_visible_arc_deg))
+        r_last = getattr(self, '_rim_r', None)
+        hh, ww = fr.shape[:2]
+        ang = np.radians(np.arange(0.0, 360.0, 5.0))
+        best, best_k = None, None
+        for h in list(hints)[:int(sk.get('max_seeds', 120))]:
+            r0 = float(h[2]) if len(h) > 2 and h[2] else r_last
+            if not r0:
+                continue
+            xs, ys = float(h[0]) + r0 * np.cos(ang), float(h[1]) + r0 * np.sin(ang)
+            vis = (xs >= 3) & (xs < ww - 3) & (ys >= 3) & (ys < hh - 3)
+            if 5.0 * float(np.count_nonzero(vis)) < min_arc - 40.0:
+                continue                                   # 这个圆心的话外圈几乎都在画面外：不用找了(省时间)
+            try:
+                pts, st = tt._sample_boundary_points(fr, (float(h[0]), float(h[1]), float(r0)))
+                model, arc, rms, edge = T._robust_circle(pts, st, cfg)
+            except (T.TurntableDetectionError, cv2.error, np.linalg.LinAlgError, ValueError):
+                continue
+            cx, cy, rr = (float(x) for x in model)
+            if not (cfg.minimum_radius_px <= rr <= cfg.maximum_radius_px) or abs(rr - r0) > 0.25 * r0:
+                continue
+            if arc < min_arc or rms > max_rms or edge < min_edge:
+                continue
+            k = (0.35 * min(1.0, arc / 180.0) + 0.5 * max(0.0, 1.0 - rms / (1.5 * max_rms)) + 0.15 * min(1.0, edge / 20.0))
+            if best_k is None or k > best_k:
+                best_k = k
+                best = T.CircleFit(True, cx, cy, rr, float(arc), float(rms), float(k), '按猜的圆心找到外圆')
+                if k >= float(sk.get('good', 0.85)):
+                    break                                  # 够好了(猜的圆心按可能性从大到小排)：后面的不用试了
+        return best
 
     def material_error(self, color_id, n=None):
         """物料偏差像素 = 物料 - 爪子(RAW)。看不到返回 None。"""
@@ -1135,8 +1249,9 @@ class Vision:
                 if plate is not None:
                     pc = plate.get('c_now', plate['c'])
                     pr = float(plate.get('r_now', plate['r']))
-                    cv2.circle(out, (int(round(pc[0])), int(round(pc[1]))), int(round(pr)), (0, 255, 255), 2)
-                    info = f' plate r={pr:.0f}px'
+                    rough = bool(plate.get('coarse'))           # (10-20)外圈只露出一小段：大概的圆心(橙色)
+                    cv2.circle(out, (int(round(pc[0])), int(round(pc[1]))), int(round(pr)), (0, 165, 255) if rough else (0, 255, 255), 2)
+                    info = f' plate r={pr:.0f}px' + (' (rough)' if rough else (' (found off-frame)' if plate.get('seek') else ''))
                 for q in pts or []:
                     cv2.circle(out, (int(round(q[0])), int(round(q[1]))), 8, (255, 255, 0), 2)
                 info += f' {len(pts or [])} materials'
