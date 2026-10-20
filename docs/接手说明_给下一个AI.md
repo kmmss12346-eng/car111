@@ -485,6 +485,8 @@ git_log.txt                ← 分支最近 120 条提交记录
   - 范围 `_raw_near_box`：以示教时停的地方(rc=D.shift)为中心，往原料盘那边 `raw_near_toward_mm`(40)、往外 `raw_near_away_mm`(80)、前后 `raw_near_along_mm`(±120)；
     哪边是原料盘按 J⁻¹(爪子点−示教圆心) 定，没有 J 按地图(停车点→`raw_center_mm`)；有地图位姿就 `_body_clear` 查车身出不出场地、离黄色区/工位/地图障碍物(ctx.obstacles，不管 exec_obstacles)，那边少挪。
   - 认出圆心后 `widen()`：对准的地方就是示教时车停的地方(相对原料盘一样，不会碰原料盘)，在范围外也把范围放大到包住它，最多 `raw_near_max_mm`(150)。
+    **防认错撞原料盘：**按猜的圆心/投票找到的外圈(vision 一直标 `seek=True`，跟着它的帧也是，直到跟丢或粗找重新认出)要画面里的物料在物料圆上
+    (`_rc_conf`)才算确认；没确认时往原料盘那边只放大到原来的 `raw_near_toward_mm`，挪近了确认了(卡在范围边上 3 秒时再看)再放大。
   - ② 存过 RAW 'ch' 就直接用(`_raw_J_stored`，比赛时不再挪着测)。
   - ③ 对准时 hints=[预测的圆心]；连着 `raw_near_lost_s`(4)秒认不出 → 停下回 ① 接着找；车轮被范围卡住 3 秒还差就停；①②③ 一共 `raw_near_find_s`(90)秒。
     认出外圈后每 `raw_center_mats_every`(5)帧才认一次物料。**只有真认出圆心的帧才算对准**(以前光靠推算也能"对准了"，修掉了)。

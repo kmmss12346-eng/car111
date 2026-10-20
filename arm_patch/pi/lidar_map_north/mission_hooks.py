@@ -2163,10 +2163,17 @@ class MissionHooks:
             self._rc_coarse = np.asarray(plate.get('c_now', plate['c']), float)   # 外圈只露出一小段：大概的圆心(只够知道往哪挪)
             plate = None
         orb = getattr(self, '_rc_orbit', None)
+        if plate is None or plate.get('seek_new'):
+            self._rc_conf = False                              # 新找到的(按猜的圆心)外圈：还没拿物料确认过
         if plate is not None and plate.get('seek') and P and orb:
             c_ = np.asarray(plate.get('c_now', plate['c']), float)
             if min(abs(float(np.linalg.norm(p - c_)) - orb) for p in P) > 0.3 * orb:
                 plate = None                                   # 看到的物料都不在物料所在的圆上：按猜的圆心找到的外圈是错的
+                self._rc_conf = False
+            else:
+                self._rc_conf = True                           # 看到的物料在物料圆上：确认没认错(之后跟着它的帧都算)
+        # 照原来的办法认出的外圈算数；按猜的圆心找到的要物料确认过才算(往原料盘那边多挪要它)
+        self._rc_sure = plate is not None and (not plate.get('seek') or bool(getattr(self, '_rc_conf', False)))
         if plate is not None:
             self._rc_rim = float(plate.get('r_now', plate['r']))
             # 10-18：用这一帧的外圈(c_now)。plate['c'] 是最近 3 帧的中值，车在走时落后一两帧，测车轮和画面的对应关系就测小了
@@ -2608,10 +2615,18 @@ class MissionHooks:
 
         def widen(c_, r_, p_):
             """认出圆心了：对准时车该停的地方就是示教时车停的地方(相对原料盘一样，不会碰到原料盘)。它在能挪的范围外(导航停偏了)
-            就把范围放大到包住它(多 10mm)，最多离示教时停的地方 max_mm；再远说明导航停车点偏太多了，挪到边上为止。"""
+            就把范围放大到包住它(多 10mm)，最多离示教时停的地方 max_mm；再远说明导航停车点偏太多了，挪到边上为止。
+            往原料盘那边超出原来的范围：外圈要是照原来的办法认出的、或者看到的物料在物料圆上(确认没认错)才放大(认错了会撞原料盘)。"""
             need = (base + p_) - np.linalg.solve(sk_J[0], tgt(c_, r_) - goalp) - rc      # 对准时车该在哪(相对 rc)
             cap = float(sk.get('max_mm', 150.0))
             want = np.clip(need, -cap, cap)
+            k_t = int(sk.get('toward_axis', 0))
+            tv = (sk.get('toward_vec') or (0.0, 0.0))[k_t]
+            if tv and not getattr(self, '_rc_sure', True):
+                lim_t = float(sk.get('toward', 40.0))
+                if tv * want[k_t] > lim_t:
+                    want[k_t] = tv * lim_t
+                    self.log(f'    外圈是按露出来的一段找到的、画面里没有物料确认：往原料盘那边先只挪原来的 {lim_t:.0f}mm，挪近了认清楚再说')
             lo2, hi2 = np.minimum(lo, want - 10.0), np.maximum(hi, want + 10.0)
             if np.any(lo2 < lo - 1e-6) or np.any(hi2 > hi + 1e-6):
                 lo[:], hi[:] = lo2, hi2
@@ -2872,6 +2887,12 @@ class MissionHooks:
                     if search and st['clamped'] and float(np.linalg.norm(st['cmd'])) < 0.5 * vmin:
                         t_stuck = t_stuck or self.now()
                         if self.now() - t_stuck > 3.0:
+                            lo0, hi0 = lo.copy(), hi.copy()
+                            if getattr(self, '_rc_sure', False):
+                                widen(c, r, p_c)               # 挪近了外圈认清楚了(物料确认了)：范围按它再放大
+                            if np.any(lo != lo0) or np.any(hi != hi0):
+                                t_stuck = None
+                                continue
                             self.log(f'    ★ 车轮挪到能挪的范围边上了({self._raw_box_text(lo, hi, sk)})，还差 {em:.1f}mm：停在这里')
                             break
                     else:

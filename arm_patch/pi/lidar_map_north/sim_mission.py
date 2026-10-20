@@ -795,10 +795,16 @@ class SimVision:
                 del hist[:-3]                                  # 和 turntable_detector 一样：报的是最近 3 帧的中值(车在走时落后一两帧)
                 med = (float(np.median([q[0] for q in hist])), float(np.median([q[1] for q in hist])))
                 pc = dict(c=med, r=rr, stable=len(hist) >= 3, rms=1.0, c_now=now, r_now=rr)
-                if not (inside or tracked):
+                if not tracked:
+                    self._seek_track = not inside              # 粗找认出的 / 按猜的圆心、投票找到的(跟着它的帧都算)
+                    if not inside:
+                        pc['seek_new'] = True
+                if self.__dict__.get('_seek_track'):
                     pc['seek'] = True
                 self.seek_hits = getattr(self, 'seek_hits', 0) + (0 if (inside or tracked) else 1)
                 self._rim_seen = rr
+            else:
+                self._seek_track = False
             self._tt_seed = now
             if coarse is not None:
                 pc = dict(c=coarse, r=float(r0), stable=False, rms=float('inf'), c_now=coarse, r_now=float(r0), coarse=True)
@@ -2934,6 +2940,25 @@ class RawNearSlotTests(unittest.TestCase):
                 vis.plate_scan = scan
             w, h, text, _n0 = self._far_run(seed, side=-60.0, hook=hook)
             self.assertIn('只看到一个物料', text)
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_unconfirmed_rim_does_not_rush_toward_plate(self):
+        """按露出来的一段外圈找到圆心、画面里又没有物料确认(可能认错)：往原料盘那边先只挪原来的 40mm(认错了会撞原料盘)；
+        挪近了照原来的办法跟住外圈(确认了)再放大范围接着对准，三个都夹到。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                vis = h.vision
+                orig = vis.material_errors
+                st = {}
+
+                def mats(colors):                                      # 车往原料盘那边挪 30mm 以前画面里看不到物料
+                    out = orig(colors)
+                    if 'x' not in st:
+                        st['x'] = w.off_s
+                    return {k: None for k in out} if w.off_s > st['x'] - 30.0 else out
+                vis.material_errors = mats
+            w, h, text, _n0 = self._far_run(seed, side=-90.0, hook=hook)
+            self.assertIn('没有物料确认', text)
             self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
 
     def test_near_box_from_map(self):

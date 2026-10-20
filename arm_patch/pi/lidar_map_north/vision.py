@@ -716,7 +716,8 @@ class Vision:
         参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。
         hints = [(x, y) 或 (x, y, 半径), ...]：(10-20)这一帧照原来的办法认不出外圆时(粗找要求圆心在画面里，车停偏了圆心就跑出画面)，
         按露出来的那段外圈投票算圆心在哪(_plate_vote，圆心在画面外也算得出)，连同这几个猜的圆心沿径向找外圈的边(_plate_seek)，
-        找到就用它，以后每帧在它附近跟(圆心在画面外也跟得住)；外圆里多了 seek=True。外圈露出来的太少、拟合不准，只有投票明显：
+        找到就用它，以后每帧在它附近跟(圆心在画面外也跟得住)；外圆里多了 seek=True(找到的那一帧还有 seek_new=True；
+        之后跟着它的每一帧也是 seek=True，直到跟丢、或者粗找重新认出来：调用的地方拿物料确认没认错)。外圈露出来的太少、拟合不准，只有投票明显：
         报个大概的圆心，外圆里多了 coarse=True(只够知道往哪边挪)。hints=[] 也算(只投票)。
         每次花的时间记在 self.last_scan_ms(物料、外圆各多少毫秒)。"""
         det = self._material_det()
@@ -743,6 +744,10 @@ class Vision:
                 if now is not None and getattr(now, 'detected', True):
                     plate['c_now'] = (float(now.center_x_px), float(now.center_y_px))
                     plate['r_now'] = float(now.radius_px)
+                if getattr(r, 'tracking_mode', 'local') != 'local':
+                    self._seek_track = False                   # 粗找(圆心在画面里)重新认出来的
+                if getattr(self, '_seek_track', False):
+                    plate['seek'] = True                       # 还在跟按猜的圆心找到的那个外圈(没确认过不是认错)
             elif hints is not None:
                 r0 = next((float(h[2]) for h in hints if len(h) > 2 and h[2]), None) or getattr(self, '_rim_r', None)
                 votes = self._plate_vote(fr, r0) if r0 else []
@@ -751,7 +756,8 @@ class Vision:
                     res = tt._accepted(time.perf_counter(), fit, 'reacquired')      # 记成跟踪的种子：下一帧在这附近局部精修
                     plate = dict(c=(float(res.center_x_px), float(res.center_y_px)), r=float(res.radius_px), stable=bool(res.stable),
                                  rms=float(res.fit_rms_px), c_now=(float(fit.center_x_px), float(fit.center_y_px)),
-                                 r_now=float(fit.radius_px), seek=True)
+                                 r_now=float(fit.radius_px), seek=True, seek_new=True)
+                    self._seek_track = True
                 elif votes and votes[0][2] >= float((self.cfg.get('turntable_seek') or {}).get('vote_min', 4.0)) \
                         and votes[0][2] >= 3.0 * (votes[1][2] if len(votes) > 1 else 0.0):
                     # 外圈露出来的太少，拟合不准：只报个大概的圆心(coarse)，够往那边挪了；挪近了露出来的多了再精确认
@@ -760,6 +766,8 @@ class Vision:
                                  r_now=float(r0), coarse=True)
             if plate is not None and not plate.get('coarse'):
                 self._rim_r = float(plate.get('r_now', plate['r']))
+            else:
+                self._seek_track = False
         t3 = time.perf_counter()
         if fr is not None:
             pts = [(cu + q[0], cv_ + q[1]) for q in out.values() if q is not None]
