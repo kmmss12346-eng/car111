@@ -535,3 +535,38 @@ git_log.txt                ← 分支最近 120 条提交记录
 - **要留意：**① R1/R3 是相对 A1P/A2P 的，停车点离圆环那一排的远近要和调的时候一样(横移到头手臂补伸缩时，1、3 号环会偏 0.46×补的毫米数)；
   ② ID1 有齿轮间隙：调 R1/R3 时从 2 号环转过去，比赛时从车上转盘转过去，方向不一样可能差一点——实车放偏了先看是不是总偏同一边；
   ③ R1T1 要选在从 2 号环往车上转盘转、1 号/3 号环那边都碰不到电池盒的地方。
+
+### 12.18 10-20 晚：四个任务(2 号环认环、夹爪三个张开角度、去掉 PL1/PL2、停车点自己输入)
+- **用户：**"工位就是类似于这个圆台去定位这个 2 这个点就好了，你不要让车乱跑了，定位好之后我就按照这个相对位置去夹取放置"；
+  "找不到环不要后退，要往前慢慢去找"；"原料盘上方张开一个角度、车上物料盘上方另一个角度、其他位置另一个角度"(从转盘里取之前张开也用转盘上方那个——用户确认"对的")；
+  "把 28、29 步的补偿去掉"；"这四个停靠位置我需要自己输入选定合适位置"；"改了点的位置路线容易规划不出来报错"；"障碍物离这四个点太近车跑不到指定位置"。
+- **任务一 2 号环(提交 5eb6dfd，mission_hooks / mission_cli)：**
+  - `_ring2_smooth` 认环：半径要在到工位时看到的三个环中位数(`_ring_rmed`)的 0.75~1.33 倍；车按推算走了 ≥25px 但画面里的圈 ≤8px 没动：
+    `fixed_or_slip` 看别的环动没动——别的环动了 = 车上的东西(拉黑，以后不认)，都没动 = 车轮打滑(交给手臂补)。
+  - 边走边修车轮和画面的对应：拿看到的环位置和 J0·车走的距离做相似变换拟合(比例 0.7~1.4、转角 ≤35°、残差 ≤8px)，修正明显、对准成功就存下。
+  - 横移：目标 = 让偏差为 0 的 S(就是 arm_calib 调 2 号环时车离那一排的远近)，范围 [目标 ± ring_strafe_max_mm] ∩ ±`zone_s_max_mm`(70)，再按地图(`_body_clear`)收。
+  - 开始时画面里不到两个环：只往前 `zone_seek_speed`(10mm/s)慢慢挪，最多 `zone_seek_mm`(200)，看到两个环就停，从后往前第二个是 2 号环；一开始就看到两个环不挪。
+  - 调过 1、3 号环(src=arm_calib)的区：2 号环没对准就这个区不放(物料留车上)，**不再一个环一个环挪车**；存的 1、3 号环 ID1 比 2 号环差不到 `zone_cal_min_deg`(5°)当没调(多半是直接回车存了 0)。
+    配置 zone_reach 不是 arm 但 arm_calib 调过：照样按新做法(log 说一次)。mtest 开跑前的说明和这个判断一致。
+  - `place_comp_on`(默认 False)：place_adj.json(PL1/PL2、pcal 量的)和 place_shift_mm 一律不加；pcal save 时提示。
+- **任务三 去掉 PL1/PL2(提交 2cafdaf)：**arm_calib 删了 PL1/PL2 两步和它们专用的摄像头对准(_WizArm/_cam_align/_open_vision/_open_store/_setup_place)，
+  Wizard 不再有 vision/store 参数；`--from PL1` 说已去掉、改从 A1P 调。
+- **任务二 夹爪三个张开角度(提交 b376de6)：**
+  - 固件 arm.c：新参数 CLWOR(原料盘上方)、CLWOT(车上转盘上方)，0 = 和 CLWO 一样(1~499 拒绝)。`Claw_OAt(CLAW_AT_RAW/TRAY)`；
+    OBS RAW O 和 GRAB 下爪前用 CLWOR；GRAB/PICK 松开放进转盘用 CLWOT；TAKE 先照旧 CLWO 转过去，到转盘上方再换 CLWOT 下去夹；DROP、PICK 下爪前、OBS RING O 用 CLWO。
+    新指令 `CLAW OR` / `CLAW OT`。`Seq_PickHere` 多一个 ring 参数。STM32 主机测试 241 项。
+  - arm_calib：ZDROP 后加 CLWOT(手臂在转盘 1 号格上方降到 ZDROP 调)、ZGRAB 后加 CLWOR(原料盘上方降到 ZGRAB 调)，needs_fw(旧固件跳过)；
+    调夹爪时 `self.tune` 记正在调的值，c 夹住看看、o 回到它不会丢；其他步 o 按这一步在哪张开(`open_us`)；CLWOR/CLWOT 没改就不存(还是 0)。
+  - 树莓派：`ArmLink.claw(True, where='RAW'|'TRAY')` 发 CLAW OR/OT，旧固件回 ERR ARG 就退回 CLAW O(说一次)；`_put_back` 用 TRAY，vclaw RAW 用 RAW。
+- **任务四 停车点(提交 c766eb4)：**
+  - run_live 新命令 `stop`(看四个停车点能不能停)/`stop 名字 X Y [车头] [force]`：`route_plan.check_stop` 按真实车身(含雷达)查黄色区/工位/原料转盘/场地边(硬余量)，
+    扫描过再查障碍物(真实大小、最少 goal_obstacle_min_margin_mm)；不能停不改，列出最近能停的(直线最近、只沿车头、只横着)；工位/原料盘在车左边、比原来的停车点远 40mm 以上、
+    沿那一排偏离工位中间 60mm(原料盘 100mm)以上只提醒。改了写配置(备份 .json.bak)，清掉旧路线/预先规划，扫描过马上重新规划。
+  - `Planner.leg`：停车点本身压到区域/出场地，改停 `_fix_goal`(5mm 一格最近、goal_fix_max_mm 200 内)，`_reshift` 把 goal_shift/stop_pose 按规定的点算、note 写清楚。
+  - `plan_mission(cfg 带 goal_near_fallback=True)`：所有车道封死档都失败后，最后一档(不封车道)开不过去的停车点用 `_near_leg` 在附近找(沿车头 ±300、横着 ±75，25mm 一格，
+    横着按两倍算距离，最多 8 秒)。map_merge_live 的 attempt() 按最小障碍物余量也失败才用它。auto_run 到站时照旧把 goal_shift 交给 `hooks.stop_offset`。
+  - mission_hooks：`stop_offset` 记下，`task()` 取出成 `_cur_shift`；`_stop_pose` 按真正停的位置算；`_ring2_smooth` 横移上限 +|往左|、往前找 +max(0,-往前)；`_raw_near_box` 范围放宽。
+    模拟：横着挪 100mm 不告诉 → 只挪 70mm、2 个掉空 2 次碰倒；告诉了 → 三个都准。
+- **测试：**单元 474 个(3 跳过) + 模拟 124 个全过 + STM32 主机 241/222/41 项全过。更新包 tasks_1020c.zip(mission_hooks / mission_cli / arm_calib / arm_link / route_plan / map_merge_live / arm.c)。
+- **要留意：**① 用户 RAW 设过 y=2210(压原料转盘)，最多 2155(按 raw_margin 30)；还没回答 RAW_CT.shift_mm 是多少。
+  ② CLWOT 要比转盘格子窄得下去：用户调的时候注意张开不能碰格子边。③ 停车点挪得太远(开不过去停附近)时，原料区找圆心按地图只放宽了范围，真实能不能够着要看实车。
