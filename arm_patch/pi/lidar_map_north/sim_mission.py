@@ -67,7 +67,7 @@ class SimWorld:
     def __init__(self, seed=0, code='156+123+516+231', armok=True, qr_present=True, noise_px=0.6, stop_err_mm=8.0,
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
-                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0,
+                 qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0, plate_jitter_deg=0.0,
                  arm_r_mm=None):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
@@ -137,6 +137,8 @@ class SimWorld:
         self.plate_stop = float(plate_stop_s) if plate_stop_s else None
         self.plate_move = float(plate_move_s)
         self.plate_t0 = 0.0
+        # (10-21 实车：原料盘每次停的角度差几度，最近那格上的物料停的位置每次差几毫米)每次停下多转/少转多少(±plate_jitter_deg 里随机)
+        self.plate_jit = math.radians(float(plate_jitter_deg or 0.0)) * np.random.default_rng(seed + 991).uniform(-1.0, 1.0, 400)
         self.plate_r = float(plate_r)                           # 原料盘上物料所在圆的半径(mm)
         self.plate_c = np.array([self.plate_r + float(plate_off_mm), float(plate_off_tan)])   # plate_off_tan：物料停的地方沿车头方向偏了多少(车停得前/后了)
         self.homed = 0                                         # 收到几次 HOME(把现在的车头方向记为要保持的方向)
@@ -320,9 +322,12 @@ class SimWorld:
         k = math.floor(tau / cyc)
         r = tau - k * cyc
         step = 2 * math.pi / 3
+
+        def stop_at(j):
+            return j * step + float(self.plate_jit[j % len(self.plate_jit)])
         if r < self.plate_stop:
-            return k * step, False
-        return k * step + step * (r - self.plate_stop) / self.plate_move, True
+            return stop_at(k), False
+        return stop_at(k) + (stop_at(k + 1) - stop_at(k)) * (r - self.plate_stop) / self.plate_move, True
 
     def raw_pos(self, it, t=None):
         """原料盘上物料现在的位置(转盘转起来时随时间变)。"""
@@ -2836,6 +2841,38 @@ class RawNearSlotTests(unittest.TestCase):
         with open(path, encoding='utf-8') as f:
             d = json.load(f)['RAW_CT']
         return d, it['color']
+
+    def test_plate_stop_jitter_fixed_by_wheels_before_grab(self):
+        """(10-21 实车"一个都没夹上来""对齐不够准")原料盘每次停的角度差 ±6°(最近那格上的物料停的位置差 ±9mm，爪子只有 8mm 余量)：
+        下爪前车轮按物料实际的位置补一下再夹(手臂不动、只用 V)，三个都夹到；夹完车轮挪回去。关掉(raw_grab_fix=False)就会夹空。
+        等原料盘时不再摆 ID1(用户"突然抽搐一下")，改成升降上下 4mm。"""
+        import tempfile
+        res = {}
+        for fix in (True, False):
+            got = air = 0
+            for seed in (1, 2, 5):
+                w = self._world(seed, plate_jitter_deg=6.0)
+                path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+                lines = []
+                h = self._make(w, path, lines, cfg=dict(raw_grab_fix=fix))
+                seed_raw_wheels_j(w, h)
+                self._teach(w, h, path)
+                lines.clear()
+                w.requests.clear()
+                run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+                text = '\n'.join(lines)
+                got += h.stats.grab_ok
+                air += w.air
+                if fix:
+                    self.assertIn('车轮挪', text)
+                    req = [q for q in w.requests if q.split()[0] in ('AD', 'AF', 'APN')]
+                    self.assertEqual(req, [], text[-2000:])              # 手臂不动
+                    self.assertNotIn('ID1 轻轻摆一下', text)
+                    self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+                    self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+            res[fix] = (got, air)
+        self.assertEqual(res[True], (9, 0), res)
+        self.assertGreater(res[False][1], 0, res)
 
     def test_near_teach_then_grab_only_there_in_code_order(self):
         """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，按任务码顺序三个都在最近那一格夹到、放对槽，

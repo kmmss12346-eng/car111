@@ -214,9 +214,24 @@ class ClockTests(unittest.TestCase):
 
 
 class KeepaliveParkTests(unittest.TestCase):
-    def test_keepalive_moves_id1_and_back_rate_limited(self):
+    def test_keepalive_bobs_the_lift_not_the_arm(self):
+        """(10-21 用户"突然抽搐一下，先向右动一点然后快速回来")车不动太久：升降往上 4mm 再回到原来的高度，手臂不左右摆。"""
         w = SimWorld(seed=1, code=CODE)
         h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        z0, a1 = w.lift_mm, w.a1
+        n = len(w.requests)
+        self.assertTrue(h.keepalive())
+        lifts = [r for r in w.requests[n:] if r.startswith('LIFT ')]
+        self.assertEqual(lifts, [f'LIFT {z0 + 4.0:.1f}', f'LIFT {z0:.1f}'], w.requests[n:])
+        self.assertFalse([r for r in w.requests[n:] if r.startswith(('AD', 'AP', 'AF'))])
+        self.assertAlmostEqual(w.lift_mm, z0)
+        self.assertAlmostEqual(w.a1, a1, places=6)
+        self.assertIn('升降往上 4mm 再回来', '\n'.join(lines))
+
+    def test_keepalive_moves_id1_and_back_rate_limited(self):
+        w = SimWorld(seed=1, code=CODE)
+        h, lines = hooks(w, dict(keepalive_lift_mm=0))               # 以前的做法：摆 ID1
         self.assertFalse(h.keepalive())                              # 机械臂还没初始化：什么也不做
         h.prepare(w.link, lines.append)
         a1 = w.a1
@@ -235,11 +250,11 @@ class KeepaliveParkTests(unittest.TestCase):
 
     def test_keepalive_never_raises(self):
         w = SimWorld(seed=1, code=CODE, fail_cmd=('AD', 1))
-        h, lines = hooks(w)
+        h, lines = hooks(w, dict(keepalive_lift_mm=0))
         h.prepare(w.link, lines.append)
         self.assertFalse(h.keepalive())
         w2 = SimWorld(seed=1, code=CODE, abort_at=('AD', 1))
-        h2, lines2 = hooks(w2)
+        h2, lines2 = hooks(w2, dict(keepalive_lift_mm=0))
         h2.prepare(w2.link, lines2.append)
         self.assertFalse(h2.keepalive())
         self.assertTrue(h2._aborted)

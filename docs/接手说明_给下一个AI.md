@@ -618,3 +618,11 @@ git_log.txt                ← 分支最近 120 条提交记录
   ③ 升降：开机等驱动器 6 秒；NOENC 时 `lift_guess`，Lift_Check 第一次读到编码器 ±20mm 内就认准(LIFTSYNC，BOOT=SYNC)；新指令 `LIFT SYNC`；
   LIFT CAL 读不到编码器不再改高度。树莓派初始化见 BOOT=NOENC 先发 LIFT SYNC，读不到就 disabled(本轮不夹不放)。
   STM32 主机测试 308 项、树莓派 607 个全过。原料区"放下去了不夹"推测是升降高度差 17mm(BOOT=NOENC)，没有日志确认。
+- **10-21 夜(用户实车 mtest RAW 1："一个都没夹上来"、"突然抽搐一下"、"对齐不够快不够准")：**日志里开机 BOOT=POS(升降高度是编码器认的)，
+  三次 GRAB 都有 `CLAWSET 1150 C`(STM32 确实发了夹紧)。改：① keepalive / 等原料盘的 `_raw_ct_keepalive` 不再摆 ID1，`_lift_bob`：升降往上
+  `keepalive_lift_mm` 4mm 再回来(靠近 LFMAX 就往下)；0 = 以前摆 ID1。② 最近那格 `_raw_ct_grab(near=True)` 下爪前 `_raw_grab_fix`：拍两帧
+  material_errors，差 `raw_grab_fix_mm` 1.5 以上按 store RAW ch 的车轮 J 用 V(_vel_goto，不行 S/F)挪(手臂不动，最多 2 次、每次 ≤15mm，
+  原料盘这次停下剩的时间不够就不挪)，夹完 `_raw_wheels_back` 挪回去；调用时 need 多留 `raw_grab_fix_s`。模拟加 `plate_jitter_deg`(原料盘每次停的
+  角度差几度)：±6° 时新做法 9/9 夹到，关掉会夹空。树莓派 609 个全过。
+  **没解决、要用户查：**如果下到底爪子根本没合上(日志里有 CLAWSET 1150 C)，是夹爪舵机没执行：CLWC 1150 可能比爪子合拢的位置还紧，空爪合上就一直顶着
+  发烫、过热保护(会"松一下再夹紧"、"不夹")；或者夹爪舵机的线/电源。让用户空爪 arm CLAW C 听有没有嗡嗡顶着、摸烫不烫，arm_calib 第 3 步重调 CLWC。
