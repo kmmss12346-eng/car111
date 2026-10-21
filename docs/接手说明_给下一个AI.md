@@ -612,5 +612,9 @@ git_log.txt                ← 分支最近 120 条提交记录
   OBS … O、待机姿态回 CLAWKEEP 不张开；`Claw_Move(target, why)` 每次动回 `CLAWSET <us> <why>`；开机夹爪直接用待机姿态的脉宽(不先 2090)。
   树莓派 `arm_link.claw_line_text` 把 CLAWSET/CLAWKEEP/READY/LIFTBOOT(中途重启)打印成中文；`_recover` 见 ERR HOLD 就 disabled + maybe_holding。
   用户不要限速(说和速度无关)。STM32 主机测试 302 项、树莓派 606 个全过。
-  **还没做、等用户说"对"：**夹爪张开只两种(原料盘上方 CLWOR，其他全用车上转盘 CLWOT)；对准 2 号环故意对偏(run_live `r2off 前后 左右`，±20mm，存配置)；
-  开机 NOENC 时升降高度自动认准(用户 LIFT? 回 BOOT=NOENC、高度差 17mm 超过 15mm 没被改，原料区"放下去了不夹"可能是它)。
+- **10-21 晚再补(用户确认"可以一起改")：**① 夹爪张开只两种：`Open_Us()` = CLWOT(0 用 CLWO)，Claw_O/Claw_OAt(TRAY) 都用它，只有 Claw_OAt(RAW) 用 CLWOR；
+  arm_calib 的 open_us 除原料盘那几步外都用 CLWOT。② 对准 2 号环故意对偏：mission_cfg `ring2_off_mm`{F,S}(±`ring2_off_max_mm` 20)，
+  `_ring2_off_px(J0)` 按车轮 J 换成像素加到 goalp(vview 的 live_goal 也跟着)；run_live `r2off 前后 左右` 改并存配置(map_merge_live)。
+  ③ 升降：开机等驱动器 6 秒；NOENC 时 `lift_guess`，Lift_Check 第一次读到编码器 ±20mm 内就认准(LIFTSYNC，BOOT=SYNC)；新指令 `LIFT SYNC`；
+  LIFT CAL 读不到编码器不再改高度。树莓派初始化见 BOOT=NOENC 先发 LIFT SYNC，读不到就 disabled(本轮不夹不放)。
+  STM32 主机测试 308 项、树莓派 607 个全过。原料区"放下去了不夹"推测是升降高度差 17mm(BOOT=NOENC)，没有日志确认。

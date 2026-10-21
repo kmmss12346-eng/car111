@@ -70,15 +70,28 @@ class PrepareTests(unittest.TestCase):
 
     def test_lift_boot_mode_is_reported(self):
         """新程序 LIFT? 带 BOOT=：开机没用编码器认高度(NOCAL/NOENC)时提醒高度不一定对，
-        (10-16 用户：自动收臂往上升顶坏过升降)这时不自动收臂；编码器认的照常收臂。"""
+        (10-16 用户：自动收臂往上升顶坏过升降)这时不自动收臂；编码器认的照常收臂。
+        (10-21 用户：原料区放下去了不夹)NOENC：先 LIFT SYNC 按编码器认准，认准了照常干活；还是读不到就本轮不夹不放。"""
         w = SimWorld(seed=3, code=CODE, lift_boot='NOENC')
+        w.enc_now = False
         h, lines = hooks(w)
         h.prepare(w.link, lines.append)
         text = '\n'.join(lines)
         self.assertIn('读不到编码器', text)
         self.assertIn('不自动收臂', text)
+        self.assertIn('本轮不夹不放', text)
+        self.assertIsNotNone(h.disabled)
         self.assertNotIn('STOW', w.requests)
         self.assertEqual(h.arm.lift_boot, 'NOENC')
+        w = SimWorld(seed=3, code=CODE, lift_boot='NOENC')
+        h, lines = hooks(w)
+        h.prepare(w.link, lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('LIFT SYNC', w.requests)
+        self.assertIn('按编码器认准高度', text)
+        self.assertIsNone(h.disabled, text)
+        self.assertIn('STOW', w.requests)
+        self.assertEqual(h.arm.lift_boot, 'SYNC')
         w = SimWorld(seed=3, code=CODE, lift_boot='ENC')
         h, lines = hooks(w)
         h.prepare(w.link, lines.append)

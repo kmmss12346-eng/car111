@@ -4,7 +4,8 @@
  *
  *  夹爪 / 转盘 / 升降
  *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开(参数 CLWO) / 夹紧(参数 CLWC) / 直接给脉宽
- *   CLAW OR | CLAW OT                     (10-20)原料盘上方张开(CLWOR) / 车上转盘上方张开(CLWOT)，0 = 和 CLWO 一样
+ *   CLAW OR | CLAW OT                     原料盘上方张开(CLWOR) / 车上转盘上方张开(CLWOT)。(10-21)张开只两种：原料盘上方 CLWOR，
+ *                                          其他所有地方(CLAW O、DROP、OBS RING O…)都用 CLWOT；CLWOT=0 用 CLWO，CLWOR=0 和其他地方一样
  *   (10-21)夹爪每动一次回 "CLAWSET <微秒> <O|OR|OT|C|STBY|US>"。GRAB/PICK/TAKE 夹紧了物料以后到放下之前不许张开：
  *          再来 TAKE/GRAB/PICK 回 ERR HOLD(不动)，OBS … O、PARK/STBY 只保持夹紧(回 "CLAWKEEP OBS|STBY")；DROP、松进转盘、CLAW O/OR/OT/<微秒> 解除
  *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位(参数 TT1/TT2/TT3) / 直接给脉宽
@@ -16,6 +17,8 @@
  *                                          BOOT=ENC / POS：编码器找准的(POS = 以 Flash 里记的上次停下的位置为中心找的)；
  *                                          BOOT=NOCAL / NOENC：没标定 / 读不到编码器，开机时直接当作在 60mm(可能不准)
  *   LIFT CAL <mm> | LIFT ENC?              标定升降编码器(升降现在离最低点多少 mm，尺子量) / 读编码器算出的高度
+ *   LIFT SYNC                              (10-21)按编码器把高度认准(在现在记的高度上下 20mm 里找，不动升降)，回 LIFTSYNC；
+ *                                          开机没读到编码器(BOOT=NOENC)时，之后第一次走完读到编码器也自动认准，LIFT? 回 BOOT=SYNC
  *   (10-21)升降每次走完用编码器核对：没到要去的高度(机构到不了、顶住丢步)差 LFCHK(默认 1.5)mm 以上，就按编码器改过来、
  *          让驱动器停住不再顶，回 "LIFTSLIP want=<要去的> got=<实际>"；差 15mm 以上只报不改(末尾 " (too far, kept)")。LFCHK 0 = 不核对
  *

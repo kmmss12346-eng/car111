@@ -161,6 +161,7 @@ class SimWorld:
         self.parked = 0                                        # 收到几次 PARK
         self.zone_fw = zone_fw                                 # 新程序：ZONE? 回的 (区, START 按过没有)；None = 旧程序不认识
         self.lift_boot = lift_boot                             # 新程序：LIFT? 后面带的 BOOT=…(默认 ENC)；None = 旧程序不带
+        self.enc_now = True                                    # (10-21)现在读得到升降编码器(LIFT SYNC 成功)
         self.move_speeds = []                                  # 底盘每条指令的速度(转/分；None = 默认)，和 moves 一一对应
         self.ring_tan = {'ROUGH': {1: 150.0, 2: 0.0, 3: -150.0}, 'TEMP': {1: -150.0, 2: 0.0, 3: 150.0}}
         # 小幅 AP(对准时的一步)额外多花的秒数：模拟里一步只按转速算(零点几秒)，10-12 用户实车上手臂对准一步要好几秒(等舵机到位、回读……)
@@ -501,6 +502,13 @@ class SimWorld:
         if verb == 'LIFT' and len(parts) == 2:
             if parts[1] == 'ZERO':
                 self.lift_known, self.lift_mm = True, 0.0
+                return True, 'DONE', info
+            if parts[1] == 'SYNC':                             # (10-21)按编码器认准高度
+                if not self.enc_now:
+                    return False, 'ERR NOENC', info
+                info.append(f'LIFTSYNC {self.lift_mm:.4f} (was {self.lift_mm:.4f})')
+                if self.lift_boot == 'NOENC':
+                    self.lift_boot = 'SYNC'
                 return True, 'DONE', info
             if not self.lift_known:
                 return False, 'ERR NOZERO', info
@@ -3601,6 +3609,26 @@ class ZoneCalTests(unittest.TestCase):
         self.assertFalse([r for r in reqs[:k] if r.startswith(('AD ', 'AF ', 'APN '))], reqs[:k])
         self.assertEqual(h.stats.place_ok, 3, text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
+    def test_ring2_deliberate_offset(self):
+        """(10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，偏多少自己调")ring2_off_mm F=8：三个环放下的点都比圆环中心往前偏 8mm
+        (1、3 号环跟着 2 号环一起偏)；超过 ±20mm 按 20 算。"""
+        for f in (8.0, 35.0):
+            w = self._world(5, park={'ROUGH': 10.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, dict(ring2_off_mm=dict(F=f, S=0.0)), lines=lines)
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            w.arrive('ROUGH', 1)
+            h.task('ROUGH', w.link, lines.append)
+            text = '\n'.join(lines)
+            if f > 20.0:
+                self.assertIn('往前 +20.0mm', text)                   # 超过 20 按 20
+                continue
+            self.assertIn('故意对偏', text)
+            errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
+            self.assertEqual(len(errs), 3, text[-3000:])
+            for e in errs:
+                self.assertAlmostEqual(e, 8.0, delta=2.0, msg=errs)
 
     def test_calc_wheels_only_never_moves_the_arm_and_reaches_far(self):
         """(10-21 用户"修正距离可以放开")车离圆环那一排远了 100mm(以前车轮横移最多 70mm、剩下的手臂补)：知道停车点在地图上哪儿

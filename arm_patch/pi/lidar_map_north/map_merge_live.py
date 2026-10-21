@@ -911,6 +911,23 @@ def main():
             return
         if k=='route':state['plan_start']=None;state['replan_from']=None;plan_route();state['plan_key']=None;redraw();print_route();return
         if k=='stop':command_stop(parts);return
+        if k=='r2off':
+            # (10-21 用户)对准 2 号环时故意对偏：r2off 前后 左右(毫米，往前/往左为正，各 ±20 以内)；r2off 看现在的；r2off 0 0 不偏
+            mc_=dict(raw_cfg.get('mission_cfg') or {});o_=dict(mc_.get('ring2_off_mm') or {})
+            if len(parts)==1:
+                print(f"对准 2 号环故意对偏：往前 {float(o_.get('F',0)):+.1f}mm、往左 {float(o_.get('S',0)):+.1f}mm(r2off 前后 左右 改)",flush=True);return
+            if len(parts)!=3:raise ValueError('格式：r2off 前后 左右(毫米，往前/往左为正，例如 r2off 5 -3；r2off 0 0 = 不偏)')
+            f_,s_=float(parts[1]),float(parts[2]);lim_=float(mc_.get('ring2_off_max_mm',20.0))
+            if abs(f_)>lim_ or abs(s_)>lim_:raise ValueError(f'每个方向最多 ±{lim_:g}mm')
+            mc_['ring2_off_mm']={'F':f_,'S':s_};raw_cfg['mission_cfg']=mc_
+            p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+            if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+            p_.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+            try:
+                import mission_cli as mcli
+                if mcli._S.get('hooks') is not None:mcli._S['hooks'].cfg['ring2_off_mm']={'F':f_,'S':s_}
+            except Exception:pass
+            print(f'已设置：对准 2 号环时放的点比圆环中心往前 {f_:+.1f}mm、往左 {s_:+.1f}mm，存进配置(粗加工区、暂存区都按它；1、3 号环跟着偏)',flush=True);return
         if k=='pose' and len(parts)==4:
             if not history.views:raise ValueError('先扫描再设置规划起点')
             state['plan_start']=tuple(float(v) for v in parts[1:]);state['turn_back']=0;redraw();print_route();return
@@ -1068,7 +1085,7 @@ def main():
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)
     print('回家对准测试：出发位置 scan → 手动挪车 → home(修) 或 home check(只测)。',flush=True)
-    print('v10 运动调试：send F 1000 = 单条指令；fix F 1000 985 = 距离校准；cal = 横移校准；get / set 名字 数值 = 看/改 STM32 参数；sync = 把配置里的参数重新发给 STM32。',flush=True)
+    print('v10 运动调试：send F 1000 = 单条指令；fix F 1000 985 = 距离校准；cal = 横移校准；get / set 名字 数值 = 看/改 STM32 参数；sync = 把配置里的参数重新发给 STM32；r2off 前后 左右 = 对准 2 号环时故意对偏(毫米)。',flush=True)
     if args.sim:print('【桌面模拟模式】',flush=True)
     threading.Thread(target=terminal,daemon=True).start();redraw()
     if raw_cfg.get('race_auto',False) and link is not None:commands.put('race')

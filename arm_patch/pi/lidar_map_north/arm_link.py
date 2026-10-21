@@ -80,6 +80,8 @@ def claw_line_text(line, cmd=''):
         what = _KEEP_WHY.get(p[1], p[1]) if len(p) >= 2 else ''
         return (f'  ★ STM32 记着爪子里夹着物料：{what}本来要张开爪子，没让它张开(夹着物料时只有放下那一步能张开){where}。'
                 '确实要拿出来：arm CLAW O')
+    if p[0] == 'LIFTSYNC':
+        return f'  升降高度按编码器认准了：{line.strip()}{where}'
     if p[0] == 'READY' or p[0] == 'LIFTBOOT':
         return (f'  ★★ STM32 刚才重启了({line.strip()}){where}：夹爪、手臂会回开机/待机的样子，参数回到程序里写的默认值。'
                 '多半是电池电压被拉低(舵机、升降一起使劲)或者 STM32 的电源线/复位线松了')

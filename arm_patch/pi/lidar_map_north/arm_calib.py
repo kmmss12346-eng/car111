@@ -81,10 +81,10 @@ STEPS = [
     dict(key='AEXT', kind='choice', title='哪个舵机管前后伸缩', setup='high',
          text='输入 1 = ID1 管伸缩(ID2 管旋转)；输入 2 = ID2 管伸缩(ID1 管旋转)。\n'
               '不确定就先输入 w1 或 w2：那个舵机会来回动 5 度，看它是伸缩还是旋转。'),
-    dict(key='CLWO', kind='claw', title='夹爪张开(地上圆环那边和其他地方)', setup='high',
+    dict(key='CLWO', kind='claw', title='夹爪张开(默认)', setup='high',
          text='调到爪子张开得足够大、能从上面套住物料，又不会碰到旁边的东西。\n'
-              '这是地上圆环那边(放下、取回之前)和其他地方张开用的。原料盘上方、车上转盘上方张开的大小后面单独调(CLWOR、CLWOT 两步)，'
-              '那两步跳过就和这个一样。'),
+              '(10-21)比赛时张开只分两种：原料盘上方下爪前用 CLWOR，其他所有地方(车上转盘、圆环上放下……)都用车上转盘上方的 CLWOT。\n'
+              '这一步只是默认值：后面 CLWOT、CLWOR 两步跳过(存 0)时用它。'),
     dict(key='CLWC', kind='claw', title='夹爪夹紧', setup='high',
          text='拿一个物料放在两个爪子中间，调到刚好夹稳(用手拽不下来)。\n'
               '不要比需要的更紧：夹得太紧，夹爪舵机会一直使劲顶着，很快发烫。'),
@@ -109,7 +109,7 @@ STEPS = [
          text='先输入 c 让爪子夹住一个物料，再用 -10 / -5 / -1 慢慢往下降，\n'
               '降到物料底部离转盘格子大约 2~5mm(松开就落进去)。从转盘里取物料时也用这个高度，爪子要能夹住格子里的物料。'),
     # (10-20 用户)夹爪张开分三个角度：车上转盘上方 CLWOT、原料盘上方 CLWOR、其他地方 CLWO。CLWOT/CLWOR 存 0 = 和 CLWO 一样
-    dict(key='CLWOT', kind='claw', title='夹爪在车上转盘上方张开 CLWOT(松开放进转盘、从转盘里取之前)', setup='tray_open_down',
+    dict(key='CLWOT', kind='claw', title='夹爪在车上转盘上方张开 CLWOT(除了原料盘上方，其他所有地方张开都用它)', setup='tray_open_down',
          needs_fw=True,
          text='手臂在转盘 1 号格上方、降到了 ZDROP。调爪子张开的大小：松开时物料能落进格子，张着下去也能套住格子里的物料，\n'
               '又不会碰到格子边。用 +50 / -50 调；c = 夹住看看，o = 回到正在调的张开。满意了回车。不用单独调(和 CLWO 一样)就输入 s。'),
@@ -352,9 +352,7 @@ class Wizard:
         kind = (st or {}).get('setup', '')
         if kind.startswith('raw'):
             return self.claw_val('CLWOR')
-        if kind.startswith(('turntable', 'tray')):
-            return self.claw_val('CLWOT')
-        return float(self.P['CLWO'])
+        return self.claw_val('CLWOT')                         # (10-21)其他地方都和车上转盘上方一样
 
     def tt_to(self, us):
         us = int(round(max(TT_RANGE[0], min(TT_RANGE[1], us))))

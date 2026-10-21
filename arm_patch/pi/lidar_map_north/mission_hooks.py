@@ -290,6 +290,9 @@ DEFAULTS = dict(
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
     zone_calc_speed=20.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)
+    ring2_off_mm=dict(F=0.0, S=0.0),     # (10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，可以自由调")对准 2 号环时爪子(放下的点)
+                                        #   比圆环中心往前 F、往左 S 毫米(各 ±ring2_off_max_mm 以内)；run_live 里 r2off 前后 左右 改并存配置。1、3 号环跟着一起偏
+    ring2_off_max_mm=20.0,
     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
                                         #   观察姿态(A1P/A2P)一下都不动；只差一点、打滑、到能挪的边上、次数用完都不交给手臂补，车轮接着修
                                         #   (最多 zone_wheels_moves 次)，最后还差不到 accept_mm 照样放，不然这个区这次不放。False = 以前(剩下的手臂补)
@@ -340,7 +343,7 @@ A1_MIN, A1_MAX = 44.0, 244.0           # STM32 里 ID1 的限位(main.c SERVO1_M
 RAW_COLORS = (1, 2, 3, 4)              # (10-19 用户：省赛没有黑、浅蓝)没有任务码时原料区认这几种颜色：红、黄、蓝、绿
 
 BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60mm', 'NOENC': '读不到编码器，当成上次停下的高度(旧程序当成 60mm)',
-             'POS': '按上次停的位置认的高度'}
+             'POS': '按上次停的位置认的高度', 'SYNC': '开机没读到编码器，后来按编码器认准了'}
 
 PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
 
@@ -1062,6 +1065,17 @@ class MissionHooks:
             else:
                 known, mm = self.arm.lift_state()
                 boot = getattr(self.arm, 'lift_boot', None)
+                if known and boot == 'NOENC':
+                    # (10-21 用户：原料区放下去了不夹)开机没读到升降编码器，高度是猜的(实车差过 17mm，夹的高度全偏)：现在读一次编码器认准
+                    ok_s, rep_s, info_s = self.arm.request('LIFT SYNC', 5.0)
+                    if ok_s:
+                        known, mm = self.arm.lift_state()
+                        boot = getattr(self.arm, 'lift_boot', None) or 'SYNC'
+                        self.log('  升降：开机时没读到编码器，现在读到了，按编码器认准高度 ' +
+                                 ' '.join(l for l in info_s if l.startswith('LIFTSYNC')))
+                    elif 'NOENC' in str(rep_s):
+                        self.disabled = ('升降高度不知道准不准：开机时、现在都读不到升降电机(5 号驱动器)的编码器，夹、放的高度可能偏一两厘米(夹不到、'
+                                         '半空松开)。本轮不夹不放。查 5 号驱动器的插头/线，电机电源开着按一下 STM32 复位，arm LIFT? 回 BOOT=POS 再跑')
                 if known:
                     self.log(f'  升降已回零，现在 {mm:.1f}mm' + (f'(开机时{BOOT_TEXT.get(boot, boot)})' if boot else ''))
                     if boot in ('NOCAL', 'NOENC'):
@@ -5802,6 +5816,9 @@ class MissionHooks:
         claw = np.array(v.claw('RING'), float)
         off = self._place_shift_px()
         goalp = claw + (np.asarray(off, float) if off is not None else 0.0)
+        r2 = self._ring2_off_px(J0)
+        if r2 is not None:
+            goalp = goalp + r2
         tol = float(cfg.get('zone_vel_tol_mm') or cfg['tol_mm']['RING'])
         acc = self._wheels_accept('RING')
         vmax = float(cfg.get('zone_vel_speed', 15.0))
@@ -7072,6 +7089,26 @@ class MissionHooks:
             self._shift_said = True
             self.log(f'    放下位置按 place_shift_mm 挪：前后 {f:+.0f}mm、左右 {sl:+.0f}mm(画面里 {off[0]:+.1f},{off[1]:+.1f} 像素)')
         return (float(off[0]), float(off[1]))
+
+    def ring2_off(self):
+        """(10-21)对准 2 号环时故意对偏多少：(往前 F, 往左 S) 毫米，各限在 ±ring2_off_max_mm。"""
+        o = self.cfg.get('ring2_off_mm') or {}
+        lim = float(self.cfg.get('ring2_off_max_mm', 20.0) or 20.0)
+        try:
+            f, s = float(o.get('F', 0.0) or 0.0), float(o.get('S', 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0, 0.0
+        return max(-lim, min(lim, f)), max(-lim, min(lim, s))
+
+    def _ring2_off_px(self, J):
+        """ring2_off 换成画面里的像素：对准时"圆环 - 爪子点"该是多少(按车轮和画面的对应关系：放的点往前 F，车要多往前走 F 才对准)。"""
+        f, s = self.ring2_off()
+        if abs(f) < 0.05 and abs(s) < 0.05:
+            return None
+        J = np.asarray(J, float)
+        off = J[:, 1] * f + J[:, 0] * s
+        self.log(f'    对准 2 号环故意对偏(r2off)：放的点比圆环中心往前 {f:+.1f}mm、往左 {s:+.1f}mm(画面里 {off[0]:+.1f},{off[1]:+.1f} 像素)')
+        return off
 
     def _zone_servo_kw(self):
         """工位里对准的底盘限制：前后挪最多 ring_fix_max_mm；横移只在手臂伸缩够不着时用，离停车点累计不超过 ring_strafe_max_mm。"""

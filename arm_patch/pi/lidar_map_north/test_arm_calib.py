@@ -307,7 +307,7 @@ class WizardTests(unittest.TestCase):
             self.assertAlmostEqual(sp[k], v, places=3, msg='配置 ' + k)
         self.assertEqual(sp['FPPM'], 12.9)                                # 原来的参数不动
         self.assertTrue(os.path.exists(self.cfg.replace('.json', '.json.bak')))
-        self.assertEqual(self.stm.claw, 2040)                             # 最后夹爪是张开的
+        self.assertEqual(self.stm.claw, 1940)                             # 最后夹爪是张开的((10-21)其他地方都用车上转盘上方的 CLWOT)
         self.assertEqual((self.stm.ang[1], self.stm.ang[2]), (343, -882))  # 收臂：A1H + A2R
         self.assertEqual(self.stm.z, 100)
 
@@ -502,7 +502,7 @@ class WizardTests(unittest.TestCase):
         self.assertTrue(any('LIFT 20' == c for c in self.stm.sent), self.stm.sent)   # 在原料盘上方降到 ZGRAB 调
 
     def test_open_angles_follow_the_place(self):
-        """原料盘那几步张开用 CLWOR，车上转盘那几步用 CLWOT，其他地方用 CLWO；没调(0)就是 CLWO。"""
+        """(10-21 用户)张开只两种：原料盘那几步用 CLWOR，其他所有地方都用车上转盘上方的 CLWOT；没调(0)就是 CLWO。"""
         stm = FakeStm32()
         stm.P['CLWOR'], stm.P['CLWOT'] = 1500, 1700
         self.run_wiz(['c', 'o', 'q', 'q'], stm=stm, start=STEP_KEYS.index('TT1'))
@@ -510,7 +510,7 @@ class WizardTests(unittest.TestCase):
         self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('A1G'))
         self.assertEqual(stm.claw, 1500)                                   # 原料盘上方：CLWOR
         self.run_wiz(['c', 'o', 'q', 'q'], stm=stm, start=STEP_KEYS.index('A1P'))
-        self.assertEqual([c for c in stm.sent if c.startswith('CLAW ')][-1], 'CLAW 2090')   # 圆环那边：CLWO
+        self.assertEqual([c for c in stm.sent if c.startswith('CLAW ')][-1], 'CLAW 1700')   # 圆环那边也用 CLWOT
         self.run_wiz(['c', '-5', '', 'q'], stm=stm, start=STEP_KEYS.index('ZDROP'))
         self.assertEqual(stm.claw, 1700)                                   # 放进转盘松开：CLWOT
 

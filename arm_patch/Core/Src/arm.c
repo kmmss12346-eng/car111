@@ -362,6 +362,7 @@ static uint8_t lift_known = 0;
  *   NOCAL 没标定，直接当作在 60mm(高度可能不准)
  *   NOENC 读不到编码器，直接当作在 60mm(高度可能不准) */
 static const char *lift_boot_how = "NOCAL";
+static uint8_t     lift_guess    = 0;         /* (10-21)开机没读到编码器，高度是猜的：之后一读到编码器就按它认准(±20mm 以内)，回 LIFTSYNC */
 
 /* 下面"编码器"那一节里的函数，Lift_Goto 要先用到 */
 static void Pos_Save(float z);
@@ -654,6 +655,23 @@ static void Lift_Check(float mm)
         }
         z = z2;
     }
+    if (lift_guess && Absf(z - mm) <= 20.0f)
+    {
+        /* (10-21)开机没读到编码器、高度是猜的：第一次读到就按编码器认准 */
+        FmtF(s1, (int)sizeof(s1), mm);
+        FmtF(s2, (int)sizeof(s2), z);
+        snprintf(m, sizeof(m), "LIFTSYNC %s (guessed %s)\r\n", s2, s1);
+        Say(m);
+        if (Absf(z - mm) >= g_lchk)
+        {
+            Emm_V5_Stop_Now(LIFT_ADDR, false);
+            HAL_Delay(5);
+        }
+        lift_mm = z;
+        lift_guess = 0;
+        lift_boot_how = "SYNC";
+        return;
+    }
     if (Absf(z - mm) < g_lchk)  return;
     FmtF(s1, (int)sizeof(s1), mm);
     FmtF(s2, (int)sizeof(s2), z);
@@ -898,16 +916,17 @@ static const char *Lift_Cal_Do(float z0)
     {
         return "ERR RANGE";
     }
-    lift_known = 1;
-    lift_mm = z0;
     for (j = 0; j < 2; j++)                        /* 两种值都读：走 10mm 后哪个变化对得上就用哪个 */
     {
         ga[j] = (uint8_t)Lift_ReadSrc(srcs[j], &a[j]);
     }
     if (!ga[0] && !ga[1])
     {
-        return "ERR NOENC";                        /* 读不到：驱动器 TX 没接到 PC11，或 5 号驱动器没回复 */
+        return "ERR NOENC";                        /* 读不到：驱动器 TX 没接到 PC11，或 5 号驱动器没回复。(10-21)这时不改程序记的高度 */
     }
+    lift_known = 1;
+    lift_mm = z0;
+    lift_guess = 0;
     step = (z0 + 15.0f <= g_lmax) ? 10.0f : -10.0f;   /* 在最低点附近就往上走，离最高点近才往下走，不会撞 */
     r = Lift_Goto(z0 + step);
     if (r != NULL || car_abort)
@@ -1043,7 +1062,8 @@ static void Lift_Boot(void)
         near_mm = LIFT_BOOT_MM;                    /* 没有记录：当作在 60 附近 */
     }
     lift_boot_how = "NOENC";
-    for (k = 0; k < 20 && !got; k++)               /* 驱动器上电要一会儿才能回复，最多等约 3 秒 */
+    lift_guess = 1;
+    for (k = 0; k < 40 && !got; k++)               /* 驱动器上电要一会儿才能回复，(10-21)最多等约 6 秒 */
     {
         got = Lift_EncPos(near_mm, &z, &e);
         if (!got)
@@ -1066,6 +1086,7 @@ static void Lift_Boot(void)
         return;
     }
     lift_mm = z;
+    lift_guess = 0;
     lift_boot_how = pos_last_ok ? "POS" : "ENC";
     FmtF(s1, (int)sizeof(s1), z);
     FmtF(s2, (int)sizeof(s2), near_mm);
@@ -1207,19 +1228,28 @@ static void Claw_Move(uint32_t target, const char *why)
 }
 
 /* 夹爪张开 / 夹紧(脉宽是参数 CLWO / CLWC) */
-static void Claw_O(void)
+/* (10-21 用户)夹爪张开只分两种：原料区原料盘上方下爪前 CLWOR；其他所有地方(车上转盘、圆环上放下、观察姿态…)都和车上转盘上方一样用 CLWOT。
+ * CLWOT 是 0(没调)就用 CLWO；CLWOR 是 0 就和其他地方一样 */
+static uint32_t Open_Us(void)
 {
-    Claw_Move((uint32_t)g_clwo, "O");
+    return (uint32_t)((g_clwot >= 500.0f) ? g_clwot : g_clwo);
 }
 
-/* (10-20 用户)夹爪张开分三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他地方 CLWO。CLWOR / CLWOT 是 0(没调)就用 CLWO */
+static void Claw_O(void)
+{
+    Claw_Move(Open_Us(), "O");
+}
+
 #define CLAW_AT_RAW   1
 #define CLAW_AT_TRAY  2
 static void Claw_OAt(uint8_t where)
 {
-    float us = (where == CLAW_AT_RAW) ? g_clwor : ((where == CLAW_AT_TRAY) ? g_clwot : 0.0f);
-
-    Claw_Move((uint32_t)((us >= 500.0f) ? us : g_clwo), (where == CLAW_AT_RAW) ? "OR" : "OT");
+    if (where == CLAW_AT_RAW && g_clwor >= 500.0f)
+    {
+        Claw_Move((uint32_t)g_clwor, "OR");
+        return;
+    }
+    Claw_Move(Open_Us(), (where == CLAW_AT_RAW) ? "OR" : "OT");
 }
 
 static void Claw_C(void)
@@ -2530,6 +2560,27 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             }
             lift_mm = 0.0f;
             lift_known = 1;
+            return 1;
+        }
+        if (strcmp(t[1], "SYNC") == 0)             /* (10-21)按编码器把高度认准(在现在记的高度上下 20mm 里找)，不动升降 */
+        {
+            char m[64];
+            char s1[20];
+            char s2[20];
+            uint16_t e;
+            float z;
+
+            if (!lift_cal_ok)  FAIL("ERR NOCAL");
+            if (!Lift_EncPos(lift_mm, &z, &e))  FAIL("ERR NOENC");
+            FmtF(s1, (int)sizeof(s1), z);
+            FmtF(s2, (int)sizeof(s2), lift_mm);
+            snprintf(m, sizeof(m), "LIFTSYNC %s (was %s)\r\n", s1, s2);
+            Say(m);
+            lift_mm = z;
+            lift_known = 1;
+            if (lift_guess || strcmp(lift_boot_how, "NOENC") == 0)  lift_boot_how = "SYNC";
+            lift_guess = 0;
+            Pos_Save(z);
             return 1;
         }
         if (strcmp(t[1], "ENC?") == 0)             /* 读编码器，看程序算出来的高度对不对 */

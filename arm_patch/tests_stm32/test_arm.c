@@ -391,32 +391,32 @@ int main(void) {
     clear(); run("TT 2"); run("TT 1");
     CHECK(has("ttus1650;") && has("tt1;"), "TT 2 用 TT2 的脉宽");
     Arm_Param_Set("CLWO", 2090); Arm_Param_Set("CLWC", 2910); Arm_Param_Set("TT2", 1708);
-    /* (10-20 用户)夹爪张开三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他地方 CLWO；CLWOR/CLWOT = 0 就用 CLWO */
+    /* (10-21 用户)夹爪张开只两种：原料盘上方 CLWOR，其他所有地方都和车上转盘上方一样用 CLWOT；CLWOT = 0 用 CLWO，CLWOR = 0 和其他地方一样 */
     CHECK(Arm_Param_Set("CLWOR", 300) == 2 && Arm_Param_Set("CLWOT", 3000) == 2 && Arm_Param_Set("CLWOR", 0) == 1,
           "CLWOR/CLWOT：0 = 用 CLWO，其他要在夹爪限位 500~2910 里面");
     away(); clear(); run("GRAB 2 H"); run("CLAW OR"); run("CLAW OT");
     CHECK(!has("claw") && at("O;") >= 0, "CLWOR/CLWOT 没调(0)：GRAB 张开、松开、CLAW OR/OT 都和以前一样用 CLWO");
     CHECK(Arm_Param_Set("CLWOR", 1500) == 1 && Arm_Param_Set("CLWOT", 1700) == 1, "CLWOR/CLWOT 可以设");
     clear(); run("CLAW OR"); run("CLAW OT"); run("CLAW O");
-    CHECK(at("claw1500;") >= 0 && at("claw1500;") < at("claw1700;") && at("claw1700;") < at("O;"), "CLAW OR / CLAW OT / CLAW O");
+    CHECK(at("claw1500;") >= 0 && at("claw1500;") < at("claw1700;") && !has("O;"), "CLAW OR 用 CLWOR；CLAW OT、CLAW O 都用 CLWOT");
     away(); clear(); run("OBS RAW O");
     CHECK(has("claw1500;") && !has("O;"), "OBS RAW O：原料盘上方张开用 CLWOR");
     away(); clear(); run("OBS RING O");
-    CHECK(has("O;") && !has("claw1500;") && !has("claw1700;"), "OBS RING O：圆环那边张开用 CLWO");
+    CHECK(has("claw1700;") && !has("claw1500;") && !has("O;"), "OBS RING O：圆环那边张开也用 CLWOT(和车上转盘一样)");
     away(); clear(); run("GRAB 2 H");
     {
         int open0 = at("claw1500;"), close = at("C;"), rel = at("claw1700;");
         CHECK(open0 >= 0 && open0 < close && close < rel && !has("O;"), "GRAB H：下爪前张开用 CLWOR，松开放进转盘用 CLWOT");
     }
     away(); clear(); run("PICK 1 H");
-    CHECK(at("O;") >= 0 && at("O;") < at("C;") && at("C;") < at("claw1700;") && !has("claw1500;"), "PICK H(圆环取回)：下爪前用 CLWO，放进转盘用 CLWOT");
+    CHECK(at("C;") >= 0 && !has("O;") && !has("claw1500;"), "PICK H(圆环取回)：下爪前、放进转盘都用 CLWOT");
     away(); clear(); run("TAKE 3");
     {
         const char *q = strstr(ev, "claw1700;");
         CHECK(q && at("C;") > (int)(q - ev) && at("L+4800;") > (int)(q - ev), "TAKE：到转盘上方换成 CLWOT 再下去夹");
     }
     clear(); run("DROP");
-    CHECK(has("O;") && !has("claw1700;") && !has("claw1500;"), "DROP：地上圆环松开用 CLWO");
+    CHECK(has("claw1700;") && !has("O;") && !has("claw1500;"), "DROP：地上圆环松开也用 CLWOT");
     Arm_Param_Set("CLWOR", 0); Arm_Param_Set("CLWOT", 0);
     /* (10-21 用户：伸缩的舵机要最快、旋转的慢一点)大动作转速分开：伸缩 EXTSPD、旋转 ROTSPD，0 = ASPD */
     CHECK(Arm_Param_Set("ROTSPD", 5) == 2 && Arm_Param_Set("EXTSPD", 2000) == 2, "ROTSPD/EXTSPD：0 或 10 以上，EXTSPD 最多 1500");
@@ -925,12 +925,29 @@ int main(void) {
     clear(); run("LIFT?");
     CHECK(pis("LIFT 1 60.0") && pis("BOOT=NOENC"), "读不到编码器：LIFT? 回 BOOT=NOENC(高度是假设的)");
     CHECK(run("LIFT CAL 60") == -1 && pis("ERR NOENC"), "读不到编码器时 LIFT CAL 报 ERR NOENC");
+    clear(); run("LIFT CAL 77"); run("LIFT?");
+    CHECK(pis("ERR NOENC") && pis("LIFT 1 60.0"), "LIFT CAL 失败(读不到编码器)：程序记的高度不改(以前被改成填的数)");
     enc_ok = 1; clear(); phys_mm = 60.0; Arm_Init(); run("LIFT 85");    /* 停在 85 关电 */
     enc_ok = 0; clear(); phys_mm = 85.0;
     Arm_Init();
     CHECK(pis("LIFTBOOT NOENC (assume last 85.0") && !has("L+") && !has("L-"), "读不到编码器：当作在上次停下的 85(Flash 里记的)，不是一律 60");
     clear(); run("LIFT?");
     CHECK(pis("LIFT 1 85.0") && pis("BOOT=NOENC"), "读不到编码器：LIFT? 回上次的 85");
+    /* (10-21)开机没读到编码器(高度是猜的)：之后一读到就认准(差 17mm 也改，以前超过 15mm 不改) */
+    enc_ok = 1; phys_mm = 68.0; clear();                  /* 其实在 68(差 17mm) */
+    CHECK(run("LIFT SYNC") == 1 && (pis("LIFTSYNC 68.0") || pis("LIFTSYNC 67.99")) && !has("L+") && !has("L-"),
+          "LIFT SYNC：按编码器认出在 68(不动升降)");
+    clear(); run("LIFT?");
+    CHECK((pis("LIFT 1 68.0") || pis("LIFT 1 67.99")) && pis("BOOT=SYNC"), "认准以后 LIFT? 回 68、BOOT=SYNC");
+    run("LIFT 85"); enc_ok = 0; phys_mm = 85.0; clear(); Arm_Init();      /* 又一次开机没读到 */
+    enc_ok = 1; phys_mm = 102.0; clear();                /* 其实在 102 */
+    run("LIFT 90");
+    CHECK(pis("LIFTSYNC") && fabs(phys_mm - 107.0) < 0.05, "猜的高度：第一次走完读到编码器就认准(差 17mm)，报 LIFTSYNC");
+    clear(); run("LIFT 90");
+    CHECK(fabs(phys_mm - 90.0) < 0.05 && !pis("LIFTSLIP"), "认准以后走到 90 就是 90");
+    enc_ok = 0; clear(); phys_mm = 90.0;
+    CHECK(run("LIFT SYNC") == -1 && pis("ERR NOENC"), "读不到编码器：LIFT SYNC 回 ERR NOENC");
+    enc_ok = 1;
     run("LIFT 60"); phys_mm = 60.0;
     enc_ok = 1; enc_frozen = 1; enc31_zero = 1; pos36_off = 0.0; clear();
     { double save = phys_mm; phys_mm = 0.0; run("LIFT 0"); phys_mm = 0.0; (void)save; }
