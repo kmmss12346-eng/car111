@@ -56,8 +56,10 @@ int HAL_UART_Init(UART_HandleTypeDef *h) { (void)h; return 0; }
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *h, uint32_t c) { (void)h; EV("pwm%u;", c); return 0; }
 void tim_set(uint32_t ch, uint32_t v) { if (ch == TIM_CHANNEL_3) EV("pwm3=%u;", (unsigned)v); }   /* 开机时夹爪的初始脉宽 */
 /* 夹爪/转盘的脉宽：是默认的张开/夹紧/1~3 号位就记成 O; C; tt1; …，方便看先后顺序 */
-void Claw_Set(uint32_t p) { if (p == 2090u) EV("O;"); else if (p == 2910u) EV("C;"); else EV("claw%u;", p); }
-void Turntable_Set(uint32_t p) { if (p == 2608u) EV("tt1;"); else if (p == 1708u) EV("tt2;"); else if (p == 808u) EV("tt3;"); else EV("ttus%u;", p); }
+static uint32_t t_tt = 0, t_close = 0;                   /* 最近一次转盘换脉宽、夹爪夹紧(2910)的时刻 */
+void Claw_Set(uint32_t p) { if (p == 2090u) EV("O;"); else if (p == 2910u) { EV("C;"); t_close = now; } else EV("claw%u;", p); }
+void Turntable_Set(uint32_t p) { static uint32_t last = 0; if (p != last) t_tt = now; last = p;
+    if (p == 2608u) EV("tt1;"); else if (p == 1708u) EV("tt2;"); else if (p == 808u) EV("tt3;"); else EV("ttus%u;", p); }
 int Servo_ReadAngle(uint8_t id, float *a) { *a = ang[id]; return 1; }
 static void away(void);
 static float block1 = 1e9f;                              /* ID1 被挡住的角度(转不过去)，1e9 = 没挡 */
@@ -1108,6 +1110,15 @@ int main(void) {
     CHECK(run("CLAW OT") == 1 && pis("CLAWSET 2090 OT"), "放回车上转盘：CLAW OT 张开");
     away(); clear();
     CHECK(run("GRAB 1 H") == 1 && at("C;") < last("O;"), "GRAB H：夹紧 -> 送进车上转盘松开");
+    /* (10-21 实车"下降的时候不夹取，抬起来了再夹取")转盘换槽要 TTWAIT 才转完，下降只要半秒：等转盘停了才夹紧 */
+    Arm_Param_Set("TTWAIT", 4000.0f);                        /* 比下降久得多：没等转盘的话夹紧一定早于它 */
+    away(); clear();
+    CHECK(run("GRAB 3 H") == 1 && t_close >= t_tt + 4000u, "GRAB 换槽：车上转盘转完(TTWAIT)才夹紧");
+    away(); clear();
+    run("CLAW O");
+    CHECK(run("PICK 1 H") == 1 && t_close >= t_tt + 4000u, "PICK 换槽：车上转盘转完(TTWAIT)才夹紧");
+    run("CLAW O");
+    Arm_Param_Set("TTWAIT", 800.0f);
     away(); clear();
     CHECK(run("TAKE 2") == 1, "GRAB 松进车上转盘以后不算夹着：能 TAKE");
     /* 存了待机姿态：夹着物料时 PARK 回待机姿态，爪子不换成待机姿态的 */

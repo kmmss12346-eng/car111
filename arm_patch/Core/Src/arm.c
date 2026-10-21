@@ -1530,6 +1530,8 @@ static const char *Seq_PickHere(uint8_t slot, float z, uint8_t ring)
     if (ring)  Claw_O();                           /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
     else       Claw_OAt(CLAW_AT_RAW);              /* (10-20)原料盘上方张开用 CLWOR */
     GO(Lift_Goto(z));                              /* 下降 */
+    if (!TT_WaitReady()) return NULL;              /* (10-21 实车"下降的时候不夹取，抬起来了再夹取")车上转盘还在转就先等它停：
+                                                    * 下降只要半秒，转盘要 TTWAIT 才转完，两个舵机一起使劲时夹爪会慢半拍、合不上 */
     Claw_C();      claw_hold = 1;  WAIT(g_clwait); /* 夹紧 */
     GO(Go_Tray(g_zdrop));                          /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降；A2T：伸着转过去) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */

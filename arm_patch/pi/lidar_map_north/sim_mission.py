@@ -437,7 +437,7 @@ class SimWorld:
         if verb == 'V' or verb == 'V?':
             if not self.vel_fw:
                 return False, 'ERR CMD', info
-            self.advance(0.01)
+            self.advance(float(self.__dict__.get('vel_latency_s', 0.01)))   # (10-21)实车串口来回一次约 0.1 秒
             if verb == 'V?':
                 info.append(f'VD {int(round(self.vel_sum[0] * 10))} {int(round(self.vel_sum[1] * 10))}')
                 return True, 'DONE', info
@@ -2812,6 +2812,31 @@ class RawCenterTeachTests(unittest.TestCase):
         self.assertIn('车轮边走边对准', text)
 
 
+class VelGotoTests(unittest.TestCase):
+    """(10-21 实车"V 慢慢走不了：9 秒还没挪到(还差 0.7mm)：改用 S/F")串口来回一次 0.2 秒、电机按整数 转/分 走：
+    只用 V 挪到一个地方，几毫米到几厘米都要很快到、停下来量的也在 tol 以内(以前快到了总冲过头、来回摆好几秒)。"""
+
+    def test_latency_and_rpm_rounding(self):
+        for lat in (0.1, 0.2, 0.3):
+            w = plate_world(1)
+            w.vel_quant, w.vel_latency_s = True, lat
+            h = make(w, {})
+            h._ensure(w.link)
+            w.arrive('RAW')
+            for d in (0.7, 1.5, 3.0, 10.0, 45.0):
+                for axis in (0, 1):
+                    h.act.reset_disp()
+                    t0, off0 = w.t, (w.off_s, w.off_f)
+                    goal = (d, 0.0) if axis == 0 else (0.0, -d)
+                    ok = h._vel_goto(goal[0], goal[1], tol_mm=0.6, vmax=30.0)
+                    took = w.t - t0
+                    real = (w.off_s - off0[0], (w.off_f - off0[1]) / w.f_gain)
+                    msg = f'延迟 {lat}s 挪 {goal}：{took:.1f} 秒，停在 {real}，{h._vel_why}'
+                    self.assertTrue(ok, msg)
+                    self.assertLess(math.hypot(real[0] - goal[0], real[1] - goal[1]), max(0.8, 0.55 * 4.2 * lat + 0.2), msg)   # 停下来以后真的在那里
+                    self.assertLess(took, 3.0 + 0.12 * d + 10.0 * lat, msg)
+
+
 class RawNearSlotTests(unittest.TestCase):
     """(10-18 用户)"最近那格"的做法：齿条不够长、手臂够不全三个停靠位。arm_calib 里把爪子摆到原料盘上离车最近那一格的正上方，
     rteach RAW near 颜色号：车轮(只用 V)把这一格上的物料对到爪子正下方、记下原料盘中心；比赛时车轮对准以后车不动，
@@ -3824,6 +3849,47 @@ class ZoneCalTests(unittest.TestCase):
             self.assertEqual(len(errs), 3, text[-3000:])
             for e in errs:
                 self.assertAlmostEqual(e, 8.0, delta=2.0, msg=errs)
+
+    def test_ring2_deliberate_offset_in_temp_and_direction(self):
+        """(10-21 夜用户"暂存区域……故意对偏的问题")r2off 在暂存区也起作用、方向对：F=+8 放的点比圆环中心往车头方向偏 8mm，
+        S=+6 往车的左边(离工位远的那边)偏 6mm；1、3 号环跟着 2 号环一起偏，日志里写了故意对偏多少。"""
+        for f, sd, want in ((8.0, 0.0, (0.0, 8.0)), (0.0, 6.0, (-6.0, 0.0))):
+            w = self._world(5, park={'ROUGH': 10.0, 'TEMP': 10.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, dict(ring2_off_mm=dict(F=f, S=sd)), lines=lines)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual(text.count('故意对偏(r2off)'), 2, text[-3000:])      # 粗加工区、暂存区各一次
+            got = 0
+            for k in (1, 2, 3):
+                st = w.rings.get(('TEMP', k)) or []
+                self.assertTrue(st, f'TEMP {k} 号环没放')
+                d = np.asarray(st[0]['pos'], float) - np.array([0.0, w.ring_tan['TEMP'][k]])
+                self.assertAlmostEqual(float(d[0]), want[0], delta=1.5, msg=(f, sd, k, d))
+                self.assertAlmostEqual(float(d[1]), want[1], delta=1.5, msg=(f, sd, k, d))
+                got += 1
+            self.assertEqual(got, 3)
+
+    def test_short_move_not_clamped_by_map_check(self):
+        """(10-21 夜实车暂存区：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)规划的停车点离场地边很近、车沿圆环那一排
+        停偏了 45mm：按地图查是当成车正好停在停车点算的，会把这 45mm 限住。离停车点 60mm 以内不按地图查(对准的地方就是调 2 号环时
+        车停的地方)，三个都放了；zone_map_free_mm=0 照旧被限住、这个区不放。"""
+        for park, pose in ((45.0, [300.0, 200.0, 90.0]), (-45.0, [300.0, 2200.0, 90.0])):
+            for free in (60.0, 0.0):
+                w = self._world(3, park={'ROUGH': park}, stop_err_mm=0.5)
+                lines = []
+                h = self._make(w, dict(zone_map_free_mm=free), lines=lines, raw={'stops': {'ROUGH': pose}})
+                run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+                w.arrive('ROUGH', 1)
+                h.task('ROUGH', w.link, lines.append)
+                text = '\n'.join(lines)
+                if free > 0:
+                    self.assertNotIn('能挪的范围限成', text)
+                    self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+                    self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+                else:
+                    self.assertIn('能挪的范围限成', text)
+                    self.assertEqual(h.stats.place_ok, 0, text[-3000:])
 
     def test_calc_wheels_only_never_moves_the_arm_and_reaches_far(self):
         """(10-21 用户"修正距离可以放开")车离圆环那一排远了 100mm(以前车轮横移最多 70mm、剩下的手臂补)：知道停车点在地图上哪儿

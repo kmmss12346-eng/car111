@@ -151,8 +151,8 @@ DEFAULTS = dict(
     raw_orbit_ratio=0.77,               # 还没看到物料时：物料所在圆的半径 ≈ 外圆半径 × 这个
     raw_center_smooth=True,             # (10-16 用户)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心(STM32 的 V 指令)，不再挪一下停一下；
                                         #   STM32 是旧程序(不认 V)时自动改回一步一步挪
-    raw_center_speed=15.0,              # 对准中心时车轮最快多少毫米/秒
-    raw_center_search_speed=20.0,       # 找中心(挪着找)时车轮多少毫米/秒
+    raw_center_speed=15.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
+    raw_center_search_speed=30.0,       # 找中心(挪着找)、只用 V 挪到一个地方(_vel_goto)时车轮最快多少毫米/秒(10-21：20 -> 30)
     raw_center_align_s=25.0,            # 对准中心最多用多少秒
     raw_center_iters=5,                 # 车轮最多挪几次
     raw_center_step_mm=20.0,            # 车轮每次最多挪多少毫米(慢慢挪，挪一次看一次)
@@ -308,7 +308,7 @@ DEFAULTS = dict(
     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
-    zone_calc_speed=20.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)
+    zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
     ring2_off_mm=dict(F=0.0, S=0.0),     # (10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，可以自由调")对准 2 号环时爪子(放下的点)
                                         #   比圆环中心往前 F、往左 S 毫米(各 ±ring2_off_max_mm 以内)；run_live 里 r2off 前后 左右 改并存配置。1、3 号环跟着一起偏
     ring2_off_max_mm=20.0,
@@ -318,6 +318,8 @@ DEFAULTS = dict(
     zone_wheels_moves=8,                #   只用车轮时最多挪几次
     zone_wheels_s_mm=150.0,             #   只用车轮时横移最多离停车点多少毫米(按地图查过：车身不压工位/黄色区、不出场地、不碰障碍物，碰就少挪)
     zone_wheels_f_mm=150.0,             #   只用车轮时沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心，同样按地图查)
+    zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)离停车点这么近以内不按地图查：
+                                        #   地图查是按"车正好停在规划的停车点"算的，车本来就停偏了才要挪；对准的地方就是 arm_calib 调 2 号环时车停的地方
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
@@ -2586,15 +2588,22 @@ class MissionHooks:
         """(10-18)车轮只用 V 速度指令挪到 disp = (s_t, f_t)(相对停车点，毫米)。V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，
         STM32 复位过以后那个方向可能差很多)，车不会转；走了多少按 STM32 自己算的(V?)。到了返回 True；
         STM32 不认 V、读不到 V?、到时间还没到返回 False(原因在 self._vel_why，调用的地方改用 S/F 或者报错)。
-        max_s = 最多挪多久(None = 按距离算：实车上串口来回一次要零点几秒，最后几毫米走得慢)；V? 偶尔读不到就再读，连着 3 次读不到才算。"""
+        max_s = 最多挪多久(None = 按距离算)；V? 偶尔读不到就再读，连着 3 次读不到才算。
+        (10-21 实车"V 慢慢走不了：9 秒还没挪到(还差 0.7mm)")串口来回一次 0.1~0.2 秒、电机按整数 转/分 走(1 转/分约 4mm/s)：
+        以前按"还差多少走多快"一直修，快到了总冲过头、来回摆，到了也是停车前量的(停下来又多走一毫米)。现在：
+        ① 按读到的位置 + 新指令生效之前车还会走的那一段(现在的速度 × 串口来回的时间)预判，够了就先停；
+        ② 只差一两毫米(按 1 转/分 走一次都嫌多)：一个方向一个方向按 1 转/分 走算好的一小段时间就停；
+        ③ 车停下以后再读一次，在 tol_mm 以内才算到了。"""
         act = self.act
         self._vel_why = ''
         if act is None or not hasattr(act, 'vel') or getattr(act, '_no_vel', False):
             self._vel_why = 'STM32 不认 V(旧程序)'
             return False
+        lat = [float(self.cfg.get('vel_latency_s', 0.1))]    # 串口来回一次多久(秒)：每次读 V? 时量
 
         def read():
             for k in range(3):
+                t0 = self.now()
                 try:
                     v1 = act.vel_read()
                 except ArmAbort:
@@ -2602,6 +2611,7 @@ class MissionHooks:
                 except ArmError:
                     v1 = None
                 if v1 is not None:
+                    lat[0] = 0.6 * lat[0] + 0.4 * min(1.0, max(0.0, self.now() - t0))
                     return np.array(v1, float)
                 self.sleep(0.05 * (k + 1))
             return None
@@ -2611,12 +2621,13 @@ class MissionHooks:
             return False
         d0 = np.array([float(act.disp['S']), float(act.disp['F'])])
         goal = np.array([float(s_t), float(f_t)])
-        vmax = float(self.cfg.get('raw_center_search_speed', 20.0) if vmax is None else vmax)
+        vmax = float(self.cfg.get('raw_center_search_speed', 30.0) if vmax is None else vmax)
         vmin = float(self.cfg.get('raw_center_min_speed', 5.0))
+        v1rpm = float(self.cfg.get('vel_one_rpm_mmps', 4.0))     # 1 转/分 车走多快(前进约 4.1、横移约 3.9mm/s)
         dist0 = float(np.linalg.norm(goal - d0))
         if max_s is None:
             max_s = 6.0 + 2.5 * dist0 / max(vmin, 1.0)
-        ok, cur = False, d0
+        ok, cur, vcmd, pulses = False, d0, np.zeros(2), 0
         t_lim = self.now() + float(max_s)
         try:
             while True:
@@ -2628,16 +2639,43 @@ class MissionHooks:
                 cur = d0 + (v1 - v0)
                 d = goal - cur
                 dn = float(np.linalg.norm(d))
-                if dn <= tol_mm:
-                    ok = True
+                moving = float(np.linalg.norm(vcmd)) > 1e-9
+                tol_ = tol_mm if pulses == 0 else max(tol_mm, 0.55 * v1rpm * lat[0])   # 1 转/分 最短也要走"串口来回"那么久
+                if dn <= tol_ and not moving:
+                    ok = True                                  # 停下来以后量的：真的到了
                     break
                 if self.now() >= t_lim:
                     self._vel_why = f'{max_s:.0f} 秒还没挪到(还差 {dn:.1f}mm)'
                     break
-                vv = d / dn * min(vmax, max(vmin, 2.0 * dn))
+                pred = d - vcmd * lat[0]                       # 新指令生效之前车还按现在的速度走 lat 秒
+                pn = float(np.linalg.norm(pred))
+                if moving and (pn <= tol_mm or float(pred @ vcmd) <= 0.0):
+                    act.vel(0.0, 0.0)                          # 够了(再走就过头)：先停，停下再量
+                    vcmd = np.zeros(2)
+                    self.sleep(0.05)
+                    continue
+                per = 2.0 * lat[0] + 0.03                      # 这条速度大约管多久(到下一条生效)
+                sp = min(vmax, pn / max(per, 0.05))
+                if sp < max(vmin, 1.05 * v1rpm):               # 只差一点：按 1 转/分 走算好的时间(一个方向一个方向走)
+                    ax = 0 if abs(float(pred[0])) >= abs(float(pred[1])) else 1
+                    if abs(float(pred[ax])) <= 0.5 * tol_mm:
+                        ax = 1 - ax
+                    vv = np.zeros(2)
+                    vv[ax] = math.copysign(1.05 * v1rpm, float(pred[ax]))
+                    if not act.vel(float(vv[0]), float(vv[1])):
+                        self._vel_why = 'STM32 不认 V(旧程序)'
+                        break
+                    self.sleep(max(0.0, abs(float(pred[ax])) / v1rpm - lat[0]))   # 停车指令发过去那一下还要走一点
+                    act.vel(0.0, 0.0)
+                    vcmd = np.zeros(2)
+                    pulses += 1
+                    self.sleep(0.05)
+                    continue
+                vv = pred / pn * sp
                 if not act.vel(float(vv[0]), float(vv[1])):
                     self._vel_why = 'STM32 不认 V(旧程序)'
                     break
+                vcmd = vv
                 self.sleep(0.03)
         finally:
             try:
@@ -2690,7 +2728,7 @@ class MissionHooks:
         tol = float(cfg.get('raw_center_tol_mm', 4.0)) if tol is None else float(tol)
         vmax = float(cfg.get('raw_center_speed', 15.0))
         vmin = float(cfg.get('raw_center_min_speed', 5.0))
-        vsearch = float(cfg.get('raw_center_search_speed', 20.0))
+        vsearch = float(cfg.get('raw_center_search_speed', 30.0))
         smax, fmax = (float(x) for x in lim) if lim else (float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0)))
         wait = float(cfg.get('raw_center_wait_s', 12.0))
         keep_s = float(cfg.get('raw_vel_keep_s', 0.15))
@@ -6527,7 +6565,7 @@ class MissionHooks:
         calc_fr = int(cfg.get('zone_calc_frames', 3))
         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
-        calc_v = float(cfg.get('zone_calc_speed', 20.0))
+        calc_v = float(cfg.get('zone_calc_speed', 30.0))
         calc_smooth = bool(cfg.get('zone_calc_smooth', True))
 
         def still_rings():
@@ -6604,7 +6642,9 @@ class MissionHooks:
             按地图查过车身不碰工位/场地边/障碍物(碰就少挪)。返回 (位置, 被限了没有)。"""
             t2 = np.array([max(-scap, min(scap, float(t[0]))), max(float(drv.lo[1]), min(float(drv.hi[1]), float(t[1])))])
             cl = float(np.linalg.norm(t2 - t)) > 0.5
-            if pose0 is not None and not self._body_clear(pose0, (float(t2[0]), float(t2[1])), obs)[0]:
+            free = float(cfg.get('zone_map_free_mm', 60.0))
+            if pose0 is not None and float(np.linalg.norm(t2)) > free \
+                    and not self._body_clear(pose0, (float(t2[0]), float(t2[1])), obs)[0]:
                 for fr_ in np.linspace(0.9, 0.0, 10):
                     q = a + (t2 - a) * fr_
                     if self._body_clear(pose0, (float(q[0]), float(q[1])), obs)[0]:
@@ -6695,9 +6735,10 @@ class MissionHooks:
                         continue
                     self.log('    ★ 车挪了，画面里的圆环一点没动：车轮好像没走起来(打滑？)')
                     return False, False, False, True, em_, False
-                moves.append((mv.copy(), dimg.copy()))
-                pred_err = float(np.linalg.norm(exp - c_new)) / sc
-                Jn, how_ = fit_j(moves)
+                if float(np.linalg.norm(mv)) >= float(cfg.get('zone_fit_min_mm', 8.0)):
+                    moves.append((mv.copy(), dimg.copy()))     # (10-21)只按挪得够多的修对应关系：挪一两毫米时认圆环差一两个像素，
+                pred_err = float(np.linalg.norm(exp - c_new)) / sc   # 算出来的转角可以是任何数(以前算出过"画面转了 +98°"还存了下来)
+                Jn, how_ = fit_j(moves) if moves else (None, '')
                 if Jn is not None:
                     J = Jn
                     Jc[0] = J
