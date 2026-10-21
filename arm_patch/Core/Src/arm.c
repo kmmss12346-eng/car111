@@ -115,6 +115,7 @@ static float g_r2spd  = 0.0f;      /* R2SPD  这一组伸长、缩回的速度(�
 static uint8_t g_side = 0;         /* 手臂在哪边干活：0 = 原料盘，1 = 地上圆环(OBS RAW/RING、GRAB、PICK、PLACE、SIDE 指令设) */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
+static float g_lvdeg  = 20.0f;     /* LVDEG  (10-21 用户)夹着物料离开车上转盘：先只转 ID1 这么多度(伸缩不动)，再开始伸缩，免得挡到电池盒；0 = 不先转 */
 static float g_rotspd = 0.0f;      /* ROTSPD (10-21 用户)旋转舵机大动作转速(度/秒)；0 = 用 ASPD */
 static float g_extspd = 0.0f;      /* EXTSPD (10-21 用户)伸缩舵机大动作转速(度/秒，舵机最快多少就按多少转)；0 = 用 ASPD。
                                     *        哪个是伸缩舵机按 AEXT。绕电池盒那几段伸缩还是按 A2SPD / R2SPD(它们是 0 时用这个) */
@@ -193,6 +194,7 @@ static const ArmTun tun[] =
     { "R2SPD",  &g_r2spd,   0.0f,    1500.0f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
     { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
+    { "LVDEG",  &g_lvdeg,   0.0f,    120.0f },
     { "ROTSPD", &g_rotspd,  0.0f,    300.0f },   /* 0 = 用 ASPD；不是 0 要 >= 10(下面查) */
     { "EXTSPD", &g_extspd,  0.0f,    1500.0f },
     { "ATOLC",  &g_atolc,   0.2f,    5.0f },
@@ -1311,8 +1313,18 @@ static const char *Leave_Tray(float a1_to, float a2_to)
     Detour d;
     int k = Detour_Get(&d);
 
-    if (!k)  return NULL;
     if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
+    if (Ext_Id() == 2 && g_lvdeg > 0.5f && Absf((float)claw_now - g_clwc) < 30.0f && Absf(a1_to - a) > 1.0f)
+    {
+        /* (10-21 用户)夹着物料离开车上转盘：先只转 ID1 一段(伸缩不动)，离开电池盒那一块再伸缩 */
+        float to = (Absf(a1_to - a) <= g_lvdeg) ? a1_to : ((a1_to > a) ? a + g_lvdeg : a - g_lvdeg);
+
+        GO(Lift_Goto(g_zhi));
+        Servo_Move(1, to, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);
+        if (car_abort)  return NULL;
+        if (!Servo_ReadAngle(1, &a))  a = to;
+    }
+    if (!k)  return NULL;
     GO(Lift_Goto(g_zhi));
     at = (Absf(d.t2) > 0.5f) ? d.t2 : a;
     if (k == 1)  return Sweep(a1_to, at, a2_to, at, a2_to, d.spd);

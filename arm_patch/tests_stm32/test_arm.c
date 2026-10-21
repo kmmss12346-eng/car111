@@ -422,6 +422,19 @@ int main(void) {
     CHECK(has("S1:323.0@1500;") && has("S2:-862.0@30;"), "AEXT=1：ID1 是伸缩舵机，按 EXTSPD");
     Arm_Param_Set("AEXT", 2);
     Arm_Param_Set("ROTSPD", 0); Arm_Param_Set("EXTSPD", 0);
+    /* (10-21 用户：从转盘里取了物料，要先转一个角度再伸长，不然挡到电池盒)LVDEG：夹着物料离开车上转盘先只转 ID1 */
+    Arm_Param_Set("A1P", 200);
+    CHECK(Arm_Param_Set("LVDEG", 25) == 1 && Arm_Param_Set("LVDEG", 200) == 2, "LVDEG 可以设，最多 120");
+    away(); clear(); run("TAKE 1"); clear();
+    CHECK(run("APZ 200 -700 60") == 1, "APZ");
+    CHECK(at("M1:298.0") >= 0 && at("M1:298.0") < at("S2:") && !has("M2:"), "夹着物料离开转盘：ID1 先只转 25°(伸缩不动)，再一起转、伸缩");
+    run("CLAW O"); away(); ang[1] = 323.0f; ang[2] = -862.0f; clear();
+    run("APZ 200 -700 60");
+    CHECK(!has("M1:298.0"), "爪子张着(没夹物料)：不先转");
+    Arm_Param_Set("LVDEG", 0);
+    away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -700 60");
+    CHECK(!has("M1:298.0") && !has("M1:303.0"), "LVDEG=0：和以前一样");
+    Arm_Param_Set("LVDEG", 20); Arm_Param_Set("A1P", 323);
     away(); clear(); run("OBS RING");
     CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "ROTSPD/EXTSPD = 0：和以前一样用 ASPD");
 

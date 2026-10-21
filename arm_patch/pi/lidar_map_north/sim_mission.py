@@ -3505,7 +3505,7 @@ class ZoneCalTests(unittest.TestCase):
             self.assertTrue(all((not m[1]) or m[4] for m in zone_moves), zone_moves)   # S/F 只在对准 2 号环时、和做完挪回停车点
             self.assertLessEqual(sum(1 for m in zone_moves if not m[1] and not m[4]), 2 * 4 * h.cfg['zone_calc_moves'])
             self.assertEqual(rec['vel_after'], [], text[-3000:])           # 对准 2 号环以后车轮不再走
-            self.assertEqual(rec['vel_n'], 0)                              # 不再用 V 边走边对
+            self.assertGreater(rec['vel_n'], 0)                            # 算好的那一下用 V 慢慢走过去(10-21 用户要丝滑)
             for z in ('ROUGH', 'TEMP'):
                 self.assertLessEqual(rec['s_max'].get(z, 0.0), h.cfg['ring_strafe_max_mm'] + 0.5, rec['s_max'])
             self.assertTrue(w.take_sides and all(s == 'RING' for z, s in w.take_sides if z in ('ROUGH', 'TEMP')), w.take_sides)
@@ -3558,16 +3558,12 @@ class ZoneCalTests(unittest.TestCase):
             self.assertLess(float(np.abs(J - Jt).max()) / w.scale['RING'], 0.15, J)
 
     def test_calc_wheels_not_moving_hands_over_to_the_arm(self):
-        """车停着算好挪过去，可是车轮没走起来(打滑：STM32 说走了，画面里的圆环一点没动)：不再挪，剩下的手臂补，照样放好。"""
-        w = self._world(9, park={'ROUGH': 6.0}, stop_err_mm=0.5)
+        """车停着算好慢慢走过去，可是车轮没走起来(打滑：STM32 说走了，画面里的圆环一点没动)：不再挪，剩下的手臂补，照样放好。"""
+        w = self._world(9, park={'ROUGH': 16.0}, stop_err_mm=0.5)
         lines = []
         h = self._make(w, lines=lines)
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
-
-        def slip(sv, f, speed=None):                                    # 发了 S/F、记了走了多少，车其实没动
-            h.act.disp['S'] += int(round(sv))
-            h.act.disp['F'] += int(round(f))
-        h.act.chassis_move = slip
+        w.vel_stuck = True                                              # V 发了、STM32 说走了，车其实没动
         w.arrive('ROUGH', 1)
         h.task('ROUGH', w.link, lines.append)
         text = '\n'.join(lines)

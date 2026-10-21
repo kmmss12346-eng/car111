@@ -287,6 +287,9 @@ DEFAULTS = dict(
     zone_calc_frames=3,                 #   每次停着拍几帧取中间值
     zone_calc_settle_s=0.3,             #   挪完等这么久再拍(车停稳)
     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
+    zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
+                                        #   STM32 不认 V 才用 S/F
+    zone_calc_speed=20.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
@@ -2498,7 +2501,7 @@ class MissionHooks:
             return f'圆心一帧一帧跳得厉害(拟合误差 {rms / sc:.1f}mm)'
         return ''
 
-    def _vel_goto(self, s_t, f_t, tol_mm=0.8, max_s=None):
+    def _vel_goto(self, s_t, f_t, tol_mm=0.8, max_s=None, vmax=None):
         """(10-18)车轮只用 V 速度指令挪到 disp = (s_t, f_t)(相对停车点，毫米)。V 不纠车头(S/F 走完会把车头转回 STM32 记着的方向，
         STM32 复位过以后那个方向可能差很多)，车不会转；走了多少按 STM32 自己算的(V?)。到了返回 True；
         STM32 不认 V、读不到 V?、到时间还没到返回 False(原因在 self._vel_why，调用的地方改用 S/F 或者报错)。
@@ -2527,7 +2530,7 @@ class MissionHooks:
             return False
         d0 = np.array([float(act.disp['S']), float(act.disp['F'])])
         goal = np.array([float(s_t), float(f_t)])
-        vmax = float(self.cfg.get('raw_center_search_speed', 20.0))
+        vmax = float(self.cfg.get('raw_center_search_speed', 20.0) if vmax is None else vmax)
         vmin = float(self.cfg.get('raw_center_min_speed', 5.0))
         dist0 = float(np.linalg.norm(goal - d0))
         if max_s is None:
@@ -6040,6 +6043,8 @@ class MissionHooks:
         calc_fr = int(cfg.get('zone_calc_frames', 3))
         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
+        calc_v = float(cfg.get('zone_calc_speed', 20.0))
+        calc_smooth = bool(cfg.get('zone_calc_smooth', True))
 
         def still_rings():
             """车停着拍几帧：画面里所有像圆环的(大小对、不是车上的东西)的中心 [(u, v)]。"""
@@ -6165,8 +6170,19 @@ class MissionHooks:
                         return False, True, False, False, em_, False
                     return False, False, False, False, em_, True      # 剩下不到 1mm 车轮挪不准：手臂补
                 self.log(f'    {"" if it == 0 else "再"}算一次：2 号环偏 {em_:.1f}mm，车停着算好要 横移 {d[0]:+.0f}mm、前进 {d[1]:+.0f}mm'
-                         + (f'(能挪的范围限成 横移 {da[0]:+.0f}、前进 {da[1]:+.0f})' if cl else '') + '，一次挪过去')
-                act.chassis_move(float(da[0]), float(da[1]))
+                         + (f'(能挪的范围限成 横移 {da[0]:+.0f}、前进 {da[1]:+.0f})' if cl else '') +
+                         ('，慢慢走过去' if calc_smooth and not note.get('no_v') else '，一次挪过去'))
+                went = False
+                if calc_smooth and not note.get('no_v'):
+                    went = self._vel_goto(float(a[0] + da[0]), float(a[1] + da[1]), tol_mm=0.6, vmax=calc_v)
+                    if not went:
+                        note['no_v'] = True
+                        self.log(f'    (V 慢慢走不了：{self._vel_why or "没走到"}：改用 S/F)')
+                        a = np.array([float(act.disp['S']), float(act.disp['F'])])
+                        da = np.round(tgt - a)
+                if not went:
+                    note['sf'] = True
+                    act.chassis_move(float(da[0]), float(da[1]))
                 self.sleep(calc_settle)
                 a_new = np.array([float(act.disp['S']), float(act.disp['F'])])
                 mv = a_new - a
@@ -6266,7 +6282,7 @@ class MissionHooks:
             if cfg.get('zone_calc', True):
                 # (10-21 用户"不要一开始就往前运动，要根据实际情况来计算位置然后修正")停着算好、一次挪过去、停稳再看、按实际修正
                 dn, ed, lo_, st_, em, sm_ = calc(c)
-                out['sf'] = True
+                out['sf'] = bool(note.get('sf'))
                 out['how'] = '车轮(停着算好再挪)'
                 return tail(dn, ed, lo_, st_, em, np.array([float(act.disp['S']), float(act.disp['F'])]), small=sm_, calc_mode=True)
             trk.append((np.asarray(p_c, float).copy(), np.asarray(c, float).copy()))
