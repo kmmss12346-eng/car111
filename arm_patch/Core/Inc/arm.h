@@ -5,6 +5,8 @@
  *  夹爪 / 转盘 / 升降
  *   CLAW O | CLAW C | CLAW <微秒>         夹爪张开(参数 CLWO) / 夹紧(参数 CLWC) / 直接给脉宽
  *   CLAW OR | CLAW OT                     (10-20)原料盘上方张开(CLWOR) / 车上转盘上方张开(CLWOT)，0 = 和 CLWO 一样
+ *   (10-21)夹爪每动一次回 "CLAWSET <微秒> <O|OR|OT|C|STBY|US>"。GRAB/PICK/TAKE 夹紧了物料以后到放下之前不许张开：
+ *          再来 TAKE/GRAB/PICK 回 ERR HOLD(不动)，OBS … O、PARK/STBY 只保持夹紧(回 "CLAWKEEP OBS|STBY")；DROP、松进转盘、CLAW O/OR/OT/<微秒> 解除
  *   TT <1~3> | TT <微秒>                   车上转盘转到 1/2/3 号位(参数 TT1/TT2/TT3) / 直接给脉宽
  *   LIFT ZERO                              把"现在的高度"记为 0 (升降最低点)。(10-21)标定过编码器时编码器的 0 也改到这里、存进 Flash，
  *                                          回 "LIFTZERO ENC <编码器原来算的高度> -> 0"(本来就对得上不改)

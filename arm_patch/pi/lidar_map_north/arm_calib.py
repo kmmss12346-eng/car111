@@ -276,8 +276,8 @@ class Wizard:
         head = cmd.split(' ', 1)[0]
         rep, info = self.link.request(cmd, TIMEOUT.get(head, 10.0))
         for line in info:
-            if line.startswith('SERVO') or line.startswith('LIFTBOOT') or 'STUCK' in line:
-                self.out('  ' + line)          # 舵机卡住/没到位这类提示要让人看到
+            if line.startswith(('SERVO', 'LIFTBOOT', 'CLAWKEEP')) or 'STUCK' in line:
+                self.out('  ' + line)          # 舵机卡住/没到位、夹着物料没让张开这类提示要让人看到
             slip = lift_slip_text(line)
             if slip:
                 self.out('  ' + slip)          # (10-21)升降顶住没到要去的高度

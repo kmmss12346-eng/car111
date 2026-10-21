@@ -54,7 +54,7 @@ int HAL_UART_Receive_IT(UART_HandleTypeDef *h, uint8_t *b, uint16_t n) {
 }
 int HAL_UART_Init(UART_HandleTypeDef *h) { (void)h; return 0; }
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *h, uint32_t c) { (void)h; EV("pwm%u;", c); return 0; }
-void tim_set(uint32_t ch, uint32_t v) { (void)ch; (void)v; }
+void tim_set(uint32_t ch, uint32_t v) { if (ch == TIM_CHANNEL_3) EV("pwm3=%u;", (unsigned)v); }   /* 开机时夹爪的初始脉宽 */
 /* 夹爪/转盘的脉宽：是默认的张开/夹紧/1~3 号位就记成 O; C; tt1; …，方便看先后顺序 */
 void Claw_Set(uint32_t p) { if (p == 2090u) EV("O;"); else if (p == 2910u) EV("C;"); else EV("claw%u;", p); }
 void Turntable_Set(uint32_t p) { if (p == 2608u) EV("tt1;"); else if (p == 1708u) EV("tt2;"); else if (p == 808u) EV("tt3;"); else EV("ttus%u;", p); }
@@ -451,6 +451,7 @@ int main(void) {
     Arm_Param_Set("R1T1", 230); Arm_Param_Set("R2T", -650); Arm_Param_Set("R1T2", 300); Arm_Param_Set("R2SPD", 500);
     Arm_Param_Set("R2STG", 1);
     run("SIDE RING");
+    run("CLAW O");                                        /* (10-21)上一个 TAKE 夹着的放下(夹着物料时不许再 TAKE) */
     away(); clear(); run("TAKE 1"); clear();
     CHECK(run("APZ 200 -800 60") == 1, "分段：APZ");
     {
@@ -466,6 +467,7 @@ int main(void) {
               "去车上转盘：只转到 R1T1 -> 只伸到 R2T -> 只转到 R1T2 -> 只缩回 A2R -> 只转到 A1D，不下降");
     }
     Arm_Param_Set("R2STG", 0);
+    run("CLAW O");
     away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -800 60");
     {
         int s1 = at("S1:200.0"), e1 = at("S2:-650.0@500"), e2 = at("S2:-800.0@500");
@@ -491,6 +493,7 @@ int main(void) {
     CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "ROTSPD/EXTSPD = 0：和以前一样用 ASPD");
 
     /* ---- 急停：升降停下并要求重新回零 ---- */
+    run("CLAW O");
     clear();
     abort_at = (int)now + 800;
     run("GRAB 1 H");
@@ -1056,6 +1059,57 @@ int main(void) {
     clear(); Arm_Init();
     CHECK(fabs(pinum("LIFTBOOT ") - 60.0) < 0.05 && fabs(phys_mm - 60.0) < 0.05, "重新开机也按新的 0 认出 60");
     phys_top = 1e9; phys_bot = -1e9;
+
+    /* ---- (10-21 用户"放 1、2 号环的时候爪子莫名其妙松开""运输过程中一定要按第三步 CLWC 夹紧")
+     *      夹爪每动一次都回 CLAWSET；夹着物料时只有放下(DROP、松进转盘、CLAW O/OR/OT)能张开 ---- */
+    Arm_Param_Set("CLWO", 2090); Arm_Param_Set("CLWC", 2910); Arm_Param_Set("CLWOR", 0); Arm_Param_Set("CLWOT", 0);
+    run("LIFT 60"); run("CLAW O"); clear();
+    CHECK(run("CLAW C") == 1 && pis("CLAWSET 2910 C"), "CLAW C：回 CLAWSET 2910 C(夹爪每动一次都说是哪一步)");
+    clear(); run("CLAW C");
+    CHECK(!pis("CLAWSET"), "没动就不说");
+    run("CLAW O"); away(); clear();
+    CHECK(run("TAKE 2") == 1 && pis("CLAWSET 2910 C"), "TAKE：夹紧时回 CLAWSET 2910 C");
+    clear();
+    CHECK(run("TAKE 3") == -1 && pis("ERR HOLD") && !has("O;") && !has("L+") && !has("L-") && !has("S1:") && !has("S2:"),
+          "夹着物料又来 TAKE：回 ERR HOLD，爪子不张开、手臂升降都不动(以前一开头就张开，物料掉在半路)");
+    clear();
+    CHECK(run("GRAB 1 H") == -1 && pis("ERR HOLD") && !has("O;"), "夹着物料 GRAB：同样 ERR HOLD");
+    away(); clear();
+    CHECK(run("OBS RING O") == 1 && pis("CLAWKEEP OBS") && !has("O;") && !pis("CLAWSET") && has("S1:"),
+          "夹着物料 OBS RING O：手臂照样摆过去，爪子保持夹紧(回 CLAWKEEP OBS)");
+    clear();
+    CHECK(run("APZ 340 -700 100") == 1 && !has("O;") && !pis("CLAWSET"), "夹着物料转来转去(APZ)：爪子一直夹紧，一次都不动");
+    clear();
+    CHECK(run("DROP") == 1 && pis("CLAWSET 2090 O") && at("O;") > at("L-"), "DROP：降到放的高度才张开(CLAWSET 2090 O)");
+    away(); clear();
+    CHECK(run("TAKE 3") == 1 && has("O;") && has("C;"), "放下以后又能 TAKE");
+    clear();
+    CHECK(run("CLAW O") == 1 && pis("CLAWSET 2090 O"), "树莓派明说张开(放下 / 放回转盘)：CLAW O 照样张开");
+    away(); clear();
+    CHECK(run("TAKE 1") == 1, "CLAW O 以后不算夹着：能 TAKE");
+    clear();
+    CHECK(run("CLAW OT") == 1 && pis("CLAWSET 2090 OT"), "放回车上转盘：CLAW OT 张开");
+    away(); clear();
+    CHECK(run("GRAB 1 H") == 1 && at("C;") < last("O;"), "GRAB H：夹紧 -> 送进车上转盘松开");
+    away(); clear();
+    CHECK(run("TAKE 2") == 1, "GRAB 松进车上转盘以后不算夹着：能 TAKE");
+    /* 存了待机姿态：夹着物料时 PARK 回待机姿态，爪子不换成待机姿态的 */
+    run("CLAW O"); run("LIFT 80"); ang[1] = 250.0f; ang[2] = -600.0f; run("CLAW 1300");
+    CHECK(run("STBY SAVE") == 1, "存一个夹爪 1300 的待机姿态");
+    away(); clear();
+    CHECK(run("TAKE 2") == 1, "夹起物料");
+    away(); clear();
+    CHECK(run("PARK") == 1 && pis("CLAWKEEP STBY") && !has("claw1300;") && has("S1:250.0"), "夹着物料 PARK：手臂回待机姿态，爪子保持夹紧(CLAWKEEP STBY)");
+    run("CLAW O"); away(); clear();
+    CHECK(run("PARK") == 1 && has("claw1300;") && pis("CLAWSET 1300 STBY"), "空爪 PARK：夹爪照常到待机姿态的 1300");
+    /* 开机：存了待机姿态就直接用它的夹爪脉宽，不先张开到 2090(STM32 万一中途重启，夹着的物料不会先掉) */
+    clear(); Arm_Init();
+    CHECK(has("pwm3=1300;") && !has("pwm3=2090;") && !has("O;"), "开机：夹爪直接是待机姿态的 1300，不先张开");
+    run("STBY CLR"); clear(); Arm_Init();
+    CHECK(has("pwm3=2090;"), "没存待机姿态：开机照旧 2090");
+    clear();
+    CHECK(run("TAKE 1") == 1, "开机以后不算夹着");
+    run("CLAW O"); run("LIFT 60");
 
     /* ---- GET/SET 用的接口 ---- */
     clear();

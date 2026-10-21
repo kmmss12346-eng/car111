@@ -62,6 +62,30 @@ def lift_slip_text(line):
     return f'★ 升降没到 {want:.1f}mm，实际在 {got:.1f}mm(顶住丢步了，STM32 已按编码器改过来){hint}'
 
 
+_CLAW_WHY = {'O': '张开', 'OR': '原料盘上方张开', 'OT': '车上转盘上方张开', 'C': '夹紧', 'STBY': '待机姿态', 'US': '直接给的脉宽'}
+_KEEP_WHY = {'OBS': '摆到观察姿态(OBS … O)', 'STBY': '回待机姿态(PARK/STBY)'}
+
+
+def claw_line_text(line, cmd=''):
+    """(10-21 用户"放 1、2 号环的时候爪子莫名其妙松开")STM32 每次动夹爪回 CLAWSET <微秒> <哪一步>，夹着物料没让张开回 CLAWKEEP <哪一步>，
+    重启时会发 READY / LIFTBOOT：翻成给人看的话(哪条指令里动的)。不是这几种返回 None。"""
+    p = line.split()
+    if not p:
+        return None
+    where = f'  ← {cmd}' if cmd else ''
+    if p[0] == 'CLAWSET' and len(p) >= 2:
+        what = _CLAW_WHY.get(p[2], p[2]) if len(p) >= 3 else ''
+        return f'      (夹爪 → {p[1]}µs {what}{where})'
+    if p[0] == 'CLAWKEEP':
+        what = _KEEP_WHY.get(p[1], p[1]) if len(p) >= 2 else ''
+        return (f'  ★ STM32 记着爪子里夹着物料：{what}本来要张开爪子，没让它张开(夹着物料时只有放下那一步能张开){where}。'
+                '确实要拿出来：arm CLAW O')
+    if p[0] == 'READY' or p[0] == 'LIFTBOOT':
+        return (f'  ★★ STM32 刚才重启了({line.strip()}){where}：夹爪、手臂会回开机/待机的样子，参数回到程序里写的默认值。'
+                '多半是电池电压被拉低(舵机、升降一起使劲)或者 STM32 的电源线/复位线松了')
+    return None
+
+
 def unknown_cmd(reply):
     """STM32 不认识这条指令(旧程序回 ERR CMD)。"""
     return 'ERR CMD' in (reply or '')
@@ -75,6 +99,7 @@ class ArmLink:
         self._screen_last = {}
         self._params = None
         self.lift_boot = None                    # 开机时升降高度是怎么认出来的(LIFT? 回复里的 BOOT=…；旧程序没有)
+        self._n_req = 0                          # 发过几条(第一条可能收到 STM32 上电时留在串口里的 READY/LIFTBOOT，不算中途重启)
         try:                                     # 扫码器插在树莓派 USB 口上时从这里读(见 qr_usb.py)；没有就只问 STM32
             import qr_usb
             self.usb_qr = qr_usb.reader(log)
@@ -98,6 +123,10 @@ class ArmLink:
             slip = lift_slip_text(line)
             if slip:
                 self.log('  ' + slip)
+            cl = claw_line_text(line, text)
+            if cl and not (self._n_req == 0 and line.startswith(('READY', 'LIFTBOOT'))):
+                self.log(cl)
+        self._n_req += 1
         return ok, reply, info
 
     def do(self, text, timeout=None):

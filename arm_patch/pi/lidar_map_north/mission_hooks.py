@@ -290,6 +290,12 @@ DEFAULTS = dict(
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
     zone_calc_speed=20.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)
+    zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
+                                        #   观察姿态(A1P/A2P)一下都不动；只差一点、打滑、到能挪的边上、次数用完都不交给手臂补，车轮接着修
+                                        #   (最多 zone_wheels_moves 次)，最后还差不到 accept_mm 照样放，不然这个区这次不放。False = 以前(剩下的手臂补)
+    zone_wheels_moves=8,                #   只用车轮时最多挪几次
+    zone_wheels_s_mm=150.0,             #   只用车轮时横移最多离停车点多少毫米(按地图查过：车身不压工位/黄色区、不出场地、不碰障碍物，碰就少挪)
+    zone_wheels_f_mm=150.0,             #   只用车轮时沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心，同样按地图查)
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
@@ -1124,6 +1130,13 @@ class MissionHooks:
     def _recover(self, why):
         """单个物料出错后：尽量把手臂收好。收不好就停下整个路线(带着伸出的手臂乱走不安全)。"""
         self.log(f'    ★ {why}；收臂')
+        if 'ERR HOLD' in str(why):
+            # (10-21)STM32 记着爪子里还夹着物料(上一个没放下)，不让 TAKE/GRAB/PICK 先张开爪子：本轮不再夹放，免得它掉在半路
+            self.maybe_holding = 'STM32 说爪子里还夹着物料(上一个没放下)'
+            if not self.disabled:
+                self.disabled = 'STM32 说爪子里还夹着物料(上一个没放下)：本轮不再夹放，免得张开爪子把它掉在半路。拿出来：arm CLAW O'
+                self.log(f'    ★ {self.disabled}')
+                self._ui('msg', 'ARM OFF')
         self._ring_ready = self._at_obs = False
         try:
             self._stow_retry()
@@ -5797,6 +5810,12 @@ class MissionHooks:
         sh_f, sh_l = getattr(self, '_cur_shift', (0.0, 0.0))
         scap = max(smax, float(cfg.get('zone_s_max_mm', 70.0))) + abs(float(sh_l))   # (10-20)规划时停车点横着挪过：多挪回来这么多
         fmax = float(cfg.get('zone_f_mm', 60.0))
+        wonly = bool(cfg.get('zone_wheels_only', True))     # (10-21 用户)只用车轮修，手臂不补
+        pose0 = self._stop_pose(zone)
+        obs = self._map_obstacles()
+        if wonly and pose0 is not None:                      # 能按地图查车身碰不碰工位/场地边：修正距离放开
+            scap = max(scap, float(cfg.get('zone_wheels_s_mm', 150.0)) + abs(float(sh_l)))
+            fmax = max(fmax, float(cfg.get('zone_wheels_f_mm', 150.0)))
         seek_mm = float(cfg.get('zone_seek_mm', 200.0)) + max(0.0, -float(sh_f))     # 停车点往后挪过：往前多找这么多
         seek_v = float(cfg.get('zone_seek_speed', 10.0))
         sp_px = float(cfg.get('ring_spacing_mm') or 150.0) * sc
@@ -5813,8 +5832,6 @@ class MissionHooks:
         drv = _VelDrive(self, lo, hi, float(cfg.get('raw_vel_keep_s', 0.15)), bool(cfg.get('raw_frame_thread', True)))
         if not drv.start():
             return 'nofw'
-        pose0 = self._stop_pose(zone)
-        obs = self._map_obstacles()
         Jc = [J0.copy()]                                      # 现在用的车轮和画面的对应关系(边走边修)
         static, seen, trk = [], [], []                        # 车上不动的假圆环；最近认到的 (像素, 拍时车走了多少)；认准的 2 号环
         note = dict(size=0, static=0, jfix_at=None, jlog=False, slip=False)
@@ -5931,7 +5948,8 @@ class MissionHooks:
             e_ = c_ + Jc[0] @ (drv.est() - p_) - goalp
             need = drv.pos() - np.linalg.solve(Jc[0], e_)    # 对上 2 号环时车该在哪(底盘位移)
             s_t = float(need[0])
-            l_, h_ = max(-scap, s_t - smax), min(scap, s_t + smax)
+            sm_ = scap if (wonly and pose0 is not None) else smax   # (10-21)只用车轮：不再只许在"该在的远近"附近挪
+            l_, h_ = max(-scap, s_t - sm_), min(scap, s_t + sm_)
             if pose0 is not None:
                 s_ok = max(-scap, min(scap, s_t))
                 for _k in range(60):
@@ -6039,7 +6057,7 @@ class MissionHooks:
             n = float(np.linalg.norm(d))
             return d if n <= lim else d * (lim / n)
 
-        calc_n = int(cfg.get('zone_calc_moves', 4))
+        calc_n = int(cfg.get('zone_wheels_moves', 8)) if wonly else int(cfg.get('zone_calc_moves', 4))
         calc_fr = int(cfg.get('zone_calc_frames', 3))
         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
@@ -6150,7 +6168,7 @@ class MissionHooks:
                 em_ = float(np.linalg.norm(e_)) / sc
                 if em_ <= tol:
                     return True, False, False, False, em_, False
-                if it > 0 and em_ <= calc_arm:
+                if it > 0 and em_ <= calc_arm and not wonly:
                     return False, False, False, False, em_, True      # 只差一点：车轮小挪动不准，剩下的手臂补
                 if it >= calc_n:
                     break
@@ -6168,7 +6186,7 @@ class MissionHooks:
                     if cl:
                         self.log(f'    2 号环还偏 {em_:.1f}mm：车轮到能挪的范围边上了')
                         return False, True, False, False, em_, False
-                    return False, False, False, False, em_, True      # 剩下不到 1mm 车轮挪不准：手臂补
+                    return False, False, False, False, em_, not wonly  # 剩下不到 1mm 车轮挪不准：手臂补(只用车轮时就到这里)
                 self.log(f'    {"" if it == 0 else "再"}算一次：2 号环偏 {em_:.1f}mm，车停着算好要 横移 {d[0]:+.0f}mm、前进 {d[1]:+.0f}mm'
                          + (f'(能挪的范围限成 横移 {da[0]:+.0f}、前进 {da[1]:+.0f})' if cl else '') +
                          ('，慢慢走过去' if calc_smooth and not note.get('no_v') else '，一次挪过去'))
@@ -6199,6 +6217,16 @@ class MissionHooks:
                 dimg = c_new - c_
                 ex_px = float(np.linalg.norm(J @ mv))
                 if ex_px >= 6.0 and float(np.linalg.norm(dimg)) < max(2.0, 0.2 * ex_px):
+                    if wonly and went:                               # 只用车轮：V 慢慢走没走起来，改用 S/F(按位置走)再挪一次，不交给手臂
+                        note['no_v'] = True
+                        self.log('    ★ 车挪了，画面里的圆环一点没动：V 慢慢走车轮好像没走起来(打滑？)，改用 S/F 再挪一次')
+                        a = a_new
+                        continue
+                    if wonly and note.get('slips', 0) < 1:
+                        note['slips'] = note.get('slips', 0) + 1
+                        self.log('    ★ 车挪了，画面里的圆环一点没动：车轮好像没走起来(打滑？)，按画面再算一次再挪')
+                        a = a_new
+                        continue
                     self.log('    ★ 车挪了，画面里的圆环一点没动：车轮好像没走起来(打滑？)')
                     return False, False, False, True, em_, False
                 moves.append((mv.copy(), dimg.copy()))
@@ -6217,14 +6245,15 @@ class MissionHooks:
         def tail(done, edge, lost, stalled, em, d_, small=False, calc_mode=False):
             """车轮对完了：记下还差多少；对准了就把修正过的对应关系存下来；没对准(到边上/没进展/到时间/剩下太少)剩下的只动手臂补。"""
             out['err_mm'] = em
+            rest_ = '手臂不补' if wonly else '剩下的手臂补'
             if stalled:
-                why_ = ('(★ 车挪了画面里的圆环没动：打滑/没走起来？剩下的手臂补)' if calc_mode
-                        else f'(★ 车轮挪了 {stall_s:g} 秒偏差都没小下去：打滑/没走起来？剩下的手臂补)')
+                why_ = (f'(★ 车挪了画面里的圆环没动：打滑/没走起来？{rest_})' if calc_mode
+                        else f'(★ 车轮挪了 {stall_s:g} 秒偏差都没小下去：打滑/没走起来？{rest_})')
             elif small:
                 why_ = '(只差一点，车轮小挪动不准：剩下的手臂补)'
             else:
-                why_ = '(横移/前后到头了，剩下的手臂补)' if edge else ('' if lost else
-                       ('(挪了 %d 次还差一点，剩下的手臂补)' % calc_n if calc_mode else '(到时间了，剩下的手臂补)'))
+                why_ = f'(横移/前后到头了，{rest_})' if edge else ('' if lost else
+                       (f'(挪了 {calc_n} 次还差一点，{rest_})' if calc_mode else f'(到时间了，{rest_})'))
             self.log(f'    车轮停在 横移 {d_[0]:+.0f}mm、前进 {d_[1]:+.0f}mm(相对停车点)：2 号环还偏 {em:.1f}mm' + ('' if done else why_))
             ja = note['jfix_at']
             if store is not None and ((note.get('jsave') and em <= max(5.0, 3.0 * tol))
@@ -6238,6 +6267,11 @@ class MissionHooks:
                 out['ok'] = True
                 return out
             if lost:
+                return out
+            if wonly:                                         # (10-21 用户)只用车轮：手臂一下都不动，还差不到 accept_mm 照样放
+                out['ok'] = em <= acc
+                if not out['ok']:
+                    out['why'] = f'只用车轮对准还差 {em:.1f}mm(超过 {acc:g}mm，手臂不补)'
                 return out
             # 车轮到头了/到时间了/没进展：只动手臂补剩下的(车不动)
             if store.get('RING', 'arm') is None:

@@ -1164,12 +1164,26 @@ static uint8_t  tt_slot     = 1;
 static uint32_t tt_ready_at = 0;
 
 /* 夹爪慢慢转到 target 微秒：往张开的方向用 CLSPO，往合上的方向用 CLSPD；速度 > 0 时每 10 毫秒挪一点
- * (用户嫌夹爪一下子张开/合上太猛)；速度 = 0 一下子到 */
-static uint32_t claw_now = CLAW_BOOT_US;
-static void Claw_Move(uint32_t target)
+ * (用户嫌夹爪一下子张开/合上太猛)；速度 = 0 一下子到。
+ * (10-21 用户"放 1、2 号环的时候爪子莫名其妙松开")夹爪每动一次都回一行 CLAWSET <微秒> <哪一步>(O 张开 / OR 原料盘上方张开 /
+ * OT 车上转盘上方张开 / C 夹紧 / STBY 待机姿态 / US 直接给的脉宽)，树莓派日志里看得到是哪一步让它动的；
+ * 爪子松了日志里却没有这一行 = 不是程序让它张开的(查夹爪舵机的线、插头、电源) */
+static uint32_t claw_now  = CLAW_BOOT_US;
+static uint8_t  claw_hold = 0;            /* (10-21 用户"运输过程中爪子一定要按第三步 CLWC 夹紧，不能松")GRAB/PICK/TAKE 夹紧了物料 = 1；
+                                           * 放下(DROP、松进车上转盘、CLAW O/OR/OT/<微秒>)= 0。是 1 时别的流程都不张开爪子：
+                                           * TAKE/GRAB/PICK 回 ERR HOLD，OBS … O、待机姿态只保持夹紧(回 CLAWKEEP) */
+static void Claw_Move(uint32_t target, const char *why)
 {
     uint8_t opening = ((g_clwo >= g_clwc) ? ((float)target > (float)claw_now) : ((float)target < (float)claw_now));
     float spd = opening ? g_clspo : g_clspd;
+
+    if (target != claw_now)
+    {
+        char m[40];
+
+        snprintf(m, sizeof(m), "CLAWSET %lu %s\r\n", (unsigned long)target, why);
+        Say(m);
+    }
 
     if (spd > 0.5f)
     {
@@ -1195,7 +1209,7 @@ static void Claw_Move(uint32_t target)
 /* 夹爪张开 / 夹紧(脉宽是参数 CLWO / CLWC) */
 static void Claw_O(void)
 {
-    Claw_Move((uint32_t)g_clwo);
+    Claw_Move((uint32_t)g_clwo, "O");
 }
 
 /* (10-20 用户)夹爪张开分三个角度：原料盘上方 CLWOR、车上转盘上方 CLWOT、其他地方 CLWO。CLWOR / CLWOT 是 0(没调)就用 CLWO */
@@ -1205,12 +1219,12 @@ static void Claw_OAt(uint8_t where)
 {
     float us = (where == CLAW_AT_RAW) ? g_clwor : ((where == CLAW_AT_TRAY) ? g_clwot : 0.0f);
 
-    Claw_Move((uint32_t)((us >= 500.0f) ? us : g_clwo));
+    Claw_Move((uint32_t)((us >= 500.0f) ? us : g_clwo), (where == CLAW_AT_RAW) ? "OR" : "OT");
 }
 
 static void Claw_C(void)
 {
-    Claw_Move((uint32_t)g_clwc);
+    Claw_Move((uint32_t)g_clwc, "C");
 }
 
 static void TT_Go(uint8_t slot)
@@ -1464,8 +1478,9 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     g_side = ring;                                 /* (10-20)之后去/离开车上转盘按这一边的绕电池盒参数走 */
     if (open_claw)
     {
-        if (ring)  Claw_O();
-        else       Claw_OAt(CLAW_AT_RAW);         /* (10-20)原料盘上方张开用 CLWOR */
+        if (claw_hold)  Say("CLAWKEEP OBS\r\n");   /* (10-21)夹着物料：不张开 */
+        else if (ring)  Claw_O();
+        else            Claw_OAt(CLAW_AT_RAW);    /* (10-20)原料盘上方张开用 CLWOR */
     }
     GO(Leave_Tray(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e));
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
@@ -1479,15 +1494,16 @@ static const char *Seq_PickHere(uint8_t slot, float z, uint8_t ring)
     const char *e = Seq_Ready();
     if (e) return e;
     if (!Slot_Ok(slot))  return "ERR ARG";
+    if (claw_hold)  return "ERR HOLD";             /* (10-21)爪子里还夹着物料：先张开就掉在半路 */
 
     TT_Go(slot);                                   /* 转盘先转，转的同时手臂也在动，省时间 */
     if (ring)  Claw_O();                           /* 确保下降时爪子是张开的(下降要一会儿，爪子这时候正好张开) */
     else       Claw_OAt(CLAW_AT_RAW);              /* (10-20)原料盘上方张开用 CLWOR */
     GO(Lift_Goto(z));                              /* 下降 */
-    Claw_C();      WAIT(g_clwait);                 /* 夹紧 */
+    Claw_C();      claw_hold = 1;  WAIT(g_clwait); /* 夹紧 */
     GO(Go_Tray(g_zdrop));                          /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降；A2T：伸着转过去) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
-    Claw_OAt(CLAW_AT_TRAY); WAIT(g_clwait);        /* 松开：物料落进转盘((10-20)车上转盘上方张开用 CLWOT) */
+    Claw_OAt(CLAW_AT_TRAY);  claw_hold = 0;  WAIT(g_clwait);   /* 松开：物料落进转盘((10-20)车上转盘上方张开用 CLWOT) */
     GO(Lift_Goto(g_zhi));
     return NULL;
 }
@@ -1498,6 +1514,7 @@ static const char *Seq_Take(uint8_t slot)
     const char *e = Seq_Ready();
     if (e) return e;
     if (!Slot_Ok(slot))  return "ERR ARG";
+    if (claw_hold)  return "ERR HOLD";             /* (10-21)爪子里还夹着物料(上一个没放下)：先张开就掉在半路 */
 
     TT_Go(slot);
     Claw_O();
@@ -1505,7 +1522,7 @@ static const char *Seq_Take(uint8_t slot)
     Claw_OAt(CLAW_AT_TRAY);                        /* (10-20)到了转盘上方：张开换成 CLWOT(没调就还是 CLWO，不动) */
     if (!TT_WaitReady()) return NULL;
     GO(Lift_Goto(g_zdrop));
-    Claw_C();      WAIT(g_clwait);                 /* 夹起 */
+    Claw_C();      claw_hold = 1;  WAIT(g_clwait); /* 夹起：之后到放下之前爪子一直夹紧 */
     GO(Lift_Goto(g_zhi));
     return NULL;
 }
@@ -1519,7 +1536,7 @@ static const char *Seq_Drop(uint8_t stack)
     if (e) return e;
 
     GO(Lift_Goto(stack ? g_zstk : g_zplc));
-    Claw_O();      WAIT(g_clwait);
+    Claw_O();      claw_hold = 0;  WAIT(g_clwait);
     if (g_ovlap > 0.5f && g_para > 0.5f)
     {
         /* (10-14 用户)放下以后先直着升 OVCLR，再一边升到 ZHI 一边缩回伸缩舵机(另一个保持现在的角度，不转) */
@@ -1573,7 +1590,8 @@ static const char *Seq_Standby(void)
 
     GO(Lift_Goto(g_zhi));
     SERVOS(sb_a1, sb_a2, 1, g_atolc, 0.0f);
-    Claw_Move(sb_claw);
+    if (claw_hold)  Say("CLAWKEEP STBY\r\n");     /* (10-21)夹着物料：夹爪保持夹紧，不换成待机姿态的 */
+    else            Claw_Move(sb_claw, "STBY");
     GO(Lift_Goto(sb_z));
     return NULL;
 }
@@ -2311,8 +2329,12 @@ void Arm_Poll(void)
 /* ================= 初始化 ================= */
 void Arm_Init(void)
 {
-    /* 工程里原来没有启动 TIM2 的 PWM，夹爪和转盘一直没有输出。先设好初始脉宽再启动，避免开机时舵机猛地跳一下 */
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, CLAW_BOOT_US);
+    /* 工程里原来没有启动 TIM2 的 PWM，夹爪和转盘一直没有输出。先设好初始脉宽再启动，避免开机时舵机猛地跳一下。
+     * (10-21)存了待机姿态就直接用它的夹爪脉宽(不先张开到 2090 再合上：STM32 万一中途重启，夹着的物料不会先掉) */
+    Sb_Load();
+    claw_now = (sb_ok && sb_claw >= 500u && sb_claw <= 3000u) ? sb_claw : CLAW_BOOT_US;
+    claw_hold = 0;
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, claw_now);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, TT_BOOT_US);
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
@@ -2442,7 +2464,11 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         {
             long us;
             if (!ParseL(t[1], &us) || us < 500 || us > 3000)  FAIL("ERR ARG");   /* 夹爪合上是 2910 */
-            Claw_Move((uint32_t)us);               /* main.c 里会再按夹爪限位夹住 */
+            Claw_Move((uint32_t)us, "US");         /* main.c 里会再按夹爪限位夹住 */
+        }
+        if (strcmp(t[1], "C") != 0)
+        {
+            claw_hold = 0;                         /* (10-21)树莓派明说张开(放下、放回转盘、人手拿出物料)：不再当夹着物料 */
         }
         Wait_Ms((uint32_t)g_clwait);
         return 1;

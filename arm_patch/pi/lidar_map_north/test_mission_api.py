@@ -713,6 +713,31 @@ class ArmLinkTests(unittest.TestCase):
         self.assertIn('差太多没改', lift_slip_text('LIFTSLIP want=70.0000 got=88.0000 (too far, kept)'))
         self.assertIsNone(lift_slip_text('LIFT 1 60.0 BOOT=ENC'))
 
+    def test_claw_lines_are_reported(self):
+        """(10-21 用户"放 1、2 号环的时候爪子莫名其妙松开")STM32 每次动夹爪回 CLAWSET：日志里写出是哪条指令让它动的；
+        夹着物料没让张开(CLAWKEEP)、STM32 中途重启(READY/LIFTBOOT)大声说。第一条指令收到的 READY 是上电时留下的，不算重启。"""
+        from arm_link import claw_line_text
+        link = self.Link({'TAKE': (True, 'DONE', ['CLAWSET 2090 O', 'CLAWSET 2910 C']),
+                          'OBS': (True, 'DONE', ['CLAWKEEP OBS']),
+                          'APZ': (False, None, ['READY ARM=1', 'LIFTBOOT NOENC (assume last 100.0)']),
+                          'GET': (True, 'DONE', ['READY ARM=1'])})
+        lines = []
+        a = ArmLink(link, log=lines.append)
+        a.request('GET')
+        self.assertEqual(lines, [])                                    # 第一条：上电时留在串口里的 READY 不算
+        a.take(2)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn('夹爪 → 2090µs 张开', lines[0])
+        self.assertIn('← TAKE 2', lines[0])
+        self.assertIn('夹爪 → 2910µs 夹紧', lines[1])
+        a.obs('RING', open_claw=True)
+        self.assertIn('没让它张开', lines[-1])
+        self.assertIn('arm CLAW O', lines[-1])
+        a.request('APZ 1 2 3')
+        self.assertTrue(any('STM32 刚才重启了' in l for l in lines[-2:]), lines)
+        self.assertIsNone(claw_line_text('ANG 1 50.0'))
+        self.assertIn('车上转盘上方张开', claw_line_text('CLAWSET 1700 OT'))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)

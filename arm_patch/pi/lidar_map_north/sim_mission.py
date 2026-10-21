@@ -1713,6 +1713,30 @@ class ZoneFlowTests(unittest.TestCase):
         self.assertEqual(w.collisions, 0, text)
         self.assertIn('号槽里还有没放出去的', text)
 
+    def test_err_hold_stops_arm_work_without_opening_the_claw(self):
+        """(10-21 用户"运输过程中爪子一定要夹紧")STM32 记着爪子里还夹着物料(上一个没放下)，TAKE 回 ERR HOLD：本轮不再夹放、
+        不再发任何会张开爪子的指令(CLAW O、OBS … O、GRAB/PICK/TAKE)，回家也不 PARK(夹着东西)。"""
+        w = SimWorld(seed=4, code=self.CODE)
+        h = make(w)
+        orig = w._handle
+        st = {'n': 0}
+
+        def handle(text):
+            if text.startswith('TAKE') and w.zone == 'ROUGH' and st['n'] == 0:
+                st['n'] = len(w.requests)
+                return False, 'ERR HOLD', []
+            return orig(text)
+        w._handle = handle
+        lines = []
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('本轮不再夹放', text)
+        self.assertIsNotNone(h.maybe_holding)
+        later = w.requests[st['n']:]
+        self.assertFalse([r for r in later if r.startswith(('CLAW O', 'TAKE', 'GRAB', 'PICK', 'PARK')) or r == 'OBS RING O'
+                          or r == 'OBS RAW O'], later)
+        self.assertIn('不收臂停 60', text)
+
     def test_wheels_first_option(self):
         """wheels_first(mtest … wheels)：沿圆环那一排先让车轮小步慢慢挪——照样全放对，工位里不横移，
         车轮每次最多 wheels_step_mm、用 wheels_rpm 的速度。"""
@@ -3356,7 +3380,7 @@ class ZoneArmGeomTests(unittest.TestCase):
         for model, ok in (('polar', True), ('linear', False)):
             w = SimWorld(seed=1, code=self.CODE, arm_r_mm=300.0)
             lines = []
-            h = self._make(w, dict(zone_arm_fine=False, zone_arm_model=model), lines=lines)
+            h = self._make(w, dict(zone_arm_fine=False, zone_arm_model=model, zone_wheels_only=False), lines=lines)   # 测几何估算本身(2 号环手臂补到 0)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
             far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH' and k in (1, 3)]
             text = '\n'.join(lines)
@@ -3429,10 +3453,10 @@ class ZoneCalTests(unittest.TestCase):
             out[str(k)] = [round(ph * (1.0 if w.k1 >= 0 else -1.0), 2), round((math.hypot(R, t) - R) / w.k2, 2)]
         return out
 
-    def _make(self, w, extra=None, lines=None, cal=True, arm_j=True):
+    def _make(self, w, extra=None, lines=None, cal=True, arm_j=True, raw=None):
         cfg = dict(align_by=ZONE_WHEELS, a1_range=[0.0, 720.0])
         cfg.update(extra or {})
-        h = make(w, cfg, log=(lines.append if lines is not None else (lambda m: None)))
+        h = make(w, cfg, log=(lines.append if lines is not None else (lambda m: None)), raw=raw)
         h._ensure(w.link)
         if arm_j:
             h.store.put('RING', 'arm', -w.scale['RING'] * w.Rcam @ np.diag([w.k2, w.k1]))
@@ -3557,20 +3581,47 @@ class ZoneCalTests(unittest.TestCase):
             Jt = w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0])
             self.assertLess(float(np.abs(J - Jt).max()) / w.scale['RING'], 0.15, J)
 
-    def test_calc_wheels_not_moving_hands_over_to_the_arm(self):
-        """车停着算好慢慢走过去，可是车轮没走起来(打滑：STM32 说走了，画面里的圆环一点没动)：不再挪，剩下的手臂补，照样放好。"""
+    def test_calc_wheels_not_moving_retries_with_sf_not_the_arm(self):
+        """(10-21 用户"对准的时候不要用机械臂修正，就用车轮修正")车停着算好慢慢走过去，可是 V 走车轮没走起来(打滑：STM32 说走了，
+        画面里的圆环一点没动)：不交给手臂，改用 S/F 再挪一次；对准 2 号环时手臂一下都不动，照样放好。"""
         w = self._world(9, park={'ROUGH': 16.0}, stop_err_mm=0.5)
         lines = []
         h = self._make(w, lines=lines)
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
         w.vel_stuck = True                                              # V 发了、STM32 说走了，车其实没动
         w.arrive('ROUGH', 1)
+        n0 = len(w.requests)
         h.task('ROUGH', w.link, lines.append)
         text = '\n'.join(lines)
         self.assertIn('画面里的圆环一点没动', text)
-        self.assertIn('手臂补(车不动)', text)
+        self.assertIn('改用 S/F 再挪一次', text)
+        self.assertNotIn('手臂补', text)
+        reqs = w.requests[n0:]
+        k = next(i for i, r in enumerate(reqs) if r.startswith('TAKE'))  # 对准 2 号环(第一次取物料之前)：手臂不转
+        self.assertFalse([r for r in reqs[:k] if r.startswith(('AD ', 'AF ', 'APN '))], reqs[:k])
         self.assertEqual(h.stats.place_ok, 3, text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
+    def test_calc_wheels_only_never_moves_the_arm_and_reaches_far(self):
+        """(10-21 用户"修正距离可以放开")车离圆环那一排远了 100mm(以前车轮横移最多 70mm、剩下的手臂补)：知道停车点在地图上哪儿
+        (能查车身碰不碰工位/场地边)时只用车轮横着挪过去对准，手臂停在看圆环的姿态一下都不动，三个都放准。"""
+        w = self._world(4, park={'ROUGH': 40.0}, park_side={'ROUGH': 100.0}, stop_err_mm=0.5)
+        lines = []
+        h = self._make(w, lines=lines, raw={'stops': {'ROUGH': [300.0, 300.0, 0.0]}})     # 场地左下角空地：横移 100mm 也不碰东西(按地图查过)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        w.arrive('ROUGH', 1)
+        n0 = len(w.requests)
+        h.task('ROUGH', w.link, lines.append)
+        text = '\n'.join(lines)
+        reqs = w.requests[n0:]
+        k = next(i for i, r in enumerate(reqs) if r.startswith('TAKE'))
+        self.assertFalse([r for r in reqs[:k] if r.startswith(('AD ', 'AF ', 'APN '))], reqs[:k])
+        self.assertNotIn('手臂补', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
+        self.assertLess(max(errs), 3.0, errs)
+        self.assertIn('车轮停在 横移 +10', text)                                # 横移了 100mm 左右(超过以前的 70)
 
     def test_shifted_stop_widens_the_strafe_range(self):
         """(10-20 用户：障碍物离停车点太近)规划时把粗加工区的停车点横着挪了 100mm(导航调 stop_offset 说了)：2 号环对准时车轮
@@ -3792,11 +3843,11 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(errs[True], errs[False], errs)
 
     def test_wheels_not_moving_hands_over_to_the_arm(self):
-        """(以前的边走边对，zone_calc=False)车轮没走起来(打滑；STM32 照样按发的速度算走了多少)：挪了 zone_stall_s 秒偏差都没小下去就不再磨，
-        手臂补上，照样放好(不干等 40 秒)。"""
+        """(以前的边走边对，zone_calc=False；zone_wheels_only=False 以前的做法)车轮没走起来(打滑；STM32 照样按发的速度算走了多少)：
+        挪了 zone_stall_s 秒偏差都没小下去就不再磨，手臂补上，照样放好(不干等 40 秒)。"""
         w = self._world(9, park={'ROUGH': 6.0}, stop_err_mm=0.5)
         lines = []
-        h = self._make(w, dict(zone_calc=False), lines=lines)
+        h = self._make(w, dict(zone_calc=False, zone_wheels_only=False), lines=lines)
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
         w.vel_stuck = True
         w.arrive('ROUGH', 1)

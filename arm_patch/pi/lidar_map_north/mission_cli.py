@@ -835,8 +835,11 @@ def _zone_preflight(h, zone, batch, force, log):
     elif cal:
         sm = h.cfg.get('zone_smooth', True) and h.store is not None and h.store.get('RING', 'ch') is not None \
             and not h.store.synth('RING')
+        wonly = sm and h.cfg.get('zone_wheels_only', True)
         log('   1、3 号环按 arm_calib 调的角度：车只把 2 号环对准一次' +
             (('(车停着看清、算好一次挪过去，停稳再看再补)' if h.cfg.get('zone_calc', True) else '(车轮连续慢慢走，只发 V)') if sm else '') +
+            (f'；只用车轮修，手臂停在看圆环的姿态一下都不动(横移最多 {float(h.cfg.get("zone_wheels_s_mm", 150.0)):.0f}mm、'
+             f'沿那一排最多 {float(h.cfg.get("zone_wheels_f_mm", 150.0)):.0f}mm，按地图查过不压工位)' if wonly else '') +
             '，之后车不动，只转手臂过去放、取；2 号环没对准这个区就不放(不再一个环一个环挪车)' +
             ('' if sm else '。★ 还没有 vcal RING 量过的车轮和画面的对应关系：2 号环这次一步一步挪着对准(顺便测)'))
     elif arm and both:

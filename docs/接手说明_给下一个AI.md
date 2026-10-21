@@ -604,3 +604,13 @@ git_log.txt                ← 分支最近 120 条提交记录
   树莓派：`arm_link.lift_slip_text()` 把 LIFTSLIP 翻成中文(要去的 ≥60 没到：ZHI/STBY/LFMAX 改到实际-2 以下；要去的 ≤30 停在更高：ZPLC/ZGRAB/ZDROP 改到实际+1 以上)，
   ArmLink.request 打印到日志，arm_calib 的 do() 也打印。STM32 主机测试 281 项(桩里加了 phys_top/phys_bot 顶住、late_mm 走得慢)；树莓派 603 个全过。
   **让用户做：**量升降最高能到多少(arm LIFT ENC? / 看 LIFTSLIP 的 got)，ZHI、STBY(重新 STBY SAVE)、LFMAX 都设到它以下；看到 LIFTSLIP 就按提示改参数。
+- **10-21 晚(两个问题："放 1、2 号环的时候爪子莫名其妙松开"、"对准时不要用机械臂修正，就用车轮，修正距离放开")：**
+  ① 2 号环对准只用车轮(mission_hooks `zone_wheels_only=True`)：`_ring2_smooth` 的 calc/tail 里"只差一点/打滑/到边上/次数用完交给手臂补"都去掉，
+  车轮接着修(最多 `zone_wheels_moves` 8 次)，最后差不到 accept_mm 照样放，不然这个区不放；V 慢走打滑就改 S/F 再挪一次。知道停车点在地图上
+  (`_stop_pose` 有)时范围放开到横移 `zone_wheels_s_mm` 150、沿那一排 `zone_wheels_f_mm` 150(都按 `_body_clear` 查地图)；没有停车点照旧 70/60。
+  ② 夹爪：程序里运输途中没有任何张开指令(查遍了 STM32 和树莓派)。固件加 `claw_hold`：GRAB/PICK/TAKE 夹紧后到放下前，TAKE/GRAB/PICK 回 ERR HOLD，
+  OBS … O、待机姿态回 CLAWKEEP 不张开；`Claw_Move(target, why)` 每次动回 `CLAWSET <us> <why>`；开机夹爪直接用待机姿态的脉宽(不先 2090)。
+  树莓派 `arm_link.claw_line_text` 把 CLAWSET/CLAWKEEP/READY/LIFTBOOT(中途重启)打印成中文；`_recover` 见 ERR HOLD 就 disabled + maybe_holding。
+  用户不要限速(说和速度无关)。STM32 主机测试 302 项、树莓派 606 个全过。
+  **还没做、等用户说"对"：**夹爪张开只两种(原料盘上方 CLWOR，其他全用车上转盘 CLWOT)；对准 2 号环故意对偏(run_live `r2off 前后 左右`，±20mm，存配置)；
+  开机 NOENC 时升降高度自动认准(用户 LIFT? 回 BOOT=NOENC、高度差 17mm 超过 15mm 没被改，原料区"放下去了不夹"可能是它)。
