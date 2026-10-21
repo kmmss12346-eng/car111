@@ -573,3 +573,10 @@ git_log.txt                ← 分支最近 120 条提交记录
 - **10-21 补充(提交见 git log)：**用户"伸缩的舵机速度加到最快、ID1 旋转慢一点"：固件加 ROTSPD(旋转舵机大动作转速，0 或 10~300)、EXTSPD(伸缩舵机，0 或 10~1500)，
   0 = 用 ASPD；哪个是伸缩按 AEXT。`Big_Spd(id)`；Servos_To 的 speed 传 0 = 各按 Big_Spd；Move_Over/Sweep/DROP 缩回/AD 大动作/AP 大变化/APN 默认都按它。
   A2SPD/R2SPD 是 0 时绕电池盒那几段伸缩也用 EXTSPD。STM32 主机测试 248 项。
+- **10-21 2 号环改成"停着算好再挪"(用户："不要一开始就往前运动，要根据实际情况来计算位置然后修正")：**实车暂存区日志：边走边对 1.3 帧/秒，
+  14mm → 27mm 越走越偏，整个区不放(J 横移那列可能是反的，或者 V 和 S 的横移方向不一致)。`zone_calc`(默认 True)：找到 2 号环以后 `calc()`：
+  停着 ring_list 取中值 → J 算要挪多少 → `clamp_to`(横移 ±zone_s_max_mm、沿那一排 fc±zone_f_mm、地图) → chassis_move 一次挪过去 → 停 zone_calc_settle_s 再拍 →
+  `match_ring2` 按所有环一起平移认出 2 号环(不靠 J 准不准；没跟着动的是车上的东西) → `fit_j`(两个方向都挪过：整个 J 直接解；只有一个方向：J0 / 横移反了 / 前进反了
+  三种加转角+比例，挑转得最少的) → 再算再挪，最多 zone_calc_moves(4) 次；只差 zone_calc_arm_mm(2.5) 以内交给手臂补(小挪动车轮差 1mm 左右)；
+  车挪了画面没动 = 打滑，交给手臂补。修正过的 J 存下(note['jsave'])。用 S/F 动过，`_zone_v_only=False`(挪回停车点用 S/F)。zone_calc=False = 以前的 V 边走边对。
+  模拟：J 横移反了、转 16°、停偏 57mm、打滑都能对上；整场 3 组放置平均 0.94mm / 最大 1.92mm。

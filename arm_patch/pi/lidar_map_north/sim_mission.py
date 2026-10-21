@@ -2250,7 +2250,7 @@ class RawFrameThreadTests(unittest.TestCase):
         car = self.Car()
         cam = self.RingCam(car, J, (320.0 + 14.0, 240.0 + 9.0), frame_s=0.5)
         lines = []
-        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, place_adj_file='', zone_lost_s=4.0)}, log=lines.append, vision=cam,
+        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, place_adj_file='', zone_lost_s=4.0, zone_calc=False)}, log=lines.append, vision=cam,
                          now=time.monotonic, sleep=time.sleep)
         h.act, h.store, h.arm = car, self.Store(), self.Arm()
         h.store.put('RING', 'ch', J)
@@ -3458,8 +3458,11 @@ class ZoneCalTests(unittest.TestCase):
         h._zone_back = back
 
         def cm(sv, f, speed=None):
-            rec['moves'].append((w.zone, w.zone in h._p2, round(float(sv)), round(float(f))))
-            return om(sv, f, speed=speed) if speed else om(sv, f)
+            rec['moves'].append((w.zone, w.zone in h._p2, round(float(sv)), round(float(f)), rec['back']))
+            r = om(sv, f, speed=speed) if speed else om(sv, f)
+            if w.zone in ('ROUGH', 'TEMP') and not rec['back']:
+                rec['s_max'][w.zone] = max(rec['s_max'].get(w.zone, 0.0), abs(w.off_s))
+            return r
 
         def vel(vs, vf):
             if w.zone in ('ROUGH', 'TEMP') and (abs(vs) > 1e-9 or abs(vf) > 1e-9):
@@ -3480,7 +3483,7 @@ class ZoneCalTests(unittest.TestCase):
         self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
 
     def test_full_course_ring2_once_then_car_still(self):
-        """整场两批：每个工位只在 2 号环用 V 连续对准一次，之后车不动(没有 S/F，也没有 V)；1、3 号环按调的角度放，取回直接按放下的角度取；
+        """整场两批：每个工位只在 2 号环对准一次(10-21：车停着算好、S/F 一次挪过去、停稳再看再补)，之后车不动；1、3 号环按调的角度放，取回直接按放下的角度取；
         12 个都放准；去圆环的 TAKE 都按圆环那边(SIDE RING)绕电池盒。"""
         errs = []
         for seed in range(3):
@@ -3491,17 +3494,18 @@ class ZoneCalTests(unittest.TestCase):
             run_mission(w, h, log=lines.append)
             text = '\n'.join(lines)
             self._ok(w, h, text)
-            self.assertIn('车轮边走边对准 2 号环', text)
+            self.assertIn('车停着算好要', text)
+            self.assertNotIn('车轮边走边对准 2 号环', text)                # (10-21 用户)不再一开始就边走边对
             self.assertIn('按 arm_calib 调的角度只转手臂', text)
             self.assertNotIn('只动手臂对准', text)                         # 1、3 号环不再用摄像头对
             for bad in ('照旧一个环一个环', '照旧挪车对准', '一步一步挪着对准'):
                 self.assertNotIn(bad, text)                                # 没有任何挪车对准的退路
             self.assertIn('车没动、只转手臂放的，不再对准', text)
             zone_moves = [m for m in rec['moves'] if m[0] in ('ROUGH', 'TEMP')]
-            self.assertEqual(zone_moves, [])                               # 工位里一条 S/F 都没有(对准、挪回停车点都只用 V)
-            self.assertIn('车轮挪回停车点(只用 V，不转车头)', text)
+            self.assertTrue(all((not m[1]) or m[4] for m in zone_moves), zone_moves)   # S/F 只在对准 2 号环时、和做完挪回停车点
+            self.assertLessEqual(sum(1 for m in zone_moves if not m[1] and not m[4]), 2 * 4 * h.cfg['zone_calc_moves'])
             self.assertEqual(rec['vel_after'], [], text[-3000:])           # 对准 2 号环以后车轮不再走
-            self.assertGreater(rec['vel_n'], 0)
+            self.assertEqual(rec['vel_n'], 0)                              # 不再用 V 边走边对
             for z in ('ROUGH', 'TEMP'):
                 self.assertLessEqual(rec['s_max'].get(z, 0.0), h.cfg['ring_strafe_max_mm'] + 0.5, rec['s_max'])
             self.assertTrue(w.take_sides and all(s == 'RING' for z, s in w.take_sides if z in ('ROUGH', 'TEMP')), w.take_sides)
@@ -3514,7 +3518,7 @@ class ZoneCalTests(unittest.TestCase):
 
     def test_parked_off_along_and_too_far_from_the_row(self):
         """车停得沿那一排偏了 45mm、离圆环那一排远了 30mm：车轮横着挪到 arm_calib 调 2 号环时的远近(30mm，以前只许 20mm)，
-        沿那一排挪 45mm，不用手臂补；1、3 号环也放得准。"""
+        沿那一排挪 45mm，手臂只补最后一点；1、3 号环也放得准。"""
         w = self._world(2, park={'ROUGH': 45.0}, park_side={'ROUGH': 30.0}, stop_err_mm=0.5)
         lines = []
         h = self._make(w, lines=lines)
@@ -3522,7 +3526,7 @@ class ZoneCalTests(unittest.TestCase):
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
         text = '\n'.join(lines)
         self.assertIn('车轮横着挪过去', text)
-        self.assertNotIn('手臂补(车不动)', text)
+        self.assertNotIn('手臂伸缩补了 ID2', text)                       # 车轮挪够了，手臂只补最后一点(10-21：小于 2.5mm 交给手臂)
         self.assertGreater(rec['s_max'].get('ROUGH', 0.0), 25.0, rec['s_max'])
         self.assertLessEqual(rec['s_max'].get('ROUGH', 0.0), 33.0, rec['s_max'])
         self.assertEqual(rec['vel_after'], [])
@@ -3530,6 +3534,47 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual(h.stats.place_ok, 3, text[-3000:])
         far = [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
         self.assertLess(max(far), 3.0, far)
+
+    def test_calc_then_move_mirrored_j_is_fixed_by_the_first_move(self):
+        """(10-21 实车暂存区：存的车轮和画面的对应关系横移方向是反的，以前边走边对越走越偏、整个区不放)：车停着算好一次挪过去，
+        挪完看到 2 号环没到推算的地方：按这一下车实际走的和圆环实际动的把对应关系改过来(横移方向是反的)，再算再挪，三个都放准；不放弃。"""
+        for seed, side in ((13, 25.0), (14, -25.0)):
+            w = self._world(seed, park={'TEMP': 12.0}, park_side={'TEMP': side}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, lines=lines)
+            h.store.put('RING', 'ch', w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0]) @ np.diag([-1.0, 1.0]))   # 横移那一列反了
+            run_mission(w, h, stops=('QR', 'RAW', 'TEMP'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('车停着算好要', text)
+            self.assertIn('横移方向是反的', text, text[-3000:])
+            for bad in ('越走越偏', '这个区这次不放', '一步一步挪着对准'):
+                self.assertNotIn(bad, text, text[-3000:])
+            self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            far = [e for (z, k, _c, e, _st) in w.placed if z == 'TEMP']
+            self.assertLess(max(far), 3.0, far)
+            J = np.asarray(h.store.get('RING', 'ch'), float)            # 改过来的存下了(下次直接用对的)
+            Jt = w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0])
+            self.assertLess(float(np.abs(J - Jt).max()) / w.scale['RING'], 0.15, J)
+
+    def test_calc_wheels_not_moving_hands_over_to_the_arm(self):
+        """车停着算好挪过去，可是车轮没走起来(打滑：STM32 说走了，画面里的圆环一点没动)：不再挪，剩下的手臂补，照样放好。"""
+        w = self._world(9, park={'ROUGH': 6.0}, stop_err_mm=0.5)
+        lines = []
+        h = self._make(w, lines=lines)
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+
+        def slip(sv, f, speed=None):                                    # 发了 S/F、记了走了多少，车其实没动
+            h.act.disp['S'] += int(round(sv))
+            h.act.disp['F'] += int(round(f))
+        h.act.chassis_move = slip
+        w.arrive('ROUGH', 1)
+        h.task('ROUGH', w.link, lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('画面里的圆环一点没动', text)
+        self.assertIn('手臂补(车不动)', text)
+        self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
 
     def test_shifted_stop_widens_the_strafe_range(self):
         """(10-20 用户：障碍物离停车点太近)规划时把粗加工区的停车点横着挪了 100mm(导航调 stop_offset 说了)：2 号环对准时车轮
@@ -3642,10 +3687,10 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
     def test_ring2_lost_for_a_while_is_found_again(self):
-        """对准时有几秒认不出 2 号环(被挡住/反光)：停下重新找，找到了接着对准。"""
+        """(以前的边走边对，zone_calc=False)对准时有几秒认不出 2 号环(被挡住/反光)：停下重新找，找到了接着对准。"""
         w = self._world(4, park={'ROUGH': 30.0})
         lines = []
-        h = self._make(w, lines=lines)
+        h = self._make(w, dict(zone_calc=False), lines=lines)
         orig = w.vision.ring_px
         st = dict(n=0)
 
@@ -3698,7 +3743,7 @@ class ZoneCalTests(unittest.TestCase):
         self.assertIn('超出限位', text)
         self.assertIn('这个环不放(车不挪', text)
         self.assertEqual(rec['vel_after'], [])
-        self.assertTrue(all(m[1] for m in rec['moves'] if m[0] == 'ROUGH'), rec['moves'])
+        self.assertTrue(all((not m[1]) or m[4] for m in rec['moves'] if m[0] == 'ROUGH'), rec['moves'])   # 对准 2 号环以后只有挪回停车点
         self.assertEqual((h.stats.place_ok, h.stats.place_total), (1, 3), text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
@@ -3751,10 +3796,11 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(errs[True], errs[False], errs)
 
     def test_wheels_not_moving_hands_over_to_the_arm(self):
-        """车轮没走起来(打滑；STM32 照样按发的速度算走了多少)：挪了 zone_stall_s 秒偏差都没小下去就不再磨，手臂补上，照样放好(不干等 40 秒)。"""
+        """(以前的边走边对，zone_calc=False)车轮没走起来(打滑；STM32 照样按发的速度算走了多少)：挪了 zone_stall_s 秒偏差都没小下去就不再磨，
+        手臂补上，照样放好(不干等 40 秒)。"""
         w = self._world(9, park={'ROUGH': 6.0}, stop_err_mm=0.5)
         lines = []
-        h = self._make(w, lines=lines)
+        h = self._make(w, dict(zone_calc=False), lines=lines)
         run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
         w.vel_stuck = True
         w.arrive('ROUGH', 1)
