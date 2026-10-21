@@ -570,3 +570,6 @@ git_log.txt                ← 分支最近 120 条提交记录
 - **测试：**单元 474 个(3 跳过) + 模拟 124 个全过 + STM32 主机 241/222/41 项全过。更新包 tasks_1020c.zip(mission_hooks / mission_cli / arm_calib / arm_link / route_plan / map_merge_live / arm.c)。
 - **要留意：**① 用户 RAW 设过 y=2210(压原料转盘)，最多 2155(按 raw_margin 30)；还没回答 RAW_CT.shift_mm 是多少。
   ② CLWOT 要比转盘格子窄得下去：用户调的时候注意张开不能碰格子边。③ 停车点挪得太远(开不过去停附近)时，原料区找圆心按地图只放宽了范围，真实能不能够着要看实车。
+- **10-21 补充(提交见 git log)：**用户"伸缩的舵机速度加到最快、ID1 旋转慢一点"：固件加 ROTSPD(旋转舵机大动作转速，0 或 10~300)、EXTSPD(伸缩舵机，0 或 10~1500)，
+  0 = 用 ASPD；哪个是伸缩按 AEXT。`Big_Spd(id)`；Servos_To 的 speed 传 0 = 各按 Big_Spd；Move_Over/Sweep/DROP 缩回/AD 大动作/AP 大变化/APN 默认都按它。
+  A2SPD/R2SPD 是 0 时绕电池盒那几段伸缩也用 EXTSPD。STM32 主机测试 248 项。

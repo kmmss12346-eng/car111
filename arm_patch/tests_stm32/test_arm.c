@@ -406,6 +406,24 @@ int main(void) {
     clear(); run("DROP");
     CHECK(has("O;") && !has("claw1700;") && !has("claw1500;"), "DROP：地上圆环松开用 CLWO");
     Arm_Param_Set("CLWOR", 0); Arm_Param_Set("CLWOT", 0);
+    /* (10-21 用户：伸缩的舵机要最快、旋转的慢一点)大动作转速分开：伸缩 EXTSPD、旋转 ROTSPD，0 = ASPD */
+    CHECK(Arm_Param_Set("ROTSPD", 5) == 2 && Arm_Param_Set("EXTSPD", 2000) == 2, "ROTSPD/EXTSPD：0 或 10 以上，EXTSPD 最多 1500");
+    CHECK(Arm_Param_Set("ROTSPD", 30) == 1 && Arm_Param_Set("EXTSPD", 1500) == 1, "ROTSPD/EXTSPD 可以设");
+    away(); clear(); run("OBS RING");
+    CHECK(has("S1:323.0@30;") && has("S2:-862.0@1500;"), "OBS：ID1(旋转)按 ROTSPD、ID2(伸缩)按 EXTSPD");
+    clear(); run("DROP");
+    CHECK(has("M2:-862.0@1500/1.00;"), "DROP 缩回伸缩舵机按 EXTSPD");
+    Arm_Param_Set("PARA", 0);
+    away(); clear(); run("STOW");
+    CHECK(has("M2:-862.0@1500/") && has("M1:323.0@30/"), "PARA=0 一个一个转也各按各的速度");
+    Arm_Param_Set("PARA", 1);
+    Arm_Param_Set("AEXT", 1);
+    away(); clear(); run("OBS RING");
+    CHECK(has("S1:323.0@1500;") && has("S2:-862.0@30;"), "AEXT=1：ID1 是伸缩舵机，按 EXTSPD");
+    Arm_Param_Set("AEXT", 2);
+    Arm_Param_Set("ROTSPD", 0); Arm_Param_Set("EXTSPD", 0);
+    away(); clear(); run("OBS RING");
+    CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "ROTSPD/EXTSPD = 0：和以前一样用 ASPD");
 
     /* ---- 急停：升降停下并要求重新回零 ---- */
     clear();

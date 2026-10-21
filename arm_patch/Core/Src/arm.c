@@ -115,6 +115,9 @@ static float g_r2spd  = 0.0f;      /* R2SPD  这一组伸长、缩回的速度(�
 static uint8_t g_side = 0;         /* 手臂在哪边干活：0 = 原料盘，1 = 地上圆环(OBS RAW/RING、GRAB、PICK、PLACE、SIDE 指令设) */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
+static float g_rotspd = 0.0f;      /* ROTSPD (10-21 用户)旋转舵机大动作转速(度/秒)；0 = 用 ASPD */
+static float g_extspd = 0.0f;      /* EXTSPD (10-21 用户)伸缩舵机大动作转速(度/秒，舵机最快多少就按多少转)；0 = 用 ASPD。
+                                    *        哪个是伸缩舵机按 AEXT。绕电池盒那几段伸缩还是按 A2SPD / R2SPD(它们是 0 时用这个) */
 static float g_atolc  = 1.0f;      /* ATOLC  大动作离目标多少度以内算到位 */
 static float g_atol   = 0.3f;      /* ATOL   微调离目标多少度以内算到位 */
 static float g_amaxd  = 60.0f;     /* AMAXD  AD 指令一次最多转多少度(防止发错数) */
@@ -190,6 +193,8 @@ static const ArmTun tun[] =
     { "R2SPD",  &g_r2spd,   0.0f,    1500.0f },
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
     { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
+    { "ROTSPD", &g_rotspd,  0.0f,    300.0f },   /* 0 = 用 ASPD；不是 0 要 >= 10(下面查) */
+    { "EXTSPD", &g_extspd,  0.0f,    1500.0f },
     { "ATOLC",  &g_atolc,   0.2f,    5.0f },
     { "ATOL",   &g_atol,    0.05f,   2.0f },
     { "AMAXD",  &g_amaxd,   1.0f,    300.0f },
@@ -231,6 +236,10 @@ int Arm_Param_Set(const char *name, float v)
             if (v < tun[i].lo || v > tun[i].hi)
             {
                 return 2;
+            }
+            if ((tun[i].p == &g_rotspd || tun[i].p == &g_extspd) && v > 0.5f && v < 10.0f)
+            {
+                return 2;                          /* 0 = 用 ASPD；太慢的不要 */
             }
             if ((tun[i].p == &g_clwor || tun[i].p == &g_clwot) && v > 0.5f && v < 500.0f)
             {
@@ -987,12 +996,23 @@ static uint8_t Ext_Id(void)
     return (g_aext < 1.5f) ? 1 : 2;
 }
 
+/* (10-21 用户：伸缩的要最快、旋转的要慢一点)大动作时舵机 id 的转速：伸缩舵机 EXTSPD、旋转舵机 ROTSPD，是 0 就用 ASPD */
+static float Big_Spd(uint8_t id)
+{
+    float v = (id == Ext_Id()) ? g_extspd : g_rotspd;
+
+    return (v > 0.5f) ? v : g_aspd;
+}
+
 /* ID1、ID2 转到 a1、a2(度)。PARA=1 时两个一起转(省时间)；否则按 order 先后：
  *   order=1：先动伸缩舵机再转(缩回时先缩回再转，免得伸着转扫到东西)
  *   order=2：先转再动伸缩舵机(伸出时先转好再伸)
- * tol：到位误差(度)，speed：转速(度/秒) */
+ * tol：到位误差(度)，speed：转速(度/秒)，0 = 大动作(各按 Big_Spd) */
 static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
 {
+    float s1 = (speed > 0.5f) ? speed : Big_Spd(1);
+    float s2 = (speed > 0.5f) ? speed : Big_Spd(2);
+
     if (g_para > 0.5f)
     {
         uint32_t t1 = 0;
@@ -1006,8 +1026,8 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
         float rem2 = 1e9f;
 
         /* 已经在目标上的那个不发转动指令(发了会往前多给补偿角度，白白动一下)，只让它在原地保持(松开过的舵机也重新上力) */
-        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, speed);
-        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, speed);
+        if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= tol)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, s1);
+        if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= tol)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, s2);
         tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
         t0 = HAL_GetTick();
         while ((HAL_GetTick() - t0) < tmax && !(ok1 && ok2) && !car_abort)
@@ -1042,8 +1062,8 @@ static void Servos_To(float a1, float a2, uint8_t order, float tol, float speed)
         uint8_t first = (order == 1) ? Ext_Id() : (uint8_t)(3 - Ext_Id());
         uint8_t second = (uint8_t)(3 - first);
 
-        Servo_Move(first, (first == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
-        Servo_Move(second, (second == 1) ? a1 : a2, speed, tol, SERVO_EXTRA_MS);
+        Servo_Move(first, (first == 1) ? a1 : a2, (first == 1) ? s1 : s2, tol, SERVO_EXTRA_MS);
+        Servo_Move(second, (second == 1) ? a1 : a2, (second == 1) ? s1 : s2, tol, SERVO_EXTRA_MS);
     }
 }
 
@@ -1141,7 +1161,7 @@ static const char *Move_Over(float a1, float a2, uint8_t order, float z_end)
         e = Lift_Goto(g_zhi);
         if (e) return e;
         if (car_abort) return NULL;
-        Servos_To(a1, a2, order, g_atolc, g_aspd);
+        Servos_To(a1, a2, order, g_atolc, 0.0f);
         if (car_abort) return NULL;
         return Lift_Goto(z_end);
     }
@@ -1156,8 +1176,8 @@ static const char *Move_Over(float a1, float a2, uint8_t order, float z_end)
     }
     e = Lift_Start(g_zhi);                         /* 一边升一边转 */
     if (e) return e;
-    if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= g_atolc)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, g_aspd);
-    if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= g_atolc)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, g_aspd);
+    if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= g_atolc)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, Big_Spd(1));
+    if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= g_atolc)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, Big_Spd(2));
     tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;
     t0 = HAL_GetTick();
     while (!(ok1 && ok2) && (HAL_GetTick() - t0) < tmax && !car_abort)
@@ -1206,7 +1226,7 @@ static int Slot_Ok(long slot)
 
 static float A2_Spd(void)
 {
-    return (g_a2spd > 0.5f) ? g_a2spd : g_aspd;
+    return (g_a2spd > 0.5f) ? g_a2spd : Big_Spd(2);
 }
 
 /* 去/离开车上转盘绕开电池盒用哪一组：t1 = 靠原料盘/圆环那头开始伸长的 ID1 角度，ext = 伸多长，t2 = 靠车上转盘那头开始缩回的角度，
@@ -1240,7 +1260,7 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2,
 
     if (!Servo_ReadAngle(1, &a))  a = at1;
     dir = (a1_end >= a) ? 1.0f : -1.0f;
-    tmax = Servo_Start(1, &tgt, g_aspd) + SERVO_EXTRA_MS;
+    tmax = Servo_Start(1, &tgt, Big_Spd(1)) + SERVO_EXTRA_MS;
     t0 = HAL_GetTick();
     while (!car_abort)
     {
@@ -1380,11 +1400,11 @@ static const char *Seq_Drop(uint8_t stack)
     GO(Lift_Goto(g_zhi));
     if (Ext_Id() == 2)                             /* 只把伸缩舵机缩回，不转 */
     {
-        Servo_Move(2, g_a2r, g_aspd, g_atolc, SERVO_EXTRA_MS);
+        Servo_Move(2, g_a2r, Big_Spd(2), g_atolc, SERVO_EXTRA_MS);
     }
     else
     {
-        Servo_Move(1, g_a1h, g_aspd, g_atolc, SERVO_EXTRA_MS);   /* ID1 管伸缩：缩到收起时的位置 */
+        Servo_Move(1, g_a1h, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);   /* ID1 管伸缩：缩到收起时的位置 */
     }
     if (car_abort) return NULL;
     return NULL;
@@ -1401,11 +1421,11 @@ static const char *Seq_Stow(void)
     {
         /* (10-16 用户)只要一个默认位置：存了待机姿态(STBY SAVE)，收臂也回到它的手臂角度和高度。
          * 夹爪不动(收臂时可能夹着物料，张开会掉) */
-        SERVOS(sb_a1, sb_a2, 1, g_atolc, g_aspd);
+        SERVOS(sb_a1, sb_a2, 1, g_atolc, 0.0f);
         GO(Lift_Goto(sb_z));
         return NULL;
     }
-    SERVOS(g_a1h, g_a2r, 1, g_atolc, g_aspd);
+    SERVOS(g_a1h, g_a2r, 1, g_atolc, 0.0f);
     return NULL;
 }
 
@@ -1419,7 +1439,7 @@ static const char *Seq_Standby(void)
     if (!sb_ok)                return "ERR NOSTBY";
 
     GO(Lift_Goto(g_zhi));
-    SERVOS(sb_a1, sb_a2, 1, g_atolc, g_aspd);
+    SERVOS(sb_a1, sb_a2, 1, g_atolc, 0.0f);
     Claw_Move(sb_claw);
     GO(Lift_Goto(sb_z));
     return NULL;
@@ -1433,7 +1453,7 @@ static const char *Seq_Park(void)
     if (g_armok > 0.5f)
     {
         GO(Lift_Goto(g_zhi));
-        SERVOS(g_a1h, g_a2r, 1, g_atolc, g_aspd);
+        SERVOS(g_a1h, g_a2r, 1, g_atolc, 0.0f);
     }
     GO(Lift_Goto(LIFT_BOOT_MM));
     return NULL;
@@ -2455,7 +2475,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (!ParseF(t[2], &f))  FAIL("ERR ARG");
         if (Absf(f) > g_amaxd)  FAIL("ERR RANGE");
         if (!Servo_ReadAngle((uint8_t)id, &a0))  FAIL("ERR READ");
-        Servo_Move((uint8_t)id, a0 + f, (Absf(f) > 8.0f) ? g_aspd : g_aspdf, g_atol, 400);
+        Servo_Move((uint8_t)id, a0 + f, (Absf(f) > 8.0f) ? Big_Spd((uint8_t)id) : g_aspdf, g_atol, 400);
         SayAngle((uint8_t)id);
         return 1;
     }
@@ -2467,7 +2487,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (!ParseF(t[1], &f) || !ParseF(t[2], &g))  FAIL("ERR ARG");
         if (Servo_ReadAngle(1, &c1) && Servo_ReadAngle(2, &c2) && (Absf(f - c1) > 10.0f || Absf(g - c2) > 10.0f))
         {
-            if (g_aspd > spd)  spd = g_aspd;       /* 角度变化大(比如从转盘回到记下的姿态)：用大动作速度，省时间 */
+            if (g_aspd > spd)  spd = 0.0f;         /* 角度变化大(比如从转盘回到记下的姿态)：用大动作速度(各按 Big_Spd)，省时间 */
         }
         Servos_To(f, g, 2, g_atol, spd);
         SayAngle(1);
@@ -2491,7 +2511,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         for (id = 1; id <= 2; id++)
         {
             float a;
-            float spd = g_aspd;
+            float spd = Big_Spd(id);
             char m[40];
             char bb[20];
 
