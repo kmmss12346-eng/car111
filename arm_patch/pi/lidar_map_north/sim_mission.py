@@ -1892,7 +1892,9 @@ ARM_VERBS = ('AP', 'AD', 'AF', 'OBS', 'STOW', 'TAKE', 'GRAB', 'PICK', 'DROP', 'L
 
 def plate_world(seed, **kw):
     """原料盘转 3 秒停 6 秒(真车上大约这样)；画面比例和真车一样。"""
-    return SimWorld(seed=seed, code=MissionSimTests.CODE, plate_stop_s=6.0, plate_move_s=3.0, raw_scale=1.97,
+    kw.setdefault('plate_stop_s', 6.0)
+    kw.setdefault('plate_move_s', 3.0)
+    return SimWorld(seed=seed, code=MissionSimTests.CODE, raw_scale=1.97,
                     params=dict(ZOBRAW=100.0, ZGRAB=80.0, LFRPM=150.0, LFMRG=100.0), **kw)
 
 
@@ -2842,73 +2844,229 @@ class RawNearSlotTests(unittest.TestCase):
             d = json.load(f)['RAW_CT']
         return d, it['color']
 
-    def test_plate_stop_jitter_fixed_by_wheels_before_grab(self):
-        """(10-21 实车"一个都没夹上来""对齐不够准")原料盘每次停的角度差 ±6°(最近那格上的物料停的位置差 ±9mm，爪子只有 8mm 余量)：
-        下爪前车轮按物料实际的位置补一下再夹(手臂不动、只用 V)，三个都夹到；夹完车轮挪回去。关掉(raw_grab_fix=False)就会夹空。
-        等原料盘时不再摆 ID1(用户"突然抽搐一下")，改成升降上下 4mm。"""
+    def _near_run(self, seed, cfg=None, hook=None, **wkw):
+        """示教一次，再跑 QR、RAW。hook(w, h) 在示教以后、比赛以前调用。返回 (w, h, 日志)。"""
         import tempfile
+        w = self._world(seed, **wkw)
+        path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+        lines = []
+        h = self._make(w, path, lines, cfg=cfg)
+        seed_raw_wheels_j(w, h)
+        self._teach(w, h, path)
+        if hook is not None:
+            hook(w, h)
+        lines.clear()
+        w.requests.clear()
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        return w, h, '\n'.join(lines)
+
+    @staticmethod
+    def _in_tray(w):
+        return sum(1 for v in w.tray.values() if v)
+
+    def test_plate_stop_jitter_fixed_by_wheels_before_grab(self):
+        """(10-21 实车"一个都没夹上来""对齐不够准")原料盘每次停的角度差 ±8°(最近那格上的物料停的位置差 ±12mm，爪子只有 8mm 余量)：
+        下爪前车轮按物料实际的位置补一下再夹(手臂不动、只用 V)，三个都进了转盘(没夹上的转回来再夹)；夹完车轮不挪回去，
+        也不因为补位挪过车就当成"车被带偏了"再对一遍。关掉(raw_grab_fix=False)就会夹空。
+        等原料盘时不再摆 ID1(用户"突然抽搐一下")，改成升降上下 4mm。屏上的抓取数和转盘里真有的一样。"""
         res = {}
         for fix in (True, False):
-            got = air = 0
+            tray = air = 0
             for seed in (1, 2, 5):
-                w = self._world(seed, plate_jitter_deg=6.0)
-                path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
-                lines = []
-                h = self._make(w, path, lines, cfg=dict(raw_grab_fix=fix))
-                seed_raw_wheels_j(w, h)
-                self._teach(w, h, path)
-                lines.clear()
-                w.requests.clear()
-                run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
-                text = '\n'.join(lines)
-                got += h.stats.grab_ok
+                backs = []
+
+                def hook(w, h, backs=backs):
+                    h._raw_wheels_back = lambda moved: backs.append(moved)
+                w, h, text = self._near_run(seed, cfg=dict(raw_grab_fix=fix), hook=hook, plate_jitter_deg=8.0)
+                tray += self._in_tray(w)
                 air += w.air
                 if fix:
+                    self.assertEqual(h.stats.grab_ok, self._in_tray(w), text[-2000:])
                     self.assertIn('车轮挪', text)
                     req = [q for q in w.requests if q.split()[0] in ('AD', 'AF', 'APN')]
                     self.assertEqual(req, [], text[-2000:])              # 手臂不动
                     self.assertNotIn('ID1 轻轻摆一下', text)
+                    self.assertNotIn('车被带偏了', text)
+                    self.assertEqual(backs, [], text[-2000:])          # 夹完不挪回去
                     self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
                     self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
-            res[fix] = (got, air)
-        self.assertEqual(res[True], (9, 0), res)
-        self.assertGreater(res[False][1], 0, res)
+            res[fix] = (tray, air)
+        self.assertEqual(res[True][0], 9, res)
+        self.assertGreater(res[False][1], res[True][1], res)
+
+    def test_grabs_whatever_needed_color_stops_first(self):
+        """(10-21 用户"对准了之后就应该立刻识别颜色然后夹取啊为什么要等待那么久")对准以后这一格上停的是这一批要的哪个颜色就马上夹，
+        放进它自己的槽(粗加工区/暂存区还是按任务码顺序放)；比按任务码顺序等快。raw_near_any_order=False 照旧按任务码顺序。"""
+        took = {}
+        for any_ in (True, False):
+            took[any_] = 0.0
+            for seed in (1, 2, 5, 7):
+                w, h, text = self._near_run(seed, cfg=dict(raw_near_any_order=any_))
+                self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+                self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+                grabs = [q for q in w.requests if q.startswith('GRAB')]
+                if any_:
+                    self.assertNotIn('等它转过来', '\n'.join(l for l in text.split('\n') if '还要' not in l))
+                    for l in text.split('\n'):                   # 这一格上是要的颜色却没夹：只能是这次停下剩的时间不够
+                        if '原料盘停了' in l and '还要' in l:
+                            at = l.split('这一格上是 ')[1].split('；')[0] if '这一格上是 ' in l else None
+                            self.assertNotIn(str(at), l.split('还要 ')[1], l)
+                else:
+                    self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])     # 按任务码顺序
+                took[any_] += float(text.split('(RAW 用了 ')[1].split(' 秒')[0])
+        self.assertLess(took[True], took[False] - 10.0, took)
+
+    def test_stopped_while_aligning_grabs_on_this_stop(self):
+        """对准原料盘中心的时候原料盘停下了(对准时每帧看物料绕圆心转没转)：对准完还停着、这一格上是要的颜色，就这一次停下马上夹，
+        不再等它转一下再停。"""
+        hits = 0
+        for seed in (1, 2, 5, 7):
+            w, h, text = self._near_run(seed)
+            self.assertEqual((h.stats.grab_ok, w.air), (3, 0), text[-3000:])
+            if '原料盘在对准的时候就停下了' in text:
+                hits += 1
+                after = text.split('原料盘在对准的时候就停下了')[1].split('\n')[1]
+                self.assertTrue('马上下爪' in after or '还要' in after or '只剩' in after, after)
+        self.assertGreater(hits, 0)
+
+    def test_stuck_measurement_is_not_followed(self):
+        """(10-21 实车 BLUE：车轮挪了 10mm 再看还差 9mm，夹空了)认的物料位置不跟着车动(被爪子挡住/和蓝色爪子连在一起)：
+        挪一下就看出来，不再按它挪，车轮挪回原来对准的地方照样夹到。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                vis = h.vision
+                orig = vis.material_errors
+                sc = w.scale['RAW']
+
+                def mats(colors):                                  # 黑色物料在爪子附近时：认的位置"粘"在爪子旁边 10mm 处
+                    out = orig(colors)
+                    if 5 in out and out[5] is not None and float(np.hypot(*out[5])) < 30.0 * sc:
+                        out[5] = (0.0, 10.0 * sc)
+                    return out
+                vis.material_errors = mats
+            w, h, text = self._near_run(seed, hook=hook, cfg=dict(raw_grab_fix=True))
+            self.assertIn('只跟着动了', text)
+            self.assertEqual((self._in_tray(w), w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_missed_grab_is_seen_and_grabbed_again(self):
+        """(10-21 实车"一会儿夹取一会儿不夹取")第一次下爪没夹上：夹过的颜色还在原料盘上，等它转到这一格再夹一次，三个都进了转盘；
+        屏上的抓取数不把没夹上的算进去。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                orig, n = h.arm.grab_here, [0]
+
+                def grab(slot):                                    # 第一次下爪时爪子偏了 20mm：夹空
+                    n[0] += 1
+                    if n[0] == 1:
+                        w.off_s += 20.0
+                        try:
+                            return orig(slot)
+                        finally:
+                            w.off_s -= 20.0
+                    return orig(slot)
+                h.arm.grab_here = grab
+            w, h, text = self._near_run(seed, hook=hook)
+            self.assertIn('还在原料盘上', text)
+            self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.air, w.collisions), (3, 3, 1, 0), text[-3000:])
+
+    def test_default_car_stays_still_after_aligning(self):
+        """(10-21 夜用户"对准一次之后就应该不动了啊，后面为什么还是乱动")默认对准以后车轮一下都不动(不按物料补位)，只记下物料偏多少。"""
+        for seed in (1, 2):
+            moves = []
+
+            def hook(w, h, moves=moves):
+                real = h._raw_ct_body
+
+                def body(items):
+                    real_go = h._vel_goto
+
+                    def go(*a, **k):
+                        if getattr(h, '_raw_center_disp', None) is not None:
+                            moves.append(a)
+                        return real_go(*a, **k)
+                    h._vel_goto = go
+                    try:
+                        return real(items)
+                    finally:
+                        h._vel_goto = real_go
+                h._raw_ct_body = body
+            w, h, text = self._near_run(seed, hook=hook)
+            self.assertEqual(moves, [], text[-2000:])
+            self.assertIn('车不动，直接下爪', text)
+            self.assertNotIn('车轮挪 横移', text)
+
+    def test_pose_changed_in_near_mode_stops_without_driving(self):
+        """(10-21 夜实车)示教以后 arm_calib 里改了 A1G：最近那格不改用以前的做法(以前会开着车到处找圆心)，这次不抓、车不动，叫重新示教。"""
+        def hook(w, h):
+            w.params['A1G'] += 20.0
+            h.arm.params(refresh=True)
+        w, h, text = self._near_run(1, hook=hook)
+        self.assertIn('重新 rteach RAW near', text)
+        self.assertNotIn('车轮边走边对准', text)
+        self.assertEqual(h.stats.grab_ok, 0)
+
+    def test_last_grab_missed_is_caught_by_one_more_look(self):
+        """最后一个没夹上：都夹过以后再看几秒原料盘，原料盘还停在这一次、它还在这一格上，就马上再夹(不是做完就走)。
+        原料盘停得久(25 秒)才来得及；停 6 秒时手臂回来它早转走了(只看得到最近那一格)，要等它转一圈太费时间，不等。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                orig, n = h.arm.grab_here, [0]
+
+                def grab(slot):
+                    n[0] += 1
+                    if n[0] == 3:
+                        w.off_s += 20.0
+                        try:
+                            return orig(slot)
+                        finally:
+                            w.off_s -= 20.0
+                    return orig(slot)
+                h.arm.grab_here = grab
+            w, h, text = self._near_run(seed, hook=hook, cfg=dict(raw_ct_stop_s=25.0), plate_stop_s=25.0)
+            self.assertIn('这一批都夹过了：再看一眼', text)
+            self.assertIn('还在原料盘上', text)
+            self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.air, w.collisions), (3, 3, 1, 0), text[-3000:])
 
     def test_near_teach_then_grab_only_there_in_code_order(self):
-        """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，按任务码顺序三个都在最近那一格夹到、放对槽，
-        每次下爪都是示教时的手臂角度(没转去别的格)。"""
+        """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，三个都在最近那一格夹到、放对槽，
+        每次下爪都是示教时的手臂角度(没转去别的格)。raw_near_any_order=False：按任务码顺序。"""
         import tempfile
-        for seed in (1, 2, 5):
-            w = self._world(seed)
-            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
-            lines = []
-            h = self._make(w, path, lines)
-            d, col = self._teach(w, h, path)
-            text = '\n'.join(lines)
-            self.assertEqual(d.get('near'), '1', text)
-            self.assertEqual(sorted(d['slots']), ['1', '2', '3'])
-            self.assertEqual(d['slots']['1']['color'], col)
-            self.assertEqual([k for k, s in d['slots'].items() if s.get('a')], ['1'])         # 只有最近那一格有抓取动作
-            self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [], text)            # 示教时车轮只用 V
-            lines.clear()
-            w.requests.clear()
-            n_moves = len(w.moves)
-            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
-            text = '\n'.join(lines)
-            self.assertIn('原料区(最近那格)', text)
-            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
-            self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
-            req = [q for q in w.requests if q.split()[0] in ('OBS', 'AP', 'APN', 'AD', 'AF', 'GRAB', 'V')]
-            self.assertEqual([q for q in req if q.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])   # 按任务码顺序
-            self.assertFalse([q for q in req if q.split()[0] in ('APN', 'AD', 'AF')], req)
-            a = tuple(round(float(x), 2) for x in d['slots']['1']['a'])
-            for g in range(len(req)):
-                if req[g].startswith('GRAB'):
-                    ap = next(q for q in reversed(req[:g]) if q.startswith('AP '))
-                    self.assertEqual(tuple(round(float(x), 2) for x in ap.split()[1:3]), a, ap)   # 下爪前就是示教的角度
-            self.assertEqual([m for m in w.moves[n_moves:] if m[2] == 'RAW' and m[0] in ('S', 'F')], [], text[-3000:])
-            self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完只用 V 挪回停车点
-            self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
+        for any_ in (True, False):
+            for seed in (1, 2, 5):
+                w = self._world(seed)
+                path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+                lines = []
+                h = self._make(w, path, lines, cfg=dict(raw_near_any_order=any_))
+                d, col = self._teach(w, h, path)
+                text = '\n'.join(lines)
+                self.assertEqual(d.get('near'), '1', text)
+                self.assertEqual(sorted(d['slots']), ['1', '2', '3'])
+                self.assertEqual(d['slots']['1']['color'], col)
+                self.assertEqual([k for k, s in d['slots'].items() if s.get('a')], ['1'])         # 只有最近那一格有抓取动作
+                self.assertEqual([m for m in w.moves if m[0] in ('S', 'F')], [], text)            # 示教时车轮只用 V
+                lines.clear()
+                w.requests.clear()
+                n_moves = len(w.moves)
+                run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+                text = '\n'.join(lines)
+                self.assertIn('原料区(最近那格)', text)
+                self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+                self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
+                req = [q for q in w.requests if q.split()[0] in ('OBS', 'AP', 'APN', 'AD', 'AF', 'GRAB', 'V')]
+                grabs = [q for q in req if q.startswith('GRAB')]
+                if any_:
+                    self.assertEqual(sorted(grabs), ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])
+                else:
+                    self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])   # 按任务码顺序
+                self.assertFalse([q for q in req if q.split()[0] in ('APN', 'AD', 'AF')], req)
+                a = tuple(round(float(x), 2) for x in d['slots']['1']['a'])
+                for g in range(len(req)):
+                    if req[g].startswith('GRAB'):
+                        ap = next(q for q in reversed(req[:g]) if q.startswith('AP '))
+                        self.assertEqual(tuple(round(float(x), 2) for x in ap.split()[1:3]), a, ap)   # 下爪前就是示教的角度
+                self.assertEqual([m for m in w.moves[n_moves:] if m[2] == 'RAW' and m[0] in ('S', 'F')], [], text[-3000:])
+                self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)                     # 做完只用 V 挪回停车点
+                self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
     def test_full_course_two_raw_visits(self):
         """整场(两次原料区都用最近那格的做法)：6 个都夹到、12 次都放对，没有夹空、碰倒。"""

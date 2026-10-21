@@ -21,7 +21,7 @@
 - sim_mission 里 `make()` 会套用 LEGACY（老测试写法）；测"比赛默认值"的用例单独写（如 `test_1010i_defaults_place_everything`）。
 
 ## 2. 用户最近定下的做法（别再改回去）
-- **原料区按任务码顺序夹，不能随机夹**：`raw_any_order=False`（10-11 晚定的；另一个对话曾改成 True，已改回）。只这一次不按顺序：`mtest RAW 1 force any`。
+- **原料区按任务码顺序夹，不能随机夹**：`raw_any_order=False`（10-11 晚定的；另一个对话曾改成 True，已改回）。只这一次不按顺序：`mtest RAW 1 force any`。(10-21 夜：最近那格做法另有 `raw_near_any_order`，默认 True，用户要的"对准了马上夹"。)
 - 原料区、工位取放总体按 1010i（= 提交 8faa371）的做法：take_first / wheels_first / zone_filter / ring_precorrect / tilt_precorrect / return_bias 默认都关。
 - **启停区 1**：和区 2 上下对称，车在两个区里**都是车头朝北**摆。`auto_run.zone_pose`：(x, y, h) -> (x, 2400-y, 180-h)；
   第二站动作换区时"前进"和"顺时针"取反（区 2：左 42、前 83、顺 60；区 1：左 42、后 83、逆 60）；PREHOME 在启停区靠场地里面那一侧。
