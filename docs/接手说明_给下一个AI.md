@@ -590,3 +590,5 @@ git_log.txt                ← 分支最近 120 条提交记录
   新指令 `TRAY`(按去车上转盘的路走到上方、不下降，要 ARMOK=1)。`AF` 大动作(>8°)按 Big_Spd(EXTSPD/ROTSPD/ASPD)，arm_calib 里伸缩和比赛时一样快。STM32 主机测试 260 项。
   arm_calib：圆环那组按出去的顺序调 R1T2(rtray0：TRAY 到车上转盘上方开始)-> R2T -> R1T1 -> R2SPD(演示缩到 A2P 再伸回 R2T)，做完缩到 A2P、转到 2 号环；
   这四步里输入 `t`：TRAY -> APZ 2 号环 -> TRAY 真走一遍(和比赛一样)，再按分段回到这一步开始的地方。ArmLink 加 TRAY 超时。
+- **10-21 最后：**用户"ID1 整个转动过程要连续，不要伸缩一下就停一下"(位置已经调好)：R2STG 默认 0(ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到要的长度，Sweep)；
+  分段只在 set R2STG 1 时用。车上已经烧了上一版(R2STG 默认 1)的话，run_live 里 set R2STG 0 就行(存进配置，每次启动发给 STM32)。arm_calib 说明改成连续的说法。
