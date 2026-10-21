@@ -37,6 +37,7 @@ class FakeStm32:
         self.claw = 2090
         self.tt = 2608
         self.block1 = None
+        self.top = None                  # (10-21)升降机构真正能到的最高(超过就顶住，STM32 回 LIFTSLIP)
         self.sent = []
 
     def _servo(self, sid, deg):
@@ -68,6 +69,9 @@ class FakeStm32:
             return 'DONE', [f'LIFT {self.known} {self.z:.4f}']
         if v == 'LIFT' and len(p) == 2:
             self.z = max(0.0, min(self.P['LFMAX'], float(p[1])))
+            if self.top is not None and self.z > self.top:
+                want, self.z = self.z, self.top
+                return 'DONE', [f'LIFTSLIP want={want:.4f} got={self.z:.4f}']
             return 'DONE', []
         if v == 'A?':
             return 'DONE', [f'ANG {p[1]} {self.ang[int(p[1])]:.4f}']
@@ -315,6 +319,16 @@ class WizardTests(unittest.TestCase):
                 z = float(cmd.split()[1])
             if cmd.startswith('AP '):
                 self.assertEqual(z, 100.0, '转舵机(AP)之前升降必须在 ZHI：' + cmd)
+
+    def test_lift_slip_shown(self):
+        """(10-21)升降顶住没到(STM32 回 LIFTSLIP)：向导里用中文说出来，提醒把 ZHI 这些改低。"""
+        stm = FakeStm32()
+        stm.top = 90.0
+        self.run_wiz(FULL, stm=stm)
+        slip = [l for l in self.lines if '升降没到 100.0mm' in l]
+        self.assertTrue(slip, self.lines[-40:])
+        self.assertIn('实际在 90.0mm', slip[0])
+        self.assertIn('ZHI', slip[0])
 
     def test_hand_pose_reengages_servos(self):
         self.run_wiz(FULL)

@@ -691,6 +691,28 @@ class ArmLinkTests(unittest.TestCase):
         self.assertEqual(old.sent, ['CLAW OT', 'CLAW O', 'CLAW O'])
         self.assertEqual(sum('旧程序' in l for l in lines), 1, lines)
 
+    def test_lift_slip_is_reported(self):
+        """(10-21 用户：下到最低了升降还往下动)STM32 走完核对发现没到(LIFTSLIP)：日志里用中文说出来，并指出是哪类参数设高/设低了。"""
+        from arm_link import lift_slip_text
+        link = self.Link({'LIFT': (True, 'DONE', ['LIFTSLIP want=120.0000 got=115.0020'])})
+        lines = []
+        a = ArmLink(link, log=lines.append)
+        a.lift(120)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn('升降没到 120.0mm，实际在 115.0mm', lines[0])
+        self.assertIn('ZHI / STBY / LFMAX', lines[0])
+        self.assertIn('改到 113 以下', lines[0])
+        low = lift_slip_text('LIFTSLIP want=2.0000 got=3.0000')          # 往下顶在 3mm 不动了：2mm 比最低点还低
+        self.assertIn('比升降最低点还低', low)
+        self.assertIn('ZPLC', low)
+        self.assertIn('改到 4 以上', low)
+        self.assertNotIn('多半是', lift_slip_text('LIFTSLIP want=2.0000 got=0.0000'))   # 记高了往下顶到底：改过来就好，不是参数的事
+        mid = lift_slip_text('LIFTSLIP want=20.0000 got=18.0000')
+        self.assertIn('实际在 18.0mm', mid)
+        self.assertNotIn('多半是', mid)                                  # 中间高度没到：只说改过来了，不乱猜参数
+        self.assertIn('差太多没改', lift_slip_text('LIFTSLIP want=70.0000 got=88.0000 (too far, kept)'))
+        self.assertIsNone(lift_slip_text('LIFT 1 60.0 BOOT=ENC'))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)

@@ -35,7 +35,8 @@ static int fails = 0, checks = 0;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; printf("  FAIL: %s  (line %d)\n", msg, __LINE__); } } while (0)
 
 uint32_t HAL_GetTick(void) { return now; }
-void HAL_Delay(uint32_t ms) { now += ms; if (abort_at >= 0 && (int)now >= abort_at) car_abort = 1; }
+static void lift_tick(uint32_t ms);
+void HAL_Delay(uint32_t ms) { now += ms; if (abort_at >= 0 && (int)now >= abort_at) car_abort = 1; lift_tick(ms); }
 void Delay_Report(uint32_t ms) { HAL_Delay(ms); }
 static char qrtx[2048];                /* 发给扫码模块(UART5)的字节，十六进制 "7E 00 07 ..." 每条后面加 | */
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) {
@@ -91,6 +92,10 @@ void Emm_V5_Reset_CurPos_To_Zero(uint8_t a) { EV("zero%u;", a); }
 static double phys_mm = 60.0, enc_off = 12345.0, enc_cpm = 1638.4, enc_cpr = 65536.0;
 static int enc_ok = 1, enc_frozen = 0, enc31_zero = 0;   /* enc31_zero：像现场那样 0x31 总回 0，只有 0x36 实时位置能用 */
 static double pos36_off = -70000.0;                      /* 0x36 实时位置(一圈 65536，多圈累计，可以是负数) */
+/* (10-21)机构真正能到的最高/最低：要去的高度超出去就停在那(丢步)；late_mm：走得比估的慢，等完时还差这么多没走，之后每 80ms 走掉 1/late_n */
+static double phys_top = 1e9, phys_bot = -1e9, late_mm = 0.0, late_left = 0.0;
+static int late_n = 3, late_steps = 0;
+static void lift_tick(uint32_t ms) { double q; if (late_steps > 0 && ms == 80) { q = late_left / late_steps; phys_mm += q; late_left -= q; late_steps--; } }
 uint32_t fake_flash[256];
 static int erases = 0;
 static void flash_blank(void) { int q; for (q = 0; q < 256; q++) fake_flash[q] = 0xFFFFFFFFu; }
@@ -115,8 +120,14 @@ int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
     out[0] = 5; out[1] = 0x31; out[2] = (uint8_t)(v >> 8); out[3] = (uint8_t)v; out[4] = 0x6B; return 1;
 }
 void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) {
+    double t;
     (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
-    if (a == 5) phys_mm += (d ? -1.0 : 1.0) * (double)clk / 80.0;
+    if (a != 5) return;
+    t = phys_mm + (d ? -1.0 : 1.0) * (double)clk / 80.0;
+    if (t > phys_top) t = phys_top;
+    if (t < phys_bot) t = phys_bot;
+    if (late_mm > 0.0) { late_left = (t > phys_mm) ? late_mm : -late_mm; late_steps = late_n; t -= late_left; }
+    phys_mm = t;
 }
 void Emm_V5_Stop_Now(uint8_t a, bool f) { (void)f; EV("stop%u;", a); }
 void Emm_V5_Origin_Trigger_Return(uint8_t a, uint8_t m, bool f) { (void)f; EV("home%u/%u;", a, m); }
@@ -134,6 +145,7 @@ static int at(const char *needle) { const char *p = strstr(ev, needle); return p
 static int has(const char *s) { return strstr(ev, s) != 0; }
 static int last(const char *needle) { int r = -1; const char *p = ev; while ((p = strstr(p, needle)) != 0) { r = (int)(p - ev); p++; } return r; }
 static int pis(const char *s) { return strstr(pi, s) != 0; }
+static double pinum(const char *key) { const char *p = strstr(pi, key); return p ? atof(p + strlen(key)) : -1e9; }   /* 回复里 key 后面的数 */
 static int scrs(const char *s) { return strstr(scr, s) != 0; }
 /* 屏发来字节：和真的串口一样，开着接收(HAL_UART_Receive_IT)才收得到，收到一个以后要回调里重新开 */
 static void scr_in(const uint8_t *f, int n) {
@@ -897,7 +909,7 @@ int main(void) {
     enc_cpr = 16384.0; enc_cpm = -409.6; enc_off = 3000.0; phys_mm = 30.0;
     run("LIFT 30"); phys_mm = 30.0;
     clear();
-    CHECK(run("LIFT CAL 30") == 1 && pis("CPR=16384"), "一圈 16384、方向相反的编码器也能标定");
+    CHECK(run("LIFT CAL 30") == 1 && pis("CPR=16384") && !pis("LIFTSLIP"), "一圈 16384、方向相反的编码器也能标定(标定时上下走不按旧标定核对)");
     run("LIFT 60");                                      /* 断电前停在 60(程序记下了) */
     clear();
     phys_mm = 68.0;
@@ -983,6 +995,67 @@ int main(void) {
     clear(); run("LIFT ZERO"); run("LIFT?");
     CHECK(pis("LIFT 1 0.0") && pis("BOOT=ENC"), "BOOT= 只说开机时怎么认的，之后 LIFT ZERO 也不变");
     run("LIFT 60"); phys_mm = 60.0;
+
+    /* ---- (10-21)升降走完用编码器核对：要去的高度机构到不了(顶住、丢步)就按编码器改过来，报 LIFTSLIP ---- */
+    enc_cpr = 65536.0; enc_cpm = 1638.4; enc_off = 12345.0; enc31_zero = 0; enc_frozen = 0;
+    phys_mm = 60.0; flash_blank(); Arm_Init(); run("LIFT CAL 60"); phys_mm = 60.0;
+    Arm_Param_Set("LFMAX", 125); phys_top = 115.0; phys_bot = 0.0;    /* 机构最高只能到 115、最低 0 */
+    clear();
+    CHECK(run("LIFT 80") == 1 && !pis("LIFTSLIP") && !has("stop5;") && fabs(phys_mm - 80.0) < 0.05, "正常走到 80：核对对得上，不报、不停");
+    clear();
+    CHECK(run("LIFT 120") == 1 && fabs(pinum("LIFTSLIP want=") - 120.0) < 0.01 && fabs(pinum(" got=") - 115.0) < 0.05 && !pis("too far")
+          && has("stop5;") && fabs(phys_mm - 115.0) < 0.05, "LIFT 120，机构最高只到 115：走完核对发现差 5mm，报 LIFTSLIP，叫驱动器停住(不再顶着)");
+    clear(); run("LIFT?");
+    CHECK(fabs(pinum("LIFT 1 ") - 115.0) < 0.05, "高度按编码器改成 115(以前还当作 120，差的 5mm 下次往下全顶到最低点下面)");
+    clear();
+    CHECK(run("LIFT 2") == 1 && fabs(phys_mm - 2.0) < 0.05 && !pis("LIFTSLIP"), "再降到 2mm(像 ZPLC)：正好到 2，不往最低点下面顶");
+    Arm_Param_Set("LFCHK", 0);                            /* 关掉核对 = 以前的样子 */
+    run("LIFT 120"); clear(); run("LIFT 2");
+    CHECK(fabs(phys_mm) < 0.05 && !pis("LIFTSLIP"), "LFCHK 0(以前)：顶住少走的 5mm 没人知道，下到 2mm 时往最低点下面顶(现场看到的'到底了还往下动')");
+    Arm_Param_Set("LFCHK", 1.5f); clear();
+    CHECK(run("LIFT 20") == 1 && fabs(pinum("LIFTSLIP want=") - 20.0) < 0.01 && fabs(pinum(" got=") - 18.0) < 0.05 && fabs(phys_mm - 18.0) < 0.05,
+          "LFCHK 打开：下一次走完就发现差了 2mm(在最低点顶住少走的)，改过来");
+    clear(); run("LIFT 20");
+    CHECK(fabs(phys_mm - 20.0) < 0.05 && !pis("LIFTSLIP"), "改过来以后再走就准了");
+    run("LIFT 60"); phys_mm = 57.0; clear();              /* 被碰下去 3mm(程序还当在 60) */
+    CHECK(run("LIFT 2") == 1 && fabs(pinum("LIFTSLIP want=") - 2.0) < 0.01 && fabs(pinum(" got=")) < 0.05 && has("stop5;") && fabs(phys_mm) < 0.05,
+          "要去的比机构最低点还低(顶住)：报 LIFTSLIP，叫驱动器别再往下顶，高度改成 0");
+    clear(); run("LIFT 2");
+    CHECK(fabs(phys_mm - 2.0) < 0.05, "之后下到 2mm 就是 2mm");
+    run("LIFT 60"); phys_mm = 78.0; clear();              /* 差了 18mm：编码器一圈 40mm，差太多可能认错圈 */
+    CHECK(run("LIFT 70") == 1 && pis("LIFTSLIP") && pis("(too far, kept)") && !has("stop5;"), "差 15mm 以上：只报(too far, kept)，不改");
+    clear(); run("LIFT?");
+    CHECK(fabs(pinum("LIFT 1 ") - 70.0) < 0.05, "差太多时高度照旧(70)");
+    phys_mm = 70.0;
+    late_mm = 3.0; late_n = 3; clear();                   /* 升降比估的慢：等完时还差 3mm 在走 */
+    CHECK(run("LIFT 90") == 1 && !pis("LIFTSLIP") && fabs(phys_mm - 90.0) < 0.05, "还在走：等它停下再核对，不当成丢步");
+    clear(); run("LIFT?");
+    CHECK(fabs(pinum("LIFT 1 ") - 90.0) < 0.05, "还在走的那次高度照样是 90");
+    late_mm = 0.0;
+    /* 边升边转(OVLAP=1，Lift_Start + Lift_Done_Now)也核对 */
+    Arm_Param_Set("OVLAP", 1); Arm_Param_Set("OVCLR", 20); Arm_Param_Set("ZHI", 120);
+    run("LIFT 60"); away(); clear();
+    CHECK(run("APZ 340 -862 60") == 1 && fabs(pinum("LIFTSLIP want=") - 120.0) < 0.01 && fabs(pinum(" got=") - 115.0) < 0.05 && fabs(phys_mm - 60.0) < 0.05,
+          "边升边转：ZHI 120 到不了，升完核对出只到 115，改过来，最后正好降到 60");
+    Arm_Param_Set("OVLAP", 0); Arm_Param_Set("ZHI", 0);
+    /* 开机认高度：停在 118 以上关电，开机时 LFMAX 还是程序里写的 115，以前会认错一整圈 */
+    phys_top = 1e9; run("LIFT 120");
+    Arm_Param_Set("LFMAX", 115); clear(); Arm_Init();
+    CHECK(fabs(pinum("LIFTBOOT ") - 120.0) < 0.05 && fabs(phys_mm - 60.0) < 0.05, "停在 120 关电：开机认出 120 走回 60(以前认成 80，'往下 20' 其实停在 100)");
+    /* LIFT ZERO：编码器的 0 也改到这里(存进 Flash)，核对和开机都按新的 0 算 */
+    run("LIFT 0"); erases = 0; clear();
+    CHECK(run("LIFT ZERO") == 1 && erases == 0 && !pis("LIFTZERO"), "就在编码器的 0 上 LIFT ZERO：本来就对得上，不擦 Flash");
+    enc_off += 4.0 * 1638.4;                              /* 编码器的 0 和真的最低点差了 4mm(标定时量错了) */
+    erases = 0; clear();
+    CHECK(run("LIFT ZERO") == 1 && erases == 1 && fake_flash[0] == 0x4C465432u && fabs(pinum("LIFTZERO ENC ") - 4.0) < 0.05,
+          "LIFT ZERO：编码器说在 4mm，把编码器的 0 改到这里，存进 Flash，回 LIFTZERO ENC 4.0 -> 0");
+    clear(); run("LIFT ENC?");
+    CHECK(fabs(pinum("Z=")) < 0.05, "LIFT ENC? 现在算出 0");
+    clear(); run("LIFT 60");
+    CHECK(!pis("LIFTSLIP") && fabs(phys_mm - 60.0) < 0.05, "之后走到 60 核对对得上(不会按旧的 0 又改回去)");
+    clear(); Arm_Init();
+    CHECK(fabs(pinum("LIFTBOOT ") - 60.0) < 0.05 && fabs(phys_mm - 60.0) < 0.05, "重新开机也按新的 0 认出 60");
+    phys_top = 1e9; phys_bot = -1e9;
 
     /* ---- GET/SET 用的接口 ---- */
     clear();

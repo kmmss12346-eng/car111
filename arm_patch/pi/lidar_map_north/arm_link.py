@@ -42,6 +42,24 @@ _QR = re.compile(r'QR (\d{3}\+\d{3}\+\d{3}\+\d{3})')
 _PARAM = re.compile(r'P (\w+)=(-?\d+(?:\.\d+)?)')
 _BOOT = re.compile(r'BOOT=(\w+)')
 _ZONE = re.compile(r'ZONE (\d) (\d)')
+_SLIP = re.compile(r'LIFTSLIP want=(-?\d+(?:\.\d+)?) got=(-?\d+(?:\.\d+)?)')
+
+
+def lift_slip_text(line):
+    """(10-21)STM32 升降走完用编码器核对，没到要去的高度(顶住、丢步)时回 LIFTSLIP want=… got=…：翻成给人看的话。不是这行返回 None。"""
+    m = _SLIP.match(line)
+    if not m:
+        return None
+    want, got = float(m.group(1)), float(m.group(2))
+    if 'too far' in line:
+        return (f'★ 升降核对：要到 {want:.1f}mm，编码器算出 {got:.1f}mm，差太多没改(编码器一圈 40mm，可能认错圈)。'
+                '输入 arm LIFT ENC? 看看；不对就关电，把升降放回 60mm 附近再开机')
+    hint = ''
+    if got < want and want >= 60:
+        hint = f'。多半是 {want:.0f}mm 比升降能到的最高还高：哪个参数设的 {want:.0f}(ZHI / STBY / LFMAX …)改到 {got - 2:.0f} 以下'
+    elif got > want and want <= 30:
+        hint = f'。多半是 {want:.0f}mm 比升降最低点还低：哪个参数设的 {want:.0f}(ZPLC / ZGRAB / ZDROP …)改到 {got + 1:.0f} 以上'
+    return f'★ 升降没到 {want:.1f}mm，实际在 {got:.1f}mm(顶住丢步了，STM32 已按编码器改过来){hint}'
 
 
 def unknown_cmd(reply):
@@ -77,6 +95,9 @@ class ArmLink:
             m = _ANG.match(line)
             if m:
                 self.angle[int(m.group(1))] = float(m.group(2))
+            slip = lift_slip_text(line)
+            if slip:
+                self.log('  ' + slip)
         return ok, reply, info
 
     def do(self, text, timeout=None):

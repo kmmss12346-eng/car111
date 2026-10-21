@@ -592,3 +592,15 @@ git_log.txt                ← 分支最近 120 条提交记录
   这四步里输入 `t`：TRAY -> APZ 2 号环 -> TRAY 真走一遍(和比赛一样)，再按分段回到这一步开始的地方。ArmLink 加 TRAY 超时。
 - **10-21 最后：**用户"ID1 整个转动过程要连续，不要伸缩一下就停一下"(位置已经调好)：R2STG 默认 0(ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到要的长度，Sweep)；
   分段只在 set R2STG 1 时用。车上已经烧了上一版(R2STG 默认 1)的话，run_live 里 set R2STG 0 就行(存进配置，每次启动发给 STM32)。arm_calib 说明改成连续的说法。
+- **10-21 升降"下到最低了还往下动"(用户："你检查一下升降的过程这一块有 bug 吗")：**找到的问题：
+  ① 升降(Emm ID5)只按发了多少脉冲、等多久当作到了，走完不核对。要去的高度机构到不了(实车开机编码器读出 115，ZHI 118 / STBY 120 比它高)就顶住丢步，
+  程序还当作到了 118/120，差的几毫米留到下一次：下到 ZPLC 这种低处时实际要去最低点下面，一直往下顶。
+  ② 开机认高度时"算出来比最高点高就减一整圈"按 g_lmax 算，开机时还是程序里写的 115(树莓派的 LFMAX 还没发过来)，停在 118 以上关电会认成低 40mm。
+  修法(arm.c)：`Lift_Check(mm)` 在 Lift_Goto / Lift_Finish / Lift_Done_Now 走完后读编码器(还在走就每 80ms 再读，停稳为止，最多约 1 秒)，
+  差 `LFCHK`(默认 1.5mm，0 = 不核对)以上：Emm_V5_Stop_Now(闭环驱动器别再顶着)、lift_mm 改成编码器的、回 `LIFTSLIP want=.. got=..`；
+  差 15mm 以上只报(末尾 ` (too far, kept)`，编码器一圈 40mm 可能认错圈)。`LIFT_TOP_MM` 130：Lift_EncPos 挪整圈和 LFMAX 上限都按它。
+  LIFT CAL 上下走那两步不核对(`lift_nochk`，旧标定可能不准)。LIFT ZERO 时标定过编码器就把编码器的 0 也改到这里存 Flash(`Lift_Rebase0`，回 `LIFTZERO ENC .. -> 0`；
+  差不到 0.3mm 不改)，不然核对/开机又按旧的 0 改回去。LIFT HOME 没改(默认 lift_init='skip' 不用；以编码器为准)。
+  树莓派：`arm_link.lift_slip_text()` 把 LIFTSLIP 翻成中文(要去的 ≥60 没到：ZHI/STBY/LFMAX 改到实际-2 以下；要去的 ≤30 停在更高：ZPLC/ZGRAB/ZDROP 改到实际+1 以上)，
+  ArmLink.request 打印到日志，arm_calib 的 do() 也打印。STM32 主机测试 281 项(桩里加了 phys_top/phys_bot 顶住、late_mm 走得慢)；树莓派 603 个全过。
+  **让用户做：**量升降最高能到多少(arm LIFT ENC? / 看 LIFTSLIP 的 got)，ZHI、STBY(重新 STBY SAVE)、LFMAX 都设到它以下；看到 LIFTSLIP 就按提示改参数。

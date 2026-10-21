@@ -45,6 +45,12 @@ import time
 import unicodedata
 from pathlib import Path
 
+try:
+    from arm_link import lift_slip_text
+except ImportError:                      # 车上的 arm_link.py 还是旧的
+    def lift_slip_text(line):
+        return None
+
 ROOT = Path(__file__).resolve().parent
 
 # 夹爪、转盘脉宽的限位(和 main.c 里 CLAW_MIN_US/CLAW_MAX_US、TURNTABLE_MIN_US/TURNTABLE_MAX_US 一样)
@@ -272,6 +278,9 @@ class Wizard:
         for line in info:
             if line.startswith('SERVO') or line.startswith('LIFTBOOT') or 'STUCK' in line:
                 self.out('  ' + line)          # 舵机卡住/没到位这类提示要让人看到
+            slip = lift_slip_text(line)
+            if slip:
+                self.out('  ' + slip)          # (10-21)升降顶住没到要去的高度
         if rep is None:
             raise CalError(f'{cmd}：STM32 没回复(串口线？STM32 在跑吗？)')
         if not rep.startswith(('DONE', 'PONG')):

@@ -63,6 +63,7 @@ extern void Delay_Report(uint32_t ms);
 /* 开机后升降要停的高度(离最低点往上多少 mm)。开机前把升降大概放在这个高度附近(±20mm)，
  * 上电后程序读电机编码器算出准确高度，自动走到正好这个高度(要先 LIFT CAL 标定一次)。改了这里要重新编译烧录 */
 #define LIFT_BOOT_MM   60.0f
+#define LIFT_TOP_MM    130.0f     /* LFMAX 能设的最大值(机构最多到这么高) */
 
 #define SCREEN_BAUD    9600u
 #define QR_BAUD        9600u
@@ -83,6 +84,8 @@ static float g_lspr   = 3200.0f;   /* LFSPR  电机每圈脉冲数，只用来�
 static float g_lmrg   = 200.0f;    /* LFMRG  升降走完后多等多少毫秒(加减速余量) */
 static float g_lhmd   = 2.0f;      /* LFHMD  LIFT HOME 用的 Emm 回零模式(0~3，见张大头手册) */
 static float g_lhtm   = 8000.0f;   /* LFHTM  LIFT HOME 最多等多少毫秒 */
+static float g_lchk   = 1.5f;      /* LFCHK  (10-21 用户：下到最低了升降还往下动)每次走完用编码器核对实际高度，差这么多毫米以上(丢步：要去的高度
+                                    *        机构到不了、顶到东西)就按编码器改过来并报 LIFTSLIP；0 = 不核对(以前的做法) */
 
 static float g_zhi    = 100.0f;    /* ZHI    搬运途中的高度(抬高，越大越高) */
 static float g_zgrab  = 20.0f;     /* ZGRAB  在原料盘上夹物料时的高度 */
@@ -166,12 +169,13 @@ static const ArmTun tun[] =
     { "LFPPM",  &g_lppm,    1.0f,    500.0f },
     { "LFRPM",  &g_lrpm,    10.0f,   600.0f },
     { "LFACC",  &g_lacc,    0.0f,    255.0f },
-    { "LFMAX",  &g_lmax,    10.0f,   130.0f },   /* (10-19 用户：机构改过还能往上)最高点最多 130mm，实际用 set LFMAX 设成量到的值 */
+    { "LFMAX",  &g_lmax,    10.0f,   LIFT_TOP_MM },   /* (10-19 用户：机构改过还能往上)最高点最多 130mm，实际用 set LFMAX 设成量到的值 */
     { "LFDIR",  &g_ldir,    0.0f,    1.0f },
     { "LFSPR",  &g_lspr,    200.0f,  51200.0f },
     { "LFMRG",  &g_lmrg,    0.0f,    2000.0f },
     { "LFHMD",  &g_lhmd,    0.0f,    3.0f },
     { "LFHTM",  &g_lhtm,    500.0f,  30000.0f },
+    { "LFCHK",  &g_lchk,    0.0f,    20.0f },
     { "ZHI",    &g_zhi,     0.0f,    400.0f },
     { "ZGRAB",  &g_zgrab,   0.0f,    400.0f },
     { "ZDROP",  &g_zdrop,   0.0f,    400.0f },
@@ -362,6 +366,7 @@ static const char *lift_boot_how = "NOCAL";
 /* 下面"编码器"那一节里的函数，Lift_Goto 要先用到 */
 static void Pos_Save(float z);
 static int  Lift_EncPos(float near_mm, float *z, uint16_t *raw);
+static void Lift_Check(float mm);
 
 static uint32_t Lift_Time_Ms(uint32_t pulses)
 {
@@ -419,8 +424,9 @@ static int Lift_Done_Now(void)
     if ((int32_t)(HAL_GetTick() - lift_end) >= 0)
     {
         lift_mm = lift_pend;
-        Pos_Save(lift_mm);
         lift_pend = -1.0f;
+        Lift_Check(lift_mm);                       /* (10-21)用编码器核对到了没有 */
+        Pos_Save(lift_mm);
         return 1;
     }
     return 0;
@@ -459,7 +465,8 @@ static const char *Lift_Finish(void)
     }
     lift_pend = -1.0f;
     lift_mm = mm;
-    Pos_Save(mm);
+    Lift_Check(mm);                                /* (10-21)用编码器核对到了没有 */
+    Pos_Save(lift_mm);
     return NULL;
 }
 
@@ -515,7 +522,8 @@ static const char *Lift_Goto(float mm)
         return NULL;
     }
     lift_mm = mm;
-    Pos_Save(mm);                                  /* 记进 Flash：下次上电从这里找 */
+    Lift_Check(mm);                                /* (10-21)用编码器核对到了没有(丢步就改过来) */
+    Pos_Save(lift_mm);                             /* 记进 Flash：下次上电从这里找 */
     return NULL;
 }
 
@@ -544,6 +552,7 @@ static float   lift_cpm    = 0.0f;        /* 每升高 1mm 编码器读数变多
 static float   lift_cpr    = 65536.0f;    /* 编码器一圈的读数(标定时自动判断 65536 / 16384 / 4096) */
 static uint8_t lift_cal_ok = 0;
 static uint8_t lift_src    = 0x31;        /* 读哪个值：0x31 编码器值；有的驱动器 0x31 总回 0，就用 0x36 实时位置(取一圈里的部分) */
+static uint8_t lift_nochk  = 0;           /* (10-21)LIFT CAL 上下走那两步不核对：旧的标定可能不准，按它改高度会把这次标定带歪 */
 
 static float   pos_last    = 0.0f;        /* 最后一次记进 Flash 的高度(一样就不重复写) */
 static uint8_t pos_last_ok = 0;
@@ -596,7 +605,7 @@ static int Lift_ReadEnc(uint16_t *v)
 static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
 {
     uint16_t e;
-    float rev;
+    float rev, top;
 
     if (!lift_cal_ok || !Lift_ReadEnc(&e))
     {
@@ -604,17 +613,58 @@ static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
     }
     *raw = e;
     *z = near_mm + Enc_Wrap((float)e - (lift_enc0 + lift_cpm * near_mm), lift_cpr) / lift_cpm;
-    /* 算出来的在行程外面(比最低点还低、比最高点还高)，那一定差了整圈：挪回 0~LFMAX 里面 */
+    /* 算出来的在行程外面(比最低点还低、比最高点还高)，那一定差了整圈：挪回行程里面。
+     * (10-21)最高点按 LFMAX 能设的最大值 130 算：开机时配置里的 LFMAX 还没发过来，按程序里写的 115 算会把停在 118 以上的认错一整圈 */
     rev = lift_cpr / Absf(lift_cpm);
-    while (*z < -3.0f && *z + rev <= g_lmax + 3.0f)
+    top = (g_lmax > LIFT_TOP_MM) ? g_lmax : LIFT_TOP_MM;
+    while (*z < -3.0f && *z + rev <= top + 3.0f)
     {
         *z += rev;
     }
-    while (*z > g_lmax + 3.0f && *z - rev >= -3.0f)
+    while (*z > top + 3.0f && *z - rev >= -3.0f)
     {
         *z -= rev;
     }
     return 1;
+}
+
+/* (10-21 用户：下到最低了升降还往下动)升降走完用编码器核对实际到了没有。以前只按发了多少脉冲、等了多久算高度：要去的高度机构到不了
+ * (ZHI/STBY 比升降能到的最高还高，或者比最低点还低)、顶到东西丢了步，也照样当作到了，记的高度和实际越差越多，后面下到低处就一直往下顶。
+ * 还在走(等的时间估短了)：等它停稳(最多约 1 秒)；差 LFCHK 毫米以上：按编码器改过来，报 LIFTSLIP。差 15mm 以上不改(编码器一圈 40mm，
+ * 差太多可能认错圈)，只报。没标定编码器 / LFCHK=0 不核对 */
+static void Lift_Check(float mm)
+{
+    float z, z2;
+    uint16_t e;
+    int k;
+    char m[80];
+    char s1[20];
+    char s2[20];
+
+    if (g_lchk <= 0.0f || !lift_cal_ok || lift_nochk)  return;
+    if (!Lift_EncPos(mm, &z, &e))  return;
+    for (k = 0; k < 12 && Absf(z - mm) >= 0.3f; k++)
+    {
+        Delay_Report(80);                          /* 还在走就等它停下(和 Wait_Ms 一样照常回报车头角度) */
+        if (car_abort || !Lift_EncPos(mm, &z2, &e))  return;
+        if (Absf(z2 - z) < 0.15f)
+        {
+            z = z2;
+            break;
+        }
+        z = z2;
+    }
+    if (Absf(z - mm) < g_lchk)  return;
+    FmtF(s1, (int)sizeof(s1), mm);
+    FmtF(s2, (int)sizeof(s2), z);
+    snprintf(m, sizeof(m), "LIFTSLIP want=%s got=%s%s\r\n", s1, s2, (Absf(z - mm) > 15.0f) ? " (too far, kept)" : "");
+    Say(m);
+    if (Absf(z - mm) <= 15.0f)
+    {
+        Emm_V5_Stop_Now(LIFT_ADDR, false);         /* 闭环驱动器顶着到不了的位置会一直使劲：叫它停住，它要去的位置也就成了现在的位置 */
+        HAL_Delay(5);
+        lift_mm = z;
+    }
 }
 
 /* 待机姿态(10-15 用户：上电、PARK 都回到自己定的高度/手臂角度/夹爪)。STBY SAVE 把现在的样子记下来，
@@ -829,7 +879,7 @@ static void Pos_Save(float z)
 }
 
 /* LIFT CAL <mm>：升降现在离最低点 z0 毫米(尺子量的)。上下动 10mm 测编码器，存进 Flash */
-static const char *Lift_Cal(float z0)
+static const char *Lift_Cal_Do(float z0)
 {
     static const float cands[3] = { 65536.0f, 16384.0f, 4096.0f };
     static const uint8_t srcs[2] = { 0x31, 0x36 };
@@ -923,6 +973,40 @@ static const char *Lift_Cal(float z0)
     Say(m);
     Pos_Save(z0);
     return NULL;
+}
+
+static const char *Lift_Cal(float z0)
+{
+    const char *r;
+
+    lift_nochk = 1;                                /* 上下走那两步不核对 */
+    r = Lift_Cal_Do(z0);
+    lift_nochk = 0;
+    return r;
+}
+
+/* (10-21)LIFT ZERO：标定过编码器就把编码器的"高度 0"也改到这里，存进 Flash(和在这里 LIFT CAL 0 一样，只是不再上下走一遍)。
+ * 不改的话，每次走完核对、下次开机还按原来的 0 算，又把高度改回去了。本来就对得上(差不到 0.3mm)不用改 */
+static void Lift_Rebase0(void)
+{
+    float z;
+    uint16_t e;
+    char m[48];
+    char s1[20];
+
+    if (!lift_cal_ok || !Lift_EncPos(0.0f, &z, &e) || Absf(z) < 0.3f)
+    {
+        return;
+    }
+    lift_enc0 = (float)e;
+    lift_enc0 -= lift_cpr * floorf(lift_enc0 / lift_cpr);   /* 折到 0~一圈 */
+    if (Cal_Save())
+    {
+        Pos_Save(0.0f);
+    }
+    FmtF(s1, (int)sizeof(s1), z);
+    snprintf(m, sizeof(m), "LIFTZERO ENC %s -> 0\r\n", s1);   /* 编码器原来算的是多少 */
+    Say(m);
 }
 
 /* 开机：用编码器找到准确高度，再走到 LIFT_BOOT_MM。
@@ -2405,6 +2489,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             Emm_V5_Reset_CurPos_To_Zero(LIFT_ADDR);
             lift_mm = 0.0f;
             lift_known = 1;
+            Lift_Rebase0();                        /* (10-21)编码器的 0 也改到这里 */
             return 1;
         }
         if (strcmp(t[1], "HOME") == 0)
