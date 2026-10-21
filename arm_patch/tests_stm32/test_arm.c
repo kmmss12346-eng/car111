@@ -435,8 +435,9 @@ int main(void) {
     away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -700 60");
     CHECK(!has("M1:298.0") && !has("M1:303.0"), "LVDEG=0：和以前一样");
     Arm_Param_Set("LVDEG", 0);
-    /* (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调")圆环那组分段走(R2STG=1 默认) */
+    /* (10-21)圆环那组分段走(R2STG=1；默认 0 = ID1 一直转，用户"ID1 整个转动过程要连续") */
     Arm_Param_Set("R1T1", 230); Arm_Param_Set("R2T", -650); Arm_Param_Set("R1T2", 300); Arm_Param_Set("R2SPD", 500);
+    Arm_Param_Set("R2STG", 1);
     run("SIDE RING");
     away(); clear(); run("TAKE 1"); clear();
     CHECK(run("APZ 200 -800 60") == 1, "分段：APZ");
@@ -454,8 +455,16 @@ int main(void) {
     }
     Arm_Param_Set("R2STG", 0);
     away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -800 60");
-    CHECK(has("S1:200.0") && !has("M1:300.0"), "R2STG=0：一边转一边伸缩(和以前一样)");
-    Arm_Param_Set("R2STG", 1);
+    {
+        int s1 = at("S1:200.0"), e1 = at("S2:-650.0@500"), e2 = at("S2:-800.0@500");
+        CHECK(s1 >= 0 && s1 < e1 && e1 < e2 && !has("M1:300.0") && !has("M1:230.0"),
+              "R2STG=0(默认)：ID1 一口气转过去不停，转过 R1T2 伸到 R2T、转过 R1T1 缩到要的长度");
+    }
+    clear(); run("TRAY");
+    {
+        int s1 = at("S1:323.0"), e1 = at("S2:-650.0@500"), e2 = at("S2:-862.0@500");
+        CHECK(s1 >= 0 && s1 < e1 && e1 < e2 && !has("M1:230.0") && !has("M1:300.0"), "R2STG=0：去车上转盘也是 ID1 一直转");
+    }
     Arm_Param_Set("R1T1", 0); Arm_Param_Set("R2T", 0); Arm_Param_Set("R1T2", 0); Arm_Param_Set("R2SPD", 0);
     run("SIDE RAW");
     /* (10-21 用户：arm_calib 里伸缩的速度要和 run 里统一)AF 大动作按 EXTSPD/ROTSPD(没设按 ASPD)，小调整照旧 ASPDF */
