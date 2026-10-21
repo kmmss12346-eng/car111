@@ -85,6 +85,16 @@ class FakeStm32:
         if v == 'U':
             self.released[int(p[1])] = True
             return 'DONE', []
+        if v == 'SIDE':
+            return 'DONE', []
+        if v in ('TRAY', 'APZ'):                                 # (10-21)按 STM32 的路走到车上转盘上方 / 从车上转盘到 (a1, a2) 高度 z
+            if self.P.get('ARMOK', 0) < 0.5:
+                return 'ERR NOCAL', []
+            a1, a2, z = (self.P['A1D'], self.P['A2R'], self.P['ZHI']) if v == 'TRAY' else (float(p[1]), float(p[2]), float(p[3]))
+            self._servo(1, a1)
+            self._servo(2, a2)
+            self.z = z
+            return 'DONE', [f'ANG 1 {self.ang[1]:.4f}', f'ANG 2 {self.ang[2]:.4f}']
         if v == 'CLAW':
             self.claw = {'O': self.P.get('CLWO', 2090), 'C': self.P.get('CLWC', 2910)}.get(p[1]) or int(p[1])
             return 'DONE', []
@@ -148,7 +158,7 @@ FULL = [
     's',                               # ZOBRAW 跳过
     '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
     's', 's',                          # 1、3 号环 R1/R3 跳过
-    's', 's', 's', 's',                # 去圆环绕开电池盒 R1T1/R2T/R1T2/R2SPD 跳过
+    's', 's', 's', 's',                # 车上转盘去圆环绕开电池盒 R1T2/R2T/R1T1/R2SPD 跳过
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
     's',                               # ZOBRNG 跳过
@@ -225,26 +235,46 @@ class WizardTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.cfg), 'ring_teach.json')))
 
     def test_ring_detour_steps(self):
-        """(10-20 用户：夹着物料去圆环怕刮到电池盒)R1T1 / R2T / R1T2 / R2SPD 从 2 号环上方开始调，做完按原路回到 2 号环上方。"""
-        self.run_wiz(['c', '1 +20', '', '2 +50', '', '1 +40', '', '400', '', 'q'], start=STEP_KEYS.index('R1T1'))
-        P = self.stm.P
-        self.assertAlmostEqual(P['R1T1'], P['A1P'] + 20, delta=0.5)
-        self.assertAlmostEqual(P['R2T'], P['A2P'] + 50, delta=0.5)
-        self.assertAlmostEqual(P['R1T2'], P['R1T1'] + 40, delta=0.5)
+        """(10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调")按从车上转盘出去的顺序调：
+        从车上转盘上方(STM32 按比赛的路走过去)开始，R1T2(只转) -> R2T(只伸) -> R1T1(只转) -> R2SPD，做完缩到 2 号环的长度、转到 2 号环上方。"""
+        stm = FakeStm32()
+        stm.P['ARMOK'] = 1
+        self.run_wiz(['c', '1 -20', '', '2 +50', '', '1 -40', '', '400', '', 'q'], stm=stm, start=STEP_KEYS.index('R1T2'))
+        P = stm.P
+        self.assertIn('TRAY', stm.sent)                                     # 从车上转盘上方开始(按比赛时去车上转盘的路)
+        self.assertAlmostEqual(P['R1T2'], P['A1D'] - 20, delta=0.5)
+        self.assertAlmostEqual(P['R2T'], P['A2R'] + 50, delta=0.5)
+        self.assertAlmostEqual(P['R1T1'], P['R1T2'] - 40, delta=0.5)
         self.assertEqual(P['R2SPD'], 400)
         self.assertEqual(P['A2T'], 0)                                      # 原料区那组不动
-        self.assertEqual([(i, s_) for i, _a, s_ in self.stm.afs], [(2, 400.0), (2, 400.0)])
-        sent = self.stm.sent
+        self.assertEqual([(i, a_, s_) for i, a_, s_ in stm.afs], [(2, -862.0, 400.0), (2, -812.0, 400.0)])   # 缩到 2 号环的长度再伸回来
+        sent = stm.sent
         i = sent.index('SET R2SPD 400', sent.index('AFS 2 -812 400'))
         back = [c for c in sent[i:] if c.startswith(('AF ', 'AP '))]
-        self.assertEqual(back[:4], ['AF 2 -812', 'AF 1 343', 'AF 2 -862', 'AP 323 -862'])   # 伸着转回去，再缩回
-        self.assertEqual(self.stm.claw, 2910)                              # 物料一直夹着(下一步 ZPLC 要用)
+        self.assertEqual(back[:2], ['AF 2 -862', 'AP 323 -862'])           # 只缩到 2 号环的长度，再转到 2 号环上方
+        self.assertEqual(stm.claw, 2910)                                   # 物料一直夹着(下一步 ZPLC 要用)
         sp = load(self.cfg)['stm32_params']
         self.assertEqual(sp['R2SPD'], 400)
 
+    def test_try_ring_path_with_t(self):
+        """t：按保存的值让 STM32 真走一遍(去车上转盘 -> 去 2 号环上方 -> 回车上转盘)，走完回到这一步开始的地方。"""
+        stm = FakeStm32()
+        stm.P.update(ARMOK=1, R1T2=303.0, R2T=-812.0, R1T1=263.0)
+        self.run_wiz(['t', 'q'], stm=stm, start=STEP_KEYS.index('R1T1'))
+        sent = stm.sent
+        k = sent.index('APZ 323 -862 100')
+        self.assertIn('TRAY', sent[:k])
+        self.assertIn('TRAY', sent[k:])
+        after = [c for c in sent[sent.index('TRAY', k):] if c.startswith('AF ')]
+        self.assertEqual(after[:2], ['AF 1 303', 'AF 2 -812'])               # 从车上转盘按分段走回这一步开始的地方(R1T2、R2T)
+        self.assertTrue(any('试走完了' in l for l in self.lines), self.lines)
+        stm = FakeStm32()                                                   # ARMOK=0：走不了，说清楚
+        self.run_wiz(['t', 'q', 'q'], stm=stm, start=STEP_KEYS.index('R2T'))
+        self.assertTrue(any('ARMOK=1' in l for l in self.lines), self.lines)
+
     def test_ring_detour_speed_zero_demo_uses_a2spd(self):
         stm = FakeStm32()
-        stm.P.update(R1T1=343.0, R2T=-812.0, R1T2=383.0, A2SPD=300.0)
+        stm.P.update(R1T1=263.0, R2T=-812.0, R1T2=303.0, A2SPD=300.0)
         self.run_wiz(['0', 'q', 'q'], stm=stm, start=STEP_KEYS.index('R2SPD'))
         self.assertEqual([(i, s_) for i, _a, s_ in stm.afs], [(2, 300.0), (2, 300.0)])
 
@@ -252,7 +282,7 @@ class WizardTests(unittest.TestCase):
         stm = FakeStm32()
         for k in ('R1T1', 'R2T', 'R1T2', 'R2SPD'):
             del stm.P[k]
-        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('R1T1'))
+        self.run_wiz(['q'], stm=stm, start=STEP_KEYS.index('R1T2'))
         out = '\n'.join(self.lines)
         self.assertEqual(out.count('旧固件'), 4)
         self.assertIn('ZPLC', out)

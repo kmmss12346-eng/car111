@@ -17,6 +17,7 @@
     o   c         夹爪张开 / 夹紧
     u             两个舵机松开，用手直接摆；摆好以后回车 = 读出角度并保存
     r             重新读一下两个舵机现在的角度
+    t             (车上转盘去圆环那几步 R1T2/R2T/R1T1/R2SPD)按 STM32 里已经保存的值真走一遍：去车上转盘 -> 去 2 号环 -> 回车上转盘
     v             打开/关掉摄像头画面(vlive.py 的窗口：看物料、圆环认得怎么样)。原料盘上方姿态、ZGRAB、ZOBRAW、
                   圆环上方姿态、ZPLC、ZOBRNG 这几步会自动打开(要在树莓派桌面的终端里运行向导)
     回车(或 ok)   保存当前值，下一步
@@ -54,6 +55,7 @@ MATERIAL_MM = 60.0            # 物料高度：码垛高度 ZSTK 默认 = ZPLC +
 TIMEOUT = dict(LIFT=25.0, AP=15.0, AF=10.0, CLAW=5.0, TT=5.0, U=3.0, SET=3.0, GET=5.0, PING=2.0)
 TIMEOUT['A?'] = 3.0
 TIMEOUT['LIFT?'] = 3.0
+TIMEOUT.update(TRAY=40.0, APZ=40.0, SIDE=3.0)     # (10-21)试走车上转盘 <-> 圆环那条路
 
 HELP = __doc__.split('然后你输入下面的东西', 1)[1].split('保存 = ', 1)[0]
 
@@ -140,19 +142,24 @@ STEPS = [
               '以前存过的话手臂先转到存过的位置，对就直接回车。要重调：python3 arm_calib.py --from A1P，先看爪子正对 2 号环再做这两步。'),
     dict(key='R3', kind='ringpose', ring=3, title='3 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动。手臂转到了 2 号环上方(以前存过 3 号环就是存过的位置)：把爪子移到 3 号环中心的正上方(和上一步一样调)，摆好回车。'),
-    # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)
-    dict(key='R1T1', kind='servo', sid=1, title='去圆环绕开电池盒①：开始伸长的角度 R1T1', setup='rdetour0', needs_fw=True,
-         text='车上转盘 <-> 地上圆环这条路单独调(夹着物料转过去怕刮到电池盒)。先 o 张开、把一个物料塞进爪子，c 夹住。\n'
-              '手臂在 2 号环上方(最高处)：用 1 +10 / 1 -10 往车上转盘那边转，转到开始伸长的角度(物料还没碰到电池盒)，回车保存。\n'
-              '不用单独调(和原料区那组一样就行)：输入 s 跳过这四步(以后要关掉：set R2T 0)。'),
-    dict(key='R2T', kind='servo', sid=2, title='去圆环绕开电池盒②：伸多长 R2T', setup='rdetour1', needs_fw=True,
-         text='手臂在开始伸长的角度：用 2 +50 / 2 -50 把爪子(连同物料)伸到转过去碰不到电池盒的长度，回车保存。'),
-    dict(key='R1T2', kind='servo', sid=1, title='去圆环绕开电池盒③：开始缩回的角度 R1T2', setup='rdetour2', needs_fw=True,
-         text='伸着往车上转盘那边转：用 1 +10 / 1 -10 转过电池盒，转到开始缩回的地方(还没到车上转盘正上方)，回车保存。'),
-    dict(key='R2SPD', kind='speed', title='去圆环绕开电池盒④：伸长、缩回的速度 R2SPD(度/秒)', setup='rdetour3', needs_fw=True,
+    # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)。
+    # (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调")按从车上转盘出去的顺序调；比赛时(R2STG=1，默认)分段走：
+    #   只转到 R1T2 -> 只伸到 R2T -> 只转到 R1T1 -> 只缩到圆环那边要的长度 -> 再转过去；回车上转盘反过来。任何一步输入 t 按保存的值真走一遍
+    dict(key='R1T2', kind='servo', sid=1, title='车上转盘去圆环①：先只转到的角度 R1T2', setup='rtray0', needs_fw=True,
+         text='手臂在车上转盘上方(最高处)。先 o 张开、把一个物料塞进爪子，c 夹住(夹着物料调)。\n'
+              '用 1 +10 / 1 -10 往圆环那边转(伸缩不动)，转到再转物料就要碰到电池盒的地方，回车保存。\n'
+              '比赛时：只转到这里 -> 只伸到 R2T -> 只转到 R1T1 -> 只缩到圆环那边的长度 -> 再转过去(回车上转盘反过来走)。\n'
+              '这几步任何时候输入 t：按 STM32 里已经保存的值真走一遍(去车上转盘 -> 去 2 号环上方 -> 回车上转盘)，和比赛时一样。\n'
+              '不用绕(直接转过去碰不到电池盒)：输入 s 跳过这四步(以后要关掉：set R2T 0)。'),
+    dict(key='R2T', kind='servo', sid=2, title='车上转盘去圆环②：伸到多长 R2T', setup='rtray1', needs_fw=True,
+         text='手臂停在刚才的角度(不转)：用 2 +50 / 2 -50 把爪子(连同物料)伸到转过去碰不到电池盒的长度，回车保存。'),
+    dict(key='R1T1', kind='servo', sid=1, title='车上转盘去圆环③：伸着再转到的角度 R1T1', setup='rtray2', needs_fw=True,
+         text='伸着往圆环那边转(伸缩不动)：用 1 +10 / 1 -10 转过电池盒，转到缩回(缩到 2 号环那边的长度)也碰不到电池盒的地方，回车保存。'),
+    dict(key='R2SPD', kind='speed', title='车上转盘去圆环④：伸长、缩回的速度 R2SPD(度/秒)', setup='rtray3', needs_fw=True,
          back_path='ring',
-         text='直接输入数字(例如 400)，或者 +100 / -100：伸缩会按这个速度缩回再伸出给你看。越大越快，0 = 和 A2SPD 一样。\n'
-              '满意了回车保存，手臂按原路(伸着转回开始伸长的角度，再到 2 号环上方)回去。物料还夹着，下一步用得上。'),
+         text='直接输入数字(例如 400)，或者 +100 / -100：伸缩会按这个速度缩到 2 号环的长度再伸回来给你看。越大越快，\n'
+              '0 = 和 A2SPD 一样(A2SPD 也是 0 就按伸缩舵机的速度 EXTSPD)。满意了回车保存，手臂缩到 2 号环的长度、转到 2 号环上方。\n'
+              '物料还夹着，下一步用得上。输入 t 按保存的值真走一遍。'),
     dict(key='ZPLC', kind='lift', title='往地上放物料的高度 ZPLC', setup='ring_down',
          text='先输入 c 夹住一个物料，用 -10 / -5 / -1 慢慢往下降，降到物料底部刚好碰到地面(圆环里)。'),
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
@@ -435,13 +442,10 @@ class Wizard:
             a2 = P.get('A2E') if kind == 'detour1' else P.get('A2T', 0.0)
             if abs(a1) > 0.5 and abs(a2) > 0.5:               # 前面一步跳过了(还是 0)就不动
                 self.pose(a1, a2)
-        elif kind == 'rdetour0':                               # (10-20)圆环那组：从 2 号环上方开始(夹爪不动：夹着物料调)
-            self.pose(P['A1P'], P['A2P'])
-        elif kind in ('rdetour1', 'rdetour2', 'rdetour3'):
-            a1 = P.get('R1T2' if kind == 'rdetour3' else 'R1T1', 0.0)
-            a2 = P.get('A2P') if kind == 'rdetour1' else P.get('R2T', 0.0)
-            if abs(a1) > 0.5 and abs(a2) > 0.5:
-                self.pose(a1, a2)
+        elif kind == 'rtray0':                                 # (10-21)圆环那组：从车上转盘上方开始(夹爪不动：夹着物料调)
+            self._to_tray()
+        elif kind in ('rtray1', 'rtray2', 'rtray3'):
+            self._tray_stage(kind)
         if kind in ('raw_obs', 'ring_obs'):
             self.lift_to(P['ZOBRAW' if kind == 'raw_obs' else 'ZOBRNG'])
 
@@ -566,16 +570,62 @@ class Wizard:
         except Exception:
             return None
 
-    def _ring_detour_back(self):
-        """(10-20)调完圆环那组绕电池盒：伸着转回开始伸长的角度 R1T1，再到 2 号环上方 A1P/A2P(不扫到电池盒)。"""
+    def _to_tray(self):
+        """(10-21)转到车上转盘上方(最高处)：STM32 按比赛时去车上转盘的路走(TRAY，绕电池盒)；旧程序/ARMOK=0 走不了就直接摆过去。"""
         P = self.P
         try:
+            self.do('SIDE RING', quiet=True)
+        except CalError:
+            pass
+        try:
+            self.do('TRAY')
+            self.z_cmd = None
+            return True
+        except CalError as e:
+            self.out(f'  (STM32 走不了去车上转盘的路：{e}。直接摆到车上转盘上方)')
+            self.lift_to(P['ZHI'])
+            self.pose(P['A1D'], P['A2R'])
+            return False
+
+    def _tray_stage(self, kind):
+        """(10-21)从车上转盘上方按分段的顺序走到这一步开始的地方：rtray1 = 只转到 R1T2；rtray2 = 再只伸到 R2T；rtray3 = 再只转到 R1T1。
+        前面哪一步没调(还是 0)就停在那里。"""
+        P = self.P
+        seq = [(1, 'R1T2'), (2, 'R2T'), (1, 'R1T1')][:{'rtray1': 1, 'rtray2': 2, 'rtray3': 3}[kind]]
+        for sid, key in seq:
+            v = float(P.get(key, 0.0) or 0.0)
+            if abs(v) <= 0.5:
+                return
+            try:
+                if abs(self.angle(sid) - v) > 0.3:
+                    self.servo_to(sid, v)
+            except CalError:
+                self.servo_to(sid, v)
+
+    def _try_ring_path(self, st):
+        """(10-21 用户"让我来自由调试")t：按 STM32 里已经保存的值真走一遍，和比赛时一模一样：去车上转盘上方(TRAY) -> 从车上转盘去 2 号环上方
+        (APZ) -> 再回车上转盘上方；走完回到这一步开始的地方。这一步调了还没回车的值不算(先回车保存再 t)。"""
+        P = self.P
+        self.out('  试走(按已经保存的 R1T2/R2T/R1T1/R2SPD，分段/一边转一边伸缩按 R2STG)：去车上转盘上方 -> 去 2 号环上方 -> 回车上转盘上方')
+        if not self._to_tray():
+            self.out('  ★ 试走要新的 STM32 程序(TRAY 指令)，并且 ARMOK=1(最后一步打开，或者 run_live 里 set ARMOK 1)')
+            return
+        self.do(f'APZ {P["A1P"]:g} {P["A2P"]:g} {P["ZHI"]:g}')
+        self.do('TRAY')
+        self.z_cmd = None
+        if st.get('setup') in ('rtray1', 'rtray2', 'rtray3'):
+            self._tray_stage(st['setup'])
+        self._read_servos()
+        self.out('  试走完了，回到这一步开始的地方')
+
+    def _ring_detour_back(self):
+        """(10-21)调完圆环那组绕电池盒(手臂在 R1T1、伸在 R2T)：只缩到 2 号环的长度，再转到 2 号环上方 A1P/A2P(和比赛时最后两段一样)。"""
+        P = self.P
+        try:
+            self.lift_to(P['ZHI'])
             if abs(P.get('R2T', 0.0)) > 0.5 and abs(P.get('R1T1', 0.0)) > 0.5:
-                self.lift_to(P['ZHI'])
-                self.servo_to(2, P['R2T'])
-                self.servo_to(1, P['R1T1'])
                 self.servo_to(2, P['A2P'])
-                self.pose(P['A1P'], P['A2P'])
+            self.pose(P['A1P'], P['A2P'])
         except CalError as e:
             self.out(f'  !! 回 2 号环上方失败：{e}')
 
@@ -679,6 +729,9 @@ class Wizard:
             self.release()
             self.out('  两个舵机松开了，用手摆好以后直接回车(会读出角度)。想先看看读数就输入 r。')
             return None
+        if line == 't' and st['key'] in ('R1T2', 'R2T', 'R1T1', 'R2SPD'):
+            self._try_ring_path(st)
+            return None
         if line == 'v':
             if self._viewer is not None and self._viewer.poll() is None:
                 self._view_close()
@@ -713,9 +766,10 @@ class Wizard:
                 ext = 'A2T' if st['key'] == 'A2SPD' else 'R2T'
                 sp = want if want > 0.5 else (float(P.get('A2SPD', 0.0)) if st['key'] == 'R2SPD' else 0.0)
                 if sp <= 0.5:
-                    sp = float(P.get('ASPD', 90.0))
+                    sp = float(P.get('EXTSPD', 0.0) or 0.0) or float(P.get('ASPD', 90.0))   # (10-21)和比赛时一样：都是 0 按伸缩舵机速度
                 if abs(P.get(ext, 0.0)) > 0.5:
-                    self.do(f'AFS 2 {P["A2R"]:g} {sp:g}')                # 按新速度缩回再伸出
+                    back = P['A2R'] if st['key'] == 'A2SPD' else P['A2P']        # 圆环那组：在 R1T1(过了电池盒)缩到 2 号环的长度
+                    self.do(f'AFS 2 {back:g} {sp:g}')                    # 按新速度缩回再伸出
                     self.do(f'AFS 2 {P[ext]:g} {sp:g}')
                 return None
             a, b = (P['CLWO'], P['CLWC']) if st['key'] == 'CLSPD' else (P['CLWC'], P['CLWO'])

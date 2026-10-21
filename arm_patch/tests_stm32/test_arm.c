@@ -434,7 +434,38 @@ int main(void) {
     Arm_Param_Set("LVDEG", 0);
     away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -700 60");
     CHECK(!has("M1:298.0") && !has("M1:303.0"), "LVDEG=0：和以前一样");
-    Arm_Param_Set("LVDEG", 20); Arm_Param_Set("A1P", 323);
+    Arm_Param_Set("LVDEG", 0);
+    /* (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调")圆环那组分段走(R2STG=1 默认) */
+    Arm_Param_Set("R1T1", 230); Arm_Param_Set("R2T", -650); Arm_Param_Set("R1T2", 300); Arm_Param_Set("R2SPD", 500);
+    run("SIDE RING");
+    away(); clear(); run("TAKE 1"); clear();
+    CHECK(run("APZ 200 -800 60") == 1, "分段：APZ");
+    {
+        int r1 = at("M1:300.0"), e1 = at("M2:-650.0@500"), r2 = at("M1:230.0"), e2 = at("M2:-800.0@500"), r3 = at("M1:200.0");
+        CHECK(r1 >= 0 && r1 < e1 && e1 < r2 && r2 < e2 && e2 < r3,
+              "离开车上转盘：只转到 R1T2 -> 只伸到 R2T(按 R2SPD) -> 只转到 R1T1 -> 只缩到要的长度 -> 再转过去");
+    }
+    clear();
+    CHECK(run("TRAY") == 1, "TRAY：去车上转盘上方");
+    {
+        int r1 = at("M1:230.0"), e1 = at("M2:-650.0@500"), r2 = at("M1:300.0"), e2 = at("M2:-862.0@500"), r3 = at("M1:323.0");
+        CHECK(r1 >= 0 && r1 < e1 && e1 < r2 && r2 < e2 && e2 < r3 && !has("L+"),
+              "去车上转盘：只转到 R1T1 -> 只伸到 R2T -> 只转到 R1T2 -> 只缩回 A2R -> 只转到 A1D，不下降");
+    }
+    Arm_Param_Set("R2STG", 0);
+    away(); clear(); run("TAKE 1"); clear(); run("APZ 200 -800 60");
+    CHECK(has("S1:200.0") && !has("M1:300.0"), "R2STG=0：一边转一边伸缩(和以前一样)");
+    Arm_Param_Set("R2STG", 1);
+    Arm_Param_Set("R1T1", 0); Arm_Param_Set("R2T", 0); Arm_Param_Set("R1T2", 0); Arm_Param_Set("R2SPD", 0);
+    run("SIDE RAW");
+    /* (10-21 用户：arm_calib 里伸缩的速度要和 run 里统一)AF 大动作按 EXTSPD/ROTSPD(没设按 ASPD)，小调整照旧 ASPDF */
+    Arm_Param_Set("EXTSPD", 1000);
+    ang[2] = -862.0f; clear(); run("AF 2 -700");
+    CHECK(has("M2:-700.0@1000/"), "AF 2 大动作按 EXTSPD");
+    clear(); run("AF 2 -704");
+    CHECK(has("M2:-704.0@40/"), "AF 小调整照旧按 ASPDF");
+    Arm_Param_Set("EXTSPD", 0);
+    Arm_Param_Set("A1P", 323);
     away(); clear(); run("OBS RING");
     CHECK(has("S1:323.0@90;") && has("S2:-862.0@90;"), "ROTSPD/EXTSPD = 0：和以前一样用 ASPD");
 

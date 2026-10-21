@@ -115,7 +115,11 @@ static float g_r2spd  = 0.0f;      /* R2SPD  这一组伸长、缩回的速度(�
 static uint8_t g_side = 0;         /* 手臂在哪边干活：0 = 原料盘，1 = 地上圆环(OBS RAW/RING、GRAB、PICK、PLACE、SIDE 指令设) */
 static float g_aspd   = 90.0f;     /* ASPD   ID1/ID2 大动作转速(度/秒) */
 static float g_aspdf  = 40.0f;     /* ASPDF  ID1/ID2 微调转速(度/秒) */
-static float g_lvdeg  = 20.0f;     /* LVDEG  (10-21 用户)夹着物料离开车上转盘：先只转 ID1 这么多度(伸缩不动)，再开始伸缩，免得挡到电池盒；0 = 不先转 */
+static float g_lvdeg  = 0.0f;      /* LVDEG  夹着物料离开车上转盘(没有绕电池盒、或者一边转一边伸缩时)：先只转 ID1 这么多度(伸缩不动)再走；0 = 不先转 */
+static float g_r2stg  = 1.0f;      /* R2STG  (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调")车上转盘 <-> 地上圆环这条路分段走：
+                                    *        1 = 只转到 R1T2 -> 只伸缩到 R2T -> 只转到 R1T1 -> 只伸缩到要的长度 -> 再转过去(去车上转盘反过来)，每段走完再走下一段；
+                                    *        0 = 一边转一边伸缩(和原料区一样) */
+static float g_a2stg  = 0.0f;      /* A2STG  原料区那组(A1T1~A2SPD)也分段走：1 = 分段；0 = 一边转一边伸缩(10-19 用户要 ID1 不停) */
 static float g_rotspd = 0.0f;      /* ROTSPD (10-21 用户)旋转舵机大动作转速(度/秒)；0 = 用 ASPD */
 static float g_extspd = 0.0f;      /* EXTSPD (10-21 用户)伸缩舵机大动作转速(度/秒，舵机最快多少就按多少转)；0 = 用 ASPD。
                                     *        哪个是伸缩舵机按 AEXT。绕电池盒那几段伸缩还是按 A2SPD / R2SPD(它们是 0 时用这个) */
@@ -195,6 +199,8 @@ static const ArmTun tun[] =
     { "ASPD",   &g_aspd,    10.0f,   300.0f },
     { "ASPDF",  &g_aspdf,   5.0f,    150.0f },
     { "LVDEG",  &g_lvdeg,   0.0f,    120.0f },
+    { "R2STG",  &g_r2stg,   0.0f,    1.0f },
+    { "A2STG",  &g_a2stg,   0.0f,    1.0f },
     { "ROTSPD", &g_rotspd,  0.0f,    300.0f },   /* 0 = 用 ASPD；不是 0 要 >= 10(下面查) */
     { "EXTSPD", &g_extspd,  0.0f,    1500.0f },
     { "ATOLC",  &g_atolc,   0.2f,    5.0f },
@@ -1234,7 +1240,7 @@ static float A2_Spd(void)
 /* 去/离开车上转盘绕开电池盒用哪一组：t1 = 靠原料盘/圆环那头开始伸长的 ID1 角度，ext = 伸多长，t2 = 靠车上转盘那头开始缩回的角度，
  * spd = 伸缩速度。(10-20)手臂在圆环那边(g_side)、圆环那组调过(R2T 不是 0)用圆环那组，不然用原料区那组(A2T 不是 0)。
  * 返回 0 = 不绕(照旧直接转)，1 = 原料区那组，2 = 圆环那组。只在 ID2 管伸缩(AEXT=2)时绕 */
-typedef struct { float t1, ext, t2, spd; } Detour;
+typedef struct { float t1, ext, t2, spd; uint8_t stg; } Detour;
 
 static int Detour_Get(Detour *d)
 {
@@ -1242,11 +1248,13 @@ static int Detour_Get(Detour *d)
     if (g_side && Absf(g_r2t) > 0.5f)
     {
         d->t1 = g_r1t1;  d->ext = g_r2t;  d->t2 = g_r1t2;  d->spd = (g_r2spd > 0.5f) ? g_r2spd : A2_Spd();
+        d->stg = (g_r2stg > 0.5f);
         return 2;
     }
     if (Absf(g_a2t) > 0.5f)
     {
         d->t1 = g_a1t1;  d->ext = g_a2t;  d->t2 = g_a1t2;  d->spd = A2_Spd();
+        d->stg = (g_a2stg > 0.5f);
         return 1;
     }
     return 0;
@@ -1291,7 +1299,30 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2,
     return NULL;
 }
 
-/* 转到车上转盘上方，停在高度 z_end：升到最高 -> ID1 一直转到 A1D，路上转过 A1T1(R1T1) 伸到 A2T(R2T)、转过 A1T2(R1T2) 缩回 A2R -> 下降 */
+/* (10-21 用户"先转动一个角度再伸长再转动一个角度再缩回，让我自由调")分段走：ID1 只转到 p1 -> ID2 只走到 l1 -> ID1 只转到 p2
+ * -> ID2 只走到 l2 -> ID1 只转到 a1_end。每段走完才走下一段；p1、p2 是 0(没调)的那段不转。转按 ROTSPD/ASPD，伸缩按 spd2。升降不动 */
+static const char *Stages(float p1, float l1, float p2, float l2, float a1_end, float spd2)
+{
+    if (Absf(p1) > 0.5f)
+    {
+        Servo_Move(1, p1, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);
+        if (car_abort)  return NULL;
+    }
+    Servo_Move(2, l1, spd2, g_atolc, SERVO_EXTRA_MS);
+    if (car_abort)  return NULL;
+    if (Absf(p2) > 0.5f)
+    {
+        Servo_Move(1, p2, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);
+        if (car_abort)  return NULL;
+    }
+    Servo_Move(2, l2, spd2, g_atolc, SERVO_EXTRA_MS);
+    if (car_abort)  return NULL;
+    Servo_Move(1, a1_end, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);
+    return NULL;
+}
+
+/* 转到车上转盘上方，停在高度 z_end：升到最高 -> ID1 一直转到 A1D，路上转过 A1T1(R1T1) 伸到 A2T(R2T)、转过 A1T2(R1T2) 缩回 A2R -> 下降
+ * (10-21)分段走(R2STG / A2STG = 1)：只转到 T1 -> 只伸到 T -> 只转到 T2 -> 只缩回 A2R -> 只转到 A1D -> 下降 */
 static const char *Go_Tray(float z_end)
 {
     float a;
@@ -1299,6 +1330,11 @@ static const char *Go_Tray(float z_end)
 
     if (!Detour_Get(&d))  return Move_Over(g_a1d, g_a2r, 1, z_end);
     GO(Lift_Goto(g_zhi));
+    if (d.stg)
+    {
+        GO(Stages(d.t1, d.ext, d.t2, g_a2r, g_a1d, d.spd));
+        return Lift_Goto(z_end);
+    }
     if (!Servo_ReadAngle(1, &a))  a = g_a1d;
     GO(Sweep(g_a1d, (Absf(d.t1) > 0.5f) ? d.t1 : a, d.ext, (Absf(d.t2) > 0.5f) ? d.t2 : g_a1d, g_a2r, d.spd));
     return Lift_Goto(z_end);
@@ -1314,7 +1350,7 @@ static const char *Leave_Tray(float a1_to, float a2_to)
     int k = Detour_Get(&d);
 
     if (!Servo_ReadAngle(1, &a) || Absf(a - g_a1d) > 15.0f)  return NULL;
-    if (Ext_Id() == 2 && g_lvdeg > 0.5f && Absf((float)claw_now - g_clwc) < 30.0f && Absf(a1_to - a) > 1.0f)
+    if ((!k || !d.stg) && Ext_Id() == 2 && g_lvdeg > 0.5f && Absf((float)claw_now - g_clwc) < 30.0f && Absf(a1_to - a) > 1.0f)
     {
         /* (10-21 用户)夹着物料离开车上转盘：先只转 ID1 一段(伸缩不动)，离开电池盒那一块再伸缩 */
         float to = (Absf(a1_to - a) <= g_lvdeg) ? a1_to : ((a1_to > a) ? a + g_lvdeg : a - g_lvdeg);
@@ -1327,9 +1363,10 @@ static const char *Leave_Tray(float a1_to, float a2_to)
     if (!k)  return NULL;
     GO(Lift_Goto(g_zhi));
     at = (Absf(d.t2) > 0.5f) ? d.t2 : a;
-    if (k == 1)  return Sweep(a1_to, at, a2_to, at, a2_to, d.spd);
+    if (k == 1)  return d.stg ? Stages(d.t2, a2_to, 0.0f, a2_to, a1_to, d.spd) : Sweep(a1_to, at, a2_to, at, a2_to, d.spd);
     at1 = (Absf(d.t1) > 0.5f) ? d.t1 : a1_to;
     b1 = ((a2_to - g_a2r) * (d.ext - g_a2r) > 0.0f && Absf(a2_to - g_a2r) >= Absf(d.ext - g_a2r)) ? a2_to : d.ext;
+    if (d.stg)  return Stages(d.t2, b1, d.t1, a2_to, a1_to, d.spd);   /* (10-21)只转到 R1T2 -> 只伸到 R2T -> 只转到 R1T1 -> 只缩到要的长度 -> 转过去 */
     return Sweep(a1_to, at, b1, at1, a2_to, d.spd);
 }
 
@@ -2467,7 +2504,11 @@ int Arm_Command(const char *cmd, char *err, int errlen)
     {
         if (!ParseL(t[1], &id) || (id != 1 && id != 2))  FAIL("ERR ARG");
         if (!ParseF(t[2], &f))  FAIL("ERR ARG");
-        Servo_Move((uint8_t)id, f, g_aspdf, g_atol, 400);
+        {
+            float a0;                              /* (10-21 用户：arm_calib 里伸缩的速度要和比赛时一样)大动作按 ROTSPD/EXTSPD(ASPD)，小调整照旧慢 */
+            float spd = (Servo_ReadAngle((uint8_t)id, &a0) && Absf(f - a0) > 8.0f) ? Big_Spd((uint8_t)id) : g_aspdf;
+            Servo_Move((uint8_t)id, f, spd, g_atol, 400);
+        }
         SayAngle((uint8_t)id);
         return 1;
     }
@@ -2657,6 +2698,18 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         if (car_abort)  return 1;
         r = Seq_Drop(stack);
         if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- (10-21)TRAY：转到车上转盘上方(最高处，不下降)，按去车上转盘的路走(绕电池盒：分段 / 一边转一边伸缩)。调绕电池盒那几个参数时试走用 ---- */
+    if (strcmp(v, "TRAY") == 0 && n == 1)
+    {
+        r = Seq_Ready();
+        if (r)  FAIL(r);
+        r = Go_Tray(g_zhi);
+        if (r)  FAIL(r);
+        SayAngle(1);
+        SayAngle(2);
         return 1;
     }
 
