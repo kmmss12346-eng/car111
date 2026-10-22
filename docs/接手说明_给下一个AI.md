@@ -705,4 +705,12 @@ git_log.txt                ← 分支最近 120 条提交记录
   用户 10-21 12:40 发的 STM32 参数(ZHI 115、ZGRAB 85、ZDROP 95、ZPLC 0、ZOBRNG 115、A1D 237.6、A1P 49.5、A2P -985.5、R1T2 194.2、R2T -702.3、
   R1T1 163.7、R2SPD/EXTSPD 1500、ROTSPD 180、S1COMP 5、CLWC 1150、CLWO 1650、CLWOR 1700、CLWOT 1450、TTWAIT 800、SPOW 30000)在对话记录里。
   还没做 vclaw RING(日志一直提示)；用户说用 r2off 手动对偏。车上才有的配置/标定文件仍然不在仓库里(要用户发过来)。
+- **10-22 下午 用户发来电脑上的 STM32 工程(car_2027_-_zhengshiban7.zip，备份在 `car_backup/2026-10-22_STM32_全部源码/`，先读那里的 README)：**
+  arm.c 和 1ad6130 一样，hex 里有 LIFTPUSH(新 arm.c 烧了)；**main.c 还是旧的**(少了急停时舵机马上停)；**栈还是 1KB**(startup .s 和 .ioc 都是 0x400，
+  仓库 10-07 起 0x1000；htm 里最深调用 1360 字节 + 中断，超出的部分写进舵机库 malloc 用的堆)。已建议用户拷 1ad6130 的 main.c、仓库的
+  startup_stm32f407xx.s 和 car_2027.ioc(和用户的只差栈那一行)重新编译烧录，包 stm32_1022c.zip，用户还没回。
+  车上树莓派(car_backup 里的 map_config_start2_roi.json)：比赛程序和仓库 a06ca37 一样；apply_mission_config.py 是 10-12 以前的旧版(没有 _migrated)，
+  OLD_DEFAULTS 里只有 raw_track_s 还是旧的 150(新默认 40，只影响没有 rteach RAW near 时的老做法)；qr_fallback_code 还在配置里但程序不用；
+  place_order 还是 sweep(10-22 起不用)。车上才有的程序和配置/标定文件已经备份在 `car_backup/2026-10-22_树莓派*`。
+
 
