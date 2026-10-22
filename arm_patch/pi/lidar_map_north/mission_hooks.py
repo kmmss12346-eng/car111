@@ -346,8 +346,8 @@ DEFAULTS = dict(
     #   (有 vcal RING 量过的车轮和画面的对应关系时不用这个，按 ring_order 推)
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': 150.0, '2': 0.0, '3': -150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
-    place_order='sweep',                # 粗加工区/暂存区放的顺序：'sweep' = 顺路(从 sweep_from 号环那头开始，3→2→1 一路走过去)；'code' = 按任务码顺序
-    sweep_from=3,                       # 顺路从几号环开始(3 或 1)
+    # (10-22 用户"这个也要按顺序来")粗加工区/暂存区(含码垛)一律按任务码的顺序放(规则：必须按照任务码的顺序和位置放置)。
+    #   以前的 place_order='sweep'(顺路 3→2→1)去掉了：车上配置里还写着也不再用
     zone_timeout_s=None,                # 工位里一次对准最多用几秒(到了还差一点点也按 accept_mm 放，不一直磨)
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
     learn_pick=False,                   # True = 还没量过 claw_px.PICK 时，放下第一个物料后回去再拍一张量一次(要多花几秒)；默认不量，取回按圆环对准
@@ -5682,7 +5682,7 @@ class MissionHooks:
         items = self.plan.items(batch)
         placed = []
         self._zone_start('ROUGH', items)
-        for item in self._sweep([(it, it.ring) for it in items]):
+        for item in self._code_order([(it, it.ring) for it in items]):
             item = item[0]
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
@@ -5751,7 +5751,7 @@ class MissionHooks:
                 left.remove(nxt)
                 pos = pos_of(nxt)
             return out
-        return list(placed)
+        return sorted(placed, key=lambda it: int(it.index))       # (10-22)按任务码顺序取回(以前跟着放的顺序，放是顺路 3→2→1 时取回也成了 3→2→1)
 
     def _pickback_item(self, item, zone):
         cfg = self.cfg
@@ -5840,7 +5840,7 @@ class MissionHooks:
                 self.log(f'    {item.color_name} 码垛到环{ring}(下面是第一批的 {self.plan.lower_item(item).color_name})')
             todo.append((item, ring, stack))
         self._zone_start('TEMP', [it for it, _r, _s in todo])
-        for item, ring, stack in self._sweep(todo):
+        for item, ring, stack in self._code_order(todo):
             self._check_abort()
             if self.disabled:                                     # 中途出了不能继续夹放的错(见 _put_back)
                 break
@@ -5853,16 +5853,15 @@ class MissionHooks:
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在物料上方)，再挪底盘
         self._zone_back('TEMP')
 
-    def _sweep(self, todo):
-        """放的顺序。place_order='sweep'：按圆环位置顺路走(sweep_from=3：3→2→1)，底盘不来回跑；'code'：按任务码顺序。
-        todo 里每一项第 2 个是圆环号。"""
-        if str(self.cfg.get('place_order', 'sweep')).lower() != 'sweep':
-            return list(todo)
-        rev = int(self.cfg.get('sweep_from', 3) or 3) == 3
-        out = sorted(todo, key=lambda t: int(t[1]), reverse=rev)
-        if [t[1] for t in out] != [t[1] for t in todo]:
-            self.log('    顺路放：' + ' → '.join(f'环{t[1]}' for t in out))
-        return out
+    def _code_order(self, todo):
+        """(10-22 用户"这个也要按顺序来")放的顺序：按任务码的顺序(规则要求)，不再顺路 3→2→1。todo 里每一项第 2 个是圆环号。"""
+        todo = list(todo)
+        if str(self.cfg.get('place_order', 'code')).lower() == 'sweep' and not getattr(self, '_sweep_said', False):
+            self._sweep_said = True
+            self.log('    (配置里的 place_order=sweep(顺路 3→2→1)不再用：规则要求按任务码的顺序放)')
+        if len(todo) > 1:
+            self.log('    按任务码顺序放：' + ' → '.join(f'环{t[1]}' for t in todo))
+        return todo
 
     def _stack_target(self, item):
         """第二批的 item 在暂存区码垛到哪个环：第一批同色的那个物料放在暂存区的环(按记录确实放在那儿)；没有返回 None。"""

@@ -1487,7 +1487,7 @@ class ZoneFlowTests(unittest.TestCase):
         for seed in range(4):
             w = SimWorld(seed=seed, code=code, cam_deg=90.0)
             lines = []
-            h = make(w, dict(place_order='code'), log=lines.append)        # 这里测按任务码顺序(默认是顺路 3→2→1)
+            h = make(w, log=lines.append)                                  # 按任务码顺序放(10-22 起一律这样)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
             text = '\n'.join(lines)
             self.assertIn('看到 3 个圆环(认出 1、2、3 号)', text, text)
@@ -1858,7 +1858,7 @@ class TiltTests(unittest.TestCase):
         off = [f for _w, _h, _t, f in self._run(tilt, False)]
         pick = lambda fs: [e for f in fs for (z, r), e in f.items() if r in (1, 3)]
         print(f'\n  [车身斜 5°/-4°] 1、3 号环第一次测量时远近差：提前补 最大 {max(pick(on)):.1f}mm，不补 平均 {np.mean(pick(off)):.1f}mm')
-        self.assertLess(max(pick(on)), 6.0, on)                           # 顺路放(3→2→1)：最后那个环离第一次量的最远，多差一点
+        self.assertLess(max(pick(on)), 6.0, on)
         self.assertGreater(np.mean(pick(off)), 5.0, off)
 
     def test_warns_at_three_degrees_and_logs_the_angle(self):
@@ -1906,23 +1906,23 @@ class NavFlowTests(unittest.TestCase):
             print(f'\n  [提速参数 + 导航 seed {seed}] 去了 {"→".join(done)}；用时 {w.t:.0f} 秒；抓 {h.stats.grab_ok}、放 {h.stats.place_ok}')
 
 
-class SweepOrderTests(unittest.TestCase):
-    def test_places_in_one_sweep_from_ring3(self):
-        """默认顺路放：3→2→1 一路走过去，不来回跑；place_order='code' 按任务码顺序。"""
-        for seed in range(3):
+class PlaceOrderTests(unittest.TestCase):
+    def test_places_and_picks_back_in_task_code_order(self):
+        """(10-22 用户"按照任务码不应该是先放2环再放3环再放1环吗……这个也要按顺序来")规则：粗加工区、暂存区必须按任务码的顺序和位置放；
+        粗加工区按任务码顺序取回。车上配置里还写着以前的 place_order='sweep'(顺路 3→2→1)也不再用，日志说一次。"""
+        for seed, cfg in ((0, None), (1, None), (2, dict(place_order='sweep', sweep_from=3))):
             w = SimWorld(seed=seed, code='652+312+526+231', cam_deg=90.0)
             lines = []
-            h = make(w, log=lines.append)
+            h = make(w, cfg, log=lines.append)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
             text = '\n'.join(lines)
-            self.assertEqual([p[1] for p in w.placed if p[0] == 'ROUGH'], [3, 2, 1], text)
-            self.assertEqual([p[1] for p in w.placed if p[0] == 'TEMP'], [3, 2, 1], text)
-            self.assertIn('顺路放：环3 → 环2 → 环1', text)
+            self.assertEqual([p[1] for p in w.placed if p[0] == 'ROUGH'], [3, 1, 2], text)     # 第一批 6->环3、5->环1、2->环2
+            self.assertEqual([p[1] for p in w.placed if p[0] == 'TEMP'], [3, 1, 2], text)
+            self.assertEqual([r for r in w.requests if r.startswith('PICK')][:3], ['PICK 1 H', 'PICK 2 H', 'PICK 3 H'], text)
+            self.assertIn('按任务码顺序放：环3 → 环1 → 环2', text)
+            self.assertNotIn('顺路放', text)
+            self.assertEqual('不再用' in text, cfg is not None, text[-2000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
-        w = SimWorld(seed=0, code='652+312+526+231', cam_deg=90.0)
-        h = make(w, dict(place_order='code'))
-        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
-        self.assertEqual([p[1] for p in w.placed], [3, 1, 2])
 
 
 WHEELS_ALIGN = dict(RAW='wheels', ROUGH='wheels', TEMP='wheels')
