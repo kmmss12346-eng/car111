@@ -1,0 +1,1108 @@
+"""摄像头闭环对准（视觉伺服）。
+
+要解决的问题：摄像头跟着手臂一起转、一起升降，画面的方向和比例会变，而且物料要放到 ±1.5mm(1 环)才拿满分。
+所以不"看一次、算一次、动一次"，而是边看边修：
+
+    测偏差 p = 目标像素 - 爪子像素  →  换成动作量  →  动 ID1/ID2(精调) 或底盘(大偏差)  →  等稳  →  再测  →  直到够小
+
+不需要事先知道摄像头朝哪、每毫米多少像素、ID1 的减速比。程序自己测出"动作量 ↔ 画面移动量"的对应关系(雅可比矩阵 J)：
+  J_arm  每个单位动作(ID2 转 1°、ID1 转 1°)，目标在画面里移动多少像素
+  J_ch   每个单位动作(底盘横移 S 1mm、前进 F 1mm)，目标在画面里移动多少像素
+第一次用(或发现对不上)时先做几个小动作测出来(探测)，存进文件，下次直接用；每次修正后还会用实际移动量在线微调(Broyden 更新)。
+
+保护：
+  - 误差变大(发散)就丢掉这组 J 重新探测，再不行就放弃，不盲动。一次测量跳一下(噪声)不算：先再测一次，还是变大才算发散；
+    丢掉的 J 只在这次运行里不用(内存里)，不从 servo_cal.json 里删(比赛中一次误判不会把 vcal 测好的 J 弄没)
+  - 手臂相对观察姿态的总偏移有上限，超了就改用底盘
+  - 每步动作量有上限；总时间有上限
+
+只动车轮(wheels_only，10-12 起比赛默认)：手臂停在观察姿态一下都不动，按底盘的 J 解出横移、前后一起修(见 _run_wheels)。
+"""
+import json
+import math
+import os
+import time
+
+import numpy as np
+
+
+class ServoError(Exception):
+    pass
+
+
+DEFAULTS = dict(
+    max_iter=6,                 # 最多修正几次
+    timeout_s=10.0,             # 一次对准最多用多少秒(不算探测 J 的时间：那是一次性的校准)
+    gain_arm=0.85,              # 手臂每次修正掉多少比例的偏差(<1 留余量，防止过冲)
+    gain_ch=0.8,                # 底盘
+    settle_arm_s=0.20,          # 手臂动完等多久再拍(摄像头在手臂上，要等它不抖)
+    settle_ch_s=0.35,           # 底盘动完等多久
+    arm_limit_deg=dict(id2=250.0, id1=12.0),    # 手臂相对开始对准时的姿态，最多再偏多少度(ID2 约 0.175mm/度：250° ≈ 伸缩 ±44mm，车离圆环远一点近一点都靠它补)
+    step_limit_deg=dict(id2=150.0, id1=4.0),    # 手臂每次最多动多少度(ID2 150° ≈ 伸缩 26mm：车离圆环远近差 2cm 也一次修到)
+    min_step_deg=dict(id2=0.35, id1=0.35),      # 舵机比这小的一步动不了(STM32 的到位误差 ATOL=0.3°)：小于它的一步要么放大到它，要么不动
+    chassis_step_max_mm=60.0,   # 底盘每次最多动多少毫米
+    chassis_min_mm=6.0,         # 偏差小于这个就不动底盘(底盘只能到几毫米精度)
+    arm_cover_mm=18.0,          # 偏差大于这个，并且允许动底盘，就先用底盘
+    probe_min_px=14.0,          # 探测时画面至少要移动这么多像素才算测准
+    probe_start_deg=dict(id2=15.0, id1=1.5),    # 探测时手臂先动多少度(不够会自动加大)
+    probe_chassis_mm=12.0,      # 探测时底盘先动多少毫米
+    probe_max_scale=6.0,
+    diverge_ratio=1.4,          # 这次误差比上次大这么多倍就认为发散
+    confirm=True,               # 误差够小时再测一次确认
+    confirm_skip=0.6,           # 偏差不到容差的这么多倍(明显在容差里)就不用再测一次确认了
+    near_avg=1.3,               # 偏差比容差大、但在容差的这么多倍以内：先再测一次取平均再决定动不动(差一点点超出容差时不去追测量噪声)
+    broyden_min_px=6.0,         # 预计移动超过这么多像素才用来在线修正 J
+    broyden_gain=0.5,
+    broyden_max_rel=0.5,        # 实际移动和预计差太多(比如原料盘自己在转)就不拿来修正 J
+    max_cond=40.0,              # J 的条件数超过这个说明两个轴在画面里几乎平行，没法解
+    max_cond_arm=6.0,           # (10-18)手臂 J 两列各自归一化以后的条件数超过这个(两个方向夹角不到约 19°)才算平行：ID1、ID2 每度动的距离差几十倍，不能直接比
+    chassis_axes='SF',          # 底盘能动哪几个方向：'SF' = 横移和前后；'F' = 只前后；
+                                #   'Fs' = 前后随便挪，横移(靠近/远离目标)只在手臂伸缩够不着时用，而且只挪够不着的那一段(粗加工区/暂存区)
+    strafe_margin=0.2,          # 'Fs' 横移时给手臂伸缩留的余量(行程上限的比例)：横移到手臂伸缩还剩这么多余量就够了，不多挪
+    chassis_fix_max_mm=None,    # 一次对准里底盘最多累计前后挪多少毫米，超过就停下(多半是认错了目标)；None = 不限
+    # 先动车轮('F' / 'Fs'，工位里)：沿圆环那一排的偏差先让车轮前后小步慢慢挪，剩下不到 wheels_min_mm 才动手臂；离圆环远近还是手臂伸缩
+    wheels_first=False,
+    wheels_min_mm=1.5,          # 沿那一排的偏差比这个小就不再动车轮(车轮只能按整毫米挪)，交给手臂
+    wheels_step_mm=15.0,        # 车轮每次最多挪多少毫米(小步)
+    wheels_rpm=None,            # 车轮小步挪的速度(转/分)；None = 用 chassis_fine_rpm
+    # 测量滤波：把每次测到的偏差和"按刚才的动作推算的偏差"合在一起(相当于多次测量取平均)，不去追一次测量的噪声
+    filter=False,
+    meas_sigma_px=0.8,          # 一次测量的噪声(像素)的初始估计；同一个位置连着测两次时自动更新
+    filter_gate=12.0,           # 测到的和推算的差得太多(J 不准、目标动了)：只信这次测的，重新开始
+    # 只动车轮(10-12 用户："每个任务点都通过微调轮子对准，不要调机械臂了，太慢了")：手臂一直停在观察姿态不动，
+    # 每次按底盘的 J(横移 S、前后 F 两列)解出 S、F 一起修(整毫米)。run(wheels_only=True) 或这里设 True 打开
+    wheels_only=False,
+    wheels_only_step_max_mm=30.0,   # 每步最多挪多少毫米(S、F 按比例一起缩，方向不变)
+    wheels_only_rpm=60,             # 车轮挪的速度(转/分)：≤ STM32 的 PSPD(60) 时用它的精确模式(柔和加减速、最后 1mm 慢慢爬、走完量车头)；
+                                    #   None = 底盘微调的默认速度(mission 的 chassis_fine_rpm)
+    wheels_only_settle_s=0.2,       # 车轮挪完等多久再拍
+    wheels_only_tol_mm=2.0,         # 容差下限：车轮按整毫米走，比这个更准做不到(run 给的 tol_mm 更小时按这个)
+    wheels_only_gain=1.0,           # 每步修掉偏差的多少(车轮按位置走，不会过冲：一下修到位)
+    wheels_only_max_iter=4,         # 最多挪几次(run 没给 max_iter 时)
+    wheels_only_min_mm=1.0,         # 某个方向要挪的不到这么多就这次不挪这个方向(车轮走不了这么小)
+    wheels_only_cmd_s=1.2,          # 一条 S/F 指令连等稳大约要多久(秒)：剩下的时间(timeout_s)不够走完这一步就不挪了(原料盘停的时间有限)
+)
+
+
+def _merge(base, extra):
+    out = {}
+    for k, v in base.items():
+        out[k] = dict(v) if isinstance(v, dict) else v
+    for k, v in (extra or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k].update(v)
+        else:
+            out[k] = v
+    return out
+
+
+class Result:
+    def __init__(self, ok, err_mm, iters, p, reason='', elapsed=0.0, history=None, used_chassis=False, probed=False):
+        self.ok = ok
+        self.err_mm = err_mm
+        self.iters = iters
+        self.p = p
+        self.reason = reason
+        self.elapsed = elapsed
+        self.history = history or []
+        self.used_chassis = used_chassis
+        self.probed = probed
+
+    def __repr__(self):
+        return (f'Result(ok={self.ok}, err={self.err_mm:.2f}mm, iters={self.iters}, '
+                f'{self.elapsed:.1f}s{", probed" if self.probed else ""}{", chassis" if self.used_chassis else ""}'
+                f'{", " + self.reason if self.reason else ""})')
+
+
+class JacStore:
+    """把测出来的 J 存成 json，下次启动直接用。键：(kind, group)，kind='RAW'/'RING'，group='arm'/'ch'。
+    suspend：这次运行里先不用这组 J(发散过)，但不从文件里删；下次 put 新的 J(对准成功、重新探测)就恢复正常。"""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.data = {}
+        self.dirty = False
+        self.suspended = set()          # (kind, group)：这次运行里先不用(只在内存里，不存进文件)
+        if path and os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    self.data = json.load(f)
+            except Exception:
+                self.data = {}
+
+    def get(self, kind, group):
+        if (kind, group) in self.suspended:
+            return None
+        v = (self.data.get(kind) or {}).get(group)
+        if not v:
+            return None
+        try:
+            a = np.array(v, float)
+            return a if a.shape == (2, 2) and np.all(np.isfinite(a)) else None
+        except Exception:
+            return None
+
+    def put(self, kind, group, J):
+        self.data.setdefault(kind, {})[group] = [[float(x) for x in row] for row in np.asarray(J)]
+        self.suspended.discard((kind, group))
+        self.dirty = True
+
+    def drop(self, kind, group):
+        """真的删掉(存文件时也没了)：只给用户的命令用(vcal、vclaw PICK)，对准过程中用 suspend。"""
+        self.suspended.discard((kind, group))
+        if kind in self.data and group in self.data[kind]:
+            del self.data[kind][group]
+            self.dirty = True
+        if group == 'ch':
+            self.set_synth(kind, False)
+
+    def suspend(self, kind, group):
+        """这次运行里先不用这组 J(发散了、可能不对)：get 返回 None，下次对准重新探测；文件里的不动。"""
+        self.suspended.add((kind, group))
+
+    def extra(self, kind, key):
+        """这个 kind 下面存的别的值(比如 RING 的 ch_f_ref)；没有返回 None。"""
+        return (self.data.get(kind) or {}).get(key)
+
+    def set_extra(self, kind, key, value):
+        d = self.data.setdefault(kind, {})
+        if d.get(key) != value:
+            d[key] = value
+            self.dirty = True
+
+    def synth(self, kind):
+        """这个 kind 的底盘 J 只测过前后(F)，横移(S)那一列是补出来的：要横移时得重新测。"""
+        return bool((self.data.get(kind) or {}).get('ch_s_synth'))
+
+    def set_synth(self, kind, flag):
+        d = self.data.get(kind)
+        if flag:
+            if d is None:
+                d = self.data.setdefault(kind, {})
+            if not d.get('ch_s_synth'):
+                d['ch_s_synth'] = True
+                self.dirty = True
+        elif d is not None and 'ch_s_synth' in d:
+            del d['ch_s_synth']
+            self.dirty = True
+
+    def save(self):
+        if not self.path or not self.dirty:
+            return
+        try:
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except Exception:
+            pass
+
+
+def _norm(v):
+    return float(np.linalg.norm(v))
+
+
+class VisualServo:
+    """act 要提供：
+         arm_move(d_id2_deg, d_id1_deg) -> (实际 ID2 动了多少度, 实际 ID1 动了多少度) 或 None(=按给的动了)
+         chassis_move(s_mm, f_mm)       S 向左为正，F 向前为正
+    """
+
+    def __init__(self, act, store=None, cfg=None, log=print, sleep=time.sleep, clock=time.monotonic):
+        self.act = act
+        self.store = store if store is not None else JacStore(None)
+        self.cfg = _merge(DEFAULTS, cfg)
+        self.log = log
+        self.sleep = sleep
+        self.clock = clock
+        self.dev = np.zeros(2)          # 手臂 [ID2, ID1] 相对开始对准时的偏移(度)
+        self._axes = None               # 这一次对准底盘能动的方向(run 里设，结束清掉)
+        self._ch_synth = False          # 现在的底盘 J 的横移那一列是不是补出来的(只测过前后)
+        self._need_s = False            # 'Fs'：这一步手臂伸缩够不着，要横移
+        self._s_frac = 1.0              # 'Fs'：横移只挪够不着的那一段(占整段的比例)
+        self._s_range = None            # 这次对准横移累计允许的范围 (下限, 上限) 毫米；None = 不限
+        self._s_used = 0.0              # 这次对准已经横移了多少毫米
+        self._s_clipped = False         # 横移被范围卡住过
+        self._wheels = False            # 这次对准先动车轮(run 里设)
+        self._rpm = None                # 这次对准车轮小步挪的速度
+        self._flt = False               # 这次对准用测量滤波
+        self._arm_range = {}            # 这次对准手臂能偏的范围(相对开始时，度)：{'id2': (下限, 上限)}；没给的轴按 ±arm_limit_deg
+        self.meas_var = {}              # kind -> 一次测量的噪声方差(像素²，每个方向)：同一个位置连着测两次时更新
+
+    # ------------------------------------------------------------------ 测量
+    def _measure(self, measure, tries=3):
+        for _ in range(tries):
+            p = measure()
+            if p is not None:
+                return np.array(p, float)
+            self.sleep(0.1)
+        raise ServoError('看不到目标')
+
+    # ------------------------------------------------------------------ 手臂 / 底盘动作
+    def _range(self, i):
+        """手臂第 i 个轴(0 = ID2，1 = ID1)这次对准能偏的范围 (下限, 上限)，相对开始对准时的角度(度)。"""
+        key = ('id2', 'id1')[i]
+        r = (getattr(self, '_arm_range', None) or {}).get(key)
+        if r is not None:
+            return float(r[0]), float(r[1])
+        lim = float(self.cfg['arm_limit_deg'][key])
+        return -lim, lim
+
+    def _clip_arm(self, du):
+        """按每步上限和总偏移上限裁剪。返回 (裁剪后的 du, 是否被明显裁剪)。"""
+        c = self.cfg
+        out = np.array(du, float)
+        sat = False
+        for i, key in enumerate(('id2', 'id1')):
+            want = out[i]
+            step = c['step_limit_deg'][key]
+            lo, hi = self._range(i)
+            v = max(-step, min(step, want))
+            v = max(lo - self.dev[i], min(hi - self.dev[i], v))
+            if abs(want) > 1e-9 and abs(want - v) > 0.3 * abs(want):
+                sat = True
+            out[i] = v
+        return out, sat
+
+    def _min_step(self, J, p, du):
+        """太小的一步舵机动不了：放大到 min_step 能让偏差更小就放大，否则这个轴这次不动。"""
+        out = np.array(du, float)
+        for i, key in enumerate(('id2', 'id1')):
+            m = float(self.cfg['min_step_deg'].get(key, 0.0))
+            if m <= 0 or abs(out[i]) < 1e-9 or abs(out[i]) >= m:
+                continue
+            big = out.copy()
+            big[i] = math.copysign(m, out[i])
+            zero = out.copy()
+            zero[i] = 0.0
+            out = big if _norm(p + J @ big) < _norm(p + J @ zero) else zero
+        return out
+
+    def _apply_arm(self, du):
+        du, sat = self._clip_arm(du)
+        if _norm(du) < 1e-6:
+            return du, sat
+        got = self.act.arm_move(float(du[0]), float(du[1]))
+        applied = np.array(got if got is not None else du, float)
+        self.dev += applied
+        self.sleep(self.cfg['settle_arm_s'])
+        return applied, sat
+
+    def _mode(self):
+        m = str(getattr(self, '_axes', None) or self.cfg.get('chassis_axes') or 'SF')
+        if m.upper() == 'F':
+            return 'F'
+        if m == 'Fs' or m.upper() == 'F+S':
+            return 'Fs'
+        return 'SF'
+
+    def _f_only(self):
+        """这一步底盘只能前后挪：'F'；或者 'Fs' 而这一步不需要横移。"""
+        return self._mode() != 'SF' and not self._need_s
+
+    def _ch_cmd(self, Jc, p):
+        """底盘这一步怎么动 (S, F)。只许前后动时：只用 J 的 F 那一列，按最小二乘算前后挪多少(横向的偏差留给手臂)。"""
+        c = self.cfg
+        if self._f_only():
+            jf = np.asarray(Jc, float)[:, 1]
+            n2 = float(jf @ jf)
+            if n2 < 1e-12:
+                return 0.0, 0.0
+            f = float(-c['gain_ch'] * float(jf @ p) / n2)
+            if self._wheels:                                 # 先动车轮：小步(每次最多 wheels_step_mm)
+                m = float(c.get('wheels_step_mm') or 15.0)
+                f = max(-m, min(m, f))
+            return 0.0, f
+        sf = -c['gain_ch'] * np.linalg.solve(Jc, p)
+        if self._need_s:
+            return float(sf[0]) * self._s_frac, float(sf[1])      # 只横移手臂伸缩够不着的那一段
+        return float(sf[0]), float(sf[1])
+
+    def _apply_chassis(self, s_mm, f_mm):
+        c = self.cfg
+        if self._f_only():
+            s_mm = 0.0                                   # 不横移
+        elif self._s_range is not None:                  # 横移累计不超过允许的范围(不压进工位)
+            lo, hi = self._s_range
+            s_cl = max(lo - self._s_used, min(hi - self._s_used, s_mm))
+            if abs(s_cl - s_mm) > 0.5:
+                self._s_clipped = True
+            s_mm = s_cl
+        s_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], s_mm))
+        f_mm = max(-c['chassis_step_max_mm'], min(c['chassis_step_max_mm'], f_mm))
+        s_mm, f_mm = float(round(s_mm)), float(round(f_mm))      # STM32 的 S/F 只收整数毫米
+        if s_mm == 0 and f_mm == 0:
+            return np.zeros(2)
+        self._s_used += s_mm
+        if self._rpm:
+            self.act.chassis_move(s_mm, f_mm, speed=self._rpm)
+        else:
+            self.act.chassis_move(s_mm, f_mm)
+        self.sleep(c['settle_ch_s'])
+        return np.array([s_mm, f_mm])
+
+    # ------------------------------------------------------------------ 探测雅可比
+    def _margin(self, p, bounds):
+        """目标离画面边缘还有多远(像素)。bounds = ((p 的下限 u, v), (p 的上限 u, v))；没给返回 None。"""
+        if bounds is None:
+            return None
+        (u0, v0), (u1, v1) = bounds
+        return float(min(p[0] - u0, u1 - p[0], p[1] - v0, v1 - p[1]))
+
+    def _probe(self, measure, group, bounds=None):
+        """小动作测出 J。返回 2x2：第 0 列 = ID2(或 S)，第 1 列 = ID1(或 F)。
+        目标离画面边缘近时用更小的探测步长(只要画面移动够测准就行)，保证探测时目标不会出画面。"""
+        c = self.cfg
+        last = self._measure(measure)           # 每个轴的基准都是"上一次测到的位置"，不会把前一个轴造成的位移算进去
+        min_px = c['probe_min_px']
+        margin = self._margin(last, bounds)
+        if margin is not None:
+            min_px = max(5.0, min(min_px, 0.45 * margin))
+        shrink = min_px / c['probe_min_px']
+        J = np.zeros((2, 2))
+        names = ('ID2', 'ID1') if group == 'arm' else ('S', 'F')
+        f_only = group != 'arm' and self._f_only()
+        for axis in ((1,) if f_only else (0, 1)):
+            if group == 'arm':
+                key = 'id2' if axis == 0 else 'id1'
+                step = c['probe_start_deg'][key] * shrink
+                lo, hi = self._range(axis)
+                sign = -1.0 if self.dev[axis] - (lo + hi) / 2.0 > 0.25 * (hi - lo) else 1.0   # 已经偏到一边：往另一边探
+            else:
+                step = c['probe_chassis_mm'] * shrink
+                sign = 1.0
+            base = last
+            moved = 0.0
+            cur = base
+            flipped = False
+            for _ in range(5):
+                if group == 'arm':
+                    du = np.zeros(2)
+                    du[axis] = sign * step
+                    applied, _sat = self._apply_arm(du)
+                    got = float(applied[axis])
+                else:
+                    ap = self._apply_chassis(sign * step if axis == 0 else 0.0, sign * step if axis == 1 else 0.0)
+                    got = float(ap[axis])
+                if abs(got) < 1e-9:
+                    break
+                moved += got
+                try:
+                    cur = self._measure(measure)
+                except ServoError:
+                    # 动了以后目标跑出了画面：撤销这一步，换相反方向、一半步长再试(只试一次)
+                    if flipped:
+                        raise
+                    flipped = True
+                    if group == 'arm':
+                        back = np.zeros(2)
+                        back[axis] = -moved
+                        self._apply_arm(back)
+                    else:
+                        self._apply_chassis(-moved if axis == 0 else 0.0, -moved if axis == 1 else 0.0)
+                    moved = 0.0
+                    sign = -sign
+                    step *= 0.5
+                    try:
+                        cur = self._measure(measure)
+                    except ServoError:
+                        raise ServoError('探测时目标出了画面，撤销后也找不回来：目标太靠近画面边缘，先手动把目标放到画面中间附近再 vcal')
+                    continue
+                if _norm(cur - base) >= min_px:
+                    break
+                scale = min(c['probe_max_scale'], max(1.5, min_px * 1.6 / max(_norm(cur - base), 1.0)))
+                step *= scale
+            dp = cur - base
+            if abs(moved) < 1e-9 or _norm(dp) < 0.4 * min_px:
+                raise ServoError(f'探测失败：动 {names[axis]} 画面几乎没变化(移动 {_norm(dp):.1f}px)，'
+                                 '检查摄像头有没有拍到目标、手臂/底盘是否真的动了')
+            J[:, axis] = dp / moved
+            last = cur
+        if f_only:
+            J[:, 0] = (-J[1, 1], J[0, 1])                 # 不横移：S 那一列用不到，按"和 F 垂直、一样大"补上(只为了 J 能求逆)
+        if group != 'arm':
+            self._ch_synth = f_only
+        if group == 'arm':
+            # 10-18 实车：ID2 每度只伸缩零点几毫米、ID1 每度转好几毫米，两列大小差几十倍，直接算条件数会把互相垂直的两列也当成"平行"。
+            # 两列各自除以自己的大小以后再算(只看方向的夹角)
+            nrm = np.linalg.norm(J, axis=0)
+            cond = float(np.linalg.cond(J / nrm)) if np.all(nrm > 1e-12) else float('inf')
+            lim = float(c.get('max_cond_arm', 6.0))
+        else:
+            cond = float(np.linalg.cond(J))
+            lim = float(c['max_cond'])
+        if not np.isfinite(cond) or cond > lim:
+            n0, n1 = float(np.linalg.norm(J[:, 0])), float(np.linalg.norm(J[:, 1]))
+            cos = abs(float(J[:, 0] @ J[:, 1])) / max(n0 * n1, 1e-12)
+            raise ServoError(f'探测失败：{names[0]} 和 {names[1]} 在画面里的移动方向几乎平行(夹角 {math.degrees(math.acos(min(1.0, cos))):.0f}°，'
+                             f'条件数 {cond:.0f}；J=[{J[0, 0]:+.3f} {J[0, 1]:+.3f}; {J[1, 0]:+.3f} {J[1, 1]:+.3f}] 像素/单位)')
+        self.log(f'    探测 {group}：J=[{J[0, 0]:+.3f} {J[0, 1]:+.3f}; {J[1, 0]:+.3f} {J[1, 1]:+.3f}] 像素/单位')
+        return J
+
+    # ------------------------------------------------------------------ 主循环
+    def _short(self, need, i):
+        """手臂第 i 个轴(0 = ID2，1 = ID1)要再转 need 度：超出这次对准的总行程吗？超出返回超出了多少度，没超出返回 0。"""
+        lo, hi = self._range(i)
+        x = float(self.dev[i]) + float(need)
+        return max(0.0, x - hi, lo - x)
+
+    def _decide(self, J, p, e, allow_chassis):
+        """这一次用手臂还是底盘。偏差大、或者手臂这一步够不着(超出行程)就用底盘；其余用手臂(精度高)。
+        'F' / 'Fs'(工位里)：底盘前后挪只管沿圆环那一排的偏差；横向(离圆环远近)靠手臂伸缩，
+        'Fs' 时手臂伸缩到头还够不着，才让车轮横着挪(只挪够不着的那一段)。"""
+        c = self.cfg
+        self._need_s = False
+        if not allow_chassis:
+            return 'arm'
+        small = e < c['chassis_min_mm'] and not self._wheels       # 偏差小：一般只动手臂(底盘只能到几毫米精度)
+        mode = self._mode()
+        if small and mode != 'Fs':
+            return 'arm'
+        if mode != 'SF' and J['ch'] is not None:
+            jf = np.asarray(J['ch'], float)[:, 1]
+            along = e * abs(float(jf @ p)) / max(_norm(jf) * _norm(p), 1e-9)   # 偏差里沿着"底盘前后"方向的那一段(毫米)
+            sat_a = short_r = False
+            if J['arm'] is not None:
+                Ja = np.asarray(J['arm'], float)
+                need = -np.linalg.solve(Ja, p)                      # 手臂要再转多少度才对准(不打折)
+                want = c['gain_arm'] * need
+                got, _sat = self._clip_arm(want)
+                ju = jf / max(_norm(jf), 1e-9)
+                ia = int(np.argmax([abs(float(Ja[:, i] @ ju)) / max(_norm(Ja[:, i]), 1e-9) for i in (0, 1)]))
+                ir = 1 - ia                                         # 沿圆环那一排动的舵机(一般 ID1) / 管远近的舵机(一般 ID2)
+                sat_a = abs(want[ia]) > 1e-9 and abs(want[ia] - got[ia]) > 0.3 * abs(want[ia])
+                if mode == 'Fs':
+                    over = self._short(need[ir], ir)
+                    if over > 0:                                    # 远近差得多，手臂伸缩到头也够不着
+                        lim = float(c['arm_limit_deg'][('id2', 'id1')[ir]])
+                        keep = float(c.get('strafe_margin', 0.2)) * lim
+                        self._s_frac = min(1.0, (over + keep) / max(abs(float(need[ir])), 1e-9))
+                        short_r = True
+            if short_r:
+                self._need_s = True                              # 车轮横着挪(靠近/远离)，只挪手臂够不着的那一段
+                return 'ch'                                      # (偏差小也挪：手臂伸缩已经到头，不挪就一直卡在这里)
+            if small:
+                return 'arm'
+            if self._wheels:
+                # 先动车轮：沿圆环那一排还差 wheels_min_mm 以上就让车轮前后小步挪；剩下的(和离圆环的远近)交给手臂
+                return 'ch' if along >= float(c.get('wheels_min_mm') or 1.5) else 'arm'
+            if along < c['chassis_min_mm']:
+                return 'arm'                             # 主要是横向的偏差：手臂伸缩够得着
+            if along > c['arm_cover_mm'] or sat_a:
+                return 'ch'                              # 沿着圆环那一排差得多(或者沿这一排的舵机够不着)：底盘前后挪
+            return 'arm'
+        if small:
+            return 'arm'
+        if e > c['arm_cover_mm']:
+            return 'ch'
+        if J['arm'] is not None:
+            _du, sat = self._clip_arm(-c['gain_arm'] * np.linalg.solve(J['arm'], p))
+            if sat:
+                return 'ch'
+        return 'arm'
+
+    def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
+            bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False,
+            gain_arm=None, near_avg=None, wheels_first=None, filt=None, arm_range=None,
+            wheels_only=None, chassis_f_range=None, gain_ch=None, probe_s=True):
+        """对准(见 _run)。
+        wheels_only = True：只动车轮(见 _run_wheels)，手臂一下都不动；None = 用配置里的 wheels_only。
+        这时 chassis_s_range / chassis_f_range = 横移 / 前后累计允许的范围(毫米，相对开始时)，chassis_fix_max_mm = 前后累计最多走多少，
+        gain_ch = 只这一次的每步修正比例，probe_s = 存着的底盘 J 横移那一列是补出来的(只测过前后)时，先横移一小步实测一次(fixed_j 时也测)。
+        chassis_axes / chassis_s_range 只管这一次：结束后恢复(vcal 之类单独探测时不受影响)。
+        chassis_s_range = (下限, 上限)：这次对准车轮横移累计允许的范围(毫米，相对开始时的位置)；None = 不限。
+        fixed_j = True：只用存好的 J——不探测、不丢、不改存着的 J；误差变大就直接停(原料盘停下的几秒钟里对准用：
+        万一转盘中途转起来，测到的移动是乱的，不能拿来改 J)。
+        gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。
+        wheels_first / filt：只这一次 先动车轮(只在 'F'/'Fs' 时有用) / 测量滤波；None = 用配置里的。
+        arm_range = {'id2': (下限, 上限)}：这次手臂能偏的范围(相对开始对准时的角度)；开始前手臂已经提前伸缩过时，
+        按机构的行程算还能往哪边偏多少(不然会按 ±arm_limit_deg 以为还能伸，顶到头)。没给的轴按 ±arm_limit_deg。"""
+        if self.cfg.get('wheels_only') if wheels_only is None else wheels_only:
+            self._fixed = bool(fixed_j)
+            saved = {'near_avg': self.cfg.get('near_avg')} if near_avg is not None else {}
+            if near_avg is not None:
+                self.cfg['near_avg'] = near_avg
+            try:
+                fix_max = chassis_fix_max_mm if chassis_fix_max_mm is not None else self.cfg.get('chassis_fix_max_mm')
+                return self._run_wheels(kind, measure, scale_px_per_mm, tol_mm, max_iter, timeout_s, label, bounds, confirm,
+                                        fix_max, chassis_s_range, chassis_f_range, gain_ch, probe_s)
+            finally:
+                self._fixed = False
+                self.cfg.update(saved)
+        self._fixed = bool(fixed_j)
+        self._wheels = bool(self.cfg.get('wheels_first') if wheels_first is None else wheels_first) and \
+            str(chassis_axes or self.cfg.get('chassis_axes') or 'SF') != 'SF'
+        self._rpm = (self.cfg.get('wheels_rpm') or None) if self._wheels else None
+        self._flt = bool(self.cfg.get('filter') if filt is None else filt)
+        saved = {}
+        for k, val in (('gain_arm', gain_arm), ('near_avg', near_avg)):
+            if val is not None:
+                saved[k] = self.cfg.get(k)
+                self.cfg[k] = val
+        self._axes = chassis_axes or self.cfg.get('chassis_axes') or 'SF'
+        self._s_range = tuple(chassis_s_range) if chassis_s_range is not None else None
+        self._arm_range = dict(arm_range or {})
+        self._s_used = 0.0
+        self._s_clipped = False
+        self._need_s = False
+        try:
+            return self._run(kind, measure, scale_px_per_mm, tol_mm, allow_chassis, max_iter, timeout_s, label, bounds, confirm,
+                             chassis_fix_max_mm)
+        finally:
+            self._axes = None
+            self._s_range = None
+            self._need_s = False
+            self._fixed = False
+            self._wheels = False
+            self._rpm = None
+            self._flt = False
+            self._arm_range = {}
+            self.cfg.update(saved)
+
+    def _run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
+             bounds=None, confirm=None, chassis_fix_max_mm=None):
+        """对准。measure() 返回 (du, dv) = 目标像素 - 爪子像素；看不到返回 None。返回 Result。
+
+        kind          'RAW'(原料盘上的物料) 或 'RING'(地上的圆环)；J 按它分开存
+        scale_px_per_mm  这个高度下每毫米多少像素(只用来把像素换成毫米判断容差)
+        tol_mm        偏差小于它就算对准
+        allow_chassis 偏差大、手臂够不着时允许动底盘
+        bounds        画面范围换算成 p 的上下限 ((u 下限, v 下限), (u 上限, v 上限))，用来在目标靠近画面边缘时缩小探测步长
+        confirm       达标后是否再测一次确认；None=用配置里的 confirm。对精度要求不高的(夹原料、取回)可以关掉省时间
+        chassis_axes  这次底盘能动的方向('SF' / 'F' / 'Fs')；None = 用配置里的
+        chassis_fix_max_mm  这次对准底盘最多累计前后挪多少毫米(横移另有 chassis_s_range)；None = 用配置里的
+
+        测量滤波(filter)：每动一下，先按 J 推算偏差该变成多少，再和这次测到的按各自的可信程度合起来；
+        离目标近、动得少的时候推算很准，几次测量的噪声就被平均掉了，不会每次都按一次测量的噪声去动。
+        测到的和推算的差得太多(J 不准、目标自己动了)就只信这次测的。
+        """
+        c = self.cfg
+        fix_max = chassis_fix_max_mm if chassis_fix_max_mm is not None else c.get('chassis_fix_max_mm')
+        ch_moved = [0.0]                # 这次对准底盘累计挪了多少毫米
+        max_iter = int(max_iter or c['max_iter'])
+        timeout = float(timeout_s or c['timeout_s'])
+        do_confirm = c['confirm'] if confirm is None else bool(confirm)
+        t0 = self.clock()
+        t_probe = [0.0]                 # 探测 J 用了多久(一次性的校准，不算进对准超时)
+        self.dev = np.zeros(2)
+        J = {g: self.store.get(kind, g) for g in ('arm', 'ch')}
+        self._ch_synth = J['ch'] is not None and self.store.synth(kind)
+        if self._ch_synth and allow_chassis and not self._f_only():
+            J['ch'] = None                  # 存着的底盘 J 只测过前后，这次要横移：重新探测
+            self._ch_synth = False
+        used_ch = False
+        probed = False
+        hist = []
+        moves = 0
+        passes = 0
+        bad = 0
+        reprobes = 0
+        prev_e = None
+        confirmed = False
+        tag = f'[{label or kind}]'
+        p = np.zeros(2)
+        e = float('inf')
+        fresh = [False]                 # p 是不是最后一次动作以后测的(动了以后没测到 = 不知道现在偏多少)
+        avg = [False]                   # 这个位置已经测过两次取了平均
+        stalls = 0
+        rechecked = False               # 这一步之后偏差一下变大了，已经再测过一次
+        flt = bool(self._flt)
+        if flt and kind not in self.meas_var:
+            self.meas_var[kind] = float(c.get('meas_sigma_px') or 0.8) ** 2
+        # 滤波状态：est = 估计的偏差(像素)，var = 它的方差(每个方向)；pred = 上次测量以后按动作推算偏差变了多少(None = 不知道，下次只信测量)
+        fs = dict(est=None, var=0.0, pred=None, q=0.0, raw=None, still=False)
+        q_still = 0.15 ** 2             # 没动时两次测量之间可能的漂移(像素²)
+
+        def meas():
+            z = self._measure(measure)
+            fresh[0] = True
+            if not flt:
+                return z
+            R = self.meas_var[kind]
+            if fs['still'] and fs['raw'] is not None:
+                # 同一个位置连着测了两次：两次之差 = 测量噪声，更新噪声估计
+                smp = float((z - fs['raw']) @ (z - fs['raw'])) / 4.0
+                R = self.meas_var[kind] = min(25.0, max(0.04, 0.75 * R + 0.25 * smp))
+            pred = fs['pred']
+            if fs['est'] is None or pred is None:
+                fs['est'], fs['var'] = z.copy(), R
+            else:
+                prior = fs['est'] + pred
+                P = fs['var'] + fs['q']
+                S = P + R
+                nu = z - prior
+                if float(nu @ nu) > float(c.get('filter_gate') or 12.0) * S:
+                    fs['est'], fs['var'] = z.copy(), R       # 和推算的差太多：只信这次测的
+                else:
+                    K = P / S
+                    fs['est'] = prior + K * nu
+                    fs['var'] = (1.0 - K) * P
+            fs['raw'] = z
+            fs['pred'], fs['q'], fs['still'] = np.zeros(2), q_still, True
+            return fs['est'].copy()
+
+        def moved():
+            fresh[0] = False
+            avg[0] = False
+            fs['pred'], fs['still'] = None, False        # 动了但还不知道动了多少(探测之类)：下次只信测量
+
+        def expect(group, applied):
+            """动了 applied(手臂度数 / 底盘毫米)：按 J 推算偏差会变多少，给下一次测量的滤波用。"""
+            if not flt or J.get(group) is None:
+                return
+            pred = np.asarray(J[group], float) @ np.asarray(applied, float)
+            q_abs = 0.35 if group == 'arm' else 1.2 * scale_px_per_mm     # 舵机回读 / 车轮走的距离 的误差
+            fs['pred'] = pred
+            fs['q'] = (0.12 * _norm(pred)) ** 2 + q_abs ** 2
+            fs['still'] = False
+
+        def over_budget():
+            return fix_max is not None and ch_moved[0] >= float(fix_max)
+
+        def finish(ok, reason=''):
+            # 对准成功：把这次用实际移动修正过的 J 存下来(fixed_j 时也存：成功说明目标没在动，修正是对的)；探测过的也存(fixed_j 不探测)。
+            # 发散过(重新探测过)又没对准：目标多半自己在动，这次探测的 J 也不可信，不存(servo_cal.json 里原来的不动)
+            if ok or (probed and not getattr(self, '_fixed', False) and not reprobes):
+                for g in ('arm', 'ch'):
+                    if J[g] is not None:
+                        self.store.put(kind, g, J[g])
+                if J['ch'] is not None:
+                    self.store.set_synth(kind, self._ch_synth)
+                self.store.save()
+            # 动了以后没测到：不能拿动之前的偏差当结果(会按一个没人测过的位置去夹)
+            return Result(ok, e if (ok or fresh[0]) else float('inf'), moves, p, reason, self.clock() - t0, hist, used_ch, probed)
+
+        try:
+            p = meas()
+            while True:
+                passes += 1
+                if passes > 4 * max_iter + 6:
+                    return finish(False, '循环次数过多')
+                e = _norm(p) / scale_px_per_mm
+                hist.append(e)
+                self.log(f'  {tag} 偏差 {e:.2f}mm  (像素 {p[0]:+.1f},{p[1]:+.1f})')
+
+                near = float(c.get('near_avg') or 0.0)
+                if tol_mm < e <= near * tol_mm and fresh[0] and not avg[0]:
+                    avg[0] = True                            # 离目标很近：再测一次取平均，免得按一次测量的噪声去动
+                    p = meas() if flt else (p + meas()) / 2.0
+                    e = _norm(p) / scale_px_per_mm
+                    self.log(f'  {tag} 再测一次取平均 {e:.2f}mm')
+                    if e <= tol_mm:
+                        self.log(f'  {tag} 对准完成')
+                        return finish(True)                  # 两次的平均已经在容差内(相当于复测过了)
+
+                if e <= tol_mm:
+                    if do_confirm and not confirmed and e > float(c.get('confirm_skip') or 0.0) * tol_mm:
+                        confirmed = True
+                        p = meas()
+                        e2 = _norm(p) / scale_px_per_mm
+                        if e2 <= tol_mm * 1.15:
+                            e = e2
+                            hist.append(e)
+                            self.log(f'  {tag} 复测 {e:.2f}mm，对准完成')
+                            return finish(True)
+                        continue
+                    return finish(True)
+                confirmed = False
+                if moves >= max_iter:
+                    return finish(False, f'{max_iter}次修正后仍有 {e:.2f}mm')
+                if self.clock() - t0 - t_probe[0] > timeout:
+                    return finish(False, f'超时({timeout:.0f}秒)，还差 {e:.2f}mm')
+
+                # 发散：这次比上次明显更差。一次测量跳一下(噪声)不算：先再测一次(滤波开着时用滤波后的值)，还是这么大才算。
+                # 第一次发散丢掉 J 重新探测，再发散就放弃。丢掉的 J 只在这次运行里不用(suspend)，不从 servo_cal.json 里删
+                if prev_e is not None and e > prev_e * c['diverge_ratio'] + 0.6:
+                    if not rechecked:
+                        rechecked = True
+                        self.log(f'  {tag} 偏差一下变大了({prev_e:.2f}→{e:.2f}mm)：再测一次，看是不是测量跳了一下')
+                        p = meas()
+                        continue
+                    bad += 1
+                    self.log(f'  {tag} 误差变大了({prev_e:.2f}→{e:.2f}mm，复测也是)，J 可能不对')
+                    if getattr(self, '_fixed', False):
+                        return finish(False, '误差变大了(目标自己在动？)，停下')
+                    if bad >= 2 or reprobes >= 1:
+                        for g in ('arm', 'ch'):
+                            self.store.suspend(kind, g)
+                        return finish(False, '发散：动作方向和画面对不上，需要重新校准(vcal)')
+                    for g in ('arm', 'ch'):
+                        J[g] = None
+                        self.store.suspend(kind, g)
+                    reprobes += 1
+                else:
+                    bad = 0
+
+                group = self._decide(J, p, e, allow_chassis)
+                if group == 'ch' and self._need_s and J['ch'] is not None and self._ch_synth:
+                    J['ch'] = None                           # 横移那一列是补出来的(只测过前后)：要横移先实测一次
+                if J[group] is None:
+                    if getattr(self, '_fixed', False):
+                        return finish(False, '没有存好的对应关系(J)，这次不探测')
+                    moved()
+                    tp = self.clock()
+                    J[group] = self._probe(measure, group, bounds)
+                    t_probe[0] += self.clock() - tp
+                    probed = True
+                    p = meas()                               # 探测动过了，重新测，下一圈再决定
+                    prev_e = None
+                    continue
+
+                cmd = None
+                if group == 'arm':
+                    du = self._min_step(J['arm'], p, -c['gain_arm'] * np.linalg.solve(J['arm'], p))
+                    cmd, _s = self._clip_arm(du)
+                    if _norm(cmd) < 1e-9 and _norm(du) < 1e-9:
+                        return finish(False, f'剩下的偏差 {e:.2f}mm 比舵机能动的最小一步还小，没法再修')
+                    moved()
+                    applied, sat = self._apply_arm(du)
+                else:
+                    if over_budget():
+                        return finish(False, f'底盘已经为对准挪了 {ch_moved[0]:.0f}mm 还差 {e:.2f}mm，停下(多半认错了目标，或者车停得太偏)')
+                    sf = self._ch_cmd(J['ch'], p)
+                    moved()
+                    applied = self._apply_chassis(sf[0], sf[1])
+                    if _norm(applied) < 1e-9 and self._wheels and J['arm'] is not None:
+                        # 先动车轮：这一步四舍五入成 0mm(车轮只能按整毫米挪)：这一次改用手臂，不当成"到头了"
+                        group = 'arm'
+                        du = self._min_step(J['arm'], p, -c['gain_arm'] * np.linalg.solve(J['arm'], p))
+                        cmd, _s = self._clip_arm(du)
+                        applied, sat = self._apply_arm(du)
+                    else:
+                        used_ch = True
+                        ch_moved[0] += abs(float(applied[1]))
+                    if group == 'ch' and self._need_s and abs(float(applied[0])) > 0:
+                        self.log(f'  {tag} 手臂伸缩够不着：车轮横着挪 {applied[0]:+.0f}mm(离圆环近一点/远一点)')
+                expect(group, applied)
+                if _norm(applied) < 1e-9:
+                    fresh[0] = True                          # 回读说一点没动：上次测的偏差还是现在的
+                else:
+                    stalls = 0                               # 只算连着两次没动
+                if group == 'arm' and cmd is not None and _norm(cmd) > 1e-6 and _norm(applied) < 1e-9:
+                    stalls += 1                              # 指令发了，角度读回来没变
+                    if stalls >= 2:
+                        return finish(False, '手臂指令发了但没动(ID1/ID2 卡住、或者这一步太小舵机动不了)')
+                    p = meas()
+                    continue
+                if _norm(applied) < 1e-9:
+                    if group == 'arm' and allow_chassis and e >= c['chassis_min_mm']:
+                        # 手臂一点都动不了(到头了)：这一圈改用底盘
+                        if J['ch'] is None:
+                            moved()
+                            tp = self.clock()
+                            J['ch'] = self._probe(measure, 'ch', bounds)
+                            t_probe[0] += self.clock() - tp
+                            probed = True
+                            p = meas()
+                            prev_e = None
+                            continue
+                        if over_budget():
+                            return finish(False, f'底盘已经为对准挪了 {ch_moved[0]:.0f}mm 还差 {e:.2f}mm，停下(多半认错了目标，或者车停得太偏)')
+                        sf = self._ch_cmd(J['ch'], p)
+                        moved()
+                        applied = self._apply_chassis(sf[0], sf[1])
+                        used_ch = True
+                        ch_moved[0] += abs(float(applied[1]))
+                        group = 'ch'
+                        expect(group, applied)
+                    if _norm(applied) < 1e-9:
+                        fresh[0] = True
+                        if self._s_clipped:
+                            return finish(False, f'离目标远近差得太多：手臂伸缩到头、车轮横着也挪到上限了，还差 {e:.2f}mm')
+                        return finish(False, f'手臂已到行程极限、底盘也不用动，还差 {e:.2f}mm')
+                prev_e = e
+                moves += 1
+                rechecked = False
+
+                p_before = p
+                pred = J[group] @ applied
+                p_new = meas()
+                # 在线修正 J：用这次实际的"动了多少 → 画面变了多少"(差得太多说明是别的原因，比如原料盘在转，不拿来修)
+                # 滤波时用这次测到的原始值(滤波后的值偏向推算值，会让 J 修不动)
+                dp = (fs['raw'] if flt else p_new) - p_before
+                ratio = _norm(dp) / max(_norm(pred), 1e-9)
+                cosang = float(dp @ pred) / max(_norm(dp) * _norm(pred), 1e-9)
+                # 方向对、只是大小差几倍(J 的比例不对，比如观察高度改过)也修；方向不对的(原料盘在转)不修
+                if _norm(pred) >= c['broyden_min_px'] and (_norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred)
+                                                            or (cosang >= 0.9 and 0.3 <= ratio <= 3.0)):
+                    # 按"每个轴让画面动了多少像素"分摊修正量：ID2 每度只动零点几像素、ID1 每度动好几像素，
+                    # 直接按角度分摊的话，测量噪声几乎全算到 ID2 那一列上，几次以后 ID2 那一列就错了(来回晃、越晃越大)
+                    sc = np.maximum(np.linalg.norm(J[group], axis=0), 1e-6)
+                    x = applied * sc
+                    J[group] = J[group] + c['broyden_gain'] * np.outer(dp - pred, x * sc) / float(x @ x)
+                p = p_new
+        except ServoError as ex:
+            return finish(False, str(ex))
+
+    # ------------------------------------------------------------------ 只动车轮
+    def _run_wheels(self, kind, measure, scale_px_per_mm, tol_mm, max_iter=None, timeout_s=None, label='', bounds=None,
+                    confirm=None, fix_max=None, s_range=None, f_range=None, gain=None, probe_s=True):
+        """只动车轮对准：手臂一下都不动(一直在观察姿态)，每次按底盘的 J 解出 横移 S、前后 F 一起修(整毫米)。
+          - 每步最多 wheels_only_step_max_mm(S、F 按比例一起缩)，慢速(wheels_only_rpm)，挪完等 wheels_only_settle_s
+          - 横移累计不超出 s_range、前后累计不超出 f_range(相对开始时，毫米)，前后累计最多走 fix_max 毫米：不压进工位/原料区
+          - 存着的底盘 J 只测过前后(横移那一列是补的)：先横移一小步实测这一列(probe_s)；没有 J 时(不是 fixed_j)S、F 各挪一小步测
+          - 离容差差一点点时先再测一次取平均；发散先复测，还是变大：fixed_j 时停下，否则丢掉 J 重测一次，再不行放弃
+        返回 Result(另外 .disp = (这次横移累计, 前后累计) 毫米)。"""
+        c = self.cfg
+        tol = max(float(tol_mm), float(c.get('wheels_only_tol_mm') or 0.0))
+        max_iter = int(max_iter or c.get('wheels_only_max_iter') or c['max_iter'])
+        timeout = float(timeout_s or c['timeout_s'])
+        do_confirm = c['confirm'] if confirm is None else bool(confirm)
+        gain = float(gain if gain is not None else c.get('wheels_only_gain', 1.0))
+        step_max = float(c.get('wheels_only_step_max_mm') or 30.0)
+        min_mm = float(c.get('wheels_only_min_mm') or 0.0)
+        rpm = c.get('wheels_only_rpm') or None
+        settle = float(c.get('wheels_only_settle_s', 0.2) or 0.0)
+        fixed = bool(getattr(self, '_fixed', False))
+        rng = [tuple(s_range) if s_range is not None else None, tuple(f_range) if f_range is not None else None]
+        tag = f'[{label or kind}]'
+        t0 = self.clock()
+        t_probe = [0.0]
+        used = np.zeros(2)              # 这次横移、前后各累计挪了多少(毫米)
+        travel = [0.0]                  # 前后累计走了多少(绝对值相加)
+        J = self.store.get(kind, 'ch')
+        synth = [J is not None and self.store.synth(kind)]
+        probed = False
+        reprobes = 0
+        hist = []
+        moves = passes = 0
+        prev_e = None
+        rechecked = confirmed = False
+        fresh = [False]
+        avg = [False]
+        p = np.zeros(2)
+        e = float('inf')
+
+        def meas():
+            q = self._measure(measure)
+            fresh[0] = True
+            return q
+
+        def room(ax, sign):
+            """第 ax 个方向(0 = S，1 = F)往 sign 那边还能挪多少毫米。"""
+            r = rng[ax]
+            out = float('inf')
+            if r is not None:
+                out = (float(r[1]) - used[ax]) if sign > 0 else (used[ax] - float(r[0]))
+            if ax == 1 and fix_max is not None:
+                out = min(out, float(fix_max) - travel[0])
+            return max(0.0, out)
+
+        def move(s, f):
+            s, f = float(round(s)), float(round(f))      # STM32 的 S/F 只收整数毫米
+            if s == 0 and f == 0:
+                return np.zeros(2)
+            fresh[0] = avg[0] = False
+            if rpm:
+                self.act.chassis_move(s, f, speed=rpm)
+            else:
+                self.act.chassis_move(s, f)
+            used[0] += s
+            used[1] += f
+            travel[0] += abs(f)
+            if settle > 0:
+                self.sleep(settle)
+            return np.array([s, f])
+
+        def probe(axes):
+            """S / F 各挪一小步，量出 J 的那几列(其余列用现在的)。返回 (J, 最后测到的 p)。"""
+            tp = self.clock()
+            last = meas()
+            min_px = c['probe_min_px']
+            margin = self._margin(last, bounds)
+            if margin is not None:
+                min_px = max(5.0, min(min_px, 0.45 * margin))
+            Jn = np.array(J, float) if J is not None else np.zeros((2, 2))
+            names = ('横移 S', '前后 F')
+            for ax in axes:
+                up, dn = room(ax, 1.0), room(ax, -1.0)
+                sign = 1.0 if up >= dn else -1.0              # 往余量多的那边探
+                step = min(float(c['probe_chassis_mm']) * min_px / c['probe_min_px'], max(up, dn))
+                if step < 3.0:
+                    raise ServoError(f'探测{names[ax]}：允许挪的范围不够了(还剩 {max(up, dn):.0f}mm)')
+                moved, cur = 0.0, last
+                for _ in range(3):
+                    d = move(sign * step if ax == 0 else 0.0, sign * step if ax == 1 else 0.0)
+                    if abs(float(d[ax])) < 1e-9:
+                        break
+                    moved += float(d[ax])
+                    cur = meas()
+                    if _norm(cur - last) >= min_px:
+                        break
+                    step = min(step * 1.6, room(ax, sign))
+                    if step < 2.0:
+                        break
+                dp = cur - last
+                if abs(moved) < 1e-9 or _norm(dp) < 0.4 * min_px:
+                    raise ServoError(f'探测失败：车轮{names[ax]}挪了 {moved:+.0f}mm 画面几乎没变化(移动 {_norm(dp):.1f}px)')
+                Jn[:, ax] = dp / moved
+                last = cur
+                if ax == 0 and rng[0] is not None and min(up, dn) < 2.0 * abs(moved) + 5.0:
+                    # 横移的范围窄(原料区 ±15mm)：探测挪过去的那一段挪回来，不然对准时往这边就只剩几毫米可挪
+                    move(-moved, 0.0)
+                    last = meas()
+            cond = float(np.linalg.cond(Jn))
+            if not np.isfinite(cond) or cond > c['max_cond']:
+                raise ServoError(f'探测失败：横移和前后在画面里的移动方向几乎平行(条件数 {cond:.0f})')
+            self.log(f'    探测车轮({"、".join(names[a] for a in axes)})：J=[{Jn[0, 0]:+.3f} {Jn[0, 1]:+.3f}; '
+                     f'{Jn[1, 0]:+.3f} {Jn[1, 1]:+.3f}] 像素/毫米')
+            t_probe[0] += self.clock() - tp
+            return Jn, last
+
+        def finish(ok, reason=''):
+            # 对准成功：存下用实际移动修正过的 J；探测过(不是 fixed_j、没发散)的也存(横移那一列实测过了，下次不用再测)
+            if J is not None and (ok or (probed and not fixed and not reprobes)):
+                self.store.put(kind, 'ch', J)
+                self.store.set_synth(kind, synth[0])
+                self.store.save()
+            r = Result(ok, e if (ok or fresh[0]) else float('inf'), moves, p, reason, self.clock() - t0, hist,
+                       bool(moves) or probed, probed)
+            r.disp = (float(used[0]), float(used[1]))
+            if not ok:
+                self.log(f'  {tag} 只动车轮没对准：{reason}(车轮这次横移 {used[0]:+.0f}mm、前后 {used[1]:+.0f}mm)')
+            return r
+
+        try:
+            if J is None:
+                if fixed:
+                    return finish(False, '没有存好的车轮和画面的对应关系(J)，这次不探测')
+                J, p = probe((0, 1))
+                probed, synth[0] = True, False
+            elif synth[0] and probe_s and max(room(0, 1.0), room(0, -1.0)) >= 3.0:
+                self.log(f'  {tag} 存着的车轮 J 只测过前后：先横移一小步，把横移那一列测出来(只测这一次)')
+                J, p = probe((0,))
+                probed, synth[0] = True, False
+            else:
+                p = meas()
+            while True:
+                passes += 1
+                if passes > 4 * max_iter + 6:
+                    return finish(False, '循环次数过多')
+                e = _norm(p) / scale_px_per_mm
+                hist.append(e)
+                self.log(f'  {tag} 偏差 {e:.2f}mm  (像素 {p[0]:+.1f},{p[1]:+.1f})  [只动车轮]')
+                near = float(c.get('near_avg') or 0.0)
+                if tol < e <= near * tol and fresh[0] and not avg[0]:
+                    p = (p + meas()) / 2.0                   # 离目标很近：再测一次取平均，不去追一次测量的噪声
+                    avg[0] = True
+                    e = _norm(p) / scale_px_per_mm
+                    self.log(f'  {tag} 再测一次取平均 {e:.2f}mm')
+                    if e <= tol:
+                        self.log(f'  {tag} 对准完成')
+                        return finish(True)
+                    if moves >= 1:
+                        # 已经挪过一次、两次测量平均只超出容差一点点：剩下的一两毫米车轮走不准(每次有 ±1mm 的误差)，追下去只是来回挪
+                        self.log(f'  {tag} 只差一点点(车轮走不准这么小的一步)，不再追，对准完成')
+                        return finish(True)
+                if e <= tol:
+                    if do_confirm and not confirmed and e > float(c.get('confirm_skip') or 0.0) * tol:
+                        confirmed = True
+                        p = meas()
+                        e2 = _norm(p) / scale_px_per_mm
+                        if e2 <= tol * 1.15:
+                            e = e2
+                            hist.append(e)
+                            self.log(f'  {tag} 复测 {e:.2f}mm，对准完成')
+                            return finish(True)
+                        continue
+                    self.log(f'  {tag} 对准完成')
+                    return finish(True)
+                confirmed = False
+                if moves >= max_iter:
+                    return finish(False, f'{max_iter}次修正后仍有 {e:.2f}mm')
+                if self.clock() - t0 - t_probe[0] > timeout:
+                    return finish(False, f'超时({timeout:.0f}秒)，还差 {e:.2f}mm')
+                if prev_e is not None and e > prev_e * c['diverge_ratio'] + 0.6:
+                    if not rechecked:
+                        rechecked = True
+                        self.log(f'  {tag} 偏差一下变大了({prev_e:.2f}→{e:.2f}mm)：再测一次，看是不是测量跳了一下')
+                        p = meas()
+                        continue
+                    self.log(f'  {tag} 误差变大了({prev_e:.2f}→{e:.2f}mm，复测也是)，车轮的 J 可能不对')
+                    if fixed:
+                        return finish(False, '误差变大了(目标自己在动？)，停下')
+                    self.store.suspend(kind, 'ch')
+                    if reprobes >= 1:
+                        J = None
+                        return finish(False, '发散：车轮动作方向和画面对不上，需要重新校准(vcal)')
+                    reprobes += 1
+                    J = None
+                    J, p = probe((0, 1))
+                    probed, synth[0] = True, False
+                    prev_e = None
+                    continue
+                rechecked = False
+                sf = -gain * np.linalg.solve(J, p)
+                blocked = False
+                for ax in (0, 1):
+                    if max(room(ax, 1.0), room(ax, -1.0)) < max(min_mm, 0.5):
+                        blocked = True
+                        # 这个方向一点都不许挪了(比如不许横移)：另一个方向按最小二乘只修它能修的那一段
+                        jo = np.asarray(J, float)[:, 1 - ax]
+                        sf = np.zeros(2)
+                        sf[1 - ax] = -gain * float(jo @ p) / max(float(jo @ jo), 1e-12)
+                        break
+                big = float(np.max(np.abs(sf)))
+                if big > step_max:
+                    sf = sf * (step_max / big)                  # 每步上限：两个方向按比例一起缩，方向不变
+                cmd = sf.copy()
+                for ax in (0, 1):
+                    lim = room(ax, 1.0 if cmd[ax] > 0 else -1.0)
+                    if abs(cmd[ax]) > lim:
+                        cmd[ax] = math.copysign(lim, cmd[ax])   # 横移/前后累计不超出允许的范围
+                    if abs(cmd[ax]) < min_mm:
+                        cmd[ax] = 0.0
+                cut = any(abs(cmd[ax] - sf[ax]) > 0.5 and abs(sf[ax]) >= min_mm for ax in (0, 1))
+                clipped = blocked or cut
+                if round(cmd[0]) != 0 and round(cmd[1]) != 0:
+                    # S、F 是两条指令(每条都要加减速、等 DONE)：只挪一个方向按 J 推算就能到容差的六成以内，就只挪那一个(省一条指令)
+                    best = None
+                    for ax in (0, 1):
+                        alt = cmd.copy()
+                        alt[1 - ax] = 0.0
+                        r = _norm(p + J @ np.round(alt)) / scale_px_per_mm
+                        if r <= 0.6 * tol and (best is None or r < best[0]):
+                            best = (r, alt)
+                    if best is not None:
+                        cmd = best[1]
+                if round(cmd[0]) == 0 and round(cmd[1]) == 0:
+                    if clipped:
+                        return finish(False, f'车轮已经挪到允许的范围边上(横移 {used[0]:+.0f}mm、前后 {used[1]:+.0f}mm)，还差 {e:.2f}mm')
+                    return finish(False, f'剩下的偏差 {e:.2f}mm 比车轮能走的最小一步还小，没法再修')
+                n_cmd = int(round(cmd[0]) != 0) + int(round(cmd[1]) != 0)
+                left = timeout - (self.clock() - t0 - t_probe[0])
+                cmd_s = float(c.get('wheels_only_cmd_s') or 0.0)
+                if n_cmd == 2 and cmd_s <= left < 2 * cmd_s:
+                    if e <= 2.0 * tol:
+                        return finish(False, f'剩 {left:.1f} 秒只够车轮走一条指令，偏差 {e:.2f}mm 已经不大：不挪了')
+                    # 剩下的时间只够走一条指令：只挪偏差减得多的那个方向
+                    alts = []
+                    for ax in (0, 1):
+                        alt = cmd.copy()
+                        alt[1 - ax] = 0.0
+                        alts.append((_norm(p + J @ np.round(alt)), ax, alt))
+                    cmd = min(alts, key=lambda a: a[0])[2]
+                    n_cmd = 1
+                    self.log(f'  {tag} 剩 {left:.1f} 秒，只够车轮走一条指令：只挪 S {cmd[0]:+.0f}、F {cmd[1]:+.0f}mm')
+                if n_cmd * cmd_s > left:
+                    return finish(False, f'超时：剩 {max(0.0, left):.1f} 秒，不够车轮再挪一步，还差 {e:.2f}mm')
+                if cut:
+                    self.log(f'  {tag} 车轮要挪 S {sf[0]:+.1f}、F {sf[1]:+.1f}mm，超出允许的范围：只挪 S {cmd[0]:+.0f}、F {cmd[1]:+.0f}mm')
+                prev_e = e
+                applied = move(cmd[0], cmd[1])
+                moves += 1
+                p_before = p
+                pred = J @ applied
+                p = meas()
+                # 在线修正 J(和手臂一样：方向对、大小差几倍也修；对不上的不修)
+                dp = p - p_before
+                ratio = _norm(dp) / max(_norm(pred), 1e-9)
+                cosang = float(dp @ pred) / max(_norm(dp) * _norm(pred), 1e-9)
+                if _norm(pred) >= c['broyden_min_px'] and (_norm(dp - pred) <= c['broyden_max_rel'] * _norm(pred)
+                                                            or (cosang >= 0.9 and 0.3 <= ratio <= 3.0)):
+                    J = J + c['broyden_gain'] * np.outer(dp - pred, applied) / float(applied @ applied)
+        except ServoError as ex:
+            return finish(False, str(ex))
+        except np.linalg.LinAlgError:
+            return finish(False, '车轮的 J 没法求逆')

@@ -1,0 +1,14 @@
+v14（只改树莓派；STM32 还是 v13 的 chassis_v3）
+
+1. 障碍物留更大余量：margin_mm 20 -> 60。车走偏几厘米也碰不到圆柱，路线会主动绕开。
+   规划不出来时自动降到 40、20，终端会提示"⚠ 降到 XXmm 才规划出来"。
+2. 看得不清楚的圆柱（扫描里少于 3 帧看到的，地图上 seen=1、2 那种）位置可能偏好几厘米，
+   规划时再多留 80mm（weak_obstacle_extra_mm）。终端会打印是哪几个。
+3. 重定位更容易成功：扫 8 帧（原来 4）、配对范围 250mm、最多信 150mm 的修正（只配上 1 个时 100mm），
+   直行累计 1000mm 就在转弯前测一次。
+4. 每次重定位的原始雷达数据都存到 map_captures/reloc_时间.json，跑完把 map_captures 文件夹发我就能分析。
+5. A* 权重 1.6，规划更快。
+
+跑的时候请用：
+   bash run_live.sh 2>&1 | tee ~/run_log.txt
+跑完把 ~/run_log.txt 和 ~/lidar_map_north/map_captures 文件夹一起发我。

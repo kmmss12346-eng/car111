@@ -1,0 +1,1321 @@
+"""摄像头与识别。
+
+物料：默认用 matdet.py(抗爪子遮挡：只用没被挡住的那段圆边拟合整个圆，被挡住大半也能算准圆心，
+      颜色范围和 chengxu/wuliao.py 一样，wuliao.py 在的话直接用它里面调好的)。
+      配置 detector='wuliao' 可以换回原来的 wuliao.find_best_target(frame, color_id)。
+圆环：默认用 ringdet.py(抗爪子遮挡：每段边缘单独拟合圆弧，同心的圆弧合成一个圆环，被爪子挡掉一截也能认)。
+      配置 ring_detector='contour' 可以换回只认闭合圆的 detect_rings_subpixel(和 ring_detect.detect_rings 一样的思路)。
+
+做的事：
+  - 只开一次摄像头(/dev/video0)，每次读之前先丢掉缓冲里的旧帧，保证拿到的是"现在"的画面
+  - (10-19)/dev/video0 打不开(USB 掉线重连以后摄像头换了编号)就改用插着的 USB 摄像头；用着用着连着 2 秒没画面就关掉重开
+  - 多帧取中值，再剔除离群点后取平均，比单帧准
+  - 输出"偏差像素" = 目标像素 - 爪子像素，交给 visual_servo
+爪子像素 claw_px 是爪子的轴线在画面里的位置：RAW 用于夹原料盘上的物料，RING 用于对准地上圆环。
+改 claw_px.RING 1 个像素，放置位置大约移动 0.34mm(按 2.96 像素/毫米算)；以后实际放偏了，就调这个数。
+claw_px.PICK：圆环上方观察时，物料正好在爪子下面，它顶面圆心在画面里的位置(物料顶面比圆环高，和 RING 不是同一个点)。
+粗加工区第一次放下物料以后自动量一次存起来；取回、码垛时圆环白心被物料盖住，就直接把物料顶面对到这个点。
+"""
+import glob
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+CAL_FILE = 'vision_cal.json'        # vclaw 实测的爪子像素存在这里(优先于配置文件里的 claw_px)
+
+
+class VisionError(Exception):
+    pass
+
+
+def _cal_path(path=None):
+    p = Path(path or CAL_FILE)
+    return p if p.is_absolute() else ROOT / p
+
+
+def load_vision_cal(path=None):
+    """读 vision_cal.json：{"claw_px": {"RAW": [u, v], "RING": [u, v]}}。没有或读不了返回 {}。path='' = 不用文件(模拟测试)。"""
+    if path == '':
+        return {}
+    p = _cal_path(path)
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_vision_cal(kind, uv, path=None, extra=None):
+    """把实测的爪子像素写进 vision_cal.json(只改这一项；extra 里的键一起存，比如 r_px、ZOBRAW)。返回文件路径。"""
+    p = _cal_path(path)
+    d = load_vision_cal(p)
+    d.setdefault('claw_px', {})[kind] = [round(float(uv[0]), 2), round(float(uv[1]), 2)]
+    for k, v in (extra or {}).items():
+        d[k] = v
+    tmp = str(p) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+    return p
+
+
+def forget_vision_cal(kinds=(), keys=(), path=None):
+    """从 vision_cal.json 里删掉几个爪子点(claw_px 里的 kind)和键。返回是否改了文件。"""
+    p = _cal_path(path)
+    d = load_vision_cal(p)
+    cp = d.get('claw_px') or {}
+    gone = [k for k in kinds if k in cp] + [k for k in keys if k in d]
+    if not gone:
+        return False
+    for k in kinds:
+        cp.pop(k, None)
+    for k in keys:
+        d.pop(k, None)
+    tmp = str(p) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+    return True
+
+
+def apply_vision_cal(cfg, path=None):
+    """配置(dict)里的 claw_px 用 vision_cal.json 里实测的覆盖。返回同一个 dict。"""
+    cal = load_vision_cal(path).get('claw_px') or {}
+    cp = dict(cfg.get('claw_px') or {})
+    for k, v in cal.items():
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            cp[k] = [float(v[0]), float(v[1])]
+    cfg['claw_px'] = cp
+    cal = load_vision_cal(path)
+    if cal.get('r_px') and not cfg.get('r_px_seed'):
+        cfg['r_px_seed'] = float(cal['r_px'])                 # vclaw 量到的物料半径(像素)
+    if cal.get('ring_rmax_px') and not cfg.get('ring_rmax_cal'):
+        cfg['ring_rmax_cal'] = float(cal['ring_rmax_px'])     # vclaw RING 量到的圆环最外圈半径(像素)
+    if cal.get('ring_outer_diam_mm'):
+        cfg['ring_outer_diam_mm'] = float(cal['ring_outer_diam_mm'])   # vclaw RING 时输入的圆环外径(毫米)
+    if cal.get('pick_r_px') and not cfg.get('pick_r_px'):
+        cfg['pick_r_px'] = float(cal['pick_r_px'])            # 圆环上方观察时物料顶面的半径(像素)，和 claw_px.PICK 一起记下
+    return cfg
+
+
+class LatestFrame:
+    """后台线程一直读摄像头，只留最新的一帧和它读完的时间。
+    这样要一帧时不用先扔掉缓冲里的旧帧(每扔一帧要等 33ms)，也保证拿到的是手臂动完以后才拍的画面。"""
+
+    def __init__(self, cap, period_s=1 / 30.0):
+        import threading
+        self.cap, self.period = cap, float(period_s)
+        self.cv = threading.Condition()
+        self.frame, self.t = None, 0.0
+        self.run = True
+        self.th = threading.Thread(target=self._loop, daemon=True)
+        self.th.start()
+
+    def _loop(self):
+        while self.run:
+            try:
+                ok = self.cap.grab()
+                if not self.run:
+                    break
+                t = time.monotonic()
+                ok, fr = self.cap.retrieve() if ok else (False, None)
+            except Exception:                       # 读一帧出错不能让线程死掉(死了以后就再也没有画面)
+                ok, fr = False, None
+            if not ok or fr is None:
+                time.sleep(0.01)
+                continue
+            with self.cv:
+                self.frame, self.t = fr, t
+                self.cv.notify_all()
+
+    def read(self, after=None, fresh=True, timeout=1.0):
+        """最新的一帧。fresh=True：要在 after(默认=现在)之后才开始拍的帧(手臂动完再拍)；
+        fresh=False：只要比 after 新的帧。返回 (帧, 时间) 或 (None, None)。"""
+        t_req = time.monotonic() if after is None else after
+        need = t_req + (self.period if fresh else 1e-4)
+        end = time.monotonic() + timeout
+        with self.cv:
+            while self.frame is None or self.t < need:
+                left = end - time.monotonic()
+                if left <= 0 or not self.run:
+                    return None, None
+                self.cv.wait(left)
+            return self.frame.copy(), self.t
+
+    def close(self):
+        """停线程；返回线程是否已经停了(没停就不能关摄像头，线程还在用它)。"""
+        self.run = False
+        with self.cv:
+            self.cv.notify_all()                    # 正在等帧的马上返回
+        self.th.join(timeout=3.0)
+        return not self.th.is_alive()
+
+
+def usb_cameras(by_id='/dev/v4l/by-id', sysfs='/sys/class/video4linux', dev='/dev'):
+    """(10-19)插着的 USB 摄像头取画面的节点 ['/dev/videoN', ...]。USB 掉线重连时旧的节点还被占着，摄像头就换个编号回来
+    (那次 /dev/video0 没了，回来的是 video1 取画面 + video2 元数据(没有画面))。先看 /dev/v4l/by-id/usb-*-video-index0
+    (只有 USB 摄像头有，index0 = 取画面的那个)；一个也没有再扫 /sys/class/video4linux：device 链到 USB 上、index 是 0 的。
+    树莓派自己的编解码/ISP(video10 以上)不是 USB，不会选到。三个目录可以换(测试用)。"""
+    out = []
+    for p in sorted(glob.glob(os.path.join(by_id, 'usb-*-video-index0'))):
+        d = os.path.realpath(p)
+        if d not in out:
+            out.append(d)
+    if out:
+        return out
+    for p in sorted(glob.glob(os.path.join(sysfs, 'video*')), key=lambda s: (len(s), s)):     # video2 排在 video10 前面
+        try:
+            with open(os.path.join(p, 'index'), 'r') as f:
+                idx = f.read().strip()
+        except OSError:
+            continue
+        if idx == '0' and '/usb' in os.path.realpath(os.path.join(p, 'device')):
+            out.append(os.path.join(dev, os.path.basename(p)))
+    return out
+
+
+def video_users(proc='/proc'):
+    """(10-19)哪些程序开着 /dev/video*：['1234「python3 vlive.py」开着 /dev/video0(已拔掉)', ...]，最多列 4 个。
+    只看得到自己这个用户的进程；读不了的跳过，出什么错都只是少列几个，不会抛。"""
+    held = {}
+    try:
+        for fd in glob.glob(os.path.join(proc, '[0-9]*', 'fd', '*')):
+            try:
+                t = os.readlink(fd)
+            except OSError:
+                continue
+            if t.startswith('/dev/video'):
+                held.setdefault(fd.split(os.sep)[-3], set()).add(t.replace(' (deleted)', '(已拔掉)'))
+    except Exception:
+        pass
+    out = []
+    for pid in sorted(held, key=lambda s: (len(s), s))[:4]:
+        try:
+            with open(os.path.join(proc, pid, 'cmdline'), 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+        except Exception:
+            cmd = ''
+        if pid == str(os.getpid()):
+            cmd = '本程序'
+        out.append(f'{pid}「{cmd[:40] or "?"}」开着 {"、".join(sorted(held[pid]))}')
+    return out
+
+
+class Camera:
+    supports_after = True               # read(after=, fresh=) 可用
+
+    def __init__(self, device='/dev/video0', width=640, height=480, fps=30, flip=None, flush=2, log=print, threaded=True,
+                 reopen_s=2.0, sleep=time.sleep, clock=time.monotonic):
+        import threading
+        self.device, self.width, self.height, self.fps = device, int(width), int(height), int(fps)
+        self.flip = flip            # None 不翻；cv2.flip 的参数：0 上下，1 左右，-1 两个都翻
+        self.flush = int(flush)
+        self.log = log
+        self.cap = None
+        self.threaded = bool(threaded)  # True：后台线程一直读，要帧时直接拿最新的(快，而且一定是新拍的)
+        self._lf = None
+        self.last_t = None
+        self.reopen_s = float(reopen_s or 0.0)  # (10-19)连着这么多秒读不到画面(USB 掉线？)就关掉重开；0 = 不重开
+        self.reopen_gap_s = 3.0                 #   重开不了：至少隔这么多秒再试
+        self.sleep, self.clock = sleep, clock
+        self._lock = threading.Lock()           # 重开时拿着：后台识别线程和主线程都会要帧，只让一个去重开
+        self._live = False                      # open 过、还没 close(读不到画面才去重开)
+        self._t_fail = None                     # 这一串读不到画面从什么时候开始(读到了就清掉)：按连着读不到算，
+                                                #   不按上次读到画面算(开车时好几分钟不要帧，回来第一次没等到不算掉线)
+        self._t_try, self._t_said = -1e9, -1e9  # 上次试着重开 / 说重开不了 的时刻
+
+    def open(self):
+        with self._lock:
+            self._open()
+        return self
+
+    def _open(self):
+        """先开配置的 device(和以前一样)。(10-19)打不开、或者打开了读不到画面：试插着的别的 USB 摄像头(USB 掉线重连以后编号会变)，
+        开得了就用它(self.device 改成它)。都不行抛 VisionError。"""
+        dev0 = self.device
+        cap, why = self._open_dev(dev0)
+        if cap is None:
+            found, bad, same = usb_cameras(), [], os.path.realpath(str(dev0))
+            for d in found:
+                if os.path.realpath(d) == same:
+                    continue                    # 就是刚才那个
+                cap, _ = self._open_dev(d)
+                if cap is not None:
+                    self.device = d
+                    break
+                bad.append(d)
+            if cap is None:
+                say = [] if why == '打不开' else [why]
+                if bad:
+                    say.append(f'USB 摄像头 {"、".join(bad)} 也打不开：可能被别的程序占着')
+                elif not found:
+                    say.append('没找到 USB 摄像头：USB 没插好？ls /dev/video* 看看')
+                elif why == '打不开':
+                    say.append('可能被别的程序占着')
+                say += video_users()
+                raise VisionError(f'打不开摄像头 {dev0}' + (f'({"；".join(say)})' if say else ''))
+        self.cap = cap
+        if self.threaded:
+            self._lf = LatestFrame(cap, 1.0 / max(1, self.fps))
+        self._live = True
+        self.log(f'  摄像头 {self.device} 已打开 {self.width}x{self.height}')
+        if self.device != dev0:
+            self.log(f'  (摄像头 {dev0} {why}，改用 {self.device}：USB 掉线重连以后编号变了)')
+
+    def _open_dev(self, dev):
+        """按设置打开 dev 这一个节点，读几帧试试。返回 (cap, '') 或 (None, '打不开' / '打开了但读不到画面')。"""
+        import cv2
+        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            return None, '打不开'
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_FPS, self.fps)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        self.sleep(0.4)
+        good = 0
+        for _ in range(10):
+            ok, fr = cap.read()
+            good += 1 if (ok and fr is not None) else 0
+            self.sleep(0.02)
+        if good == 0:
+            cap.release()
+            return None, '打开了但读不到画面'
+        return cap, ''
+
+    def read(self, after=None, fresh=True):
+        """最新的一帧，读不到返回 None。后台线程模式：fresh=True 保证是 after(默认=现在)之后才拍的。
+        (10-19)连着 reopen_s 秒读不到画面(USB 掉线？)：关掉重开(编号变了也找得到)，重开好了这一次就返回新拍的一帧；
+        重开不了也只是返回 None，不抛。"""
+        fr = self._read(after, fresh)
+        if fr is not None:
+            self._t_fail = None
+            return fr
+        now = self.clock()
+        if self._t_fail is None:
+            self._t_fail = now
+        if self._live and self.reopen_s > 0 and now - self._t_fail > self.reopen_s:
+            ok = self._revive()
+            if ok:
+                fr = self._read(after, fresh)
+                if fr is not None:
+                    self._t_fail = None
+            elif ok is None:
+                self.sleep(0.2)                 # 别的线程正在重开 / 刚试过：歇一下，别让一直要帧的地方空转
+        return fr
+
+    def _read(self, after, fresh):
+        if self.threaded:                       # 后台线程模式只从 LatestFrame 拿，不直接碰 cap(后台线程在用它)
+            lf = self._lf                       # 重开时会换掉：先拿到手里
+            if lf is None:
+                return None
+            fr, t = lf.read(after=after, fresh=fresh)
+            self.last_t = t
+        else:
+            with self._lock:                    # 不用后台线程：cap 一次只能一个线程用，也不能和重开撞上
+                cap = self.cap
+                if cap is None:
+                    return None
+                try:
+                    for _ in range(self.flush):
+                        cap.grab()
+                    ok, fr = cap.read()
+                except Exception:               # (10-19)USB 掉线时读帧出错：当没读到(过一会儿会重开)
+                    ok, fr = False, None
+            if not ok:
+                fr = None
+        if fr is not None and self.flip in (-1, 0, 1):
+            import cv2
+            fr = cv2.flip(fr, self.flip)
+        return fr
+
+    def _revive(self):
+        """(10-19)连着 reopen_s 秒读不到画面：关掉重开(和 open 一样，原来的编号打不开就找 USB 摄像头)。
+        返回 True 重开好了 / False 重开不了 / None 没去重开(别的线程正在重开，或者 reopen_gap_s 秒内刚试过)。不会抛。"""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            now, t0 = self.clock(), self._t_fail
+            if not self._live or t0 is None or now - t0 <= self.reopen_s or now - self._t_try < self.reopen_gap_s:
+                return None                     # 关掉了 / 别的线程刚重开好 / 刚试过
+            self._t_try = now
+            loud = now - self._t_said >= 30.0   # 一直重开不了：30 秒才说一次，免得刷屏
+            if loud:
+                self.log(f'  摄像头 {self.reopen_s:g} 秒没有画面了(USB 掉线？)：重新打开…')
+            try:
+                self._close()
+                self._open()
+            except Exception as ex:
+                if loud:
+                    self._t_said = now
+                    self.log(f'  ★ 重开摄像头没成功(每 {self.reopen_gap_s:g} 秒再试一次)：{ex}')
+                return False
+            self._t_said, self._t_fail = -1e9, now        # 重开好了：从现在重新算
+            return True
+        finally:
+            self._lock.release()
+
+    def close(self):
+        with self._lock:                        # (10-19)别的线程正在重开/读：等它完了再关；关了就不再自己重开
+            self._live = False
+            self._close()
+
+    def _close(self):
+        cap, lf = self.cap, self._lf
+        self.cap = self._lf = None              # 先摘下来，别的线程不会再拿去读
+        stopped = lf.close() if lf is not None else True     # 先停线程再关摄像头
+        if cap is not None:
+            if stopped:
+                cap.release()
+            else:
+                self.log('  摄像头读帧卡住了，线程没停下来：先不关摄像头(程序退出时会关)')
+
+
+def circle_material_detector(cfg=None, seed_r=None):
+    """matdet.MaterialDetector：抗遮挡的圆拟合。返回 det(frame, color_id) -> (u, v) 或 None；det.detector.last 是完整结果(半径等)。"""
+    try:
+        from matdet import MaterialDetector
+    except ImportError as ex:
+        raise VisionError('找不到 matdet.py(或者没装 numpy/opencv)：把 matdet.py 复制到 lidar_map_north 文件夹') from ex
+    md = MaterialDetector(cfg)
+    if seed_r:
+        md.seed_radius(seed_r)
+
+    def det(frame, color_id):
+        res = md.detect(frame, int(color_id))
+        if res is None:
+            return None
+        c = res['center']
+        return (float(c[0]), float(c[1]))
+    det.detector = md
+    return det
+
+
+def default_material_detector(kind='circle', cfg=None, seed_r=None):
+    if kind != 'wuliao':
+        return circle_material_detector(cfg, seed_r)
+    try:
+        import wuliao
+    except ImportError as ex:
+        raise VisionError('找不到 wuliao.py：把 chengxu 里的 wuliao.py 复制到 lidar_map_north 文件夹') from ex
+
+    def det(frame, color_id):
+        res, _mask = wuliao.find_best_target(frame, int(color_id))
+        if res is None:
+            return None
+        c = res['center']
+        return (float(c[0]), float(c[1]))
+    return det
+
+
+def detect_rings_subpixel(frame):
+    """和 chengxu/ring_detect.detect_rings 同一套参数和思路(Canny 边缘 -> 圆形轮廓 -> 同心圆合并成一个圆环)，
+    区别：中心不取整(亚像素)；中心按半径加权平均(大圆的中心更准)；多返回一个"这组圆里最大的半径"，
+    用来区分真圆环(最外圈很大)和圆环上放着的物料(只有小圆)。返回 [(x, y, 平均半径, 最大半径), ...]，从左到右。"""
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    edge = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edge, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    circles = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        per = cv2.arcLength(cnt, True)
+        if per == 0 or area < 100:
+            continue
+        if 4 * np.pi * area / (per * per) < 0.75:
+            continue
+        (x, y), r = cv2.minEnclosingCircle(cnt)
+        if r < 10:
+            continue
+        circles.append((float(x), float(y), float(r)))
+    groups = []
+    for c in circles:
+        for g in groups:
+            gx = sum(q[0] * q[2] for q in g) / sum(q[2] for q in g)
+            gy = sum(q[1] * q[2] for q in g) / sum(q[2] for q in g)
+            if (c[0] - gx) ** 2 + (c[1] - gy) ** 2 < 8.0 ** 2:
+                g.append(c)
+                break
+        else:
+            groups.append([c])
+    rings = []
+    for g in groups:
+        if len(g) < 2:
+            continue
+        w = sum(q[2] for q in g)
+        rings.append((sum(q[0] * q[2] for q in g) / w, sum(q[1] * q[2] for q in g) / w,
+                      w / len(g), max(q[2] for q in g)))
+    rings.sort(key=lambda t: t[0])
+    return rings
+
+
+def default_ring_detector(kind='arcs', cfg=None):
+    """'arcs' = ringdet.RingDetector(抗遮挡，要传爪子区域)；'contour' = detect_rings_subpixel(只认闭合的圆)。"""
+    if kind == 'contour':
+        return detect_rings_subpixel
+    try:
+        from ringdet import RingDetector
+    except ImportError as ex:
+        raise VisionError('找不到 ringdet.py(或者没装 numpy/opencv)：把 ringdet.py 复制到 lidar_map_north 文件夹') from ex
+    return RingDetector(cfg)
+
+
+def _robust_mean(points, reject_px=3.0):
+    """点列表 -> (均值 u, 均值 v)：先取中值，丢掉离中值超过 reject_px 的，再对剩下的取平均。"""
+    n = len(points)
+    mu = sorted(p[0] for p in points)[n // 2]
+    mv = sorted(p[1] for p in points)[n // 2]
+    keep = [p for p in points if abs(p[0] - mu) <= reject_px and abs(p[1] - mv) <= reject_px] or points
+    return (sum(p[0] for p in keep) / len(keep), sum(p[1] for p in keep) / len(keep))
+
+
+class Vision:
+    DEFAULT = dict(
+        camera=dict(device='/dev/video0', width=640, height=480, fps=30, flip=None),
+        claw_px=dict(RAW=[336.8, 282.9], RING=[336.8, 282.9]),
+        px_per_mm=dict(RAW=1.97, RING=2.96),   # RAW：现场画面物料半径 49 像素 / 25mm；认到物料以后按 material_diam_mm 现算
+        material_diam_mm=50.0,     # 物料顶面直径(毫米)：用认到的物料半径算 RAW 的每毫米像素数；0/None = 用 px_per_mm.RAW
+        detector='circle',         # 物料识别：'circle' = matdet.py(抗遮挡圆拟合)；'wuliao' = 原来的 wuliao.find_best_target
+        matdet=dict(),             # 给 matdet.MaterialDetector 的参数(r_px 半径范围、claw_mask 爪子区域文件 等)
+        frames=5,                  # 每次测量取几帧
+        frame_gap_s=0.03,
+        reject_px=3.0,
+        still_px=2.0,              # 原料盘上的物料连续几次测量移动小于这么多像素才算停稳
+        ring_detector='arcs',      # 圆环识别：'arcs' = ringdet.py(抗爪子遮挡)；'contour' = 原来只认闭合圆的办法
+        ringdet=dict(),            # 给 ringdet.RingDetector 的参数
+        ring_r_px=None,            # [最小, 最大] 圆环(组)的平均半径像素，None=不限制
+        ring_rmax_px=None,         # [最小, 最大] 圆环(组)里最大的圆的半径像素；None=vclaw RING 量过就用量到的 0.85~1.2 倍，
+                                   #   没量过按 px_per_mm.RING 估(最外圈直径 ring_outer_diam_mm 的 0.6~1.6 倍，放得比较宽)
+        ring_outer_diam_mm=95.0,   # 圆环最外圈(黑环外边)直径(毫米)：vclaw RING 100 这样输入实测值；用它算 RING 的每毫米像素数
+        ring_line_mm=0.0,          # 6 条细线那种靶填线宽 1.5(识别出来的最外圈半径是线的外边)；校赛粗黑环靶是 0
+        live_view='/tmp/vision_live.jpg',   # 识别时把带标注的画面写到这里，另开终端 python3 vview.py 实时看；''=不写
+        live_fps=8.0,              # 最多每秒写几张
+        pick_r_px=None,            # 圆环上方观察时物料顶面半径(像素)：和 claw_px.PICK 一起自动量出来存进 vision_cal.json
+    )
+
+    def __init__(self, cfg=None, camera=None, material_detector=None, ring_detector=None, log=print, sleep=time.sleep):
+        c = {}
+        for k, v in self.DEFAULT.items():
+            c[k] = dict(v) if isinstance(v, dict) else v
+        for k, v in (cfg or {}).items():
+            if isinstance(v, dict) and isinstance(c.get(k), dict):
+                c[k].update(v)
+            else:
+                c[k] = v
+        self.cfg = c
+        self.log = log
+        self.sleep = sleep
+        self.camera = camera
+        self._material = material_detector
+        self._ring = ring_detector
+        self._mask_md = None            # 只用来找爪子区域的 matdet(物料识别不是 matdet 时)
+        self.last_claw = None           # 最近一次认圆环时用的爪子区域(画图用)
+        self.last_ring_rmax = None      # 最近一次 ring_px 认到的圆环最外圈半径(像素)
+        self._pick = None               # 认圆环上物料用的 matdet(和原料盘的分开)
+        self.last_pick_r = None         # 最近一次 pick_px 认到的物料顶面半径(像素)
+        self._live_t = 0.0
+        self.live_goal = None           # (10-18)原料区对准圆心时要对到的点(画面像素)：实时画面里画成紫色菱形
+
+    # ------------------------------------------------------------ 基础
+    def open(self):
+        if self.camera is None:
+            cc = self.cfg['camera']
+            self.camera = Camera(cc.get('device', '/dev/video0'), cc.get('width', 640), cc.get('height', 480),
+                                 cc.get('fps', 30), cc.get('flip'), flush=cc.get('flush', 2), log=self.log,
+                                 threaded=cc.get('threaded', True), reopen_s=cc.get('reopen_s', 2.0)).open()
+        return self
+
+    def close(self):
+        if self.camera is not None and hasattr(self.camera, 'close'):
+            self.camera.close()
+
+    def scale(self, kind):
+        """每毫米多少像素。RAW：配置了物料直径(material_diam_mm)并且已经认到过没被挡住的物料时，
+        用认到的物料半径现算(观察高度变了也准)；RING：vclaw RING 量过圆环最外圈半径时用它和 ring_outer_diam_mm 算；
+        PICK(圆环上放着的物料的顶面)：用量到的物料顶面半径和物料直径算；
+        否则用配置里的 px_per_mm。"""
+        if kind == 'PICK':
+            r = self.cfg.get('pick_r_px') or self.last_pick_r
+            if r and self.cfg.get('material_diam_mm'):
+                return 2.0 * float(r) / float(self.cfg['material_diam_mm'])
+            pp = (self.cfg.get('px_per_mm') or {}).get('PICK')
+            return float(pp) if pp else 1.3 * self.scale('RING')         # 物料顶面比地面近，像素/毫米大一些(估计)
+        if kind == 'RING' and self.cfg.get('ring_rmax_cal') and self.cfg.get('ring_outer_diam_mm'):
+            d = float(self.cfg['ring_outer_diam_mm']) + float(self.cfg.get('ring_line_mm') or 0.0)   # 量到的是最外圈线的外边
+            return 2.0 * float(self.cfg['ring_rmax_cal']) / d
+        if kind == 'RAW' and self.cfg.get('material_diam_mm'):
+            md = self.material_detector_obj() if (self._material is not None or self.cfg.get('detector', 'circle') != 'wuliao') else None
+            rr = list(getattr(md, 'r_ref', {}).values()) if md is not None else []
+            if rr:
+                rr.sort()
+                return 2.0 * rr[len(rr) // 2] / float(self.cfg['material_diam_mm'])
+        return float(self.cfg['px_per_mm'][kind])
+
+    def bounds(self, kind, inset=8.0):
+        """画面范围换算成"偏差像素 p = 目标 - 爪子"的上下限(四边各缩进 inset 像素)，给 visual_servo 判断目标离边缘多远。"""
+        cc = self.cfg['camera']
+        W, H = float(cc.get('width', 640)), float(cc.get('height', 480))
+        cu, cv_ = self.claw(kind)
+        return ((inset - cu, inset - cv_), (W - inset - cu, H - inset - cv_))
+
+    def claw(self, kind):
+        cp = self.cfg['claw_px']
+        v = cp.get(kind)
+        if v is None and kind == 'PICK':
+            v = cp['RING']              # PICK 还没量过：画图、算画面范围先用圆环的点(对准前要先 has_pick())
+        return (float(v[0]), float(v[1]))
+
+    def has_pick(self):
+        """claw_px.PICK 量过没有(没量过就不能按物料对准取回/码垛)。"""
+        return (self.cfg.get('claw_px') or {}).get('PICK') is not None
+
+    def set_pick(self, uv, r=None):
+        """记下 claw_px.PICK 和物料顶面半径；认圆环上物料的 matdet 按新的半径重建。uv=None：忘掉(下次放下物料时重新量)。"""
+        if uv is None:
+            self.cfg.get('claw_px', {}).pop('PICK', None)
+            self.cfg.pop('pick_r_px', None)
+        else:
+            self.cfg.setdefault('claw_px', {})['PICK'] = [float(uv[0]), float(uv[1])]
+            if r:
+                self.cfg['pick_r_px'] = float(r)
+        self._pick = None
+
+    def _material_det(self):
+        if self._material is None:
+            self._material = default_material_detector(self.cfg.get('detector', 'circle'), self.cfg.get('matdet'),
+                                                       self.cfg.get('r_px_seed'))
+        return self._material
+
+    def material_detector_obj(self):
+        """matdet.MaterialDetector(用的是它时)，否则 None。画图、标定爪子区域用。"""
+        return getattr(self._material_det(), 'detector', None)
+
+    def _ring_det(self):
+        if self._ring is None:
+            self._ring = default_ring_detector(self.cfg.get('ring_detector', 'arcs'), self.cfg.get('ringdet'))
+        return self._ring
+
+    def claw_mask(self, fr):
+        """这一帧里爪子占的区域(白 = 爪子)：标定过的 claw_mask.png 优先，没有就自动找蓝色爪子。认圆环时这块的边缘不用。"""
+        md = None
+        try:
+            md = self.material_detector_obj()
+        except VisionError:
+            pass
+        if md is None:
+            if getattr(self, '_mask_md', None) is None:
+                try:
+                    from matdet import MaterialDetector
+                except ImportError:
+                    return None
+                self._mask_md = MaterialDetector(self.cfg.get('matdet'))
+            md = self._mask_md
+        cache = getattr(md, '_auto_cache', None)
+        if cache is not None and not md.has_static_mask() and cache.shape[:2] == fr.shape[:2]:
+            return cache            # 找物料时记下的爪子区域(蓝色圆环/蓝色物料挨着爪子时，现找会把它们也当成爪子)
+        return md.claw_mask(frame=fr)
+
+    def _frame(self, after=None, fresh=True):
+        if self.camera is None:
+            self.open()
+        if getattr(self.camera, 'supports_after', False) and getattr(self.camera, '_lf', None) is not None:
+            return self.camera.read(after=after, fresh=fresh)
+        return self.camera.read()
+
+    def _threaded(self):
+        return getattr(self.camera, '_lf', None) is not None
+
+    def _frames(self, n):
+        """连续 n 帧：第一帧一定是现在以后才拍的(手臂刚动完)，后面每帧都比前一帧新。"""
+        t = None
+        for i in range(n):
+            fr = self._frame(after=t, fresh=(i == 0))
+            t = getattr(self.camera, 'last_t', None)
+            yield fr
+            if i < n - 1 and not self._threaded():
+                self.sleep(self.cfg['frame_gap_s'])
+
+    # ------------------------------------------------------------ 物料(原料盘上)
+    def material_px(self, color_id, n=None):
+        """物料(顶面中心)的像素位置，多帧稳健平均；检测到的帧太少返回 None。"""
+        n = int(n or self.cfg['frames'])
+        det = self._material_det()
+        pts = []
+        for fr in self._frames(n):
+            if fr is not None:
+                p = det(fr, color_id)
+                self._publish(fr, 'RAW', p, color_id=color_id)
+                if p is not None:
+                    pts.append(p)
+        if len(pts) < (1 if n == 1 else max(2, n // 2 + 1)):        # n=1：一帧认到就算(原料盘停下的几秒钟里要快)
+            return None
+        return _robust_mean(pts, self.cfg['reject_px'])
+
+    def material_stream(self, color_id):
+        """原料盘转一会儿停一会儿时用：一直读新画面，每帧单独认这个颜色的物料(不取平均，免得慢)，
+        再和上一帧比一比整个画面(爪子以外)有多少地方变了——原料盘在转，盘面上的线条、物料都在动，变的地方就多。
+        每认完一帧 yield (这帧拍下的时间, 物料像素 (u, v) 或 None, 变了的比例 0~1 或 None)；时间和 time.monotonic() 同一个钟。"""
+        import cv2
+        import numpy as np
+        det = self._material_det()
+        md = getattr(det, 'detector', None)
+        t_last, g_last = None, None
+        while True:
+            fr = self._frame(after=t_last, fresh=False)
+            t = getattr(self.camera, 'last_t', None) if self._threaded() else None
+            if t is None or t == t_last:
+                t = time.monotonic()
+            if fr is None:
+                g_last = None
+                yield t, None, None
+                continue
+            t_last = t
+            p = det(fr, color_id) if color_id is not None else None        # None：只看画面动没动(不按顺序抓时，停下以后再认颜色)
+            self._publish(fr, 'RAW', p, color_id=color_id if color_id is not None else 'any')
+            g = cv2.GaussianBlur(cv2.resize(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (160, 120), interpolation=cv2.INTER_AREA), (3, 3), 0)
+            moved = None
+            if g_last is not None and g_last.shape == g.shape:
+                diff = cv2.absdiff(g, g_last) > int(self.cfg.get('motion_diff', 25))
+                claw = getattr(md, 'last_claw', None) if md is not None else None
+                if claw is not None and getattr(claw, 'shape', None) is not None and claw.any():
+                    keep = cv2.resize(claw, (160, 120), interpolation=cv2.INTER_NEAREST) == 0
+                    moved = float(diff[keep].mean()) if keep.any() else float(diff.mean())
+                else:
+                    moved = float(diff.mean())
+            g_last = g
+            yield t, p, moved
+
+    def material_errors(self, colors):
+        """同一帧里认这几个颜色：{颜色: 偏差像素 (物料 - 爪子) 或 None}。不按顺序抓时，原料盘停下以后看哪个在爪子附近。"""
+        det = self._material_det()
+        fr = self._frame()
+        out = {}
+        cu, cv_ = self.claw('RAW')
+        for c in colors:
+            p = det(fr, int(c)) if fr is not None else None
+            out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        return out
+
+    def plate_scan(self, colors, hints=None):
+        """(10-16 用户：照抄开源方案)同一帧里：原料盘(转盘)外圆 + 这几个颜色的物料。
+        返回 (外圆 dict(c=(x, y), r=半径, stable=是否连续几帧稳定, rms=拟合残差, c_now=(x, y), r_now=半径) 或 None, {颜色: 偏差像素 或 None})。
+        c、r 是最近几帧的中值(车停着时更稳)；c_now、r_now 只是这一帧(10-18：车在走时用它，中值会落后一两帧)。
+        这一帧连同认出来的外圆、物料写给 vview.py 实时看(live_goal = 要对到的点，画成紫色菱形)。
+        外圆用 turntable_detector.py(开源方案原样)：粗 Hough 找大圆 -> 沿径向采样边缘精修；锁定以后每帧只做局部精修(快)。
+        参数在 vision 配置的 turntable 里改(半径范围按我们 640x480、离转盘近的画面：外圆半径约 240 像素)。
+        hints = [(x, y) 或 (x, y, 半径), ...]：(10-20)这一帧照原来的办法认不出外圆时(粗找要求圆心在画面里，车停偏了圆心就跑出画面)，
+        按露出来的那段外圈投票算圆心在哪(_plate_vote，圆心在画面外也算得出)，连同这几个猜的圆心沿径向找外圈的边(_plate_seek)，
+        找到就用它，以后每帧在它附近跟(圆心在画面外也跟得住)；外圆里多了 seek=True(找到的那一帧还有 seek_new=True；
+        之后跟着它的每一帧也是 seek=True，直到跟丢、或者粗找重新认出来：调用的地方拿物料确认没认错)。外圈露出来的太少、拟合不准，只有投票明显：
+        报个大概的圆心，外圆里多了 coarse=True(只够知道往哪边挪)。hints=[] 也算(只投票)。
+        每次花的时间记在 self.last_scan_ms(物料、外圆各多少毫秒)。"""
+        det = self._material_det()
+        t0 = time.perf_counter()
+        fr = self._frame()
+        t1 = time.perf_counter()
+        out = {}
+        cu, cv_ = self.claw('RAW')
+        for c in colors:
+            p = det(fr, int(c)) if fr is not None else None
+            out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        t2 = time.perf_counter()
+        plate = None
+        if fr is not None and self.cfg.get('turntable_on', True):
+            tt = self._turntable()
+            try:
+                r = tt.detect(fr)
+            except Exception:
+                r = None
+            if r is not None and r.detected:
+                plate = dict(c=(float(r.center_x_px), float(r.center_y_px)), r=float(r.radius_px), stable=bool(r.stable),
+                             rms=float(r.fit_rms_px))
+                now = tt.samples[-1] if getattr(tt, 'samples', None) else None
+                if now is not None and getattr(now, 'detected', True):
+                    plate['c_now'] = (float(now.center_x_px), float(now.center_y_px))
+                    plate['r_now'] = float(now.radius_px)
+                if getattr(r, 'tracking_mode', 'local') != 'local':
+                    self._seek_track = False                   # 粗找(圆心在画面里)重新认出来的
+                if getattr(self, '_seek_track', False):
+                    plate['seek'] = True                       # 还在跟按猜的圆心找到的那个外圈(没确认过不是认错)
+            elif hints is not None:
+                r0 = next((float(h[2]) for h in hints if len(h) > 2 and h[2]), None) or getattr(self, '_rim_r', None)
+                votes = self._plate_vote(fr, r0) if r0 else []
+                fit = self._plate_seek(tt, fr, list(hints) + [(x, y, r0) for x, y, _v in votes[:3]])
+                if fit is not None:
+                    res = tt._accepted(time.perf_counter(), fit, 'reacquired')      # 记成跟踪的种子：下一帧在这附近局部精修
+                    plate = dict(c=(float(res.center_x_px), float(res.center_y_px)), r=float(res.radius_px), stable=bool(res.stable),
+                                 rms=float(res.fit_rms_px), c_now=(float(fit.center_x_px), float(fit.center_y_px)),
+                                 r_now=float(fit.radius_px), seek=True, seek_new=True)
+                    self._seek_track = True
+                elif votes and votes[0][2] >= float((self.cfg.get('turntable_seek') or {}).get('vote_min', 4.0)) \
+                        and votes[0][2] >= 3.0 * (votes[1][2] if len(votes) > 1 else 0.0):
+                    # 外圈露出来的太少，拟合不准：只报个大概的圆心(coarse)，够往那边挪了；挪近了露出来的多了再精确认
+                    x, y, _v = votes[0]
+                    plate = dict(c=(float(x), float(y)), r=float(r0), stable=False, rms=float('inf'), c_now=(float(x), float(y)),
+                                 r_now=float(r0), coarse=True)
+            if plate is not None and not plate.get('coarse'):
+                self._rim_r = float(plate.get('r_now', plate['r']))
+            else:
+                self._seek_track = False
+        t3 = time.perf_counter()
+        if fr is not None:
+            pts = [(cu + q[0], cv_ + q[1]) for q in out.values() if q is not None]
+            self._publish(fr, 'RAW', None if plate is None else plate.get('c_now', plate['c']), color_id='plate', plate=plate, pts=pts)
+        self.last_scan_ms = dict(frame=1000.0 * (t1 - t0), mat=1000.0 * (t2 - t1), rim=1000.0 * (t3 - t2),
+                                 show=1000.0 * (time.perf_counter() - t3), n=len(colors))
+        return plate, out
+
+    def _turntable(self):
+        tt = getattr(self, '_tt', None)
+        if tt is None:
+            import turntable_detector as T
+            doc = T.build_default_turntable_detector_document()
+            doc['coarse_search'].update(image_scale=0.29, minimum_radius_px=200.0, maximum_radius_px=420.0,
+                                        canny_threshold=24.0, accumulator_threshold=26.0)
+            doc['refinement'].update(radial_search_half_width_px=53.0, minimum_visible_arc_deg=90.0, maximum_fit_rms_px=6.6,
+                                     local_recheck_rms_above_px=1.6)
+            doc['stability'].update(window_frames=3, maximum_center_jitter_px=10.0)
+            for k, v in (self.cfg.get('turntable') or {}).items():
+                if isinstance(v, dict) and k in doc:
+                    doc[k].update(v)
+            tt = self._tt = T.TurntableDetector(T.turntable_config_from_document(doc))
+        return tt
+
+    def _plate_vote(self, fr, r_px, scale=0.29, k=4):
+        """(10-20)外圈半径知道(r_px)：缩小的画面里每个边缘点沿梯度方向往两边各走一个半径投一票，外圈露出来的那段弧的票都投在圆心上
+        (圆心在画面外也行，投票的格子比画面大)。返回票最多的几个 [(x, y, 票数), ...](原画面像素，票多的在前)。
+        车停偏了、圆心跑出画面时用：粗找(Hough)要求圆心在画面里，这里不用。"""
+        import cv2
+        import numpy as np
+        small = cv2.resize(fr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (7, 7), 1.5)
+        edges = cv2.Canny(gray, 12, 24)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        ys, xs = np.nonzero(edges)
+        if len(xs) < 20:
+            return []
+        g = np.hypot(gx[ys, xs], gy[ys, xs]) + 1e-6
+        ux, uy = gx[ys, xs] / g, gy[ys, xs] / g
+        h, w = gray.shape
+        R = float(r_px) * scale
+        P = int(round(1.2 * R))
+        acc = np.zeros((h + 2 * P, w + 2 * P), np.float32)
+        wgt = np.minimum(g / 20.0, 1.0).astype(np.float32)          # 边越清楚票越重(地面纹理的边弱)
+        for dr in (-6.0, -3.0, 0.0, 3.0, 6.0):                     # 半径差一点也投得上(缩小的画面里 ±6 像素 ≈ 原画面 ±20)
+            for sg in (1.0, -1.0):
+                ix = np.round(xs + sg * (R + dr) * ux).astype(np.int32) + P
+                iy = np.round(ys + sg * (R + dr) * uy).astype(np.int32) + P
+                ok = (ix >= 0) & (ix < acc.shape[1]) & (iy >= 0) & (iy < acc.shape[0])
+                np.add.at(acc, (iy[ok], ix[ok]), wgt[ok])
+        acc = cv2.GaussianBlur(acc, (0, 0), 1.5)
+        out = []
+        sep = max(3, int(0.3 * R))
+        for _ in range(k):
+            iy, ix = np.unravel_index(int(np.argmax(acc)), acc.shape)
+            v = float(acc[iy, ix])
+            if v <= 0:
+                break
+            out.append(((ix - P) / scale, (iy - P) / scale, v))
+            acc[max(0, iy - sep):iy + sep + 1, max(0, ix - sep):ix + sep + 1] = 0
+        return out
+
+    def _plate_seek(self, tt, fr, hints):
+        """(10-20)按猜的圆心找外圆：每个猜的圆心(半径没给就用上次认出的外圆半径)沿 180 条径向射线找边、鲁棒拟合圆
+        (和 turntable_detector 局部跟踪一样的办法，圆心在画面外也行，只要露出来的圆弧够长)。
+        猜错的圆心会拟合到地面纹理上：再要求边够清楚(外圈是白盘子的边，边缘强度高；纹理拟合出来的圆边缘弱)、残差小、半径和猜的差不多。
+        都不行返回 None；有好几个取最像的(圆弧长、残差小、边清楚)。配置 turntable_seek：min_edge、max_rms、min_arc_deg、max_seeds。"""
+        import turntable_detector as T
+        import cv2
+        import numpy as np
+        cfg = tt.config
+        sk = self.cfg.get('turntable_seek') or {}
+        min_edge = float(sk.get('min_edge', 12.0))
+        max_rms = float(sk.get('max_rms', 4.0))
+        min_arc = float(sk.get('min_arc_deg', cfg.minimum_visible_arc_deg))
+        r_last = getattr(self, '_rim_r', None)
+        hh, ww = fr.shape[:2]
+        ang = np.radians(np.arange(0.0, 360.0, 5.0))
+        best, best_k = None, None
+        info = self.last_seek = dict(tried=0, near=None)     # 认不出时日志里说最像的那个差在哪(实车上调 min_edge 等用)
+        for h in list(hints)[:int(sk.get('max_seeds', 120))]:
+            r0 = float(h[2]) if len(h) > 2 and h[2] else r_last
+            if not r0:
+                continue
+            xs, ys = float(h[0]) + r0 * np.cos(ang), float(h[1]) + r0 * np.sin(ang)
+            vis = (xs >= 3) & (xs < ww - 3) & (ys >= 3) & (ys < hh - 3)
+            if 5.0 * float(np.count_nonzero(vis)) < min_arc - 40.0:
+                continue                                   # 这个圆心的话外圈几乎都在画面外：不用找了(省时间)
+            try:
+                pts, st = tt._sample_boundary_points(fr, (float(h[0]), float(h[1]), float(r0)))
+                model, arc, rms, edge = T._robust_circle(pts, st, cfg)
+            except (T.TurntableDetectionError, cv2.error, np.linalg.LinAlgError, ValueError):
+                continue
+            cx, cy, rr = (float(x) for x in model)
+            info['tried'] += 1
+            if not (cfg.minimum_radius_px <= rr <= cfg.maximum_radius_px) or abs(rr - r0) > 0.25 * r0:
+                continue
+            if arc < min_arc or rms > max_rms or edge < min_edge:
+                if info['near'] is None or arc > info['near'][0]:
+                    info['near'] = (float(arc), float(rms), float(edge))   # 圆弧最长的那个：露出多少度、残差、边缘强度
+                continue
+            k = (0.35 * min(1.0, arc / 180.0) + 0.5 * max(0.0, 1.0 - rms / (1.5 * max_rms)) + 0.15 * min(1.0, edge / 20.0))
+            if best_k is None or k > best_k:
+                best_k = k
+                best = T.CircleFit(True, cx, cy, rr, float(arc), float(rms), float(k), '按猜的圆心找到外圆')
+                if k >= float(sk.get('good', 0.85)):
+                    break                                  # 够好了(猜的圆心按可能性从大到小排)：后面的不用试了
+        return best
+
+    def material_error(self, color_id, n=None):
+        """物料偏差像素 = 物料 - 爪子(RAW)。看不到返回 None。"""
+        p = self.material_px(color_id, n)
+        if p is None:
+            return None
+        cu, cv_ = self.claw('RAW')
+        return (p[0] - cu, p[1] - cv_)
+
+    def wait_still(self, color_id, timeout_s=10.0, period_s=0.12, need=4):
+        """等原料盘停稳：物料位置连续 need 次测量移动都小于 still_px。返回 (是否停稳, 最后的像素位置或 None)。"""
+        t_end = time.monotonic() + timeout_s
+        hist = []
+        last = None
+        while time.monotonic() < t_end:
+            p = self.material_px(color_id, n=2)
+            if p is None:
+                hist = []
+            else:
+                last = p
+                hist.append(p)
+                hist = hist[-need:]
+                if len(hist) >= need:
+                    span = max(max(abs(a[0] - b[0]), abs(a[1] - b[1])) for a in hist for b in hist)
+                    if span <= self.cfg['still_px']:
+                        return True, last
+            self.sleep(period_s)
+        return False, last
+
+    # ------------------------------------------------------------ 圆环(地上)
+    def _ring_rmax_range(self):
+        rm = self.cfg.get('ring_rmax_px')
+        if rm:
+            return float(rm[0]), float(rm[1])
+        if self.cfg.get('ring_rmax_cal'):                     # vclaw RING 实测过最外圈半径
+            r = float(self.cfg['ring_rmax_cal'])
+            return 0.85 * r, 1.2 * r
+        outer = float(self.cfg.get('ring_outer_diam_mm') or 95.0) / 2.0 * float(self.cfg['px_per_mm']['RING'])   # 最外圈半径，像素(估计)
+        return 0.35 * outer, 2.0 * outer             # 还没量过：放宽(要看到两圈同心圆才算，不会把别的圆当成圆环)
+
+    def _rings_in_frame(self, fr, any_size=False, roi=None):
+        """检测到的圆环列表 [(x, y, r, ...)]。只保留"最外圈够大"的，物料自己的圆(小)和别的杂圆不算圆环。
+        any_size=True：不按大小过滤(只去掉最外圈小于 20 像素的)，vclaw RING 第一次量圆环大小用。
+        roi=(x0, y0, x1, y1)：只在画面这一块里找(对准时只要爪子附近那个环，要拟合的边缘少一大半，快好几倍)；返回的还是整幅画面的坐标。"""
+        det = self._ring_det()
+        x0 = y0 = 0
+        sub = fr
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            sub = fr[y0:y1, x0:x1]
+        if getattr(det, 'wants_claw', False):
+            self.last_claw = self.claw_mask(fr)
+            mask = self.last_claw
+            if roi is not None and mask is not None:
+                if mask.shape[:2] != fr.shape[:2]:
+                    import cv2
+                    mask = cv2.resize(mask, (fr.shape[1], fr.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask = mask[y0:y1, x0:x1]
+            rexp = None
+            if not any_size and (self.cfg.get('ring_rmax_px') or self.cfg.get('ring_rmax_cal')):
+                rexp = self._ring_rmax_range()          # 圆环大小已知：中间被物料盖住、只剩最外圈时也能认
+            elif not any_size and self.cfg.get('ring_rmax_seen'):
+                r = float(self.cfg['ring_rmax_seen'])   # 没量过，但这次放物料时认到过空圆环：按那个大小认
+                rexp = (0.85 * r, 1.2 * r)
+            rings = det(sub, mask, r_expect=rexp)
+        else:
+            rings = det(sub)
+        if x0 or y0:
+            rings = [(r[0] + x0, r[1] + y0) + tuple(r[2:]) for r in rings]
+        rr = self.cfg.get('ring_r_px')
+        if rr:
+            rings = [r for r in rings if rr[0] <= r[2] <= rr[1]]
+        lo, hi = (20.0, 1e9) if any_size else self._ring_rmax_range()
+        return [r for r in rings if len(r) < 4 or lo <= r[3] <= hi]
+
+    def _ring_r_bound(self):
+        """圆环最外圈半径最大可能有多少像素(只用来定 roi 的大小，宁大勿小)。"""
+        if self.cfg.get('ring_rmax_px'):
+            return float(self.cfg['ring_rmax_px'][1])
+        if self.cfg.get('ring_rmax_cal'):
+            return 1.2 * float(self.cfg['ring_rmax_cal'])
+        for k in ('ring_rmax_seen', 'ring_rmax_hint'):          # 这次放物料时认到过 / 到工位看三个环时认到过
+            if self.cfg.get(k):
+                return 1.3 * float(self.cfg[k])
+        return self._ring_rmax_range()[1]
+
+    def _ring_roi(self, shape, ex, reach):
+        """离 ex 不到 reach 像素的圆环整个都在里面的那一块画面 (x0, y0, x1, y1)。比整幅画面小不了多少就返回 None(不裁)。"""
+        if not reach or not self.cfg.get('ring_roi', True):
+            return None
+        h, w = shape[:2]
+        half = float(reach) + min(self._ring_r_bound(), 300.0) + 8.0
+        x0, x1 = max(0, int(ex[0] - half)), min(w, int(math.ceil(ex[0] + half)))
+        y0, y1 = max(0, int(ex[1] - half)), min(h, int(math.ceil(ex[1] + half)))
+        if x1 - x0 < 16 or y1 - y0 < 16 or (x1 - x0) * (y1 - y0) > 0.85 * w * h:
+            return None
+        return x0, y0, x1, y1
+
+    def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
+        """离 expect(默认=爪子像素)最近的那个圆环的中心像素，多帧稳健平均；看不到返回 None。
+        max_px：最近的那个也离 expect 超过这么多像素，就当没看到(不去追旁边那个圆环)。给了它就只在 expect 附近那一块画面里找(快)；
+        对准过程中上一次刚认到过(圆环正往爪子点靠)，找的那一块再缩小到"上次的位置到爪子点"附近，没找到再用整块找一次。
+        self.last_ring_rmax = 这几帧里那个圆环最外圈半径(像素)的中值。"""
+        n = int(n or self.cfg['frames'])
+        ex = expect or self.claw('RING')
+        pts = []
+        rmax = []
+        reach_full = float(max_px) if max_px else None
+        reach = reach_full
+        tr = getattr(self, '_ring_track', None)
+        if reach and tr is not None and time.monotonic() - tr[1] < 2.5:
+            reach = min(reach, 1.3 * math.hypot(tr[0][0] - ex[0], tr[0][1] - ex[1]) + 30.0)
+        for fr in self._frames(n):
+            if fr is not None:
+                best = rings = None
+                for r_try in ((reach, reach_full) if reach != reach_full else (reach_full,)):
+                    rings = self._rings_in_frame(fr, any_size, self._ring_roi(fr.shape, ex, r_try))
+                    best = min(rings, key=lambda r: (r[0] - ex[0]) ** 2 + (r[1] - ex[1]) ** 2) if rings else None
+                    if best is not None and max_px and math.hypot(best[0] - ex[0], best[1] - ex[1]) > float(max_px):
+                        best = None
+                    if best is not None:
+                        break
+                    reach = reach_full                      # 小的那块里没找到：这次测量剩下的帧都用整块
+                self._publish(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
+                if best is not None:
+                    pts.append((best[0], best[1]))
+                    if len(best) >= 4:
+                        rmax.append(float(best[3]))
+        self.last_ring_rmax = sorted(rmax)[len(rmax) // 2] if rmax else None
+        if len(pts) < (1 if n <= 2 else max(2, n // 2 + 1)):          # 一两帧(对准时要快)：认到一帧就算
+            self._ring_track = None
+            return None
+        p = _robust_mean(pts, self.cfg['reject_px'])
+        self._ring_track = (p, time.monotonic()) if max_px else None
+        return p
+
+    def note_ring_size(self, r):
+        """对准空圆环时认到的最外圈半径(像素)。没做 vclaw RING 量圆环大小时记下来(只在这次运行里有效)：
+        取回、码垛时白心被物料盖住、只剩黑环外圈，也能按这个大小认出来。"""
+        if not r:
+            return
+        seen = self._ring_seen = (getattr(self, '_ring_seen', []) + [float(r)])[-5:]
+        self.cfg['ring_rmax_seen'] = sorted(seen)[len(seen) // 2]
+
+    def note_claw_clear(self):
+        """刚对准过空圆环(爪子是空的，附近只有黑白圆环)：这时找到的爪子区域是干净的，记给认圆环上物料的 matdet 用。
+        这样取回蓝色/浅蓝物料时，挨着蓝色爪子的物料不会被当成爪子去掉。"""
+        import numpy as np
+        m = self.last_claw
+        if m is None or not getattr(m, 'any', lambda: False)():
+            return
+        try:
+            md = self._pick_det()
+        except VisionError:
+            return
+        if md._auto_cache is None or (md._auto_cache.shape == m.shape and
+                                      int(np.count_nonzero(m)) < int(np.count_nonzero(md._auto_cache))):
+            md._auto_cache = m          # 原料盘那边记下的爪子区域可能连着蓝色物料(只会偏大)：空圆环上方这份更小就用这份
+
+    def _clean_claw(self, shape):
+        """不会把物料算进去的爪子区域：标定过的 claw_mask.png 优先；没有就用之前记下的(蓝色物料连进去只会偏大，取最小的那份)。
+        都没有返回 None。爪子在画面里的位置不随姿态变，所以哪个工位记下的都能用。"""
+        import numpy as np
+        cands = []
+        for md in (self._pick, getattr(self._material, 'detector', None), self._mask_md):
+            if md is None:
+                continue
+            try:
+                st = md._load_static(shape)
+            except Exception:
+                st = None
+            if st is not None and st.shape[:2] == tuple(shape[:2]) and st.any():
+                return st                                   # 标定过的最准
+            m = getattr(md, '_auto_cache', None)
+            if m is not None and m.shape[:2] == tuple(shape[:2]) and m.any():
+                cands.append(m)
+        if not cands:
+            return None
+        return min(cands, key=lambda m: int(np.count_nonzero(m)))
+
+    def ring_centre_free(self, n=2):
+        """爪子点附近那个圆环的白心是不是空的(没放着物料)：True 空 / False 有东西 / None 看不清(被爪子挡住太多、没认到圆环)。
+        白心里白色(亮、颜色淡)的像素占多少：印的数字是黑的，占得不多；放着物料就基本没有白的了。
+        "白"按这一帧圆环外面的白纸/白板有多亮来定(光线暗、摄像头曝光低时白心也只有灰白，不能当成"放了东西")；
+        爪子区域用干净的那份(蓝色物料挨着爪子时，现找的爪子区域会把它算进去，白心就"看不见"了)。
+        几帧意见不一致返回 None(照常放)。"""
+        import cv2
+        import numpy as np
+        votes = []
+        cu, cv_ = self.claw('RING')
+        for fr in self._frames(int(n)):
+            if fr is None:
+                continue
+            rings = self._rings_in_frame(fr)
+            if not rings:
+                continue
+            best = min(rings, key=lambda r: (r[0] - cu) ** 2 + (r[1] - cv_) ** 2)
+            R = float(best[3]) if len(best) >= 4 else float(best[2])
+            h, w = fr.shape[:2]
+            yy, xx = np.ogrid[:h, :w]
+            d2 = (xx - best[0]) ** 2 + (yy - best[1]) ** 2
+            inside = d2 <= (0.4 * R) ** 2
+            claw = self._clean_claw((h, w))
+            if claw is None:
+                claw = self.last_claw
+            free = np.ones((h, w), bool)
+            if claw is not None and claw.shape[:2] == (h, w):
+                free = cv2.dilate(claw, np.ones((9, 9), np.uint8)) == 0
+            inside &= free
+            npx = int(inside.sum())
+            if npx < 120:
+                continue
+            hsv = cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)
+            val, sat = hsv[:, :, 2], hsv[:, :, 1]
+            pale = sat < 70
+            ref_px = val[(d2 >= (1.08 * R) ** 2) & (d2 <= (1.45 * R) ** 2) & free & pale]   # 圆环外面一圈的白纸/白板
+            if ref_px.size < 200:
+                ref_px = val[free & pale]
+            ref = float(np.percentile(ref_px, 75)) if ref_px.size else 255.0
+            white = (val > max(60.0, min(140.0, 0.65 * ref))) & pale
+            frac = float((white & inside).sum()) / npx
+            votes.append(True if frac >= 0.55 else (False if frac < 0.4 else None))
+        votes = [v for v in votes if v is not None]
+        if not votes or (len(votes) > 1 and sum(votes) * 2 == len(votes)):
+            return None
+        return sum(votes) * 2 > len(votes) if len(votes) > 1 else votes[0]
+
+    def ring_list(self, n=None):
+        """这几帧里认到的所有圆环(不挑离爪子点近的)：[(u, v, 最外圈半径), ...]，按 u(画面从左到右)排。
+        一个圆环要在一半以上的帧里认到才算；大小和大多数差得多的(不是圆环)去掉。"""
+        n = int(n or self.cfg['frames'])
+        tracks, nf = [], 0
+        for fr in self._frames(n):
+            if fr is None:
+                continue
+            nf += 1
+            rings = self._rings_in_frame(fr)
+            self._publish(fr, 'RING', None, rings=rings)
+            for r in rings:
+                u, v = float(r[0]), float(r[1])
+                rm = float(r[3]) if len(r) >= 4 else float(r[2])
+                for t in tracks:
+                    if math.hypot(t[0][0] - u, t[0][1] - v) < max(10.0, 0.3 * rm):
+                        t.append((u, v, rm))
+                        break
+                else:
+                    tracks.append([(u, v, rm)])
+        out = []
+        need = nf // 2 + 1                                   # 一半以上的帧里认到(只拍了 1 帧就是那 1 帧)
+        for t in tracks:
+            if len(t) >= need:
+                k = len(t) // 2
+                out.append((sorted(q[0] for q in t)[k], sorted(q[1] for q in t)[k], sorted(q[2] for q in t)[k]))
+        if out:
+            med = sorted(r[2] for r in out)[len(out) // 2]
+            out = [r for r in out if 0.75 * med <= r[2] <= 1.33 * med]
+        out.sort(key=lambda r: r[0])
+        return out
+
+    def ring_error(self, n=None, max_px=None):
+        """圆环中心偏差像素 = 圆环中心 - 爪子(RING)。看不到返回 None。max_px 见 ring_px。"""
+        p = self.ring_px(n, max_px=max_px)
+        if p is None:
+            return None
+        cu, cv_ = self.claw('RING')
+        return (p[0] - cu, p[1] - cv_)
+
+    # ------------------------------------------------------------ 圆环上放着的物料(取回、码垛)
+    def _pick_det(self):
+        """认圆环上物料用的 matdet。和原料盘的分开：观察高度不一样，物料看起来大小不一样，原料盘学到的半径不能用。"""
+        if self._pick is None:
+            try:
+                from matdet import MaterialDetector
+            except ImportError as ex:
+                raise VisionError('找不到 matdet.py(或者没装 numpy/opencv)：把 matdet.py 复制到 lidar_map_north 文件夹') from ex
+            self._pick = MaterialDetector(self.cfg.get('matdet'))
+            if self.cfg.get('pick_r_px'):
+                self._pick.seed_radius(float(self.cfg['pick_r_px']))
+        md = self._pick
+        if md._auto_cache is None:
+            # 原料盘那边记下过爪子区域就拿来用(爪子在画面里的位置不随姿态变)：蓝色物料挨着爪子时不会和爪子连成一块
+            try:
+                main = self.material_detector_obj()
+            except VisionError:
+                main = None
+            if getattr(main, '_auto_cache', None) is not None:
+                md._auto_cache = main._auto_cache
+        return md
+
+    def pick_px(self, color_id, n=None):
+        """圆环上(取回时)或下面一层(码垛时)这个颜色的物料，顶面圆心的像素位置，多帧稳健平均；看不到返回 None。
+        量过物料顶面半径(pick_r_px)时，大小差得多的不算。self.last_pick_r = 这几帧里顶面半径的中值。"""
+        n = int(n or self.cfg['frames'])
+        md = self._pick_det()
+        r0 = self.cfg.get('pick_r_px')
+        pts, rr = [], []
+        for fr in self._frames(n):
+            if fr is None:
+                continue
+            res = md.detect(fr, int(color_id))
+            if res is not None and r0 and not 0.8 * float(r0) <= res['radius'] <= 1.25 * float(r0):
+                res = None
+            p = None if res is None else (float(res['center'][0]), float(res['center'][1]))
+            self._publish(fr, 'PICK', p, color_id=color_id)
+            if p is not None:
+                pts.append(p)
+                rr.append(float(res['radius']))
+        self.last_pick_r = sorted(rr)[len(rr) // 2] if rr else None
+        if len(pts) < (1 if n <= 2 else max(2, n // 2 + 1)):          # 一两帧(对准时要快)：认到一帧就算
+            return None
+        return _robust_mean(pts, self.cfg['reject_px'])
+
+    def pick_error(self, color_id, n=None):
+        """物料顶面偏差像素 = 物料顶面圆心 - claw_px.PICK。PICK 还没量过、或者看不到，返回 None。"""
+        if not self.has_pick():
+            return None
+        p = self.pick_px(color_id, n)
+        if p is None:
+            return None
+        cu, cv_ = self.claw('PICK')
+        return (p[0] - cu, p[1] - cv_)
+
+    # ------------------------------------------------------------ 调试
+    def save_debug(self, path, kind='RING', color_id=None):
+        """存一张带标注的图(和 vview 看到的一样)：爪子点(绿十字)、圆环(黄；大小不对被过滤掉的是灰色)/物料(青色圆、红叉)。"""
+        import cv2
+        fr = self._frame()
+        if fr is None:
+            return False
+        try:
+            if color_id is not None:
+                out = self.overlay(fr, 'RAW', self._material_det()(fr, color_id), color_id=color_id)
+            else:
+                rings = self._rings_in_frame(fr)
+                cu, cv_ = self.claw('RING')
+                best = min(rings, key=lambda r: (r[0] - cu) ** 2 + (r[1] - cv_) ** 2) if rings else None
+                out = self.overlay(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
+        except VisionError:
+            out = fr
+        return bool(cv2.imwrite(path, out))
+
+    # ------------------------------------------------------------ 实时画面(给 vview.py 看)
+    def overlay(self, fr, kind, target=None, color_id=None, rings=None, plate=None, pts=None):
+        """在一帧上画出识别结果，返回新图。kind='RAW' 物料 / 'RING' 圆环；target = 认到的中心(像素)或 None。
+        color_id='plate'：原料盘外圆(plate，黄圈)、它的圆心(target)、这一帧认出的物料(pts，青色小圈)；
+        live_goal(原料区要把圆心对到的点)画成紫色菱形，左上角写离它多少。"""
+        import cv2
+        out = fr.copy()
+        md = None
+        if kind == 'RING':
+            claw = self.last_claw
+        else:
+            try:
+                md = self._pick if kind == 'PICK' else self.material_detector_obj()
+            except VisionError:
+                md = None
+            claw = getattr(md, 'last_claw', None) if md is not None else None
+        if claw is not None and getattr(claw, 'shape', None) is not None and claw.shape[:2] == out.shape[:2] and claw.any():
+            out[claw > 0] = (out[claw > 0] * 0.5).astype(out.dtype)               # 爪子区域变暗(这块不用来识别)
+        cu, cv_ = self.claw(kind)
+        info = ''
+        if kind == 'RING':
+            details = getattr(self._ring, 'last', None) or []
+            kept = [(r[0], r[1]) for r in (rings or [])]
+            for d in details:
+                x, y = d['center']
+                ok = any(abs(x - kx) < 0.05 and abs(y - ky) < 0.05 for kx, ky in kept)
+                col = (0, 255, 255) if ok else (150, 150, 150)
+                for r in (d['radii'] if ok else [d['r_max']]):
+                    cv2.circle(out, (int(round(x)), int(round(y))), int(round(r)), col, 1)
+                if not ok:
+                    cv2.putText(out, f'r={d["r_max"]:.0f} size?', (int(x) + 6, int(y) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+                elif target is not None and abs(x - target[0]) < 0.05 and abs(y - target[1]) < 0.05:
+                    info = f' rmax={d["r_max"]:.0f}px {d["n_circles"]} circles seen {d["coverage"] * 100:.0f}%'
+            if not details:
+                for r in rings or []:
+                    cv2.circle(out, (int(round(r[0])), int(round(r[1]))), int(round(r[2])), (0, 255, 255), 1)
+            what = f'RING ({len(kept)} found' + (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
+        else:
+            res = getattr(md, 'last', None) if md is not None else None
+            if color_id == 'plate':
+                if plate is not None:
+                    pc = plate.get('c_now', plate['c'])
+                    pr = float(plate.get('r_now', plate['r']))
+                    rough = bool(plate.get('coarse'))           # (10-20)外圈只露出一小段：大概的圆心(橙色)
+                    cv2.circle(out, (int(round(pc[0])), int(round(pc[1]))), int(round(pr)), (0, 165, 255) if rough else (0, 255, 255), 2)
+                    info = f' plate r={pr:.0f}px' + (' (rough)' if rough else (' (found off-frame)' if plate.get('seek') else ''))
+                for q in pts or []:
+                    cv2.circle(out, (int(round(q[0])), int(round(q[1]))), 8, (255, 255, 0), 2)
+                info += f' {len(pts or [])} materials'
+            elif target is not None and res is not None:
+                cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
+                info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
+            what = 'PLATE CENTER' if color_id == 'plate' else ('WATCHING PLATE' if color_id == 'any' else f'MATERIAL {color_id}')
+            if kind == 'PICK':
+                what += ' on ring' + ('' if self.has_pick() else ' (PICK point not learned)')
+        goal = getattr(self, 'live_goal', None) if color_id == 'plate' else None
+        if goal is not None:
+            cv2.drawMarker(out, (int(round(goal[0])), int(round(goal[1]))), (255, 0, 255), cv2.MARKER_DIAMOND, 24, 2)
+        if target is not None:
+            cv2.drawMarker(out, (int(round(target[0])), int(round(target[1]))), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 28, 2)
+            ref = goal if goal is not None else (cu, cv_)
+            cv2.line(out, (int(round(ref[0])), int(round(ref[1]))), (int(round(target[0])), int(round(target[1]))), (255, 0, 255), 1)
+            du, dv = target[0] - ref[0], target[1] - ref[1]
+            try:
+                mm = (du * du + dv * dv) ** 0.5 / self.scale(kind)
+            except Exception:
+                mm = float('nan')
+            msg = f'{what}: ' + ('to goal' if goal is not None else 'off') + f' {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm'
+        else:
+            msg = f'{what}: NOT FOUND'
+        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
+        lines = [msg + time.strftime('   %H:%M:%S')]
+        if info.strip():
+            lines.append(info.strip())                 # 第二行：半径、遮挡、看到几个物料(一行写不下)
+        for i, t in enumerate(lines):
+            (tw, th), _b = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            y = 22 + 22 * i
+            cv2.rectangle(out, (4, y - th - 5), (12 + tw, y + 6), (0, 0, 0), -1)      # 黑底白字(描粗边的字会错开、看不清)
+            cv2.putText(out, t, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        return out
+
+    def _publish(self, fr, kind, target=None, color_id=None, rings=None, plate=None, pts=None):
+        """把带标注的这一帧写到 live_view 文件(限速)，另一个终端里 python3 vview.py 就能实时看。出错也不影响识别。"""
+        path = self.cfg.get('live_view')
+        if not path or fr is None:
+            return
+        now = time.monotonic()
+        if now - self._live_t < 1.0 / max(0.5, float(self.cfg.get('live_fps') or 8.0)):
+            return
+        self._live_t = now
+        try:
+            import cv2
+            ok, buf = cv2.imencode('.jpg', self.overlay(fr, kind, target, color_id, rings, plate=plate, pts=pts),
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                tmp = path + '.tmp'
+                with open(tmp, 'wb') as f:
+                    f.write(buf.tobytes())
+                os.replace(tmp, path)                   # 一次换掉，看的那边不会读到写了一半的图
+        except Exception:
+            pass

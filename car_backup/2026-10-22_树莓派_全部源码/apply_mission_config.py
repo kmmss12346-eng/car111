@@ -1,0 +1,95 @@
+"""给 map_config_start2_roi.json 加上机械臂任务的配置 mission_cfg。
+
+  python3 apply_mission_config.py                  加配置(默认启用)
+  python3 apply_mission_config.py --disable        把 mission_cfg.enabled 设成 false(go 时不做夹取，只走路线)
+  python3 apply_mission_config.py 别的配置文件.json
+
+只加不改：你已经有的值一个都不动，只补上缺的；原文件自动备份成 .json.bak_mission。
+"""
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from mission_hooks import DEFAULTS, deep_merge
+
+NOTE = ('机械臂任务配置。claw_px=爪子轴线在画面里的位置(调它就能微调放置位置，1 像素≈0.34mm)；px_per_mm=每毫米多少像素；'
+        'tol_mm=对准到多小算好；ring_offset_mm=圆环相对停车点沿车头方向的位置(要去现场核对圆环编号方向)；'
+        'time_limit_s=超过这个时间不再做夹放，留时间回家；round_s/home_margin_s/work_item_s=按时间判断还做不做下一个物料、要不要直接回家；'
+        'qr_*=读不到码时沿车道前后挪着找；ring_strafe_max_mm=工位里车轮横移最多多少。详见 README_mission.md')
+
+
+# 改过默认值的项：配置里还是旧的默认值(说明没人改过)就换成新的。(None, 键) = mission_cfg 下面直接的键
+OLD_DEFAULTS = {('px_per_mm', 'RAW'): (4.36, 1.97), ('tol_mm', 'RAW'): (3.0, 2.0), ('accept_mm', 'RAW'): (6.0, 4.0),
+                (None, 'learn_pick'): (True, False),          # 10-10：放完不再回去拍物料(慢)，取回认圆环外圈
+                (None, 'chassis_fine_rpm'): (60, 100),        # 10-10：视觉微调时底盘快一点
+                ('tol_mm', 'RING'): ((1.0, 2.0), 1.2),       # 10-10：赛规 1 环 = 偏心 <1.5mm(15 分)，2 环 <4mm(10 分)
+                ('tol_mm', 'STACK'): (2.0, 2.5),             # 码垛不掉下来就得分
+                ('accept_mm', 'RING'): ((2.5, 3.0), 3.5),       # 4mm 以内还是 2 环(10 分)：放下比不放强
+                (None, 'raw_stop_s'): (4.0, 5.0),             # 10-10 晚：原料区换回 1010i 的做法(当时配置里是 5 秒)
+                (None, 'raw_frames'): (1, 2),                 # 10-10 晚：原料区换回 1010i 的做法(当时配置里是 2 帧)
+                (None, 'ring_strafe_max_mm'): ((40.0, 40), 20.0),   # 10-10：工位里横移最多 20mm(停车点离白区只有 60mm，40 太近)
+                (None, 'wheels_min_mm'): (1.5, 4.0),
+                # 10-10 晚：原料区夹取、工位放置/取回都换回 1010i 的做法(用户定的)：下面这些新做法的开关关掉
+                (None, 'raw_any_order'): (True, False),     # 10-11 晚 用户：原料区按任务码顺序夹(不能随机夹)
+                (None, 'wheels_first'): (True, False),
+                (None, 'take_first'): (True, False),
+                (None, 'zone_filter'): (True, False),
+                (None, 'ring_precorrect'): (True, False),
+                (None, 'tilt_precorrect'): (True, False),
+                (None, 'return_bias'): (True, False),
+                (None, 'zone_frames'): (2, None),
+                (None, 'zone_gain'): (1.0, 0.85),
+                (None, 'survey_frames'): (3, None),
+                ('place_shift_mm', 'F'): (-20.0, 0.0),
+                (None, 'raw_wheels_first'): (True, False),
+                (None, 'raw_seek'): (True, False),
+                (None, 'raw_track_s'): (30.0, 150.0),
+                (None, 'raw_max_iter'): (3, 1),
+                (None, 'raw_grab_max_mm'): ((5.0, 12.0, 12), 30.0)}   # 10-11：原料区修一次就夹，30mm 以内都夹         # 10-11：原料区一定要夹起来，等到时间用完为止            # 10-11：原料区到了停车点车不动，只动爪子    # 10-10：原料区只动爪子(上一版默认先动车轮)          # 10-10：先动车轮时差 4mm 以下交给手臂(1.5 时模拟里失败多)
+
+
+def main(argv):
+    disable = '--disable' in argv
+    paths = [a for a in argv if not a.startswith('--')]
+    path = Path(paths[0]) if paths else Path(__file__).resolve().parent / 'map_config_start2_roi.json'
+    if not path.exists():
+        print(f'找不到 {path}')
+        return 1
+    cfg = json.loads(path.read_text(encoding='utf-8'))
+    old = cfg.get('mission_cfg') or {}
+    new = deep_merge(DEFAULTS, old)          # DEFAULTS 打底，已有的值覆盖它(不会改你已经设的)
+    for (sec, k), (was, now) in OLD_DEFAULTS.items():     # 以前的默认值、没改过的：换成新的默认值
+        cur = old.get(k, None) if sec is None else (old.get(sec) or {}).get(k)
+        olds = was if isinstance(was, tuple) else (was,)
+        if cur is not None and any(type(cur) is type(w) and cur == w for w in olds):
+            if sec is None:
+                new[k] = now
+            else:
+                new[sec][k] = now
+            print(f'  {(sec + ".") if sec else ""}{k}：旧的默认值 {cur} -> 新的默认值 {now}')
+    if disable:
+        new['enabled'] = False
+    elif 'enabled' not in old:
+        new['enabled'] = True
+    bak = path.with_suffix('.json.bak_mission')
+    if not bak.exists():
+        shutil.copyfile(path, bak)
+    cfg['mission_cfg'] = new
+    cfg['_mission_cfg_note'] = NOTE
+    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding='utf-8')
+    added = [k for k in new if k not in old]
+    print(f'已写入 {path}（原文件备份在 {bak.name}）')
+    print(f'  mission_cfg.enabled = {new["enabled"]}')
+    print('  新增的项：' + (', '.join(added) if added else '(没有，都已经有了)'))
+    stops = cfg.get('mission')
+    print(f'  路线(mission)：{stops}')
+    if stops and sum(1 for s in stops if str(s).upper().startswith('RAW')) > 1:
+        print('  提示：路线里有两批。3 分钟一般做不完两批：时间不够时不再开始新的物料，新的导航会从当前停车点直接回家；'
+              '想稳一点先只做第一批：把 "mission" 改成 ["QR","RAW","ROUGH","TEMP","START"]。')
+    print('下一步：看 README_mission.md 的上车测试步骤(物料颜色用 wuliao.py 里的范围，没有就用 matdet.py 里一样的默认值)。')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
