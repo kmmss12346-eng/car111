@@ -738,7 +738,7 @@ def _raw_preflight(h, batch, force, log):
     for s in full:
         h.in_tray.pop(s, None)
     mode = str(h.cfg.get('raw_chassis') or 'off').upper()
-    anyo = bool(h.cfg.get('raw_any_order')) or bool(getattr(h, '_any_next', False))
+    anyo = bool(getattr(h, '_any_next', False))          # (10-22)只有 mtest RAW n any 才不按顺序(配置里的 raw_any_order 不再用)
     log(f'== 原料区 第{batch}批：' + ('不按顺序，哪个先停在爪子附近就先夹哪个' if anyo else '按这个顺序抓') + '，放进车上转盘 ==')
     for it in items:
         log(f'   {it.color_name} -> {it.slot}号槽')

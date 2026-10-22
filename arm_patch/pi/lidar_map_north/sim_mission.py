@@ -1924,6 +1924,28 @@ class PlaceOrderTests(unittest.TestCase):
             self.assertEqual('不再用' in text, cfg is not None, text[-2000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text)
 
+    def test_whole_run_two_batches_all_in_task_code_order(self):
+        """(10-22 用户"你只需要把这12次夹取和放置的顺序改对全部按照任务码来")整场两批：原料区按第 1/3 组的颜色顺序夹(放进 1、2、3 号槽)；
+        粗加工区按颜色顺序放到第 2/4 组的环、按同样顺序取回；暂存区第一批按第 2 组平放，第二批按第 3 组的顺序叠在同色的第一批上。
+        车上配置里写着以前的"不按顺序"(raw_any_order、raw_near_any_order、place_order=sweep)也不用。"""
+        code = '652+312+526+231'                       # 第一批 浅蓝->3 黑->1 黄->2；第二批 黑->粗加工2 黄->3 浅蓝->1(暂存区叠在同色上：1、2、3)
+        w = SimWorld(seed=1, code=code, cam_deg=90.0)
+        lines = []
+        h = make(w, dict(raw_any_order=True, raw_near_any_order=True, place_order='sweep'), log=lines.append)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+        self.assertEqual([r for r in w.requests if r.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'] * 2, text[-3000:])
+        self.assertEqual([r for r in w.requests if r.startswith('PICK')], ['PICK 1 H', 'PICK 2 H', 'PICK 3 H'] * 2, text[-3000:])
+        self.assertEqual([(p[0], p[1], p[2]) for p in w.placed if p[0] == 'ROUGH'],
+                         [('ROUGH', 3, 6), ('ROUGH', 1, 5), ('ROUGH', 2, 2), ('ROUGH', 2, 5), ('ROUGH', 3, 2), ('ROUGH', 1, 6)])
+        self.assertEqual([(p[0], p[1], p[2], p[4]) for p in w.placed if p[0] == 'TEMP'],
+                         [('TEMP', 3, 6, False), ('TEMP', 1, 5, False), ('TEMP', 2, 2, False),
+                          ('TEMP', 1, 5, True), ('TEMP', 2, 2, True), ('TEMP', 3, 6, True)])
+        self.assertIn('不按顺序夹)不再用', text)
+        self.assertIn('place_order=sweep', text)
+
 
 WHEELS_ALIGN = dict(RAW='wheels', ROUGH='wheels', TEMP='wheels')
 ZONE_WHEELS = dict(RAW='arm', ROUGH='wheels', TEMP='wheels')
@@ -1950,10 +1972,11 @@ def seed_raw_wheels_j(w, h):
 class RawFollowTests(unittest.TestCase):
     """10-16 用户：原料区跟随抓取——原料盘转的时候手臂就跟着要夹的物料走，停下马上夹；不按任务码顺序。"""
 
-    def _run(self, seed, cfg=None, arm_j=True, **kw):
+    def _run(self, seed, cfg=None, arm_j=True, any_once=False, **kw):
         w = plate_world(seed, **kw)
         lines = []
         h = make(w, dict(dict(raw_follow=True), **(cfg or {})), log=lines.append)
+        h.raw_any_once = any_once
         h._ensure(w.link)
         if arm_j:
             h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
@@ -1979,7 +2002,9 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('平滑跟随', text)
         self.assertGreater(sum(1 for r in w.requests if r.startswith('APN ')), 10)
         self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
-        w2, h2, text2 = self._run(1, plate_off_tan=40.0, apn_fw=False)
+        # 旧程序一步一步跟得慢：按任务码顺序只等一个颜色时这个种子 40 秒内跟不上(10-22 起默认按顺序)；这里只测"不认 APN 能退回 AP"，
+        # 用 mtest RAW n any 那样的不按顺序(raw_any_once)
+        w2, h2, text2 = self._run(1, plate_off_tan=40.0, apn_fw=False, any_once=True)
         self.assertIn('不认 APN', text2)
         self.assertEqual(sum(1 for r in w2.requests if r.startswith('APN ')), 1)
         self.assertEqual((h2.stats.grab_ok, w2.air, w2.loose, w2.collisions), (3, 0, 0, 0), text2[-3000:])
@@ -2961,14 +2986,16 @@ class RawNearSlotTests(unittest.TestCase):
         self.assertEqual(res[True][0], 9, res)
         self.assertGreater(res[False][1], res[True][1], res)
 
-    def test_grabs_whatever_needed_color_stops_first(self):
-        """(10-21 用户"对准了之后就应该立刻识别颜色然后夹取啊为什么要等待那么久")对准以后这一格上停的是这一批要的哪个颜色就马上夹，
-        放进它自己的槽(粗加工区/暂存区还是按任务码顺序放)；比按任务码顺序等快。raw_near_any_order=False 照旧按任务码顺序。"""
+    def test_task_order_by_default_any_only_with_mtest_any(self):
+        """(10-22 用户"就是要全部按照这个任务码的顺序来放置和夹取")最近那格默认按任务码顺序夹，车上配置里写着 raw_near_any_order=true
+        也不用(日志说一次)；只有 mtest RAW n any(raw_any_once)才是"这一格上停的是这一批要的哪个颜色就马上夹"(10-21 用户要过，比按顺序等快)。"""
         took = {}
         for any_ in (True, False):
             took[any_] = 0.0
             for seed in (1, 2, 5, 7):
-                w, h, text = self._near_run(seed, cfg=dict(raw_near_any_order=any_))
+                def hook(w, h, any_=any_):
+                    h.raw_any_once = any_
+                w, h, text = self._near_run(seed, cfg=dict(raw_near_any_order=True), hook=hook)
                 self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
                 self.assertEqual({k: v for k, v in w.tray.items() if v}, {1: 1, 2: 5, 3: 6}, text[-3000:])
                 grabs = [q for q in w.requests if q.startswith('GRAB')]
@@ -2980,6 +3007,8 @@ class RawNearSlotTests(unittest.TestCase):
                             self.assertNotIn(str(at), l.split('还要 ')[1], l)
                 else:
                     self.assertEqual(grabs, ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'], text[-3000:])     # 按任务码顺序
+                    self.assertIn('不按顺序夹)不再用', text)
+                    self.assertIn('按任务码顺序下一个要', text)
                 took[any_] += float(text.split('(RAW 用了 ')[1].split(' 秒')[0])
         self.assertLess(took[True], took[False] - 10.0, took)
 
@@ -3096,14 +3125,15 @@ class RawNearSlotTests(unittest.TestCase):
 
     def test_near_teach_then_grab_only_there_in_code_order(self):
         """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，三个都在最近那一格夹到、放对槽，
-        每次下爪都是示教时的手臂角度(没转去别的格)。raw_near_any_order=False：按任务码顺序。"""
+        每次下爪都是示教时的手臂角度(没转去别的格)。默认按任务码顺序；any_ = mtest RAW n any(只这一次不按顺序)。"""
         import tempfile
         for any_ in (True, False):
             for seed in (1, 2, 5):
                 w = self._world(seed)
                 path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
                 lines = []
-                h = self._make(w, path, lines, cfg=dict(raw_near_any_order=any_))
+                h = self._make(w, path, lines)
+                h.raw_any_once = any_
                 d, col = self._teach(w, h, path)
                 text = '\n'.join(lines)
                 self.assertEqual(d.get('near'), '1', text)

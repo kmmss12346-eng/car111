@@ -690,4 +690,12 @@ git_log.txt                ← 分支最近 120 条提交记录
   找到的问题是连续绕电池盒(R2STG=0)时 ID1 转到 R1T2 才开始伸、ID1 不等，按用户参数(ROTSPD 180、R1T2 194.2→R1T1 163.7 只有 30°=0.17 秒，
   伸到 R2T 要 327°≥0.42 秒)经过电池盒时伸缩不到一半，2 号环还会在 R1T1 全速反向缩回。让用户先 `set R2STG 1` 试，等结果再决定改不改固件
   (建议：转到 R1T2 时没伸到位 ID1 就等它伸到位，伸缩不在半路反向)。
+- **10-22 再改(用户"就是要全部按照这个任务码的顺序来放置和夹取"、"爪子的问题已经修好了不用管"、"只需要把这12次夹取和放置的顺序改对")：**
+  `_grab_any_order()`：原料区一律按任务码顺序夹，配置里的 raw_any_order / raw_near_any_order 写着 true 也不用(日志说一次)，
+  只有 mtest RAW n any(raw_any_once，只这一次)才不按顺序。最近那格一律走 `_raw_near_any(in_order=True)`：只等还没夹的里面最靠前的那个
+  (没夹上的放回去又是最靠前的，先把它再夹上；连着 raw_ct_skip_stops 次停下都不是它就记没夹到、等下一个)，"没夹上再夹/都夹完再看一眼"照样有。
+  `_raw_any`(跟随/停靠位/等停到爪子附近)按顺序只给下一个颜色当候选，等 raw_track_s 没夹到就记没夹到、接着下一个；`_raw_grabpos_loop` 同样。
+  missed() 把 grab_total 也减回去(再夹到/没夹到时只记一次)。暂存区途中松爪用户说已经修好了，固件没改。
+  测试：`PlaceOrderTests.test_whole_run_two_batches_all_in_task_code_order`(两批 6 次夹 + 粗加工放/取回 + 暂存放/码垛全按顺序)、
+  `RawNearSlotTests.test_task_order_by_default_any_only_with_mtest_any`。树莓派 621 个(3 跳过)全过。
 

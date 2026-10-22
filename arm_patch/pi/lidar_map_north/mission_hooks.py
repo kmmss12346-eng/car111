@@ -123,9 +123,8 @@ DEFAULTS = dict(
     raw_grab_fix_trust=0.5,             #   (10-21)挪完画面里物料要跟着动(按车轮和画面的对应关系)至少这么多：动得太少 = 认的位置不对
                                         #   (多半被爪子挡住、和蓝色爪子连在一起)，不再按它挪，车轮挪回去按原来对准的位置夹
     raw_grab_fix_back=False,            #   (10-21 用户"对准的时间太长")夹完车轮不挪回去(下一个照样先看它停在哪再补)；True = 以前的挪回去
-    raw_near_any_order=True,            # (10-21 用户"对准了之后就应该立刻识别颜色然后夹取啊为什么要等待那么久")最近那格：这一格上停的是这一批
-                                        #   还没夹的哪个颜色就马上夹哪个(放进它自己的槽，粗加工区/暂存区照样按任务码顺序放)，不按任务码顺序等。
-                                        #   ★ 规则按任务码顺序算"正确抓取"(每个 2 分)：要按顺序抓改 false(以前的做法，有时要等原料盘转两圈)
+    raw_near_any_order=False,           # (10-22 用户"就是要全部按照这个任务码的顺序来放置和夹取")不再用：原料区一律按任务码顺序夹，
+                                        #   配置里写着 true 也不用(见 _grab_any_order)。只想这一次不按顺序(测试用)：mtest RAW 1 any
     raw_near_regrab=1,                  #   (10-21 实车"一会儿夹取一会儿不夹取")夹过的颜色还在原料盘上(刚才没夹上)：等它转到这一格再夹几次(0 = 不再夹)
     raw_near_check_last=True,           #   这一批都夹过以后再看 raw_near_check_s 秒原料盘：夹过的还在上面就再夹(最后一个没夹上也看得出来)
     raw_near_check_s=3.0,
@@ -137,7 +136,7 @@ DEFAULTS = dict(
     raw_grab_max_mm=30.0,               # (10-11 用户：误差 30mm 以内都可以夹)修正完按当时的偏差下爪，只要不超过这个。以前 5
     raw_tol_mm=3.0,                     # 原料区对准到多小就马上下爪(夹爪合上时会把物料夹正，不用像放圆环那么准)
     raw_follow=True,                    # (10-16 用户)原料区"跟随抓取"：手臂停在看得到整个原料盘的高度(ZOBRAW)，挑一个要夹的颜色，原料盘转的时候
-                                        #   手臂跟着它转(ID1/ID2，用 vcal RAW 颜色号 arm 测的 J)，原料盘一停马上下爪；不按任务码顺序，哪个先跟上先夹哪个。
+                                        #   手臂跟着它转(ID1/ID2，用 vcal RAW 颜色号 arm 测的 J)，原料盘一停马上下爪；(10-22 起)按任务码顺序，只跟下一个要夹的。
                                         #   要有手臂的 J(没有就照旧等物料停到爪子附近)。False = 以前的做法
     raw_follow_limit_deg=dict(id1=25.0, id2=250.0),   # 跟随时手臂相对 OBS RAW 姿态最多转多少度(超出就换一个够得着的物料跟；ID2 还受 STM32 里的限位)
     raw_follow_deadband_mm=3.0,         # 物料离爪子点不到这么多毫米就不动手臂(省得来回抖)
@@ -218,7 +217,7 @@ DEFAULTS = dict(
     raw_frame_thread=True,              # (10-18)对准圆心车在走时，认一帧放在后台线程，这边每 raw_vel_keep_s 秒给 STM32 续一次速度
     raw_vel_keep_s=0.15,                #   (STM32 0.4 秒收不到新的 V 就停车，实车上认一帧要零点几秒到一秒多：不续的话车走一下停一下)
     raw_center_probe_speed=10.0,        # 测车轮和画面的对应关系时车轮走多快(毫米/秒)
-    raw_any_order=False,                # (10-11 晚 用户：原料区要按顺序夹，不能随机夹)False = 按任务码顺序一个一个等着夹；True = 哪个需要的颜色停在爪子附近就先夹哪个(放进它自己的槽)。只想这一次不按顺序：mtest RAW 1 force any
+    raw_any_order=False,                # (10-11 晚 用户：原料区要按顺序夹，不能随机夹)(10-22 起配置里写着 true 也不再用，一律按任务码顺序)。只想这一次不按顺序：mtest RAW 1 force any
                                         #   规则按任务码顺序算"正确抓取"的 2 分，不按顺序可能拿不到这 2 分(放置分不受影响)
     raw_seek=False,                     # (10-11 早 用户：到了原料区停车点车就不动，只动爪子对准夹)True = 原料盘停下时要夹的物料都停在手臂够不着的地方：车挪过去
                                         #   (不横移，不压线)，下一次停下再夹；记住这个位置，同一轮第二批到原料区直接挪到这里
@@ -1612,9 +1611,8 @@ class MissionHooks:
         if self._raw_follow_on():
             self._raw_any(self.plan.items(batch), follow=True)
             return
-        if ((self.cfg.get('raw_any_order') and not getattr(self, '_raw_in_order', False)) or getattr(self, 'raw_any_once', False)) \
-                and hasattr(self.vision, 'material_stream'):
-            self._raw_any(self.plan.items(batch))
+        if self._grab_any_order() and hasattr(self.vision, 'material_stream'):
+            self._raw_any(self.plan.items(batch))               # 只有 mtest RAW n any 才走这里(不按顺序)
             return
         for item in self.plan.items(batch):
             self._check_abort()
@@ -1656,10 +1654,22 @@ class MissionHooks:
             return False
         return True
 
+    def _grab_any_order(self):
+        """(10-22 用户"就是要全部按照这个任务码的顺序来放置和夹取")原料区一律按任务码顺序夹：配置里的 raw_any_order /
+        raw_near_any_order 写着 true 也不用(日志说一次)。只有 mtest RAW n any(只这一次，测试用)才不按顺序。"""
+        if getattr(self, 'raw_any_once', False):
+            return True
+        if (self.cfg.get('raw_any_order') or self.cfg.get('raw_near_any_order')) and not getattr(self, '_any_cfg_said', False):
+            self._any_cfg_said = True
+            self.log('    (配置里的 raw_any_order / raw_near_any_order(不按顺序夹)不再用：原料区按任务码顺序夹)')
+        return False
+
     def _raw_any(self, items, follow=False):
-        """不按任务码顺序抓：每次原料盘停下，要抓的几个颜色里哪个停在爪子附近、够得着，就先夹哪个，放进它自己的槽。
-        follow=True：原料盘转的时候手臂就跟着一个要夹的物料走，停下马上夹(_raw_follow_pick)。"""
+        """跟随抓取 / 按停靠位抓 / 等停在爪子附近再夹(follow=False)。(10-22)默认按任务码顺序：每次只等下一个要夹的颜色，
+        等了 raw_track_s 秒没夹到就记"没夹到"、接着夹下一个；mtest RAW n any 时才是"要抓的几个颜色里哪个停在爪子附近、
+        够得着就先夹哪个"。follow=True：原料盘转的时候手臂就跟着要夹的物料走，停下马上夹(_raw_follow_pick)。"""
         cfg = self.cfg
+        in_order = not self._grab_any_order()
         todo = []
         for item in items:
             left = self.in_tray.get(item.slot)
@@ -1668,11 +1678,18 @@ class MissionHooks:
                 self.stats.grab(False)
                 continue
             todo.append(item)
-        self.log(('  原料区(按停靠位抓)：原料盘每停一次看一眼，要夹的颜色停在够得着的位上就直接转过去夹(放进它自己的槽)：'
-                  if follow and getattr(self, '_raw_slots_rt', None) else
-                  '  原料区(跟随抓取)：手臂跟着要夹的物料转，原料盘一停就夹，哪个先跟上先夹哪个(放进它自己的槽)：' if follow else
-                  '  原料区：不按任务码顺序，哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)：')
-                 + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
+        if in_order:
+            self.log(('  原料区(按停靠位抓)：按任务码顺序，原料盘每停一次看一眼，下一个要的颜色停在够得着的位上就直接转过去夹：'
+                      if follow and getattr(self, '_raw_slots_rt', None) else
+                      '  原料区(跟随抓取)：按任务码顺序，手臂跟着下一个要夹的物料转，原料盘一停就夹：' if follow else
+                      '  原料区：按任务码顺序一个一个夹(停在爪子附近就对准下爪)：')
+                     + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
+        else:
+            self.log(('  原料区(按停靠位抓)：原料盘每停一次看一眼，要夹的颜色停在够得着的位上就直接转过去夹(放进它自己的槽)：'
+                      if follow and getattr(self, '_raw_slots_rt', None) else
+                      '  原料区(跟随抓取)：手臂跟着要夹的物料转，原料盘一停就夹，哪个先跟上先夹哪个(放进它自己的槽)：' if follow else
+                      '  原料区：不按任务码顺序，哪个颜色停在爪子附近就先夹哪个(放进它自己的槽)：')
+                     + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
         md = self.vision.material_detector_obj() if hasattr(self.vision, 'material_detector_obj') else None
         if md is not None and hasattr(md, 'need_vmask') and any(md.need_vmask(it.color) for it in todo) and not self._warned_vmask:
             self._warned_vmask = True
@@ -1684,7 +1701,7 @@ class MissionHooks:
             if not self.cfg.get('full_course', True) and self.time_left() < 0:
                 self.log('    ★ 时间到，不再抓取')
                 break
-            self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3 ANY')
+            self._ui('stage', f'RAW GRAB {len(items) - len(todo) + 1}/3' + ('' if in_order else ' ANY'))
             wheels = (not follow) and self._raw_wheels_on()
             if not wheels:
                 self._raw_recenter()                        # 只动车轮时不挪回：物料每次停在同一个地方，留在上次对准的位置(横移/前后都限着范围)
@@ -1694,7 +1711,7 @@ class MissionHooks:
                 if not wheels and not follow:
                     self._raw_goto_pose()
                 t_end = min(self.now() + float(cfg.get('raw_track_s', 30.0)), self.t0 + (1e9 if cfg.get('full_course', True) else float(cfg['time_limit_s'])))
-                cands = [(it.color, it.slot, it) for it in todo]
+                cands = [(it.color, it.slot, it) for it in (todo[:1] if in_order else todo)]
                 if follow:
                     self._raw_follow_now = True
                     try:
@@ -1709,6 +1726,12 @@ class MissionHooks:
                     raise
                 self._recover(f'抓取出错：{ex}')
             if got is None:
+                if in_order and not self.disabled:
+                    it0 = todo.pop(0)                       # 按顺序：这一个等不到/没夹成，记没夹到，接着夹下一个(不跳着夹)
+                    self.log(f'    ★ {it0.color_name} 没夹到：接着夹下一个')
+                    self.stats.grab(False)
+                    self._show_stats()
+                    continue
                 break
             it = got[2]
             self.stats.grab(True)
@@ -3705,12 +3728,22 @@ class MissionHooks:
                  + '  '.join(f'{it.color_name}->{it.slot}号槽' for it in todo))
         watch = sorted(set(self._raw_center_colors()) | {it.color for it in todo})
         t_end = self.now() + float(cfg.get('raw_track_s', 30.0)) * max(1, len(todo)) + 10.0
+        in_order = not self._grab_any_order()                  # (10-22)按任务码顺序：停在抓取位的要是下一个要夹的颜色才夹
         first = True
         home = self._raw_home()
+        head, t_head = None, 0.0
         while todo and self.now() < t_end:
             self._check_abort()
             if self.disabled:
                 break
+            if in_order and head is not todo[0]:
+                head, t_head = todo[0], self.now() + float(cfg.get('raw_track_s', 30.0))
+            if in_order and self.now() > t_head:               # 按顺序：这一个等太久没转到抓取位，记没夹到，接着夹下一个(不跳着夹)
+                self.log(f'    ★ {head.color_name} 等了 {float(cfg.get("raw_track_s", 30.0)):.0f} 秒没转到抓取位：没夹到，接着夹下一个')
+                self.stats.grab(False)
+                todo.pop(0)
+                self._show_stats()
+                continue
             ob = self._raw_wait_still(watch, 20.0, after_move=not first)
             first = False
             if ob is None:
@@ -3724,9 +3757,9 @@ class MissionHooks:
             if dist > match:
                 self.log(f'  [抓] 原料盘停了，抓取位上没有物料(最近的 {name} 离爪子点 {dist / sc:.0f}mm)：等下一次停')
                 continue
-            it = next((x for x in todo if x.color == k), None)
+            it = (todo[0] if todo[0].color == k else None) if in_order else next((x for x in todo if x.color == k), None)
             if it is None:
-                self.log(f'  [抓] 停在抓取位的是 {name}，这次不要：等下一次停')
+                self.log(f'  [抓] 停在抓取位的是 {name}，这次不要' + (f'(下一个要 {todo[0].color_name})' if in_order else '') + '：等下一次停')
                 continue
             if t_stop is None:
                 self.log(f'  [抓] 停在抓取位的是 {name}，但没看到它什么时候停下的(下爪时可能转起来)：等下一次停')
@@ -4501,7 +4534,7 @@ class MissionHooks:
             todo.append(item)
         if not todo:
             return True
-        any_order = bool(near_k) and bool(cfg.get('raw_near_any_order', True))
+        any_order = bool(near_k) and self._grab_any_order()     # (10-22)一律按任务码顺序；只有 mtest RAW n any 才不按顺序
         if any_order:
             self.log('  原料区(最近那格)：手臂摆到看原料盘的姿态不动，车轮把原料盘中心对到示教时的位置(爪子就在离车最近那一格上方)；'
                      '对准以后车不动，原料盘每停一次，这一格上是这一批要的哪个颜色就马上夹哪个(不按任务码顺序等，'
@@ -4607,9 +4640,10 @@ class MissionHooks:
             return occ
 
         known = self._rc_plate_stop() if near_k else None     # (10-21)对准的时候看着原料盘停下的：一对准完、还停着就能夹
-        if any_order:
+        if near_k:
+            # (10-22)最近那格一律走这里(没夹上的认得出来再夹)：按任务码顺序只等下一个要的颜色；mtest RAW n any 时哪个先来夹哪个
             self._raw_near_any(D, todo, dict(P=P, keys=keys, reach=reach, sp=sp, match=match, T=T, margin=margin, spd=spd,
-                                             home=home, comp=comp, watch=watch, known=known,
+                                             home=home, comp=comp, watch=watch, known=known, in_order=not any_order,
                                              cyc=float(cfg.get('raw_ct_stop_s', 6.0)) + float(cfg.get('raw_ct_move_s', 3.0))))
             self._stow_quiet()
             return True
@@ -4739,6 +4773,8 @@ class MissionHooks:
     def _raw_near_any(self, D, todo, ctx):
         """(10-21 用户"对准了之后就应该立刻识别颜色然后夹取啊为什么要等待那么久")最近那格、车已经对准：原料盘每停一次，
         这一格上是这一批还没夹的哪个颜色就马上夹哪个，放进它自己的转盘槽(不按任务码顺序等)。
+        (10-22 用户"就是要全部按照这个任务码的顺序来放置和夹取")ctx['in_order']=True(默认的做法)：只等任务码里下一个要夹的颜色
+        (还没夹的里面最靠前的；没夹上的放回去，它又是最靠前的，先把它再夹上)；这一格连着 raw_ct_skip_stops 次停下都不是它就记没夹到、等下一个。
         (10-21 实车"一会儿夹取一会儿不夹取")夹过的颜色又出现在原料盘上(刚才没夹上)：raw_near_regrab 次以内等它转到这一格再夹。
         每夹到一个，等下一个最多 raw_track_s 秒；连着 raw_ct_skip_stops 次停下这一格都没有要的颜色(原料盘上没有？)就不再等。"""
         cfg, v = self.cfg, self.vision
@@ -4746,6 +4782,7 @@ class MissionHooks:
         P, keys, reach = ctx['P'], ctx['keys'], ctx['reach']
         sp, match, T, margin, spd = ctx['sp'], ctx['match'], ctx['T'], ctx['margin'], ctx['spd']
         home, comp, watch, cyc, known = ctx['home'], ctx['comp'], ctx['watch'], ctx['cyc'], ctx['known']
+        in_order = bool(ctx.get('in_order', False))
         Jc = self.store.get('RAW', 'ch') if self.store is not None else None
         Jc = None if Jc is None else np.asarray(Jc, float)
 
@@ -4789,6 +4826,7 @@ class MissionHooks:
             nonlocal t_end
             it0 = got_at.pop(int(c_))
             self.stats.grab_ok = max(0, self.stats.grab_ok - 1)
+            self.stats.grab_total = max(0, self.stats.grab_total - 1)   # (10-22)这一个重新算：再夹到/没夹到时再记一次(不重复记)
             if self.in_tray.get(it0.slot) is it0:
                 self.in_tray.pop(it0.slot, None)               # 转盘这一格是空的(粗加工区不去取)
             self._show_stats()
@@ -4865,19 +4903,32 @@ class MissionHooks:
                         del wait_n[c_]
                         self.in_tray[it_.slot] = it_                # 多半看错了：当它还在转盘里(和刚才夹的时候一样算)
                         self.stats.grab_ok += 1
+                        self.stats.grab_total += 1
                         self._show_stats()
                         self.log(f'  [抓 {it_.color_name}] 等了 3 次停下都没转到这一格：刚才多半看错了，当它已经夹到了')
             if not left:
                 break
             names = f'这一格上是 {COLOR_NAMES.get(int(at), at)}' if at is not None else '这一格上没认出物料'
-            item = next((it_ for it_ in left if int(it_.color) == at), None) if at is not None else None
+            head = min(left, key=lambda it_: int(it_.index))   # 按任务码顺序下一个要夹的
+            if in_order:
+                item = head if (at is not None and int(head.color) == at) else None
+            else:
+                item = next((it_ for it_ in left if int(it_.color) == at), None) if at is not None else None
             if same and item is None:
                 continue                                       # 刚下过爪的那一次停下：这一格上没有没夹上的，等下一次停
             if item is None:
                 misses += 1
-                want = '、'.join(it_.color_name for it_ in left)
-                self.log(f'  [抓] 原料盘停了：{names}；还要 {want}，等它转过来')
+                want = head.color_name if in_order else '、'.join(it_.color_name for it_ in left)
+                self.log(f'  [抓] 原料盘停了：{names}；' + (f'按任务码顺序下一个要 {want}' if in_order else f'还要 {want}') + '，等它转过来')
                 if misses >= int(cfg.get('raw_ct_skip_stops', 4)):
+                    if in_order and len(left) > 1:
+                        left.remove(head)                      # 按顺序：这一个一直没转过来(原料盘上没有？)，记没夹到，接着等下一个
+                        wait_n.pop(int(head.color), None)
+                        self.log(f'    ★ 连着 {misses} 次停下这一格上都不是 {want}(原料盘上没有？)：{want} 没夹到，接着等下一个')
+                        self.stats.grab(False)
+                        self._show_stats()
+                        misses = 0
+                        continue
                     self.log(f'    ★ 连着 {misses} 次停下这一格上都没有要的颜色({want})(原料盘上没有？)：不再等')
                     break
                 continue
