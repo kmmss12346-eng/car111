@@ -1,0 +1,24 @@
+{
+  "pose_and_mount_measured": true,
+  "car_x_mm": 2250,
+  "car_y_mm": 150,
+  "car_yaw_deg": 180,
+  "lidar_forward_mm": 0,
+  "lidar_left_mm": 140,
+  "lidar_yaw_deg": -139.43,
+  "sdk_y_sign": -1,
+  "cylinder_diameter_mm": 50,
+  "margin_mm": 20,
+  "mount_note": "User requested left140 forward0. Angular offset retained; valid only if sensor orientation unchanged. Previous calibration report is historical.",
+  "car_length_mm": 290,
+  "car_width_mm": 260,
+  "self_echo_pad_mm": 120,
+  "reference_correction_enabled": true,
+  "boundary_target_windows": [
+    {
+      "x_mm": 2400,
+      "y_mm": 1200,
+      "radius_mm": 60
+    }
+  ]
+}

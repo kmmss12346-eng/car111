@@ -1,0 +1,566 @@
+{
+  "pose_and_mount_measured": true,
+  "car_x_mm": 2250,
+  "car_y_mm": 150,
+  "car_yaw_deg": 90,
+  "lidar_forward_mm": 22.453557227708068,
+  "lidar_left_mm": 134.7743150753031,
+  "lidar_yaw_deg": -49.54228881174433,
+  "sdk_y_sign": -1,
+  "cylinder_diameter_mm": 50,
+  "margin_mm": 60,
+  "boundary_guard_mm": 120,
+  "cylinder_exclusion_zones": [
+    {
+      "name": "temp_zone_exact",
+      "rect_mm": [
+        0,
+        910,
+        150,
+        1490
+      ]
+    },
+    {
+      "name": "rough_zone_exact",
+      "rect_mm": [
+        910,
+        0,
+        1490,
+        150
+      ]
+    },
+    {
+      "name": "yellow_left_bottom",
+      "rect_mm": [
+        550,
+        550,
+        1000,
+        1000
+      ]
+    },
+    {
+      "name": "yellow_right_bottom",
+      "rect_mm": [
+        1400,
+        550,
+        1850,
+        1000
+      ]
+    },
+    {
+      "name": "yellow_left_top",
+      "rect_mm": [
+        550,
+        1400,
+        1000,
+        1850
+      ]
+    },
+    {
+      "name": "yellow_right_top",
+      "rect_mm": [
+        1400,
+        1400,
+        1850,
+        1850
+      ]
+    },
+    {
+      "name": "start1_exact",
+      "rect_mm": [
+        2100,
+        2100,
+        2400,
+        2400
+      ]
+    },
+    {
+      "name": "start2_exact",
+      "rect_mm": [
+        2100,
+        0,
+        2400,
+        300
+      ]
+    },
+    {
+      "name": "qr_board_strip",
+      "rect_mm": [
+        2330,
+        950,
+        2400,
+        1450
+      ]
+    }
+  ],
+  "exclusion_pad_mm": 12,
+  "cylinder_exclusion_capsules": [
+    {
+      "name": "raw_turntable_possible_area",
+      "segment_mm": [
+        1100,
+        2400,
+        1300,
+        2400
+      ],
+      "radius_mm": 150
+    }
+  ],
+  "previous_mount_calibration_report": {
+    "method": "fixed pose and translation; fit yaw only",
+    "max_landmark_residual_mm": 2.9256937019176146,
+    "predicted_map_mm": [
+      [
+        1702.1606996045468,
+        150.70573146579977
+      ],
+      [
+        1707.1686145413873,
+        348.20996126350656
+      ]
+    ],
+    "residuals_mm": [
+      2.9256937019176146,
+      2.8119615408578533
+    ],
+    "independent_validation": false,
+    "note": "Residual is fit consistency, NOT global map accuracy. Car position/heading and 145mm offset are assumed measurements."
+  },
+  "mount_note": "2026-10-01：车头朝北(90°)，雷达在白色托盘下、车左侧140mm。安装角由旧标定换算：旧版按车头朝西(180°)标定，雷达世界朝向=180-139.53=40.47°，与现在90-49.53相同。旧版把雷达放在车南侧(2250,10)，实际在西侧(2110,150)，差约200mm，这是以前坐标偏的主要原因。",
+  "car_length_mm": 290,
+  "car_width_mm": 260,
+  "self_echo_pad_mm": 120,
+  "reference_correction_enabled": false,
+  "second_relative_moves": {
+    "left_mm": 42,
+    "forward_mm": 83,
+    "cw_deg": 60
+  },
+  "start_zone": 2,
+  "drive_mode": "mecanum",
+  "stops": {
+    "QR": [
+      2100,
+      1350,
+      90
+    ],
+    "RAW": [
+      1200,
+      2160,
+      180
+    ],
+    "ROUGH": [
+      1200,
+      340,
+      0
+    ],
+    "TEMP": [
+      340,
+      1200,
+      -90
+    ],
+    "START1": [
+      2250,
+      2250,
+      90
+    ],
+    "START2": [
+      2250,
+      150,
+      90
+    ]
+  },
+  "mission": [
+    "QR",
+    "RAW",
+    "ROUGH",
+    "TEMP",
+    "RAW",
+    "ROUGH",
+    "TEMP",
+    "START"
+  ],
+  "raw_center_mm": [
+    1200,
+    2480
+  ],
+  "raw_radius_mm": 150,
+  "turn_margin_mm": 20,
+  "turn_edge_allow_mm": 0,
+  "turn_cost_mm": 500,
+  "stop_cost_mm": 150,
+  "scan_field_margin_mm": 30,
+  "sim_obstacles": [
+    [
+      430,
+      265,
+      25
+    ],
+    [
+      2240,
+      1690,
+      25
+    ],
+    [
+      285,
+      2060,
+      25
+    ]
+  ],
+  "sim_second_pose_error": [
+    70,
+    -50,
+    0.5
+  ],
+  "_second_pose_note": "2026-10-02 两次实测反推：车走完 左移150/前进150/顺时针60 后实际停在约(2208,233)、车头约33°，两次相差不到6mm。改了STM32移动参数后要重新测；删掉这一项就按动作推算。",
+  "second_use_gyro": true,
+  "turn_pivot_back_mm": 0,
+  "_turn_pivot_note": "2026-10-02 实测：原地转90°，车绕车中心后方约93mm、左右居中的点转，多次测量一致。规划按这个转轴算。",
+  "_stops_note": "爪子在车的右侧：停车时车头方向=工位方向+90°，让右侧对着工位。二维码在东→车头朝北；原料在北→朝西；粗加工在南→朝东；暂存在西→朝南。停车点离边线的距离先沿用300mm，要按爪子实际够得着的距离调整。",
+  "reverse_cost_factor": 1.5,
+  "strafe_cost_factor": 3.0,
+  "strafe_max_mm_per_leg": 300,
+  "scan_frames": 12,
+  "scan_settle_s": 0.3,
+  "reloc_enabled": true,
+  "reloc_frames": 8,
+  "reloc_min_travel_mm": 1000,
+  "reloc_pos_tol_mm": 15,
+  "reloc_yaw_tol_deg": 1.0,
+  "reloc_max_shift_mm": 150,
+  "reloc_max_yaw_deg": 5,
+  "reloc_pair_mm": 250,
+  "reloc_allow_single": true,
+  "safe_margin_mm": 50,
+  "near_cost_factor": 1.5,
+  "astar_weight": 1.6,
+  "sim_reloc_error": [
+    25,
+    -30,
+    1.0
+  ],
+  "zone_margin_mm": 30,
+  "reloc_final_tol_mm": 8,
+  "reloc_lateral_tol_mm": 15,
+  "reloc_slow_rpm": 60,
+  "weak_obstacle_extra_mm": 80,
+  "weak_seen": 3,
+  "weak_count": 0,
+  "turn_pivot_left_mm": 0,
+  "reloc_split_mm": 1200,
+  "_v16_note": "v16：规划时车身按 300×300 正方形(plan_footprint_mm=300；car_length/width_mm 是真实尺寸，只给雷达滤掉车身用)，原地转弯按实测转轴(后109、左12)算整个车身扫过的圆弧，外面再留 turn_margin_mm=20；黄区/暂存/粗加工/原料转盘外硬留 zone_margin_mm=30；障碍物余量 margin_mm=60(看不清的再+80)；粗加工、暂存停车点再往外挪到离边线 340mm。执行：每次转弯后、>1200mm 的长直行中间、每个停车点都用雷达测，左右偏≥15mm/角度偏≥1°立刻修，前后偏差并进下一条前进。规划不出来时自动减小余量并提示。",
+  "plan_footprint_mm": 300,
+  "cam_side_targets": {
+    "QR": 177.2,
+    "START2": 30.5,
+    "ROUGH": 225.1
+  },
+  "clearance_pref_mm": 150,
+  "clearance_penalty": 5,
+  "route_speed_rpm": 150,
+  "route_acc_rpm_s": 300,
+  "strafe_speed_rpm": 140,
+  "strafe_acc_rpm_s": 200,
+  "fwd_mm_per_rev": 249.0,
+  "strafe_mm_per_rev": 235.0,
+  "turn90_s": 1.8,
+  "turn180_s": 2.5,
+  "cmd_overhead_s": 0.25,
+  "stm32_params": {
+    "BPPM": 12.78,
+    "SCKP": 2.0,
+    "FPPM": 12.9305,
+    "DRR": 0.0,
+    "SSCAL": -0.0001278,
+    "SSCDL": -0.0004659,
+    "SSCAR": 0.0001409,
+    "SSCDR": 0.0006368,
+    "SSACC": 140.0,
+    "SSKP": 1.5,
+    "SSKI": 0.3,
+    "SSLEAD": 0.1,
+    "SSRT": 0.0,
+    "LPPM": 13.7767,
+    "DRL": 0.0,
+    "RPPM": 13.8798,
+    "SCACC": 100.0,
+    "SCBB": 0.0,
+    "SCBF": 0.0,
+    "LFRPM": 150.0,
+    "LFACC": 0.0,
+    "LFDIR": 0.0,
+    "LFMAX": 116.0,
+    "AEXT": 2.0,
+    "CLWO": 1650.0,
+    "CLWC": 1150.0,
+    "ZHI": 115.0,
+    "SPOW": 30000.0,
+    "ASPDF": 80.0,
+    "A1D": 237.7,
+    "A2R": -1057.0,
+    "TT1": 2380.0,
+    "TT2": 1560.0,
+    "TT3": 700.0,
+    "ZDROP": 97.0,
+    "A1G": 54.8,
+    "A2E": -946.6,
+    "ZGRAB": 85.0,
+    "A1P": 46.1,
+    "A2P": -984.9,
+    "ZPLC": 0.0,
+    "ZSTK": 55.0,
+    "A1H": 241.7,
+    "ARMOK": 1.0,
+    "ZOBRAW": 116.0,
+    "ZOBRNG": 115.0,
+    "ASPD": 180.0,
+    "CLSPD": 0.0,
+    "CLSPO": 0.0,
+    "OVCLR": 10.0,
+    "SCKI": 1.0,
+    "SCLPF": 0.04,
+    "SCRL": 200.0,
+    "ALTOL": 0.5,
+    "SCDF": 0.0,
+    "SCCM": 0.25,
+    "SCDEC": 70.0,
+    "SCDB": 0.0,
+    "SCIM": 6.0,
+    "SCBLB": 1.0,
+    "SCBLF": 1.0,
+    "WMAP": 0.0,
+    "WROL": 0.0,
+    "WADR": 2134.0,
+    "TCA": 400.0,
+    "WQ": -0.05,
+    "PVB": 0.0,
+    "PVL": 0.0,
+    "TCV": 80.0,
+    "PPD": 47.0,
+    "S2MAX": -290.0,
+    "S2MIN": -1100.0,
+    "A2T": -595.8,
+    "A1T1": 59.8,
+    "A1T2": 190.8,
+    "A2SPD": 1500.0,
+    "S1MIN": 2.0,
+    "R1T1": 163.7,
+    "R2T": -702.3,
+    "R1T2": 194.2,
+    "R2SPD": 1500.0,
+    "CLWOT": 1450.0,
+    "CLWOR": 1700.0,
+    "EXTSPD": 1500.0,
+    "R2STG": 0.0,
+    "ROTSPD": 180.0,
+    "CLWAIT": 400.0
+  },
+  "_second_pose_mm_old": [
+    2208,
+    233,
+    33.0
+  ],
+  "_v10_note": "v10：转弯绕车中心；第二站=左移42/前进83/顺时针60(车停在(2208,233)，和之前实测的位置一样)；路线按用时规划；运动参数用 set/fix/cal 命令改，存在 stm32_params 里，每次启动自动发给 STM32。",
+  "far_detect_mm": 1800,
+  "far_min_frames": 2,
+  "lidar_overhang_mm": 40,
+  "mission_cfg": {
+    "enabled": true,
+    "time_limit_s": 150,
+    "round_s": 180,
+    "home_margin_s": 12.0,
+    "stop_finish_s": 3.0,
+    "home_when_idle": true,
+    "work_item_s": {
+      "grab": 12.0,
+      "place": 10.0,
+      "pick": 8.0,
+      "stack": 10.0
+    },
+    "work_base_s": {
+      "QR": 3.0,
+      "RAW": 2.0,
+      "ROUGH": 6.0,
+      "TEMP": 5.0,
+      "START": 3.0
+    },
+    "next_leg_s": 12.0,
+    "qr_timeout_s": 6.0,
+    "qr_search": true,
+    "qr_first_wait_s": 3.0,
+    "qr_targets_mm": [
+      1200.0,
+      1260.0,
+      1140.0,
+      1320.0,
+      1080.0
+    ],
+    "qr_dwell_s": 2.0,
+    "qr_board_axis": "y",
+    "qr_scanner_from_rear_mm": 20.0,
+    "qr_scanner_from_right_mm": 40.0,
+    "qr_max_move_mm": 300.0,
+    "qr_obstacle_margin_mm": 60.0,
+    "qr_zone_margin_mm": 30.0,
+    "qr_move_rpm": null,
+    "qr_retry_at_stops": true,
+    "code_plus": true,
+    "raw_wait_s": 10.0,
+    "raw_chassis": "F",
+    "raw_fix_max_mm": 90,
+    "raw_wheels_first": false,
+    "raw_track_s": 150,
+    "raw_stop_s": 5.0,
+    "raw_still_px": 6.0,
+    "raw_motion_frac": 0.004,
+    "raw_static_s": 9.0,
+    "raw_keepalive_s": 12.0,
+    "raw_keepalive_deg": 1.0,
+    "raw_frames": 2,
+    "raw_max_iter": 1,
+    "raw_gain": 1.0,
+    "raw_grab_max_mm": 30,
+    "raw_tol_mm": 3.0,
+    "raw_any_order": false,
+    "raw_seek": false,
+    "raw_seek_steps_mm": [
+      40,
+      20,
+      10,
+      5
+    ],
+    "raw_seek_dir": "right",
+    "raw_keep_pose": true,
+    "raw_claw_close_s": 0.15,
+    "lift_init": "zero",
+    "lift_park_mm": 60.0,
+    "keepalive_deg": 3.0,
+    "keepalive_min_s": 5.0,
+    "camera": {
+      "device": "/dev/video0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "flip": null
+    },
+    "frames": 5,
+    "detector": "circle",
+    "matdet": {},
+    "claw_px": {
+      "RAW": [
+        336.8,
+        282.9
+      ],
+      "RING": [
+        336.8,
+        282.9
+      ]
+    },
+    "px_per_mm": {
+      "RAW": 1.97,
+      "RING": 2.96
+    },
+    "material_diam_mm": 50.0,
+    "tol_mm": {
+      "RAW": 2.0,
+      "RING": 3.0,
+      "PICK": 3.0,
+      "STACK": 3.0
+    },
+    "accept_mm": {
+      "RAW": 4.0,
+      "RING": 8.0,
+      "PICK": 5.0,
+      "STACK": 4.0
+    },
+    "place_confirm": false,
+    "align_max_iter": 4,
+    "zone_frames": null,
+    "zone_gain": 0.85,
+    "zone_filter": false,
+    "take_first": false,
+    "take_first_iter": 4,
+    "take_first_drop_mm": 12.0,
+    "take_first_retry_max_mm": 40.0,
+    "place_shift_mm": {
+      "F": 0.0,
+      "S": 0.0
+    },
+    "take_first_clear_mm": 15.0,
+    "wheels_first": false,
+    "wheels_step_mm": 15.0,
+    "wheels_min_mm": 4.0,
+    "wheels_rpm": 60,
+    "ring_precorrect": false,
+    "tilt_precorrect": false,
+    "tilt_warn_deg": 3.0,
+    "survey_frames": null,
+    "servo": {},
+    "servo_cal_file": "servo_cal.json",
+    "vision_cal_file": "vision_cal.json",
+    "place_adj_file": "place_adj.json",
+    "chassis_fine_rpm": 100,
+    "ring_survey": true,
+    "ring_order": {
+      "ROUGH": "lr",
+      "TEMP": "lr"
+    },
+    "ring_spacing_mm": 150.0,
+    "chassis_strafe": false,
+    "ring_strafe_max_mm": 20.0,
+    "ring_fix_max_mm": 60.0,
+    "ring_move_min_mm": 15.0,
+    "drop_retract": false,
+    "mtest_hold_heading": true,
+    "ring_offset_mm": {
+      "ROUGH": {
+        "1": 150.0,
+        "2": 0.0,
+        "3": -150.0
+      },
+      "TEMP": {
+        "1": -150.0,
+        "2": 0.0,
+        "3": 150.0
+      }
+    },
+    "pickback_fast": true,
+    "place_order": "sweep",
+    "sweep_from": 3,
+    "zone_timeout_s": 6,
+    "pickback_order": "code",
+    "learn_pick": false,
+    "stow_at_start": true,
+    "return_tol_deg": 1.5,
+    "return_bias": false,
+    "return_preload_deg": [
+      0.0,
+      0.0
+    ],
+    "stop_aliases": null,
+    "screen": {
+      "code": "t0",
+      "code2": "t7",
+      "stage": "t1",
+      "grab": "t2",
+      "place": "t3",
+      "msg": "t4",
+      "b1": "t5",
+      "b2": "t6"
+    },
+    "raw_force_grab": true,
+    "raw_force_max_mm": 60,
+    "qr_fixed_code": null,
+    "qr_fallback_code": "142+321+142+213",
+    "full_course": true,
+    "ring2_off_mm": {
+      "F": 0.0,
+      "S": 0.0
+    }
+  },
+  "_mission_cfg_note": "机械臂任务配置。claw_px=爪子轴线在画面里的位置(调它就能微调放置位置，1 像素≈0.34mm)；px_per_mm=每毫米多少像素；tol_mm=对准到多小算好；ring_offset_mm=圆环相对停车点沿车头方向的位置(要去现场核对圆环编号方向)；time_limit_s=超过这个时间不再做夹放，留时间回家；round_s/home_margin_s/work_item_s=按时间判断还做不做下一个物料、要不要直接回家；qr_*=读不到码时沿车道前后挪着找；ring_strafe_max_mm=工位里车轮横移最多多少。详见 README_mission.md",
+  "plan_body_mm": 330,
+  "yellow_margin_mm": 50,
+  "yellow_min_margin_mm": 30,
+  "station_frames": 12
+}
