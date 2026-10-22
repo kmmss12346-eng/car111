@@ -253,7 +253,9 @@ class CliTests(unittest.TestCase):
 
     def test_any_order_grabs_whatever_stops_under_the_claw(self):
         """mtest RAW 1 any：哪个颜色先停在爪子附近就先夹哪个，放进它自己的槽；比按顺序等快。"""
-        self._plate_world(seed=7)
+        # 没示教时的这个做法：一回来就看到原料盘停着、不知道停了多久就马上下爪，可能正好赶上它转起来(见 sim_mission 的
+        # test_raw_align_by_wheels_on_a_stop_go_plate)。10-22 固件 GRAB 等车上转盘转完才夹紧(多约 0.4 秒)，seed 7 正好碰上，换成 4
+        self._plate_world(seed=4)
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1 any')
         text = '\n'.join(self.lines)
@@ -264,7 +266,7 @@ class CliTests(unittest.TestCase):
         self.assertIn('这次停在爪子附近的是', text)
         self.assertIn('不按顺序', text)
         self.assertFalse(self.h.raw_any_once)                              # 只这一次
-        self._plate_world(seed=7)                                          # 同一个世界按顺序抓：要等更久
+        self._plate_world(seed=4)                                          # 同一个世界按顺序抓：要等更久
         t0 = self.w.t
         self.run_cli('mtest', 'mtest RAW 1')
         self.assertEqual(self.h.stats.grab_ok, 3, '\n'.join(self.lines))

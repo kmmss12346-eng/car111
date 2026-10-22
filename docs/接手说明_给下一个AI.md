@@ -654,4 +654,32 @@ git_log.txt                ← 分支最近 120 条提交记录
      边走边看太快了存的对应关系反了时来不及发现，test_center_bad_stored_wheel_j)。仿真加了 `vel_latency_s`、VelGotoTests。
   修到的 bug：`_ring2_smooth` 的 `fit_j` 以前连挪一两毫米的那几下也拿来修车轮和画面的对应关系(认圆环差一两个像素，转角算成多少都有可能，
      还会存下来)：改成只用挪了 `zone_fit_min_mm` 8mm 以上的。
-  ⑤ `zone_map_free_mm` 60：离停车点 60mm 以内挪车不按地图查(test_short_move_not_clamped_by_map_check 复现了实车"限成 30mm、差 16mm 不放")。
+  ⑤ `zone_map_free_mm` 60：离停车点 60mm 以内挪车不按地图查(test_short_move_not_clamped_by_map_check 复现了实车"限成 30mm、差 16mm 不放")；横着(往工位那边/往外)只有 `zone_map_free_s_mm` 10mm 以内不查(横着压进工位这一轮就结束了)。
+  ⑥ 故意对偏 r2off：ROUGH/TEMP 方向都对(test_ring2_deliberate_offset_in_temp_and_direction)；对应关系 J 修过以后故意对偏的像素按新 J 重算；
+     一步一步对准(`_p2_align`)和码垛认圆环(`_align_covered(ring_off=)`)也偏(认物料顶面对 PICK 点不偏，PICK 点是量过的)。
+  ② 查 bug(固件 + 树莓派各查了一遍)改了的：
+     - 固件升降：`Lift_Check` 以前在 Move_Over 15ms 一次的舵机循环里(Lift_Done_Now)停下来等编码器最多 1 秒，ID1 会转过头：改成置 `lift_chk_due`，
+       手臂转完在 Lift_Finish 里补。差 0.5mm~LFCHK = 爪子/物料顶到原料盘、地面、转盘槽底(闭环驱动器一直往下顶，爪子被压住合不上，
+       很像"下降的时候不夹取，抬起来了再夹取")：Stop_Now 不再顶、`LIFTPUSH want=.. got=..`(树莓派提示把 ZGRAB/ZPLC/ZDROP 调高 1~2mm)。
+       编码器一圈 40mm 会认错圈：认出的高度不在上次核对以后走过的范围(`lift_span_lo/hi` ±2mm)里、或差 15mm 以上：不改高度，Lift_Goto/Lift_Finish
+       回 `ERR LIFT`(GRAB/PICK/TAKE/DROP 不在半空夹/松爪子)。开机擦 Flash 后马上 Pos_Save；`LIFT SYNC` 没回零回 ERR NOZERO；`TT <微秒>` 后 tt_slot=0；
+       ParseF / Arm_Param_Set 挡住 nan。main.c `Servo_Wait` 读到角度时见急停就 Servo_Hold(以前急停了还要等它转完)。STM32 主机测试 316/222/42 项。
+     - 树莓派 GRAB 出错(`_grab_failed`)：按 STM32 回的最后一次夹爪动作(`ArmLink.claw_last`，CLAWSET 的 C/OT…)：还没夹紧 = 物料还在原料盘上，收臂当没夹到；
+       夹紧了 = 放回它的转盘槽(张开以后 STM32 也不再当夹着，不然后面都 ERR HOLD)，当夹到了；已经松进转盘 = 当夹到了；ERR LIFT = 本轮不再夹放，叫 arm LIFT ZERO。
+     - 原料区最近那格：没夹上减抓取数时转盘那一格也清掉；等 3 次停下都没转来就当已经夹到了(多半看错)；下爪前一看"离爪子点 122mm"但别的物料都没动
+       = 认错了，照样下爪(`_raw_plate_still`)；都夹过以后再看原料盘只算停在停靠位上的(蓝色爪子不算)；`_rc_plate_stop` 两个以上颜色要都往同一边转才算转、
+       只看到一个颜色要转得更多；`_raw_close_delay` = max(升降下降, TTWAIT) + 合上(和新固件一样)；等原料盘动升降出错不停；
+       动升降(keepalive)那段时间里停下的按动之前算(保守)、这个时刻**不记进周期推算**(记进去会把周期算错：模拟里在同一次停下里又按"刚停下"去夹，
+       下爪时原料盘已经转了)；回不到看原料盘的姿态这个原料区就不接着夹(收着的手臂直接转过去会刮电池盒，剩下的记没夹到)。
+     - 2 号环：车挪了画面没动(打滑)时记的位移按画面实际改回来(不然挪回停车点会差出没走的那段)。
+     - arm_link：屏幕文字里的 '!' 换成 '.'(STM32 把 '!' 当急停)；LIFTPUSH、新的 too far 翻成中文。arm_calib：CLWOR=0 按 CLWOT 算(和固件一样)。
+     - 仿真跟着新固件：GRAB/PICK 等车上转盘转完才夹紧；`claw_hold`(GRAB/PICK/TAKE 回 ERR HOLD、OBS … O 回 CLAWKEEP)；GRAB/PICK 回 CLAWSET 行；
+       `fail_cmd=('GRAB', n, 'closed')` = 夹紧以后才出错(test_grab_error_after_closing_puts_it_back)。
+  ③ 备份：tag `backup-1021`；对话记录 docs/对话记录/2026-10-18_22_对话记录.md。车上才有的文件(lidar_map_live、ld14p_scan、pose_fix、merge_stations、
+     reference_correction、stm32_link、home_fix 这几个模块和 map_config_*.json、place_adj.json、servo_cal.json、vision_cal.json、claw_mask.png、ring_teach.json)
+     仓库里没有，要用户从车上发过来才能备份。更新包 fix_1021j.zip(arm.c、main.c、mission_hooks.py、arm_link.py、arm_calib.py)。
+  测试：STM32 主机 316/222/42 项、树莓派 620 个(3 跳过)全过。转盘等完才夹紧以后(下爪到夹住多约 0.4 秒)：用户用的"最近那格"(不按顺序)
+  模拟 30 组 90/90 全进转盘、没夹空，12 组总用时只多 3 秒；没示教时的旧做法(_raw_stop_pick：一回来看到原料盘停着、不知道停了多久就马上下爪)
+  本来就有约三成的组会夹空一次(改之前 20 组 8 组、改之后 6 组)，3 个测试换了没碰上的种子(测试里写了原因)。
+  `_raw_predict_stop_start` 还没量到完整周期时：离上次看到它停下(或上一个是在哪次停下里夹的，raw_cycle['grab_stop'])不到"停一次+转一次"，就按那次停下算。
+

@@ -738,7 +738,14 @@ class ArmLinkTests(unittest.TestCase):
         mid = lift_slip_text('LIFTSLIP want=20.0000 got=18.0000')
         self.assertIn('实际在 18.0mm', mid)
         self.assertNotIn('多半是', mid)                                  # 中间高度没到：只说改过来了，不乱猜参数
-        self.assertIn('差太多没改', lift_slip_text('LIFTSLIP want=70.0000 got=88.0000 (too far, kept)'))
+        far = lift_slip_text('LIFTSLIP want=70.0000 got=88.0000 (too far, kept)')
+        self.assertIn('差太多', far)
+        self.assertIn('ERR LIFT', far)
+        self.assertIn('LIFT ZERO', far)
+        push = lift_slip_text('LIFTPUSH want=85.0000 got=85.8000')       # (10-21)差一点没到：爪子顶到原料盘了
+        self.assertIn('顶到下面', push)
+        self.assertIn('ZGRAB', push)
+        self.assertIn('set 名字 87', push)
         self.assertIsNone(lift_slip_text('LIFT 1 60.0 BOOT=ENC'))
 
     def test_claw_lines_are_reported(self):

@@ -343,9 +343,12 @@ class Wizard:
         return us
 
     def claw_val(self, key):
-        """参数 key 的夹爪脉宽；CLWOR / CLWOT 存的 0(没单独调)= CLWO。"""
+        """参数 key 的夹爪脉宽；CLWOT 存的 0(没单独调)= CLWO；CLWOR 存的 0 = 和其他地方一样(CLWOT，它也是 0 才是 CLWO)，
+        和固件的 Claw_OAt(RAW) 一样(10-21：以前 CLWOR=0 时这里用 CLWO，比赛时却是 CLWOT)。"""
         v = float(self.P.get(key, 0.0) or 0.0)
-        return v if (key not in ('CLWOR', 'CLWOT') or v >= CLAW_RANGE[0]) else float(self.P['CLWO'])
+        if key not in ('CLWOR', 'CLWOT') or v >= CLAW_RANGE[0]:
+            return v
+        return self.claw_val('CLWOT') if key == 'CLWOR' else float(self.P['CLWO'])
 
     def open_us(self, st=None):
         """(10-20)这一步张开爪子用哪个角度：原料盘那几步 CLWOR、车上转盘那几步 CLWOT、其他 CLWO。"""

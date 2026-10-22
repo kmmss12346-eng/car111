@@ -84,13 +84,14 @@ class SimWorld:
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
         self.claw_open = True
+        self.claw_hold = False                # 和 arm.c 的 claw_hold 一样：GRAB/PICK/TAKE 夹紧了 = True，张开 = False；True 时 GRAB/PICK/TAKE 回 ERR HOLD
         self.tt_slot = 1
         self.tt_ready = 0.0
         self.screen = {}
         self.requests = []
         self.abort_flag = False
         self.abort_at = abort_at              # 例如 ('GRAB', 2) = 第 2 次 GRAB 时被急停
-        self.fail_cmd = fail_cmd              # 例如 ('GRAB', 1) = 第 1 次 GRAB 时 STM32 回 ERR TIMEOUT
+        self.fail_cmd = fail_cmd              # 例如 ('GRAB', 1) = 第 1 次 GRAB 时 STM32 回 ERR TIMEOUT；('GRAB', 1, 'closed') = 夹紧以后(抬起来时)才出错
         self.count = {}
         self.time_by_verb = {}
         # 世界
@@ -269,6 +270,12 @@ class SimWorld:
         if slot != self.tt_slot:
             self.tt_slot = slot
             self.tt_ready = self.t + self.params['TTWAIT'] / 1000.0
+
+    def _clawset(self, why):
+        """arm.c 每动一次夹爪回的那一行(树莓派出错时按最后一次看爪子里有没有物料)。"""
+        P = self.params
+        us = P.get('CLWC', 2910.0) if why == 'C' else P.get('CLWO', 2090.0)
+        return f'CLAWSET {int(us)} {why}'
 
     def _tt_wait(self):
         if self.t < self.tt_ready:
@@ -456,8 +463,11 @@ class SimWorld:
         n = self.count[verb] = self.count.get(verb, 0) + 1
         if self.abort_at and verb == self.abort_at[0] and n == self.abort_at[1]:
             return False, 'ERR ABORT', info
+        fail_at = None
         if self.fail_cmd and verb == self.fail_cmd[0] and n == self.fail_cmd[1]:
-            return False, 'ERR TIMEOUT', info
+            if len(self.fail_cmd) < 3:
+                return False, 'ERR TIMEOUT', info
+            fail_at = self.fail_cmd[2]
         P = self.params
 
         def ang(i):
@@ -535,6 +545,8 @@ class SimWorld:
         if verb == 'CLAW':
             if parts[1] in ('OR', 'OT') and not self.claw3_fw:
                 return False, 'ERR ARG', info                     # 旧程序：当成脉宽数字，解析不了
+            if parts[1] != 'C':
+                self.claw_hold = False                             # arm.c：树莓派明说张开(或给脉宽)就不再当夹着物料
             if parts[1] in ('O', 'OR', 'OT'):
                 self.claw_log.append((parts[1], self.held is not None))
                 self._open_claw()
@@ -607,7 +619,10 @@ class SimWorld:
             self.a1_ref = P['A1P'] if ring else P['A1G']
             self.a2_ref = P['A2P'] if ring else P['A2E']
             if len(parts) == 3:
-                self._open_claw()
+                if self.claw_hold:
+                    info.append('CLAWKEEP OBS')                    # arm.c：夹着物料不张开
+                else:
+                    self._open_claw()
             self._lift_to(P['ZHI'])
             self._servos_to(self.a1_ref, self.a2_ref, P['ASPD'])
             if self.obs_err_deg:
@@ -620,9 +635,13 @@ class SimWorld:
             self.side = 'RING' if verb == 'PICK' else 'RAW'    # 和 arm.c 一样：PICK = 圆环那边，GRAB = 原料盘
             if len(parts) != 3 or parts[2] != 'H':
                 return False, 'ERR ARG', info
-            self._open_claw()                                      # arm.c 下降前先张开爪子
+            if self.claw_hold:
+                return False, 'ERR HOLD', info                     # arm.c：爪子里还夹着物料，先张开就掉在半路
             self._tt_go(slot)
+            self._open_claw()                                      # arm.c 下降前先张开爪子
+            info.append(self._clawset('OR' if verb == 'GRAB' else 'O'))
             self._lift_to(P['ZGRAB'] if verb == 'GRAB' else P['ZPLC'])
+            self._tt_wait()                                        # (10-21)arm.c：车上转盘还在转就先等它停了再夹紧
             self.advance(CLAW_CLOSE_S)                             # 夹爪合上的那一刻(原料盘在转的话物料又走了一点)
             c = self.claw()
             got = None
@@ -637,23 +656,32 @@ class SimWorld:
                 if best is not None and np.linalg.norm(best[1]['pos'] - c) <= 8.0 and self.claw_open:
                     got = best[1]['color']
                     self.rings[(self.zone, best[0])].pop()
+            info.append(self._clawset('C'))
+            self.claw_open, self.claw_hold = False, True
             if got is None:
                 self.air += 1
-            else:
+            self.advance(max(0.0, self.params['CLWAIT'] / 1000.0 - CLAW_CLOSE_S))
+            if fail_at == 'closed':                                # 夹紧了，抬起来的时候出错：物料在爪子里，STM32 记着夹着物料
+                self.held = got
+                self._lift_to(P['ZHI'])
+                return False, 'ERR TIMEOUT', info
+            if got is not None:
                 if self.tray[slot] is not None:
                     self.collisions += 1
                 self.tray[slot] = got
-            self.advance(max(0.0, self.params['CLWAIT'] / 1000.0 - CLAW_CLOSE_S))
             self._lift_to(P['ZHI'])
             self._servos_to(P['A1D'], P['A2R'], P['ASPD'])
             self._lift_to(P['ZDROP'])
             self._tt_wait()
+            info.append(self._clawset('OT'))
             self._claw_wait()
             self._lift_to(P['ZHI'])
-            self.claw_open = True
+            self.claw_open, self.claw_hold = True, False
             return True, 'DONE', info
         if verb == 'TAKE':
             slot = int(parts[1])
+            if self.claw_hold:
+                return False, 'ERR HOLD', info                     # arm.c：上一个没放下
             self.take_sides.append((self.zone, self.side))
             self._open_claw()                                      # arm.c 一开始就张开爪子
             self.held = self.tray[slot]
@@ -665,7 +693,7 @@ class SimWorld:
             self._lift_to(P['ZDROP'])
             self._claw_wait()
             self._lift_to(P['ZHI'])
-            self.claw_open = False
+            self.claw_open, self.claw_hold = False, True
             return True, 'DONE', info
         if verb == 'DROP':
             stack = len(parts) == 2 and parts[1] == 'S'
@@ -675,7 +703,7 @@ class SimWorld:
             elif self.zone in ('ROUGH', 'TEMP'):
                 self._place_held(stack)
             self.held = None
-            self.claw_open = True
+            self.claw_open, self.claw_hold = True, False
             self._claw_wait()
             self._lift_to(P['ZHI'])
             self.advance(self._servo_t(P['A2R'] - self.a2, P['ASPD']))
@@ -1214,6 +1242,20 @@ class MissionSimTests(unittest.TestCase):
         self.assertEqual(h.stats.grab_total, 6)
         self.assertEqual(h.stats.grab_ok, 5)                            # 失败的那个被跳过，其余照常
         self.assertTrue(any(r == 'STOW' for r in w.requests))
+
+    def test_grab_error_after_closing_puts_it_back(self):
+        """(10-21)GRAB 夹紧以后(抬起来时)才出错：STM32 回的夹爪动作最后是 C = 物料在爪子里、STM32 也记着夹着物料(再 GRAB 回 ERR HOLD)：
+        先放回它的转盘槽(在转盘上方张开，STM32 就不再当夹着)，当夹到了；后面照常夹放，不掉、不碰、不停下夹放。"""
+        w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2, 'closed'))
+        lines = []
+        h = make(w, log=lines.append)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('先放回转盘', text)
+        self.assertIsNone(h.disabled, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), text[-3000:])
+        self.assertEqual(w.tray, {1: None, 2: None, 3: None})
 
     def test_time_limit_skips_remaining_work(self):
         w = SimWorld(seed=10, code=self.CODE)
@@ -3449,8 +3491,9 @@ class WheelsAlignTests(unittest.TestCase):
     def test_raw_align_by_wheels_on_a_stop_go_plate(self):
         """原料区只动车轮(原料盘转 3 秒停 6 秒，物料停的地方离爪子偏前/后、左/右几毫米)：手臂停在 OBS RAW 不动，3 个都夹到，
         横移不出 raw_wheels_s_range、前后不出 ±raw_fix_max_mm，做完挪回原料区停车点。"""
-        # (原料盘一开始就停着、不知道停了多久时会马上下爪，可能正好赶上它转起来——手臂对准时也一样，见 HANDOFF；这里挑没碰上的)
-        for seed, off, tan in ((4, 0.0, 0.0), (1, 8.0, 0.0), (2, -6.0, 5.0), (3, 0.0, -8.0)):
+        # (原料盘一开始就停着、不知道停了多久时会马上下爪，可能正好赶上它转起来——手臂对准时也一样，见 HANDOFF；这里挑没碰上的。
+        #  10-22 固件 GRAB 等车上转盘转完才夹紧，下爪到夹住多了约 0.4 秒，seed 3 正好碰上，换成 5)
+        for seed, off, tan in ((4, 0.0, 0.0), (1, 8.0, 0.0), (2, -6.0, 5.0), (5, 0.0, -8.0)):
             w = plate_world(seed, plate_off_mm=off, plate_off_tan=tan)
             lines = []
             h = make(w, dict(align_by=WHEELS_ALIGN, raw_max_iter=1, raw_grab_max_mm=30.0, raw_force_grab=True), log=lines.append)
@@ -3483,7 +3526,9 @@ class WheelsAlignTests(unittest.TestCase):
         import mission_hooks
         D = mission_hooks.DEFAULTS
         self.assertEqual(D['align_by'], WHEELS_ALIGN)
-        for seed in (16, 17, 18):
+        # 没示教时的这个做法：原料盘一开始就停着、不知道停了多久时马上下爪，可能正好赶上它转起来(见上面 test_raw_align_by_wheels_on_a_stop_go_plate)；
+        # 10-22 固件 GRAB 等车上转盘转完才夹紧(下爪到夹住多约 0.4 秒)，seed 17 正好碰上，换成 19
+        for seed in (16, 18, 19):
             w = plate_world(seed)
             lines = []
             live = {k: D[k] for k in LEGACY}                             # 不用老测试的写法，全按比赛默认

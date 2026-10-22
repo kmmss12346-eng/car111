@@ -96,6 +96,7 @@ static int enc_ok = 1, enc_frozen = 0, enc31_zero = 0;   /* enc31_zero：像现�
 static double pos36_off = -70000.0;                      /* 0x36 实时位置(一圈 65536，多圈累计，可以是负数) */
 /* (10-21)机构真正能到的最高/最低：要去的高度超出去就停在那(丢步)；late_mm：走得比估的慢，等完时还差这么多没走，之后每 80ms 走掉 1/late_n */
 static double phys_top = 1e9, phys_bot = -1e9, late_mm = 0.0, late_left = 0.0;
+static int lift_dead = 0;                 /* 1 = 升降驱动器收到指令也不动(堵转保护、丢了帧)：编码器照旧读 */
 static int late_n = 3, late_steps = 0;
 static void lift_tick(uint32_t ms) { double q; if (late_steps > 0 && ms == 80) { q = late_left / late_steps; phys_mm += q; late_left -= q; late_steps--; } }
 uint32_t fake_flash[256];
@@ -124,7 +125,7 @@ int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
 void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) {
     double t;
     (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
-    if (a != 5) return;
+    if (a != 5 || lift_dead) return;
     t = phys_mm + (d ? -1.0 : 1.0) * (double)clk / 80.0;
     if (t > phys_top) t = phys_top;
     if (t < phys_bot) t = phys_bot;
@@ -1045,7 +1046,8 @@ int main(void) {
     clear(); run("LIFT 2");
     CHECK(fabs(phys_mm - 2.0) < 0.05, "之后下到 2mm 就是 2mm");
     run("LIFT 60"); phys_mm = 78.0; clear();              /* 差了 18mm：编码器一圈 40mm，差太多可能认错圈 */
-    CHECK(run("LIFT 70") == 1 && pis("LIFTSLIP") && pis("(too far, kept)") && !has("stop5;"), "差 15mm 以上：只报(too far, kept)，不改");
+    CHECK(run("LIFT 70") == -1 && pis("LIFTSLIP") && pis("(too far, kept)") && pis("ERR LIFT") && !has("stop5;"),
+          "差 15mm 以上：报(too far, kept)，不改，回 ERR LIFT(GRAB/DROP 就停在这里，不在半空夹/松爪子)");
     clear(); run("LIFT?");
     CHECK(fabs(pinum("LIFT 1 ") - 70.0) < 0.05, "差太多时高度照旧(70)");
     phys_mm = 70.0;
@@ -1078,6 +1080,19 @@ int main(void) {
     clear(); Arm_Init();
     CHECK(fabs(pinum("LIFTBOOT ") - 60.0) < 0.05 && fabs(phys_mm - 60.0) < 0.05, "重新开机也按新的 0 认出 60");
     phys_top = 1e9; phys_bot = -1e9;
+    /* (10-21 实车"下降的时候不夹取，抬起来了再夹取")差一点没到(爪子顶到下面了)：叫驱动器别再往下顶，报 LIFTPUSH */
+    run("LIFT 60"); phys_bot = 21.0; clear();
+    CHECK(run("LIFT 20") == 1 && pis("LIFTPUSH want=20") && !pis("LIFTSLIP") && has("stop5;"), "差 1mm 没到(顶住了)：LIFTPUSH，叫驱动器停住不再顶");
+    clear(); run("LIFT?");
+    CHECK(fabs(pinum("LIFT 1 ") - 21.0) < 0.05, "高度记成真的 21");
+    phys_bot = -1e9;
+    /* (10-21)升降根本没动(堵转保护/丢帧)：编码器一圈 40mm，以前会把 100 认成 76 当"丢了 7mm"，在半空夹下去 */
+    Arm_Param_Set("ZGRAB", 69.0f);
+    run("LIFT 100"); run("CLAW O"); away(); lift_dead = 1; clear();
+    CHECK(run("GRAB 2 H") == -1 && pis("ERR LIFT") && pis("(too far, kept)") && !has("C;") && fabs(phys_mm - 100.0) < 0.05,
+          "GRAB 时升降没下去：认出的高度不在走过的范围里，回 ERR LIFT，不在半空夹");
+    lift_dead = 0; phys_mm = 69.0;                        /* (实车上这时要重新 LIFT ZERO)模拟里把机构放回程序以为的地方 */
+    run("LIFT 60");
 
     /* ---- (10-21 用户"放 1、2 号环的时候爪子莫名其妙松开""运输过程中一定要按第三步 CLWC 夹紧")
      *      夹爪每动一次都回 CLAWSET；夹着物料时只有放下(DROP、松进转盘、CLAW O/OR/OT)能张开 ---- */
@@ -1118,7 +1133,14 @@ int main(void) {
     run("CLAW O");
     CHECK(run("PICK 1 H") == 1 && t_close >= t_tt + 4000u, "PICK 换槽：车上转盘转完(TTWAIT)才夹紧");
     run("CLAW O");
+    /* TT <微秒>(arm_calib 调转盘时发的)以后再 TT_Go 到原来那个号位：也要等转盘转到 */
+    run("TT 1"); run("TT 1500"); away(); clear(); run("CLAW O");
+    CHECK(run("GRAB 1 H") == 1 && t_close >= t_tt + 4000u, "TT 1500 以后 GRAB 1：车上转盘转回 1 号位(TTWAIT)才夹紧");
+    run("CLAW O");
     Arm_Param_Set("TTWAIT", 800.0f);
+    CHECK(Arm_Param_Set("LFMAX", NAN) == 2 && Arm_Param_Set("CLWC", NAN) == 2, "SET 参数给 nan：不认(以前范围检查挡不住)");
+    clear();
+    CHECK(run("AP nan 100") == -1, "AP nan：不认");
     away(); clear();
     CHECK(run("TAKE 2") == 1, "GRAB 松进车上转盘以后不算夹着：能 TAKE");
     /* 存了待机姿态：夹着物料时 PARK 回待机姿态，爪子不换成待机姿态的 */

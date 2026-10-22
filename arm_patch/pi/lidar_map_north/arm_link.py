@@ -42,7 +42,7 @@ _QR = re.compile(r'QR (\d{3}\+\d{3}\+\d{3}\+\d{3})')
 _PARAM = re.compile(r'P (\w+)=(-?\d+(?:\.\d+)?)')
 _BOOT = re.compile(r'BOOT=(\w+)')
 _ZONE = re.compile(r'ZONE (\d) (\d)')
-_SLIP = re.compile(r'LIFTSLIP want=(-?\d+(?:\.\d+)?) got=(-?\d+(?:\.\d+)?)')
+_SLIP = re.compile(r'LIFT(SLIP|PUSH) want=(-?\d+(?:\.\d+)?) got=(-?\d+(?:\.\d+)?)')
 
 
 def lift_slip_text(line):
@@ -50,10 +50,15 @@ def lift_slip_text(line):
     m = _SLIP.match(line)
     if not m:
         return None
-    want, got = float(m.group(1)), float(m.group(2))
+    want, got = float(m.group(2)), float(m.group(3))
+    if m.group(1) == 'PUSH':                     # (10-21)差一点没到：爪子顶到下面(原料盘/地面/转盘槽底)，驱动器一直往下顶，爪子合不上
+        if got > want:
+            return (f'★ 升降要降到 {want:.1f}mm，到 {got:.1f}mm 就下不去了(爪子顶到下面了？顶着爪子合不上)：STM32 已叫它别再往下顶。'
+                    f'哪个高度设的 {want:.0f}(ZGRAB / ZPLC / ZDROP)调高一两毫米(set 名字 {got + 1:.0f})')
+        return f'★ 升降要升到 {want:.1f}mm，到 {got:.1f}mm 就上不去了(顶到最高点？)：STM32 已叫它别再往上顶'
     if 'too far' in line:
-        return (f'★ 升降核对：要到 {want:.1f}mm，编码器算出 {got:.1f}mm，差太多没改(编码器一圈 40mm，可能认错圈)。'
-                '输入 arm LIFT ENC? 看看；不对就关电，把升降放回 60mm 附近再开机')
+        return (f'★ 升降核对：要到 {want:.1f}mm，编码器算出 {got:.1f}mm，差太多(升降没走/被卡住了？)：没改，这一步不往下做(ERR LIFT)。'
+                '车停好以后看一下升降，放到最低点，输入 arm LIFT ZERO')
     hint = ''
     if got < want and want >= 60:
         hint = f'。多半是 {want:.0f}mm 比升降能到的最高还高：哪个参数设的 {want:.0f}(ZHI / STBY / LFMAX …)改到 {got - 2:.0f} 以下'
@@ -102,6 +107,7 @@ class ArmLink:
         self._params = None
         self.lift_boot = None                    # 开机时升降高度是怎么认出来的(LIFT? 回复里的 BOOT=…；旧程序没有)
         self._n_req = 0                          # 发过几条(第一条可能收到 STM32 上电时留在串口里的 READY/LIFTBOOT，不算中途重启)
+        self.claw_last = None                    # (10-21)上一条指令里夹爪最后一次动作(CLAWSET 的 C/O/OR/OT…，没动过是 None)
         try:                                     # 扫码器插在树莓派 USB 口上时从这里读(见 qr_usb.py)；没有就只问 STM32
             import qr_usb
             self.usb_qr = qr_usb.reader(log)
@@ -113,6 +119,7 @@ class ArmLink:
         """发一条，返回 (ok, 回复, 信息行列表)。收到急停抛 ArmAbort。"""
         if text.split(' ', 1)[0] in _MOVING:
             self.angle = {1: None, 2: None}
+        self.claw_last = None                       # (10-21)这条指令里夹爪最后一次动作(CLAWSET 的 C/O/OR/OT…)：出错时看爪子里有没有物料
         out = self.link.request(text, timeout or _timeout_for(text), collect=True)
         ok, reply, info = out
         reply = reply or ''
@@ -122,6 +129,9 @@ class ArmLink:
             m = _ANG.match(line)
             if m:
                 self.angle[int(m.group(1))] = float(m.group(2))
+            if line.startswith('CLAWSET '):
+                parts_ = line.split()
+                self.claw_last = parts_[2] if len(parts_) >= 3 else None
             slip = lift_slip_text(line)
             if slip:
                 self.log('  ' + slip)
@@ -165,7 +175,7 @@ class ArmLink:
 
     def screen(self, obj, text):
         """往串口屏的文本控件写字(只能 ASCII，且不超过 STM32 一行 47 字符的限制)。同样的内容不重复发。失败只记日志不抛错。"""
-        text = str(text).encode('ascii', 'replace').decode('ascii').replace('"', "'")
+        text = str(text).encode('ascii', 'replace').decode('ascii').replace('"', "'").replace('!', '.')   # '!' = STM32 的急停
         cmd = f'SCR {obj} {text}'[:47]
         if self._screen_last.get(obj) == cmd:
             return

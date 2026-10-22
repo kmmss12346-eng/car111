@@ -486,13 +486,13 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(saved['CLWOT'], 1890)                             # 从 CLWO 2090 开始调
         self.assertEqual(self.stm.P['CLWOT'], 1890)
         claws = [c for c in self.stm.sent if c.startswith('CLAW ')]
-        self.assertEqual(claws[-3:], ['CLAW 2910', 'CLAW 1890'] + claws[-1:])   # c 夹住看看，o 回到正在调的
+        self.assertEqual(claws[-3:], ['CLAW 1890', 'CLAW 2910', 'CLAW 1890'])   # 调到 1890，c 夹住看看，o 回到正在调的
         i = self.stm.sent.index('CLAW 1890')
         lifts = [c for c in self.stm.sent[:i] if c.startswith('LIFT ')]
         self.assertEqual(lifts[-1], 'LIFT 60')                             # 降到 ZDROP 调
         self.assertIn('AP 323 -862', self.stm.sent[:i])                    # 转盘上方的姿态
         self.assertEqual(self.stm.z, 100)                                  # 回车以后抬回 ZHI
-        self.assertEqual(claws[-1], 'CLAW 2090')                           # 下一步到原料盘上方：CLWOR 没调 = CLWO
+        self.assertEqual(self.stm.claw, 1890)                              # 下一步到原料盘上方：CLWOR 没调 = 和其他地方一样用 CLWOT(和固件一样)
 
     def test_raw_open_step_unchanged_stays_zero(self):
         saved = self.run_wiz(['', 'q'], start=STEP_KEYS.index('CLWOR'))

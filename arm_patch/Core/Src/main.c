@@ -1259,6 +1259,11 @@ static int Servo_Wait(uint8_t id, float target, float speed_dps, float tol_deg, 
         el = HAL_GetTick() - t0;
         if (FSUS_QueryServoAngleMTurn(&usart2, id, &a) == FSUS_STATUS_SUCCESS)
         {
+            if (car_abort)
+            {
+                Servo_Hold(id, a);                 /* (10-21)急停：停在现在的地方(以前要等它转完，最多 9 秒) */
+                return 0;
+            }
             left = Servo_Left(id, a, target);
             if (left <= tol_deg)
             {

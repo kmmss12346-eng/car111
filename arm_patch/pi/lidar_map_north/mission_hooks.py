@@ -318,8 +318,9 @@ DEFAULTS = dict(
     zone_wheels_moves=8,                #   只用车轮时最多挪几次
     zone_wheels_s_mm=150.0,             #   只用车轮时横移最多离停车点多少毫米(按地图查过：车身不压工位/黄色区、不出场地、不碰障碍物，碰就少挪)
     zone_wheels_f_mm=150.0,             #   只用车轮时沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心，同样按地图查)
-    zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)离停车点这么近以内不按地图查：
+    zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)沿圆环那一排离停车点这么近以内不按地图查：
                                         #   地图查是按"车正好停在规划的停车点"算的，车本来就停偏了才要挪；对准的地方就是 arm_calib 调 2 号环时车停的地方
+    zone_map_free_s_mm=10.0,            #   横着(往工位那边/往外)只有这么近以内不查：横着挪压进工位、别的颜色区域这一轮就结束了，照样按地图查
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
@@ -1193,6 +1194,42 @@ class MissionHooks:
             self.sleep(0.3)
             self.arm.stow()
 
+    def _grab_failed(self, item, ex):
+        """(10-21)GRAB 出错以后：按这条指令里 STM32 回的夹爪动作(CLAWSET，最后一次)看物料在哪：
+        - 还没夹紧(夹爪没动过/只张开过)：物料还在原料盘上，收臂，当没夹到；
+        - 夹紧了(C，夹紧以后抬起、转去车上转盘时出的错)：物料可能在爪子里，STM32 也记着"夹着物料"(后面 GRAB 都回 ERR HOLD)：
+          放回它的转盘槽(在转盘上方张开，STM32 就不再当夹着；爪子是空的也没坏处)，当夹到了(其实没夹上的话，最近那格夹完再看一眼原料盘认得出来)；
+        - 已经在车上转盘上方松开了(OT)：物料已经在它的转盘槽里，收臂，当夹到了。
+        ERR HOLD：上一个没放下，本轮不再夹放。ERR LIFT：升降的高度认不准了，不再按它动升降，本轮不再夹放，叫重新 LIFT ZERO。
+        返回 True = 物料在它的转盘槽里了(算夹到)。"""
+        msg = str(ex)
+        why = f'抓 {item.color_name} 出错：{ex}'
+        claw = getattr(self.arm, 'claw_last', None)
+        if 'ERR HOLD' in msg:
+            self._recover(why)
+            return False
+        if 'ERR LIFT' in msg:
+            self.disabled = ('升降的高度认不准了(编码器读的和程序记的差太多，可能是升降没走/被卡住)：本轮不再夹放。'
+                             '车停好以后看一下升降，放到最低点，输入 arm LIFT ZERO')
+            if claw == 'C':
+                self.maybe_holding = f'{item.color_name}可能夹在爪子里'
+            self.log(f'    ★ {why}；{self.disabled}')
+            self._ui('msg', 'ARM OFF')
+            if claw == 'OT':
+                self.in_tray[item.slot] = item
+            self._recover(why)
+            return claw == 'OT'
+        if claw == 'C':
+            self._put_back(item, why)
+            return (not self.disabled) and self.in_tray.get(item.slot) is item
+        if claw == 'OT':
+            self.log(f'    {item.color_name} 已经松进转盘 {item.slot} 号槽了(出错在松开以后)')
+            self.in_tray[item.slot] = item
+            self._recover(why)
+            return True
+        self._recover(why)                                     # 还没夹紧：爪子是空的
+        return False
+
     def _put_back(self, item, why):
         """从转盘取出物料以后出错(回不到对准姿态、DROP 失败…)：把物料放回它的转盘槽，再收臂。
         不能夹着物料直接收臂：后面任何一步一张开爪子(OBS … O、TAKE、GRAB)，物料就掉在半路上。
@@ -1598,7 +1635,9 @@ class MissionHooks:
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
-                self._recover(f'抓 {item.color_name} 出错：{ex}')
+                ok = self._grab_failed(item, ex) if isinstance(ex, ArmError) else False
+                if not ok and isinstance(ex, VisionError):
+                    self._recover(f'抓 {item.color_name} 出错：{ex}')
             self.stats.grab(ok)
             if ok:
                 self.in_tray[item.slot] = item
@@ -1819,14 +1858,19 @@ class MissionHooks:
         return f(None if color is None else int(color)) if f is not None else None
 
     def _raw_close_delay(self, mode):
-        """从发出下爪指令到夹爪合上要多久(秒)：升降从 ZOBRAW 降到 ZGRAB(和 STM32 算等待时间的办法一样，含 LFMRG) + 夹爪合上。"""
+        """从发出下爪指令到夹爪合上要多久(秒)：升降从 ZOBRAW 降到 ZGRAB(和 STM32 算等待时间的办法一样，含 LFMRG) + 夹爪合上。
+        (10-21)STM32 下爪时车上转盘同时换槽，转盘转完(TTWAIT)才夹紧：两个里慢的那个(按会换槽算，保守一点)。"""
         P = self.arm.params() or {}
         try:
             sps = float(P['LFRPM']) / 60.0 * float(P['LFSPR'])
             lift = abs(float(P['ZOBRAW']) - float(P['ZGRAB'])) * float(P['LFPPM']) / sps + float(P.get('LFMRG', 0.0)) / 1000.0
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             lift = 0.45
-        return lift + float(self.cfg.get('raw_claw_close_s', 0.15)) + (0.04 if mode == 'lift' else 0.02)
+        try:
+            tt = float(P.get('TTWAIT', 800.0)) / 1000.0
+        except (TypeError, ValueError):
+            tt = 0.8
+        return max(lift, tt) + float(self.cfg.get('raw_claw_close_s', 0.15)) + (0.04 if mode == 'lift' else 0.02)
 
     def _raw_stop_len(self):
         """原料盘每次停多久：看到过完整的停(从停下到开始转)就按实测的中值打九折，没看到过按配置的 raw_stop_s。"""
@@ -1837,9 +1881,16 @@ class MissionHooks:
 
     def _raw_predict_stop_start(self, t):
         """一开始就看到原料盘停着(没看到它停下的那一刻)：按前面量到的周期(停多久 + 转多久)推算这一次是什么时候停下的。
-        推算不了(还没量到周期、太久以前量的、推算出来这会儿应该在转)返回 None。"""
+        (10-22)还没量到完整的周期：离上次看到它停下还不到"停一次 + 转一次"的时间，就还是那一次停下(刚才在这次停下里夹了上一个，
+        回来它还停着)，按那一次停下算——不能当它刚停下，不然对准完、下爪时原料盘已经转起来了。
+        推算不了(没看到过它停下、太久以前量的、推算出来这会儿应该在转)返回 None。"""
         c = self.raw_cycle
-        if not c.get('t_stop') or not self.raw_stops or not self.raw_moves:
+        if not self.raw_stops or not self.raw_moves:
+            mv = sorted(self.raw_moves[-5:])[len(self.raw_moves[-5:]) // 2] if self.raw_moves else 3.0
+            win = self._raw_stop_len() + mv
+            seen = [float(x) for x in (c.get('t_stop'), c.get('grab_stop')) if x is not None and 0.0 <= t - float(x) < win]
+            return min(seen) if seen else None                 # 拿不准就按早的算(保守)
+        if not c.get('t_stop'):
             return None
         st = sorted(self.raw_stops[-5:])[len(self.raw_stops[-5:]) // 2]
         mv = sorted(self.raw_moves[-5:])[len(self.raw_moves[-5:]) // 2]
@@ -2050,6 +2101,8 @@ class MissionHooks:
                 self.log(f'  {tag} 停着，离爪子点 {np.linalg.norm(e) / v.scale("RAW"):.1f}mm：马上对准'
                          + ('' if left is None else f'(这次停下大约还剩 {left:.1f} 秒)'))
                 if self._raw_align_go(cand[0], cand[1], mode, e, deadline, lab, probe=probe):
+                    # (10-22)这一个是在哪次停下里夹的(没看到它停下的那一刻：至少从 t_still 起就停着)：下一个回来一看还停着，就按它算还剩多久
+                    self.raw_cycle['grab_stop'] = t_stop0 if t_stop0 is not None else t_still
                     return cand
                 J = self._raw_J()
                 if home[0] is not None and home[1] is not None and not wheels:
@@ -2485,9 +2538,17 @@ class MissionHooks:
             common = [col for col in a1 if col in a0]
             if not common:
                 return None
-            dmax = max(abs((a1[col] - a0[col] + 180.0) % 360.0 - 180.0) for col in common)
-            if dmax > thr:
+            dd = [(a1[col] - a0[col] + 180.0) % 360.0 - 180.0 for col in common]
+            if len(dd) >= 2:                                   # 原料盘转 = 看到的物料都往同一边转(车在走时圆心认偏一点不算)
+                turned = all(abs(x) > thr for x in dd) and (all(x > 0 for x in dd) or all(x < 0 for x in dd))
+                jitter = max(abs(x) for x in dd) > thr
+            else:                                              # 只看到一个：要转得更多才算
+                turned = abs(dd[0]) > 2.0 * thr
+                jitter = abs(dd[0]) > thr
+            if turned:
                 return t0 if still >= 1 else None
+            if jitter:
+                return None                                    # 说不清转没转：不当知道它是什么时候停下的
             still += 1
         return None
 
@@ -4194,12 +4255,20 @@ class MissionHooks:
         claw = np.array(v.claw('RAW'), float)
         still_px = float(cfg.get('raw_still_px', 6.0))
         keep_s = float(cfg.get('raw_keepalive_s', 12.0) or 0.0)
-        prev, t_move = None, None
+        prev, t_move, gap_t = None, None, None
         t_lim = self.now() + float(max_s)
         while self.now() < t_lim:
             self._check_abort()
             if keep_s > 0 and self.now() - self._ct_t_arm > keep_s:
-                self._raw_ct_keepalive()
+                if t_move is not None and gap_t is None:
+                    gap_t = self.now()                         # (10-21)原料盘在转的时候去动升降：这段时间里停下的，按动之前算(保守)
+                try:
+                    self._raw_ct_keepalive()
+                except ArmAbort:
+                    raise
+                except ArmError as ex:
+                    self.log(f'    (等原料盘时动一下升降出错：{ex}；接着等)')
+                    self._ct_t_arm = self.now()
                 prev = None                                    # 手臂动过：重新比画面
                 continue
             t = self.now()
@@ -4218,10 +4287,14 @@ class MissionHooks:
                 if moved:
                     if t_move is None:
                         t_move = prev[0]
+                    gap_t = None                               # 动过升降以后又看着它在转：停下是在这以后，看得到
                 elif t_move is not None:
                     t_stop = prev[0] - 0.07                    # 看着它停下：停下大概在第一帧停着的帧之前一点点
-                    self.raw_cycle['t_stop'] = t_stop
-                    self._ct_stops = (getattr(self, '_ct_stops', None) or [])[-5:] + [t_stop]
+                    if gap_t is not None:
+                        t_stop = min(t_stop, gap_t)            # 中间动过升降没看：可能早就停了，按动之前算(保守)；这个时刻不准，不记进周期
+                    else:
+                        self.raw_cycle['t_stop'] = t_stop
+                        self._ct_stops = (getattr(self, '_ct_stops', None) or [])[-5:] + [t_stop]
                     return t, t_stop, px
                 elif not after_move:
                     return t, None, px
@@ -4243,7 +4316,23 @@ class MissionHooks:
             prev = (t, pf)
         return None
 
-    def _raw_ct_grab(self, item, k, a, tag, t_end=None, near=False):
+    def _raw_plate_still(self, watch_px, color):
+        """(10-21)最近那格下爪前：原料盘上别的物料是不是都还在等原料盘时看到的地方(手臂没动、画面没动 = 原料盘没转)。
+        看得到别的物料：都在原地返回 True，有一个挪了返回 False；一个都看不到：再看一帧要夹的，这次在爪子附近就算 True。"""
+        v = self.vision
+        claw = np.array(v.claw('RAW'), float)
+        tol = 2.0 * float(self.cfg.get('raw_still_px', 6.0))
+        others = [int(c_) for c_ in (watch_px or {}) if int(c_) != int(color)]
+        if others:
+            errs = v.material_errors(others)
+            seen = [(c_, claw + np.asarray(errs[c_], float)) for c_ in others if errs.get(c_) is not None]
+            if seen:
+                return all(float(np.linalg.norm(p_ - np.asarray(watch_px[c_], float))) <= tol for c_, p_ in seen)
+        q = v.material_errors([color]).get(color)
+        return q is not None and float(np.linalg.norm(np.asarray(q, float))) / float(v.scale('RAW')) \
+            <= float(self.cfg.get('raw_slot_accept_mm', 25.0))
+
+    def _raw_ct_grab(self, item, k, a, tag, t_end=None, near=False, watch_px=None):
         """按 k 号停靠位示教的角度 a 转过去(在看原料盘的高度)，直接下爪夹进 item 自己的转盘槽。返回 True 夹了 / False 没夹。
         (10-21)near(最近那格)：下爪前车轮按物料实际停的位置补一下(_raw_grab_fix，t_end 之前要下爪)；夹完不挪回去
         (raw_grab_fix_back=False；等原料盘时按车轮挪了多少算停靠位在画面里的位置)。"""
@@ -4255,9 +4344,16 @@ class MissionHooks:
             if q is not None:
                 d = float(np.linalg.norm(np.asarray(q, float))) / float(v.scale('RAW'))
                 if d > float(cfg.get('raw_slot_accept_mm', 25.0)):
-                    self.log(f'  {tag} ★ 转过去一看 {item.color_name} 离爪子点 {d:.0f}mm(原料盘又转了？认错了？)：不下爪，等下一次停')
-                    return False
-                J = self.store.get('RAW', 'ch') if (near and self.store is not None) else None
+                    if watch_px is not None and self._raw_plate_still(watch_px, item.color):
+                        # (10-21 实车 BLUE 一次认成离爪子点 122mm、一次 60mm，每次停下都不夹)：手臂没动，别的物料都还在原地 = 原料盘没转
+                        self.log(f'  {tag} 下爪前一看 {item.color_name} 离爪子点 {d:.0f}mm，但原料盘上别的物料都还在原地(没转)：'
+                                 '这一帧多半认错了(和蓝色爪子连在一起？)，照样下爪')
+                        q = None
+                    else:
+                        self.log(f'  {tag} ★ 转过去一看 {item.color_name} 离爪子点 {d:.0f}mm(原料盘又转了？)：不下爪，等下一次停')
+                        return False
+            if q is not None:
+                J = self.store.get('RAW', 'ch') if ((near or watch_px is not None) and self.store is not None) else None
                 if J is not None and not cfg.get('raw_grab_fix', False):     # 车不动：只记下物料偏在哪边(看爪子点是不是整体偏了)
                     try:
                         dd = -np.linalg.solve(np.asarray(J, float), np.asarray(q, float))
@@ -4523,9 +4619,14 @@ class MissionHooks:
         after = True                                           # 车轮刚动过：等原料盘重新停一次(知道它是什么时候停下的)
         cyc = float(cfg.get('raw_ct_stop_s', 6.0)) + float(cfg.get('raw_ct_move_s', 3.0))
         last_stop = None
+        quit_ = False
         for i, item in enumerate(todo, 1):
             self._check_abort()
-            if self.disabled:
+            if self.disabled or quit_:
+                if quit_:
+                    self.log(f'    ★ {item.color_name} 没夹到')
+                    self.stats.grab(False)
+                    continue
                 break
             if not cfg.get('full_course', True) and self.time_left() < 0:
                 self.log('    ★ 时间到，不再抓取')
@@ -4600,12 +4701,13 @@ class MissionHooks:
                     self.log(f'  {tag} 原料盘停了：{names}{how}；{item.color_name} 在 {k} 号位：按示教的角度转过去下爪，放 {item.slot} 号槽')
                 try:
                     got = self._raw_ct_grab(item, k, reach[k], tag, t_end=t_stop + self._raw_ct_stop_len() - T - margin,
-                                            near=bool(near_k) and left >= need + fix_s)
+                                            near=bool(near_k) and left >= need + fix_s, watch_px=px if near_k else None)
                 except (ArmError, VisionError) as ex:
                     if isinstance(ex, ArmAbort):
                         raise
-                    self._recover(f'抓 {item.color_name} 出错：{ex}')
-                    got = False
+                    got = self._grab_failed(item, ex) if isinstance(ex, ArmError) else False
+                    if not got and isinstance(ex, VisionError):
+                        self._recover(f'抓 {item.color_name} 出错：{ex}')
                 if got:
                     self.stats.grab(True)
                     self.in_tray[item.slot] = item
@@ -4621,6 +4723,9 @@ class MissionHooks:
                     raise
                 except ArmError as ex:
                     self._recover(f'回到看原料盘的姿态出错：{ex}')
+                    self.log('    ★ 回不到看原料盘的姿态：这个原料区不再接着夹(收着的手臂直接转过去会刮到电池盒)')
+                    quit_ = True
+                    break
                 self._ct_t_arm = self.now()
                 if near_k and cfg.get('raw_near_recheck', True) and not self.disabled and (not got or i < len(todo)):
                     recheck = True                             # 车被带偏了就车轮慢慢对回去(还有要夹的才看；等原料盘时顺便看，不另外停)
@@ -4684,6 +4789,8 @@ class MissionHooks:
             nonlocal t_end
             it0 = got_at.pop(int(c_))
             self.stats.grab_ok = max(0, self.stats.grab_ok - 1)
+            if self.in_tray.get(it0.slot) is it0:
+                self.in_tray.pop(it0.slot, None)               # 转盘这一格是空的(粗加工区不去取)
             self._show_stats()
             if regrab.get(int(c_), 0) < n_regrab:
                 regrab[int(c_)] = regrab.get(int(c_), 0) + 1
@@ -4701,7 +4808,9 @@ class MissionHooks:
                     break
                 checked = True                                 # 都夹了：再看几秒原料盘，夹过的还在上面就是没夹上
                 self.log('    这一批都夹过了：再看一眼原料盘(夹过的还在上面 = 刚才没夹上，再夹)')
-                c_ = self._raw_near_leftover(sorted(got_at), float(cfg.get('raw_near_check_s', 3.0)))
+                Pn_ = {k_: P[k_] + shift() for k_ in keys}
+                c_ = self._raw_near_leftover(sorted(got_at), float(cfg.get('raw_near_check_s', 3.0)),
+                                             at_slot=lambda p_: any(float(np.linalg.norm(p_ - Pn_[k_])) <= match for k_ in keys))
                 if c_ is None:
                     self.log('    夹过的都不在原料盘上了')
                     break
@@ -4754,7 +4863,10 @@ class MissionHooks:
                     if wait_n[c_] >= 3:
                         left.remove(it_)
                         del wait_n[c_]
-                        self.log(f'  [抓 {it_.color_name}] 等了 3 次停下都没转到这一格：刚才多半看错了(或者掉了)，不再等它')
+                        self.in_tray[it_.slot] = it_                # 多半看错了：当它还在转盘里(和刚才夹的时候一样算)
+                        self.stats.grab_ok += 1
+                        self._show_stats()
+                        self.log(f'  [抓 {it_.color_name}] 等了 3 次停下都没转到这一格：刚才多半看错了，当它已经夹到了')
             if not left:
                 break
             names = f'这一格上是 {COLOR_NAMES.get(int(at), at)}' if at is not None else '这一格上没认出物料'
@@ -4783,12 +4895,13 @@ class MissionHooks:
             self.log(f'  {tag} 原料盘停了：{names}；马上下爪，放 {item.slot} 号槽')
             try:
                 got = self._raw_ct_grab(item, near_k, reach[near_k], tag, t_end=t_stop + self._raw_ct_stop_len() - T - margin,
-                                        near=left_s >= need + fix_s)
+                                        near=left_s >= need + fix_s, watch_px=px)
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
-                self._recover(f'抓 {item.color_name} 出错：{ex}')
-                got = False
+                got = self._grab_failed(item, ex) if isinstance(ex, ArmError) else False
+                if not got and isinstance(ex, VisionError):
+                    self._recover(f'抓 {item.color_name} 出错：{ex}')
             if got:
                 self.stats.grab(True)
                 self.in_tray[item.slot] = item
@@ -4804,6 +4917,8 @@ class MissionHooks:
                 raise
             except ArmError as ex:
                 self._recover(f'回到看原料盘的姿态出错：{ex}')
+                self.log('    ★ 回不到看原料盘的姿态：这个原料区不再接着夹(收着的手臂直接转过去会刮到电池盒)')
+                break
             self._ct_t_arm = self.now()
             known, reuse = t_stop, int(item.color)             # 原料盘还停在这一次：这一格上还是它(没夹上)就马上再夹
             if cfg.get('raw_near_recheck', True) and not self.disabled and left:
@@ -4814,15 +4929,19 @@ class MissionHooks:
         if left:
             self._show_stats()
 
-    def _raw_near_leftover(self, cols, max_s):
-        """(10-21)这一批都夹过了：看 max_s 秒原料盘(转着也行)，夹过的颜色还在上面(连着两帧看到)就返回那个颜色；没看到返回 None。"""
+    def _raw_near_leftover(self, cols, max_s, at_slot=None):
+        """(10-21)这一批都夹过了：看 max_s 秒原料盘(转着也行)，夹过的颜色还在上面(连着两帧看到)就返回那个颜色；没看到返回 None。
+        at_slot(像素) = 这个位置在不在原料盘的停靠位上：只算停在停靠位上的(画面里别处的一块同色，比如蓝色爪子，不算)。"""
         n = {}
+        claw = np.array(self.vision.claw('RAW'), float)
         t_lim = self.now() + float(max_s)
         while self.now() < t_lim:
             self._check_abort()
             errs = self.vision.material_errors(list(cols))
             for c_ in cols:
-                n[c_] = n.get(c_, 0) + 1 if errs.get(c_) is not None else 0
+                q = errs.get(c_)
+                hit = q is not None and (at_slot is None or at_slot(claw + np.asarray(q, float)))
+                n[c_] = n.get(c_, 0) + 1 if hit else 0
                 if n[c_] >= 2:
                     return int(c_)
         return None
@@ -6237,12 +6356,16 @@ class MissionHooks:
             else:
                 self._obs_ring()
             kw = self._wheels_kw() if (wheels or cal) else self._zone_servo_kw()
+            Jw = self.store.get('RING', 'ch') if self.store is not None else None
+            r2 = self._ring2_off_px(Jw) if Jw is not None else None   # (10-21)一步一步对准也故意对偏(以前只有连续对准时偏)
             low = (self.on_ring.get((zone, 2)) or [None])[-1]
             if low is not None:                          # 暂存区第二批：2 号环上放着第一批的物料(白心被盖住)：认物料顶面/圆环外圈
-                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal))
+                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal),
+                                                ring_off=r2)
             else:
-                res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'), cfg['tol_mm']['RING'],
-                                     allow_chassis=True, label=f'{zone}对准2号环', bounds=self.vision.bounds('RING'), confirm=False, **kw)
+                res = self.servo.run('RING', self._offset_measure(self._ring_measure(), r2), self.vision.scale('RING'),
+                                     cfg['tol_mm']['RING'], allow_chassis=True, label=f'{zone}对准2号环',
+                                     bounds=self.vision.bounds('RING'), confirm=False, **kw)
             self.log(f'    2 号环对准结果：{res}')
             acc = self._wheels_accept('RING') if (wheels or cal) else cfg['accept_mm']['RING']
             if res is None or not (res.ok or res.err_mm <= acc):
@@ -6302,10 +6425,12 @@ class MissionHooks:
                 pass
         claw = np.array(v.claw('RING'), float)
         off = self._place_shift_px()
-        goalp = claw + (np.asarray(off, float) if off is not None else 0.0)
+        goal0 = claw + (np.asarray(off, float) if off is not None else 0.0)
+        goalp = goal0
         r2 = self._ring2_off_px(J0)
+        r2_mm = self.ring2_off() if r2 is not None else None   # (前后 F, 左右 S) 毫米
         if r2 is not None:
-            goalp = goalp + r2
+            goalp = goal0 + r2
         tol = float(cfg.get('zone_vel_tol_mm') or cfg['tol_mm']['RING'])
         acc = self._wheels_accept('RING')
         vmax = float(cfg.get('zone_vel_speed', 15.0))
@@ -6642,12 +6767,19 @@ class MissionHooks:
             按地图查过车身不碰工位/场地边/障碍物(碰就少挪)。返回 (位置, 被限了没有)。"""
             t2 = np.array([max(-scap, min(scap, float(t[0]))), max(float(drv.lo[1]), min(float(drv.hi[1]), float(t[1])))])
             cl = float(np.linalg.norm(t2 - t)) > 0.5
-            free = float(cfg.get('zone_map_free_mm', 60.0))
-            if pose0 is not None and float(np.linalg.norm(t2)) > free \
-                    and not self._body_clear(pose0, (float(t2[0]), float(t2[1])), obs)[0]:
+            free_f = float(cfg.get('zone_map_free_mm', 60.0))
+            free_s = float(cfg.get('zone_map_free_s_mm', 10.0))
+
+            def ok_(q):
+                """离停车点这么近(沿那一排 free_f 以内、横着 free_s 以内)不按地图查；再远按地图查过车身不碰东西才行。
+                横着往工位那边挪照样按地图查(压进工位/别的颜色区域这一轮就结束了)。"""
+                if abs(float(q[0])) <= free_s and abs(float(q[1])) <= free_f:
+                    return True
+                return self._body_clear(pose0, (float(q[0]), float(q[1])), obs)[0]
+            if pose0 is not None and not ok_(t2):
                 for fr_ in np.linspace(0.9, 0.0, 10):
                     q = a + (t2 - a) * fr_
-                    if self._body_clear(pose0, (float(q[0]), float(q[1])), obs)[0]:
+                    if ok_(q):
                         t2, cl = q, True
                         break
                 else:
@@ -6659,6 +6791,7 @@ class MissionHooks:
             要挪多少，S/F 一次挪过去；停稳再看：车实际走了多少、2 号环在画面里实际动了多少，按它修正对应关系，还差就再算再挪
             (最多 zone_calc_moves 次)。挪完反而更偏(对应关系不对)也不放弃，按实际的改过来再挪。
             返回 (对准了, 到范围边上了, 跟丢了, 车轮没走起来, 还差多少 mm, 剩下太少车轮挪不准)。"""
+            nonlocal goalp
             drv.finish()                                      # 不再用 V：V 走过的记进 act.disp
             a = np.array([float(act.disp['S']), float(act.disp['F'])])
             pts = still_rings()
@@ -6723,6 +6856,12 @@ class MissionHooks:
                 dimg = c_new - c_
                 ex_px = float(np.linalg.norm(J @ mv))
                 if ex_px >= 6.0 and float(np.linalg.norm(dimg)) < max(2.0, 0.2 * ex_px):
+                    try:                                       # (10-21)车其实没走(打滑)：记的位移按画面里实际动了多少改回来，
+                        seen_ = np.linalg.solve(J, dimg)       #   不然做完"挪回停车点"会差出没走的那一段
+                        act.disp['S'], act.disp['F'] = float(a[0] + seen_[0]), float(a[1] + seen_[1])
+                        a_new = np.array([float(act.disp['S']), float(act.disp['F'])])
+                    except np.linalg.LinAlgError:
+                        pass
                     if wonly and went:                               # 只用车轮：V 慢慢走没走起来，改用 S/F(按位置走)再挪一次，不交给手臂
                         note['no_v'] = True
                         self.log('    ★ 车挪了，画面里的圆环一点没动：V 慢慢走车轮好像没走起来(打滑？)，改用 S/F 再挪一次')
@@ -6742,6 +6881,8 @@ class MissionHooks:
                 if Jn is not None:
                     J = Jn
                     Jc[0] = J
+                    if r2_mm is not None:                      # (10-21)对应关系修过(比如横移方向是反的)：故意对偏的像素也按新的算
+                        goalp = goal0 + J[:, 1] * float(r2_mm[0]) + J[:, 0] * float(r2_mm[1])
                     if pred_err >= 3.0 or len(moves) >= 2:
                         note['jsave'] = True
                     if pred_err >= 3.0:
@@ -7741,11 +7882,23 @@ class MissionHooks:
         self.arm.lift(zhi)
 
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
-    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None):
+    @staticmethod
+    def _offset_measure(measure, off):
+        """(10-21)对准用的测量减去 off(像素)：要让"圆环 - 爪子点"等于 off(故意对偏)。off=None 原样返回。"""
+        if off is None:
+            return measure
+
+        def shifted():
+            e = measure()
+            return None if e is None else (float(e[0]) - float(off[0]), float(e[1]) - float(off[1]))
+        return shifted
+
+    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None, ring_off=None):
         """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
         1 claw_px.PICK 量过、认得到这个颜色的物料：把物料顶面对到 PICK 点(最准，不用认圆环)
         2 否则认圆环(vclaw RING 量过圆环大小时，白心被盖住也能认最外圈)
         wheels=True：只动车轮(手臂不动)。arm_kw：(10-19)只动手臂、车不动(这些是给 servo.run 的参数，见 _arm_only_kw)。
+        ring_off：(10-21)认圆环对准时故意对偏多少像素(码垛时 r2off；认物料顶面对的是 PICK 点，量过的，不偏)。
         返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
         v, cfg = self.vision, self.cfg
         tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
@@ -7767,7 +7920,7 @@ class MissionHooks:
                 self.log(f'    按物料没对准({res.reason})，改认圆环')
             else:
                 self.log('    认不到圆环上的物料，改认圆环')
-        measure = self._ring_measure()
+        measure = self._offset_measure(self._ring_measure(), ring_off)
         e = measure()
         if e is None:
             return None, None

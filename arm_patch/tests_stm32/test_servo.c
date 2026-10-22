@@ -60,7 +60,9 @@ static void step(uint32_t ms) {
     }
 }
 uint32_t HAL_GetTick(void) { return now; }
-void HAL_Delay(uint32_t ms) { uint32_t i; for (i = 0; i < ms; i++) { now++; step(1); } }
+static uint32_t abort_ms;
+extern volatile uint8_t car_abort;
+void HAL_Delay(uint32_t ms) { uint32_t i; for (i = 0; i < ms; i++) { now++; step(1); if (abort_ms && now >= abort_ms) car_abort = 1; } }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) { (void)h; (void)t; strncat(out, (char *)b, n); return 0; }
 FSUS_STATUS FSUS_QueryServoAngleMTurn(Usart_DataTypeDef *u, uint8_t id, float *a) { (void)u; HAL_Delay(3); if (read_fail) return FSUS_STATUS_FAIL; *a = (float)(floor(pos[id] * 10 + 0.5) / 10); return FSUS_STATUS_SUCCESS; }
 FSUS_STATUS FSUS_SetServoAngleMTurnByVelocity(Usart_DataTypeDef *u, uint8_t id, float a, float v, uint16_t ta, uint16_t td, uint16_t p, uint8_t w) {
@@ -89,6 +91,8 @@ FSUS_STATUS FSUS_WriteData(Usart_DataTypeDef *u, uint8_t id, uint8_t addr, uint8
     if (size == 2 && addr != 51 && addr != 52) uparam[addr] = (long)(uint16_t)(val[0] | (val[1] << 8));
     return FSUS_STATUS_SUCCESS; }
 #define SERVO_FINE_DEG 4.5f      /* 正式程序里在 arm.h */
+volatile uint8_t car_abort = 0;
+static uint32_t abort_ms = 0;            /* 不是 0：到这个时刻(ms)假装树莓派发了 '!' */
 #include "servo_section.c"
 static int fails = 0, checks = 0;
 #define CHECK(c, m) do { checks++; if (!(c)) { fails++; printf("  FAIL: %s\n    out=[%s] pos1=%.1f tgt1=%.1f now=%u\n", m, out, pos[1], tgt[1], now); } else printf("  ok: %s\n", m); } while (0)
@@ -101,6 +105,11 @@ int main(void) {
     reset1(300); t0 = now;
     Servo_Move(1, 350, 40, 0.3f, 400);
     CHECK(fabs(pos[1] - 350) < 0.31 && out[0] == 0 && now - t0 < 1700, "正常转 50°：到位返回，不打印");
+    /* (10-21)转的时候急停('!')：马上停在现在的地方，不再等它转完(以前要等，最多 9 秒) */
+    reset1(300); t0 = now; abort_ms = now + 300;
+    Servo_Move(1, 400, 40, 0.3f, 400);
+    CHECK(now - t0 < 450 && fabs(tgt[1] - pos[1]) < 0.5 && pos[1] < 320, "急停：0.3 秒时停在原地(没转到 400)");
+    abort_ms = 0; car_abort = 0;
     CHECK(nset == 2 && fabs(tgt[1] - pos[1]) < 0.11, "到了以后让它停在现在的位置(不再往目标使劲)");
     /* 2. 被挡住(电流大)：停在原地，打印 STUCK 和电流 */
     reset1(300); block_hi = 367.6; t0 = now;

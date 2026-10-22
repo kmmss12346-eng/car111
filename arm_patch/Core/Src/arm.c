@@ -245,7 +245,7 @@ int Arm_Param_Set(const char *name, float v)
     {
         if (strcmp(tun[i].name, name) == 0)
         {
-            if (v < tun[i].lo || v > tun[i].hi)
+            if (!(v >= tun[i].lo && v <= tun[i].hi))  /* (10-21)这样写 nan 也挡得住 */
             {
                 return 2;
             }
@@ -367,7 +367,7 @@ static uint8_t     lift_guess    = 0;         /* (10-21)开机没读到编码器
 /* 下面"编码器"那一节里的函数，Lift_Goto 要先用到 */
 static void Pos_Save(float z);
 static int  Lift_EncPos(float near_mm, float *z, uint16_t *raw);
-static void Lift_Check(float mm);
+static int Lift_Check(float mm);
 
 static uint32_t Lift_Time_Ms(uint32_t pulses)
 {
@@ -379,6 +379,21 @@ static uint32_t Lift_Time_Ms(uint32_t pulses)
 static float    lift_pend = -1.0f;
 static float    lift_from = 0.0f;
 static uint32_t lift_end  = 0;
+/* (10-21)上次用编码器核对过以后升降走过的高度范围：编码器一圈 40mm，按它认的高度只有落在这个范围里才信(差出去就是认错了圈) */
+static float    lift_span_lo = 0.0f;
+static float    lift_span_hi = 0.0f;
+static uint8_t  lift_chk_due = 0;     /* Lift_Done_Now 到点了还没核对(手臂正在转，不能停下来等编码器)：Lift_Finish 里补 */
+
+static void Lift_Span(float mm)
+{
+    if (mm < lift_span_lo)  lift_span_lo = mm;
+    if (mm > lift_span_hi)  lift_span_hi = mm;
+}
+
+static void Lift_Span_Reset(void)
+{
+    lift_span_lo = lift_span_hi = lift_mm;
+}
 
 /* 只发升降指令不等(和舵机同时动用)。之后一定要调 Lift_Finish。成功返回 NULL */
 static const char *Lift_Start(float mm)
@@ -409,6 +424,8 @@ static const char *Lift_Start(float mm)
     Emm_V5_En_Control(LIFT_ADDR, true, false);
     HAL_Delay(5);
     Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
+    Lift_Span(lift_mm);
+    Lift_Span(mm);
     lift_pend = mm;
     lift_from = lift_mm;
     lift_end  = HAL_GetTick() + Lift_Time_Ms(pulses);
@@ -426,7 +443,8 @@ static int Lift_Done_Now(void)
     {
         lift_mm = lift_pend;
         lift_pend = -1.0f;
-        Lift_Check(lift_mm);                       /* (10-21)用编码器核对到了没有 */
+        lift_chk_due = 1;                          /* (10-21)用编码器核对等手臂转完再做(Lift_Finish)：这里在 15ms 一次的舵机循环里，
+                                                    * 停下来等编码器最多要 1 秒，ID1 会转过头(往前多给的 S1COMP 5°) */
         Pos_Save(lift_mm);
         return 1;
     }
@@ -441,6 +459,12 @@ static const char *Lift_Finish(void)
 
     if (mm < 0.0f)
     {
+        if (lift_chk_due)                          /* (10-21)Lift_Done_Now 到点时手臂在转、没核对：现在补上 */
+        {
+            lift_chk_due = 0;
+            if (Lift_Check(lift_mm))  return "ERR LIFT";
+            Pos_Save(lift_mm);
+        }
         return NULL;
     }
     left = (int32_t)(lift_end - HAL_GetTick());
@@ -466,7 +490,8 @@ static const char *Lift_Finish(void)
     }
     lift_pend = -1.0f;
     lift_mm = mm;
-    Lift_Check(mm);                                /* (10-21)用编码器核对到了没有 */
+    lift_chk_due = 0;
+    if (Lift_Check(mm))  return "ERR LIFT";        /* (10-21)用编码器核对到了没有；认的高度不可信就不往下做(免得在半空夹/松爪子) */
     Pos_Save(lift_mm);
     return NULL;
 }
@@ -501,6 +526,8 @@ static const char *Lift_Goto(float mm)
     Emm_V5_En_Control(LIFT_ADDR, true, false);
     HAL_Delay(5);                                  /* 两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
     Emm_V5_Pos_Control(LIFT_ADDR, dir, (uint16_t)g_lrpm, (uint8_t)g_lacc, pulses, 0, false);
+    Lift_Span(lift_mm);
+    Lift_Span(mm);
 
     if (!Wait_Ms(Lift_Time_Ms(pulses)))
     {
@@ -523,7 +550,7 @@ static const char *Lift_Goto(float mm)
         return NULL;
     }
     lift_mm = mm;
-    Lift_Check(mm);                                /* (10-21)用编码器核对到了没有(丢步就改过来) */
+    if (Lift_Check(mm))  return "ERR LIFT";        /* (10-21)用编码器核对到了没有(丢步就改过来)；认的高度不可信：不往下做 */
     Pos_Save(lift_mm);                             /* 记进 Flash：下次上电从这里找 */
     return NULL;
 }
@@ -631,23 +658,25 @@ static int Lift_EncPos(float near_mm, float *z, uint16_t *raw)
 
 /* (10-21 用户：下到最低了升降还往下动)升降走完用编码器核对实际到了没有。以前只按发了多少脉冲、等了多久算高度：要去的高度机构到不了
  * (ZHI/STBY 比升降能到的最高还高，或者比最低点还低)、顶到东西丢了步，也照样当作到了，记的高度和实际越差越多，后面下到低处就一直往下顶。
- * 还在走(等的时间估短了)：等它停稳(最多约 1 秒)；差 LFCHK 毫米以上：按编码器改过来，报 LIFTSLIP。差 15mm 以上不改(编码器一圈 40mm，
- * 差太多可能认错圈)，只报。没标定编码器 / LFCHK=0 不核对 */
-static void Lift_Check(float mm)
+ * 还在走(等的时间估短了)：等它停稳(最多约 1 秒)；差 0.5mm~LFCHK：顶到东西了，叫它别再顶，报 LIFTPUSH；差 LFCHK 毫米以上：按编码器改过来，
+ * 报 LIFTSLIP。(10-21)编码器一圈 40mm，差 20mm 以上会认错圈：差 15mm 以上、或者认出的高度不在上次核对以后走过的范围里，不改、返回 1
+ * (调用的地方报 ERR LIFT，不夹/不松爪子)。没标定编码器 / LFCHK=0 不核对 */
+static int Lift_Check(float mm)
 {
-    float z, z2;
+    float z, z2, d;
     uint16_t e;
     int k;
+    int bad;
     char m[80];
     char s1[20];
     char s2[20];
 
-    if (g_lchk <= 0.0f || !lift_cal_ok || lift_nochk)  return;
-    if (!Lift_EncPos(mm, &z, &e))  return;
+    if (g_lchk <= 0.0f || !lift_cal_ok || lift_nochk)  { Lift_Span_Reset(); return 0; }
+    if (!Lift_EncPos(mm, &z, &e))  { Lift_Span_Reset(); return 0; }
     for (k = 0; k < 12 && Absf(z - mm) >= 0.3f; k++)
     {
         Delay_Report(80);                          /* 还在走就等它停下(和 Wait_Ms 一样照常回报车头角度) */
-        if (car_abort || !Lift_EncPos(mm, &z2, &e))  return;
+        if (car_abort || !Lift_EncPos(mm, &z2, &e))  { Lift_Span_Reset(); return 0; }
         if (Absf(z2 - z) < 0.15f)
         {
             z = z2;
@@ -670,19 +699,38 @@ static void Lift_Check(float mm)
         lift_mm = z;
         lift_guess = 0;
         lift_boot_how = "SYNC";
-        return;
+        Lift_Span_Reset();
+        return 0;
     }
-    if (Absf(z - mm) < g_lchk)  return;
+    d = Absf(z - mm);
+    if (d < 0.5f)  { Lift_Span_Reset(); return 0; }
     FmtF(s1, (int)sizeof(s1), mm);
     FmtF(s2, (int)sizeof(s2), z);
-    snprintf(m, sizeof(m), "LIFTSLIP want=%s got=%s%s\r\n", s1, s2, (Absf(z - mm) > 15.0f) ? " (too far, kept)" : "");
-    Say(m);
-    if (Absf(z - mm) <= 15.0f)
+    if (d < g_lchk)
     {
-        Emm_V5_Stop_Now(LIFT_ADDR, false);         /* 闭环驱动器顶着到不了的位置会一直使劲：叫它停住，它要去的位置也就成了现在的位置 */
+        /* (10-21 实车"下降的时候不夹取，抬起来了再夹取")差一点没到(爪子顶到原料盘/地面/转盘槽底了)：闭环驱动器会一直使劲往下顶，
+         * 爪子被压住合不上。叫它停住(要去的位置就成了现在的位置，不再顶)，报 LIFTPUSH 让树莓派提醒把那个高度调高一点 */
+        Emm_V5_Stop_Now(LIFT_ADDR, false);
         HAL_Delay(5);
         lift_mm = z;
+        snprintf(m, sizeof(m), "LIFTPUSH want=%s got=%s\r\n", s1, s2);
+        Say(m);
+        Lift_Span_Reset();
+        return 0;
     }
+    /* 编码器一圈 40mm：实际差 20mm 以上会认成差另一圈的某个数。只有落在这次走过的高度范围里(多 2mm)、差不到 15mm 才信 */
+    bad = (d > 15.0f || z < lift_span_lo - 2.0f || z > lift_span_hi + 2.0f);
+    snprintf(m, sizeof(m), "LIFTSLIP want=%s got=%s%s\r\n", s1, s2, bad ? " (too far, kept)" : "");
+    Say(m);
+    if (bad)
+    {
+        return 1;                                  /* 不可信：调用的地方报 ERR LIFT，不夹/不松爪子 */
+    }
+    Emm_V5_Stop_Now(LIFT_ADDR, false);             /* 闭环驱动器顶着到不了的位置会一直使劲：叫它停住，它要去的位置也就成了现在的位置 */
+    HAL_Delay(5);
+    lift_mm = z;
+    Lift_Span_Reset();
+    return 0;
 }
 
 /* 待机姿态(10-15 用户：上电、PARK 都回到自己定的高度/手臂角度/夹爪)。STBY SAVE 把现在的样子记下来，
@@ -926,6 +974,7 @@ static const char *Lift_Cal_Do(float z0)
     }
     lift_known = 1;
     lift_mm = z0;
+    Lift_Span_Reset();
     lift_guess = 0;
     step = (z0 + 15.0f <= g_lmax) ? 10.0f : -10.0f;   /* 在最低点附近就往上走，离最高点近才往下走，不会撞 */
     r = Lift_Goto(z0 + step);
@@ -1044,6 +1093,7 @@ static void Lift_Boot(void)
 
     lift_known = 1;
     lift_mm = LIFT_BOOT_MM;
+    Lift_Span_Reset();
     lift_boot_how = "NOCAL";
     Cal_Load();
     if (!lift_cal_ok)
@@ -1077,6 +1127,7 @@ static void Lift_Boot(void)
         {
             /* (10-16)读不到编码器：当作停在 Flash 里记的上次停下的高度(比一律当 60 准：停在待机高度关电的也不会认错) */
             lift_mm = pos_last;
+            Lift_Span_Reset();
             FmtF(s2, (int)sizeof(s2), pos_last);
             snprintf(m, sizeof(m), "LIFTBOOT NOENC (assume last %s)\r\n", s2);
             Say(m);
@@ -1086,6 +1137,7 @@ static void Lift_Boot(void)
         return;
     }
     lift_mm = z;
+    Lift_Span_Reset();
     lift_guess = 0;
     lift_boot_how = pos_last_ok ? "POS" : "ENC";
     FmtF(s1, (int)sizeof(s1), z);
@@ -1095,6 +1147,7 @@ static void Lift_Boot(void)
     if (Pos_Count() > POS_N / 4u * 3u)             /* 位置记录快满了：擦掉扇区，标定重新写回去 */
     {
         Cal_Save();
+        Pos_Save(lift_mm);                         /* (10-21)擦掉以后马上记一条：这次开机升降一下都没动就关电，下次开机也知道停在哪 */
     }
     if (!sb_ok)                                    /* 存了待机姿态：Arm_Init 里整个回到待机姿态，这里先不动 */
     {
@@ -2451,6 +2504,7 @@ static int ParseF(const char *s, float *v)
     char *e;
 
     *v = (float)strtod(s, &e);
+    if (!(*v - *v == 0.0f))  return 0;             /* (10-21)nan / inf：后面的范围检查都挡不住，不认 */
     return (e != s && *e == 0);
 }
 
@@ -2517,6 +2571,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         else if (slot >= 500 && slot <= 2700)
         {
             Turntable_Set((uint32_t)slot);
+            tt_slot = 0;                           /* (10-21)不在哪个号位了：之后 TT_Go 到哪个号位都要等它转到 */
             tt_ready_at = HAL_GetTick() + (uint32_t)g_ttwait;
         }
         else
@@ -2548,6 +2603,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             lift_mm = 0.0f;
             lift_known = 1;
             Lift_Rebase0();                        /* (10-21)编码器的 0 也改到这里 */
+            Lift_Span_Reset();
             return 1;
         }
         if (strcmp(t[1], "HOME") == 0)
@@ -2562,6 +2618,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             }
             lift_mm = 0.0f;
             lift_known = 1;
+            Lift_Span_Reset();
             return 1;
         }
         if (strcmp(t[1], "SYNC") == 0)             /* (10-21)按编码器把高度认准(在现在记的高度上下 20mm 里找)，不动升降 */
@@ -2573,6 +2630,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             float z;
 
             if (!lift_cal_ok)  FAIL("ERR NOCAL");
+            if (!lift_known)  FAIL("ERR NOZERO");      /* (10-21)急停停在半路(走了 36mm 以上)：记的高度是出发的地方，在它附近找会认错圈 */
             if (!Lift_EncPos(lift_mm, &z, &e))  FAIL("ERR NOENC");
             FmtF(s1, (int)sizeof(s1), z);
             FmtF(s2, (int)sizeof(s2), lift_mm);
@@ -2580,6 +2638,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             Say(m);
             lift_mm = z;
             lift_known = 1;
+            Lift_Span_Reset();
             if (lift_guess || strcmp(lift_boot_how, "NOENC") == 0)  lift_boot_how = "SYNC";
             lift_guess = 0;
             Pos_Save(z);
