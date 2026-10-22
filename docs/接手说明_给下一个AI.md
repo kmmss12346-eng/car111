@@ -698,4 +698,11 @@ git_log.txt                ← 分支最近 120 条提交记录
   missed() 把 grab_total 也减回去(再夹到/没夹到时只记一次)。暂存区途中松爪用户说已经修好了，固件没改。
   测试：`PlaceOrderTests.test_whole_run_two_batches_all_in_task_code_order`(两批 6 次夹 + 粗加工放/取回 + 暂存放/码垛全按顺序)、
   `RawNearSlotTests.test_task_order_by_default_any_only_with_mtest_any`。树莓派 621 个(3 跳过)全过。
+- **10-22 备份时车上应该是的版本(下一个接手的先对一下)：** 已发给用户的更新包和对应提交：
+  fix_1021j = 1ad6130(arm.c、main.c 烧 STM32；mission_hooks.py、arm_link.py、arm_calib.py)；
+  order_1022a = 71bf450(mission_hooks.py：按任务码顺序放/取回)；order_1022b = a06ca37(mission_hooks.py、mission_cli.py：夹取也按顺序)。
+  所以车上固件 = 1ad6130 的 arm.c/main.c(用户烧没烧要问)，树莓派 = a06ca37 的 mission_hooks.py/mission_cli.py + 1ad6130 的 arm_link.py/arm_calib.py。
+  用户 10-21 12:40 发的 STM32 参数(ZHI 115、ZGRAB 85、ZDROP 95、ZPLC 0、ZOBRNG 115、A1D 237.6、A1P 49.5、A2P -985.5、R1T2 194.2、R2T -702.3、
+  R1T1 163.7、R2SPD/EXTSPD 1500、ROTSPD 180、S1COMP 5、CLWC 1150、CLWO 1650、CLWOR 1700、CLWOT 1450、TTWAIT 800、SPOW 30000)在对话记录里。
+  还没做 vclaw RING(日志一直提示)；用户说用 r2off 手动对偏。车上才有的配置/标定文件仍然不在仓库里(要用户发过来)。
 
