@@ -860,7 +860,7 @@ class MissionHooks:
     def prepare(self, link, log=None):
         """一键出发以后马上调(第二站动作之前)：把开跑前能做的先做掉，到了 QR 点就不用再等。
           机械臂初始化 + 收臂(STOW)、同步参数(和第一次 task 一样)；
-          QR CLR：清掉 STM32 里存的旧任务码(上一轮/调试时扫过的)；(10-23)清屏(ZONE LOCK)，屏上先只写 GRAB 0、PLACE 0；
+          QR CLR：清掉 STM32 里存的旧任务码(上一轮/调试时扫过的)；(10-23)清屏(ZONE LOCK)，屏上先空着(读到码写任务码，回到启停区写抓取数、放置数)；
           打开摄像头。
         调多次没关系(做成过的不再做)；出错只记日志、不抛异常(导航照常走；到 QR 点 task 会再初始化)。返回机械臂是否就绪。
         比赛(race)时在 ZONE LOCK 之后调；这里自己也清一次屏(go 的时候屏上还留着上一次的字)。"""
@@ -897,8 +897,8 @@ class MissionHooks:
                     self.log(f'  开跑前扫码器刚读到任务码 {u.get()}：到 QR 点直接用它')
                 if ok is False:
                     raise ArmError('QR CLR 没有回 DONE')
-                self._screen_clear()                # (10-23)清屏：上一次的任务码擦掉，读到码再写；屏上先只有 GRAB 0、PLACE 0
-                self._show_stats()
+                self._screen_clear()                # (10-23)清屏：上一次的任务码擦掉，读到码再写
+                self._show_stats()                  # screen_stats_live=true 才写 GRAB 0、PLACE 0(默认回家才写)
                 self._prep['qr'] = True
                 self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上的字也清了(读到任务码再显示)')
             except Exception as ex:
