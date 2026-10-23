@@ -4548,6 +4548,21 @@ class PreArmTests(unittest.TestCase):
         h.pre_cancel('RAW')                                            # 没摆过：什么都不做
         self.assertEqual(len(w.requests), n)
 
+    def test_bail_out_clears_pending(self):
+        # (10-23)停车点里出了意外的错(_bail_out 收臂)：提前摆臂的标记要清掉，不然后面每一站都不再提前摆
+        w = SimWorld(seed=0, code=self.CODE)
+        lines = []
+        h = make(w, log=lines.append)
+        h.prepare(w.link, lines.append)
+        h._use_code(self.CODE)
+        h._ensure(w.link)
+        self.assertTrue(h.pre_arrive('RAW', w.link, lines.append))
+        h.maybe_holding = '测试'                                       # 爪子里可能有东西：_bail_out 不收臂(不张开爪子)
+        h._bail_out('RAW')
+        self.assertIsNone(h._pre_pending)
+        h.maybe_holding = None
+        self.assertTrue(h.pre_arrive('RAW', w.link, lines.append))
+
     def test_holding_or_empty_tray_no_pre(self):
         w = SimWorld(seed=0, code=self.CODE)
         lines = []

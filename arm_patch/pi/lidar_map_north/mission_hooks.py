@@ -1180,6 +1180,7 @@ class MissionHooks:
     # ------------------------------------------------------------------ 出错以后
     def _bail_out(self, role):
         """停车点里出了意外的错：把手臂收好(夹着物料就先放回转盘)、底盘挪回停车点，路线照走。收不好/挪不回去就停下(Abort)。"""
+        self._pre_pending = None                    # (10-23)手臂在这里收；不清掉的话后面每一站都不再提前摆臂
         try:
             if self.holding is not None:
                 self._put_back(self.holding, '出错时爪子里夹着物料')
