@@ -14,7 +14,8 @@
     q     退出
 
 画面上：
-    绿十字   爪子位置(vclaw 实测的 vision_cal.json 优先，没有就用配置里的 mission_cfg.claw_px)
+    绿十字   爪子位置(vclaw 实测的 vision_cal.json 优先，没有就用配置里的 mission_cfg.claw_px)。
+             (10-23)arm_calib 看原料的那几步里输入 g 左右 上下 可以挪原料的绿十字；vision_cal.json 一变这里马上重新读
     红十字   (10-23，找圆环时、设了 r2off)比赛时 2 号环对准后圆环中心真正要对到的点：绿十字按 r2off 故意对偏以后的位置
              (和 mission_hooks 一样按 vcal RING 存的车轮和画面的对应关系换算)。这时左上角的偏差是圆环离红十字多少
     红斜十字 + 青色圆  识别到的物料圆心和拟合出来的整个圆(被爪子挡住的部分也画出来)
@@ -29,6 +30,7 @@
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -52,6 +54,43 @@ def load_vision_cfg(cfg_path):
     if cfg.get('vision_cal_file'):
         apply_vision_cal(vc, cfg['vision_cal_file'])
     return vc
+
+
+def _cal_file(cfg_path):
+    """(10-23)这份配置用的 vision_cal.json 的完整路径(配置里 vision_cal_file 是空的 = 不用这个文件，返回 None)。"""
+    from mission_hooks import DEFAULTS, deep_merge
+    from vision import _cal_path
+    raw = {}
+    if cfg_path is not None and Path(cfg_path).exists():
+        raw = json.loads(Path(cfg_path).read_text(encoding='utf-8'))
+    name = deep_merge(DEFAULTS, raw.get('mission_cfg')).get('vision_cal_file')
+    return _cal_path(name) if name else None
+
+
+def _mtime(p):
+    try:
+        return os.path.getmtime(p) if p is not None else None
+    except OSError:
+        return None
+
+
+def claw_shift(cfg_path, du, dv, kind='RAW'):
+    """(10-23 用户"把这个绿色的十字搞成可移动的，可以根据我输入的数字改变这个绿色十字的位置")绿十字(爪子点 claw_px)挪 (du, dv) 像素，
+    往右、往下为正，存进 vision_cal.json(只改这一项，别的不动)。开着的 vlive 发现文件变了会重新读，画面里的绿十字马上跟着动。
+    返回 (原来的 (u, v), 现在的 (u, v), 文件路径)。挪出画面就不存，抛 ValueError。"""
+    from vision import Vision, save_vision_cal
+    path = _cal_file(cfg_path)
+    if path is None:
+        raise ValueError('配置里 vision_cal_file 是空的(不用 vision_cal.json)，绿十字没地方存')
+    vc = load_vision_cfg(cfg_path)
+    old = Vision(vc).claw(kind)
+    new = (old[0] + float(du), old[1] + float(dv))
+    cam = vc.get('camera') or {}
+    w, h = float(cam.get('width', 640) or 640), float(cam.get('height', 480) or 480)
+    if not (0.0 <= new[0] <= w and 0.0 <= new[1] <= h):
+        raise ValueError(f'挪到 ({new[0]:.0f}, {new[1]:.0f}) 就出画面了(画面 {w:.0f}×{h:.0f})')
+    save_vision_cal(kind, new, path)
+    return old, new, path
 
 
 def r2off_px(cfg_path):
@@ -191,7 +230,21 @@ def main(argv=None):
     color = args.color
     t_last, fps, last_msg = time.monotonic(), 0.0, ''
     try:
+        cal_p = _cal_file(cfg_path)
+    except Exception:
+        cal_p = None
+    cal_mt, t_cal = _mtime(cal_p), 0.0
+    try:
         while True:
+            if cal_p is not None and time.monotonic() - t_cal >= 0.5:
+                # (10-23)arm_calib 里 g 挪了绿十字(改了 vision_cal.json)：重新读，画面里马上跟着动
+                t_cal = time.monotonic()
+                mt = _mtime(cal_p)
+                if mt != cal_mt:
+                    cal_mt = mt
+                    from vision import apply_vision_cal
+                    apply_vision_cal(vis.cfg, str(cal_p))
+                    print(f'绿十字更新了：原料 {vis.claw("RAW")}  圆环 {vis.claw("RING")}', flush=True)
             fr = vis.camera.read()
             if fr is None:
                 time.sleep(0.05)
