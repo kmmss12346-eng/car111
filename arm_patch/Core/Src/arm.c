@@ -2407,12 +2407,14 @@ static void QR_Draw(void)
 }
 
 /* (10-23 用户"一键启动是一个物理的上电开关、整车的电闸")上电就开跑：树莓派开机、程序启动要几十秒，这段时间车一动不动会按
- * "停止运行 15 秒本轮结束"判掉。上电以后、树莓派发来第一条机械臂指令(之后树莓派自己保活)之前，每 BOOT_KA_MS 升降往上 4mm
- * 再回来(和树莓派的保活一样，手臂不左右动；已经在最高处就往下)，最多 BOOT_KA_MAX_MS(调试时开着电不开程序，过一会儿就不动了)。
- * 升降高度不知道(lift_known=0)不动 */
-#define BOOT_KA_MS      6000u
+ * "停止运行 15 秒本轮结束"判掉。上电以后、树莓派发来第一条机械臂指令(之后树莓派自己保活)之前，每 BOOT_KA_MS 升降往上 BOOT_KA_MM
+ * 再回来(手臂不左右动)，最多 BOOT_KA_MAX_MS(调试时开着电不开程序，过一会儿就不动了)。升降高度不知道(lift_known=0)不动。
+ * (10-23 晚 命题解析："机器人 15 秒没有移动，本轮比赛结束")开机这段只有升降在动，4mm 裁判不一定看得出来：改成往上 15mm、每 5 秒一次。
+ * 上面不够 15mm 就少走一点；不够 BOOT_KA_MIN_MM 才往下 BOOT_KA_MIN_MM(不会比原来低很多，碰不到车上的东西) */
+#define BOOT_KA_MS      5000u
 #define BOOT_KA_MAX_MS  90000u
-#define BOOT_KA_MM      4.0f
+#define BOOT_KA_MM      15.0f
+#define BOOT_KA_MIN_MM  4.0f
 static uint8_t  boot_ka    = 0;           /* 1 = 上电以后还没收到过机械臂指令(Arm_Init 设、Arm_Command 清) */
 static uint32_t boot_ka_t0 = 0;           /* 上电(Arm_Init 做完)的时刻 */
 static uint32_t boot_ka_t  = 0;           /* 上次摆的时刻 */
@@ -2421,6 +2423,7 @@ static void Boot_Keepalive(void)
 {
     uint32_t t = HAL_GetTick();
     float z = lift_mm;
+    float up = g_lmax - 0.5f - z;
 
     if (!boot_ka)
     {
@@ -2436,7 +2439,8 @@ static void Boot_Keepalive(void)
         return;
     }
     boot_ka_t = t;
-    if (Lift_Goto((z + BOOT_KA_MM <= g_lmax - 0.5f) ? z + BOOT_KA_MM : z - BOOT_KA_MM) == NULL && !car_abort)
+    if (up > BOOT_KA_MM)  up = BOOT_KA_MM;
+    if (Lift_Goto((up >= BOOT_KA_MIN_MM) ? z + up : z - BOOT_KA_MIN_MM) == NULL && !car_abort)
     {
         (void)Lift_Goto(z);
     }
