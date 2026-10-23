@@ -98,6 +98,24 @@ def unknown_cmd(reply):
     return 'ERR CMD' in (reply or '')
 
 
+# (10-23)串口偶尔一次没回话、总线舵机偶尔一次读写失败：这几条都是"转到/升到/张到某个绝对位置"，重发一次没坏处(只多等一下)。
+#   以前一次没回话，这个物料就放回车上不放了(少 15 分)。STM32 明确说了原因的错(升降位置不知道、夹着东西、打滑、参数不对…)不重发
+_RETRY_VERBS = ('LIFT', 'AP', 'APZ', 'CLAW', 'TT', 'STOW', 'OBS', 'SIDE')
+_NO_RETRY = ('ERR NOZERO', 'ERR LIFT', 'ERR HOLD', 'ERR RANGE', 'ERR ARG', 'ERR CMD', 'ERR NOCAL', 'ERR NOENC', 'ERR ENCMOVE',
+             'ERR STALL', 'ERR NOSTBY', 'ERR NAME', 'ERR FLASH', 'ERR GYRO', 'ABORT')
+_NUM = re.compile(r'^-?\d+(?:\.\d+)?$')
+
+
+def retry_ok(text, reply):
+    """这条指令失败了，能不能原样再发一次。LIFT 只重发"升到多少毫米"(LIFT ZERO / HOME / CAL / SYNC 不重发)。"""
+    parts = str(text).split()
+    if not parts or parts[0] not in _RETRY_VERBS:
+        return False
+    if parts[0] == 'LIFT' and (len(parts) != 2 or not _NUM.match(parts[1])):
+        return False
+    return not any(k in (reply or '') for k in _NO_RETRY)
+
+
 class ArmLink:
     def __init__(self, link, log=print):
         self.link = link
@@ -142,8 +160,13 @@ class ArmLink:
         return ok, reply, info
 
     def do(self, text, timeout=None):
-        """发一条，必须成功，否则抛 ArmError(带原因，如 ERR NOCAL / ERR NOZERO)。"""
+        """发一条，必须成功，否则抛 ArmError(带原因，如 ERR NOCAL / ERR NOZERO)。
+        (10-23)转到/升到绝对位置的指令(retry_ok)偶尔一次没回话：歇一下原样再发一次。"""
         ok, reply, info = self.request(text, timeout)
+        if not ok and retry_ok(text, reply):
+            self.log(f'    ({text} 没成：{reply}；串口/舵机偶尔一次没回话，再发一次)')
+            time.sleep(0.2)
+            ok, reply, info = self.request(text, timeout)
         if not ok:
             raise ArmError(f'{text} 失败：{reply}')
         return reply, info
@@ -262,6 +285,10 @@ class ArmLink:
         cmd = {'RAW': 'CLAW OR', 'TRAY': 'CLAW OT'}.get(str(where or '').upper())
         if cmd and getattr(self, '_claw3', True):
             ok, reply, _ = self.request(cmd)
+            if not ok and retry_ok(cmd, reply):
+                self.log(f'    ({cmd} 没成：{reply}；再发一次)')       # (10-23)和 do() 一样重发一次
+                time.sleep(0.2)
+                ok, reply, _ = self.request(cmd)
             if ok:
                 return
             if not ('ERR ARG' in reply or unknown_cmd(reply)):
@@ -306,6 +333,9 @@ class ArmLink:
                 if (ok or 'READ' in (reply or '')) and k < tries - 1:
                     time.sleep(0.05 + 0.05 * k)
                     continue
+                if k == 0 and not (unknown_cmd(reply) or 'ERR ARG' in (reply or '')):
+                    time.sleep(0.2)                     # (10-23)串口偶尔一次没回话(超时)：只读角度，再问一次没坏处
+                    continue
                 raise ArmError(f'A? {i} 失败：{reply if not ok else "回了 OK 但没有角度"}(读了 {k + 1} 次)')
         return self.angle[1], self.angle[2]
 
@@ -314,7 +344,12 @@ class ArmLink:
         if not getattr(self, '_no_apz', False):
             self.angle[1] = None
             self.angle[2] = None
-            ok, reply, info = self.request(f'APZ {a1:.3f} {a2:.3f} {float(z):.1f}')
+            cmd = f'APZ {a1:.3f} {a2:.3f} {float(z):.1f}'
+            ok, reply, info = self.request(cmd)
+            if not ok and retry_ok(cmd, reply) and not unknown_cmd(reply):
+                self.log(f'    ({cmd} 没成：{reply}；串口/舵机偶尔一次没回话，再发一次)')   # (10-23)和 do() 一样重发一次
+                time.sleep(0.2)
+                ok, reply, info = self.request(cmd)
             if ok:
                 return
             if 'CMD' not in str(reply):
@@ -354,7 +389,9 @@ class ArmLink:
                 m = _PARAM.match(line)
                 if m:
                     d[m.group(1)] = float(m.group(2))
-            self._params = d if ok else {}
+            if not ok or not d:                 # (10-23)这次没取到不记下来(以前记成 {}，一次没回话整轮都当没有参数、不夹不放)：
+                return self._params or {}       #   有以前取到的就还用它，下次再问
+            self._params = d
         return self._params
 
     def set_param(self, name, value):

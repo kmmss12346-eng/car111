@@ -348,7 +348,10 @@ class ErrorTests(unittest.TestCase):
         w = SimWorld(seed=2, code=CODE, fail_cmd=('STOW', 3))
         h, lines = hooks(w)
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
-        self.assertIn('再收一次', '\n'.join(lines))
+        text = '\n'.join(lines)
+        self.assertIn('STOW 没成', text)                         # (10-23)ArmLink 原样再发一次(以前是 _stow_retry 的"再收一次")
+        self.assertIn('再发一次', text)
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (3, 6), text[-2000:])   # 这一轮照常做完
         self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})   # (10-23)屏上只有任务码、抓取数、放置数(不写阶段 DONE)
 
 

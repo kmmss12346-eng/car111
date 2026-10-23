@@ -52,6 +52,10 @@ except Exception:                       # 单独测试时没有 auto_run
         pass
 
 
+class DroppedError(ArmError):
+    """(10-23)放置时已经在环上松了手，抬起来才出的错：物料已经放下了，不能当还夹着放回转盘(放回去程序会以为物料在车上、环是空的)。"""
+
+
 RAW_CAR_FIXED = True   # (10-11 用户：写死)原料区：不挪车找物料(配置里的 raw_seek / raw_chassis / raw_wheels_first 都不管)。
                        #   10-12 起 align_by.RAW='wheels'(默认)时对准只动车轮(横移限 raw_wheels_s_range、前后限 raw_fix_max_mm)，手臂不动；
                        #   align_by.RAW='arm' 时是 10-11 的做法：车不动，只动手臂
@@ -1271,11 +1275,17 @@ class MissionHooks:
         try:
             params = self.arm.params()
             if not params or 'ARMOK' not in params:
+                self.sleep(0.3)                     # (10-23)串口偶尔一次没回话：再问一次(以前一次没回话整轮都不夹不放)
+                params = self.arm.params(refresh=True)
+            if not params or 'ARMOK' not in params:
                 self.disabled = 'STM32 里没有机械臂参数(GET 里找不到 ARMOK)：STM32 程序是不是新版(arm.c)'
             elif params['ARMOK'] < 0.5:
                 self.disabled = '机械臂参数还没标定(ARMOK=0)：标定好各姿态后 set ARMOK 1'
             else:
                 known, mm = self.arm.lift_state()
+                if not known:
+                    self.sleep(0.3)                 # (10-23)LIFT? 偶尔一次没回话(回 0 和没回话分不出来)：再问一次
+                    known, mm = self.arm.lift_state()
                 boot = getattr(self.arm, 'lift_boot', None)
                 if known and boot == 'NOENC':
                     # (10-21 用户：原料区放下去了不夹)开机没读到升降编码器，高度是猜的(实车差过 17mm，夹的高度全偏)：现在读一次编码器认准
@@ -1400,7 +1410,7 @@ class MissionHooks:
             self.sleep(0.3)
             self.arm.stow()
 
-    def _grab_failed(self, item, ex):
+    def _grab_failed(self, item, ex, what='抓'):
         """(10-21)GRAB 出错以后：按这条指令里 STM32 回的夹爪动作(CLAWSET，最后一次)看物料在哪：
         - 还没夹紧(夹爪没动过/只张开过)：物料还在原料盘上，收臂，当没夹到；
         - 夹紧了(C，夹紧以后抬起、转去车上转盘时出的错)：物料可能在爪子里，STM32 也记着"夹着物料"(后面 GRAB 都回 ERR HOLD)：
@@ -1409,7 +1419,7 @@ class MissionHooks:
         ERR HOLD：上一个没放下，本轮不再夹放。ERR LIFT：升降的高度认不准了，不再按它动升降，本轮不再夹放，叫重新 LIFT ZERO。
         返回 True = 物料在它的转盘槽里了(算夹到)。"""
         msg = str(ex)
-        why = f'抓 {item.color_name} 出错：{ex}'
+        why = f'{what} {item.color_name} 出错：{ex}'
         claw = getattr(self.arm, 'claw_last', None)
         if 'ERR HOLD' in msg:
             self._recover(why)
@@ -1835,14 +1845,21 @@ class MissionHooks:
                 self._show_stats()
                 continue
             ok = False
-            try:
-                ok = self._grab_item(item)
-            except (ArmError, VisionError) as ex:
-                if isinstance(ex, ArmAbort):
-                    raise
-                ok = self._grab_failed(item, ex) if isinstance(ex, ArmError) else False
-                if not ok and isinstance(ex, VisionError):
-                    self._recover(f'抓 {item.color_name} 出错：{ex}')
+            for again in (False, True):
+                try:
+                    ok = self._grab_item(item)
+                except (ArmError, VisionError) as ex:
+                    if isinstance(ex, ArmAbort):
+                        raise
+                    claw = getattr(self.arm, 'claw_last', None)
+                    ok = self._grab_failed(item, ex) if isinstance(ex, ArmError) else False
+                    if not ok and isinstance(ex, VisionError):
+                        self._recover(f'抓 {item.color_name} 出错：{ex}')
+                    if (not ok and not again and isinstance(ex, ArmError) and not self.disabled and claw not in ('C', 'OT')
+                            and not any(k in str(ex) for k in ('ERR HOLD', 'ERR LIFT', 'ERR NOZERO'))):
+                        self.log(f'    {item.color_name} 还在原料盘上(夹爪没夹)：再抓一次')   # (10-23)串口偶尔一次没回话
+                        continue
+                break
             self.stats.grab(ok)
             if ok:
                 self.in_tray[item.slot] = item
@@ -5239,6 +5256,11 @@ class MissionHooks:
                 wait_n.pop(int(item.color), None)
                 got_at[int(item.color)] = item
                 t_end = self.now() + track
+            elif not self.disabled and regrab.get(int(item.color), 0) < n_regrab:
+                # (10-23)这次没夹(下爪出错、串口偶尔一次没回话，或者下爪前一看不对)，物料还在原料盘上：给它再转一圈回来的时间。
+                #   以前等的时间不重新算，要的那个转一圈回来之前就到时间了，这一批后面的全记"没夹到"
+                regrab[int(item.color)] = regrab.get(int(item.color), 0) + 1
+                t_end = max(t_end, self.now() + track)
             try:
                 home, comp = self._raw_ct_pose(D)              # 回到看原料盘的姿态(同一边转过去)，顺便算手臂角度还差的一点让画面挪了多少
                 self._ct_home = home
@@ -6077,9 +6099,9 @@ class MissionHooks:
             return out
         return sorted(placed, key=lambda it: int(it.index))       # (10-22)按任务码顺序取回(以前跟着放的顺序，放是顺路 3→2→1 时取回也成了 3→2→1)
 
-    def _pickback_item(self, item, zone):
+    def _pickback_item(self, item, zone, again=False):
         cfg = self.cfg
-        self.log(f'  ▶ 从{zone}取回 {item.color_name}(环{item.ring}) -> 转盘 {item.slot} 号槽')
+        self.log(f'  ▶ 从{zone}取回 {item.color_name}(环{item.ring}) -> 转盘 {item.slot} 号槽' + ('(再取一次)' if again else ''))
         self._ui('stage', f'{zone[:5]} PICK {item.index + 1}/3 R{item.ring}')
         wheels = self._by_wheels(zone)
         acc = self._wheels_accept('PICK') if wheels else cfg['accept_mm']['PICK']
@@ -6134,7 +6156,21 @@ class MissionHooks:
             self.arm.pick_here(item.slot)
         except ArmAbort:
             raise
-        except (ArmError, VisionError) as ex:
+        except ArmError as ex:
+            # (10-23)以前一律"收臂"：夹紧以后才出错时物料还在爪子里、STM32 也记着夹着，后面取回、放置全回 ERR HOLD，整轮不再夹放。
+            #   和 GRAB 出错一样按夹爪最后一次动作看：夹紧了 -> 放进它的转盘槽(算取回了)；松进转盘了 -> 算取回了；
+            #   还没夹 -> 物料还在环上，收臂以后再取一次
+            claw = getattr(self.arm, 'claw_last', None)
+            if self._grab_failed(item, ex, what='取回'):
+                stack = self.on_ring.get((zone, item.ring))
+                if stack and item in stack:
+                    stack.remove(item)
+                return True
+            if (not again and not self.disabled and claw not in ('C', 'OT')
+                    and not any(k in str(ex) for k in ('ERR HOLD', 'ERR LIFT', 'ERR NOZERO'))):
+                return self._pickback_item(item, zone, again=True)
+            return False
+        except VisionError as ex:
             self._recover(f'取回出错：{ex}')
             return False
         self.in_tray[item.slot] = item
@@ -6214,7 +6250,17 @@ class MissionHooks:
             return False, False, None
         self._goto_ring(zone, ring)
         self._ring_ready = self._at_obs = False
-        self.arm.take(item.slot)                                 # 先去转盘取物料
+        try:
+            self._take(item)                                     # 先去转盘取物料
+        except ArmAbort:
+            raise
+        except ArmError as ex:                                   # (10-23)以前这里出错整个停车点都不做了
+            if self.holding is item:
+                self._put_back(item, f'先取物料出错：{ex}')
+                self.holding = None
+            else:
+                self._recover(f'先取物料出错：{ex}')
+            return False, False, None
         self.holding = item
         try:
             d2 = self._predict_d2() if cfg.get('ring_precorrect', True) else None
@@ -6275,6 +6321,10 @@ class MissionHooks:
             return True, True, err
         except ArmAbort:
             raise
+        except DroppedError as ex:                               # (10-23)已经在环上松手了：算放了，只收臂
+            self.holding = None
+            self._recover(f'{item.color_name}已经放在环{ring}上，抬起来时出错：{ex}')
+            return True, True, None
         except VisionError as ex:
             if self.holding is None:
                 return False, False, None
@@ -6283,6 +6333,12 @@ class MissionHooks:
                 self._drop(False)
                 self.holding = None
                 self._ring_ready = True
+                return True, True, None
+            except ArmAbort:
+                raise
+            except DroppedError as ex2:
+                self.holding = None
+                self._recover(f'{item.color_name}已经放在环{ring}上，抬起来时出错：{ex2}')
                 return True, True, None
             except ArmError as ex2:
                 self._put_back(item, f'放下出错：{ex2}')
@@ -6302,6 +6358,7 @@ class MissionHooks:
         err_mm = None
         ok = False
         held = False                                             # 爪子里夹着从转盘取出来的物料
+        dropped = None                                           # (10-23)已经松手、抬起来才出的错
         wheels = self._by_wheels(zone)                           # (10-12 用户)只动车轮对准，手臂停在观察姿态不动
         if not stack and cfg.get('check_ring_empty', True) and self.on_ring.get((zone, ring)):
             names = '、'.join(it.color_name for it in self.on_ring[(zone, ring)])
@@ -6383,7 +6440,7 @@ class MissionHooks:
                     self.log('    (nogo：对准好了，不取物料、不放)')
                     return True
                 self._ring_ready = self._at_obs = False
-                self.arm.take(item.slot)                         # 去转盘取物料
+                self._take(item)                                 # 去转盘取物料
                 held = True
                 self.holding = item
                 adj = self.place_adj('STACK' if stack else 'RING')
@@ -6398,8 +6455,11 @@ class MissionHooks:
                 self._ring_ready = True                          # 爪子张着停在这个环上方：去下一个环不用整套 OBS
         except ArmAbort:
             raise
+        except DroppedError as ex:                               # (10-23)已经在环上松手了：算放了，只收臂
+            held, ok, dropped = False, True, ex
+            self.holding = None
         except (ArmError, VisionError) as ex:
-            if held:
+            if held or self.holding is item:                     # (10-23)_take 夹紧了才出错的也算夹着
                 self._put_back(item, f'放置出错：{ex}')
             else:
                 self._recover(f'放置出错：{ex}')
@@ -6409,6 +6469,9 @@ class MissionHooks:
             self.on_ring.setdefault((zone, ring), []).append(item)
             self.placements.append((zone, ring, bool(stack), err_mm))
         self._show_stats()
+        if ok and dropped is not None:
+            self._recover(f'{item.color_name}已经放在环{ring}上，抬起来时出错：{dropped}')
+            return ok
         if ok and not stack and self._want_pick(item):
             self._learn_pick(item, self.pose_at[(zone, item.slot)])
         return ok
@@ -7569,10 +7632,10 @@ class MissionHooks:
             self.arm.ap(a1, a2)
             self.log('    (nogo：转到了，不取物料、不放)')
             return True
-        ok, held = False, False
+        ok, held, dropped = False, False, None
         try:
             self._ring_ready = self._at_obs = False
-            self.arm.take(item.slot)
+            self._take(item)
             held = True
             self.holding = item
             adj = self.place_adj(key)
@@ -7586,8 +7649,11 @@ class MissionHooks:
             self._ring_ready = True
         except ArmAbort:
             raise
+        except DroppedError as ex:                               # (10-23)已经在环上松手了：算放了，只收臂
+            held, ok, dropped = False, True, ex
+            self.holding = None
         except (ArmError, VisionError) as ex:
-            if held:
+            if held or self.holding is item:                     # (10-23)_take 夹紧了才出错的也算夹着
                 self._put_back(item, f'放置出错：{ex}')
             else:
                 self._recover(f'放置出错：{ex}')
@@ -7597,6 +7663,8 @@ class MissionHooks:
             self.on_ring.setdefault((zone, ring), []).append(item)
             self.placements.append((zone, ring, bool(stack), None))
         self._show_stats()
+        if ok and dropped is not None:
+            self._recover(f'{item.color_name}已经放在环{ring}上，抬起来时出错：{dropped}')
         return ok
 
     # ------------------------------------------------------------------ 粗加工区 / 暂存区：到工位先看清三个圆环
@@ -8252,21 +8320,66 @@ class MissionHooks:
         self._return_to_pose(a1 + adj[0], a2 + adj[1])
         return True
 
-    def _drop(self, stack):
-        """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。"""
-        if self.cfg.get('drop_retract', False):
-            self.arm.drop(stack)
+    def _take(self, item):
+        """(10-23)从车上转盘取物料(TAKE)。偶尔一次出错时看这条指令里夹爪最后一次动作(CLAWSET)：
+        - 还没夹紧：物料还在转盘槽里 -> 收臂、再取一次(以前直接不放了，少一个环的分)；
+        - 夹紧了(C)：物料在爪子里(抬起来时出的错) -> 记下夹着它，先升到最高(别在转盘里就转)，接着放。
+        升降位置不知道、打滑、爪子里本来就有东西(ERR NOZERO / LIFT / HOLD …)照旧抛出去。"""
+        try:
+            self.arm.take(item.slot)
             return
+        except ArmAbort:
+            raise
+        except ArmError as ex:
+            if any(k in str(ex) for k in ('ERR HOLD', 'ERR LIFT', 'ERR NOZERO', 'ERR NOCAL', 'ERR CMD', 'ERR RANGE')):
+                raise
+            if str(getattr(self.arm, 'claw_last', None) or '') == 'C':
+                self.log(f'    取{item.color_name}时出错({ex})，夹爪已经夹紧了：先升到最高，接着放')
+                self.holding = item
+                zhi = (self.arm.params() or {}).get('ZHI')
+                if zhi is not None:
+                    self.arm.lift(float(zhi))
+                return
+            self.log(f'    取{item.color_name}时出错({ex})，夹爪还没夹：物料还在转盘里，收臂再取一次')
+        self._stow_retry()
+        self.arm.take(item.slot)
+
+    def _drop(self, stack):
+        """手臂已经对准：下降、松手、抬起。drop_retract=False 时不缩回伸缩舵机(接着去下一个环，工位做完再收臂)。
+        (10-23)松手以后才出错(抬起来时串口没回话之类)：再抬一次；还不行抛 DroppedError(物料已经放在环上了)。"""
         P = self.arm.params() or {}
         try:
             z = float(P['ZSTK' if stack else 'ZPLC'])
             zhi = float(P['ZHI'])
         except (KeyError, TypeError, ValueError):
-            self.arm.drop(stack)
+            z = zhi = None
+        def opened():                                            # 这条指令里 STM32 张开过夹爪(CLAWSET O…)：物料已经放下
+            return str(getattr(self.arm, 'claw_last', None) or '').startswith('O')
+
+        if self.cfg.get('drop_retract', False) or z is None:
+            try:
+                self.arm.drop(stack)
+            except ArmAbort:
+                raise
+            except ArmError as ex:
+                if opened():
+                    raise DroppedError(f'{ex}(已经松手)') from ex
+                raise
             return
-        self.arm.lift(z)
-        self.arm.claw(True)
-        self.arm.lift(zhi)
+        self.arm.lift(z)                                         # 还夹着：出错就抛(LIFT 偶尔没回话 ArmLink 已经重发过一次)
+        try:
+            self.arm.claw(True)
+        except ArmAbort:
+            raise
+        except ArmError:
+            if not opened():
+                raise
+        try:
+            self.arm.lift(zhi)
+        except ArmAbort:
+            raise
+        except ArmError as ex:
+            raise DroppedError(f'{ex}(已经松手)') from ex
 
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
     @staticmethod

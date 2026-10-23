@@ -1289,11 +1289,14 @@ class MissionSimTests(unittest.TestCase):
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
     def test_stm32_error_on_one_grab_is_recovered(self):
+        # (10-23)GRAB 出错、夹爪还没夹：物料还在原料盘上，收臂以后再抓一次(以前直接跳过这个物料，少它后面的几个环的分)
         w = SimWorld(seed=9, code=self.CODE, fail_cmd=('GRAB', 2))
-        h = make(w)
-        run_mission(w, h)
+        lines = []
+        h = make(w, log=lines.append)
+        run_mission(w, h, log=lines.append)
         self.assertEqual(h.stats.grab_total, 6)
-        self.assertEqual(h.stats.grab_ok, 5)                            # 失败的那个被跳过，其余照常
+        self.assertEqual(h.stats.grab_ok, 6, '\n'.join(lines)[-3000:])
+        self.assertIn('再抓一次', '\n'.join(lines))
         self.assertTrue(any(r == 'STOW' for r in w.requests))
 
     def test_grab_error_after_closing_puts_it_back(self):
@@ -1367,10 +1370,11 @@ class MissionSimTests(unittest.TestCase):
         return st
 
     def test_material_put_back_when_placing_fails_after_take(self):
-        """取出物料以后回不到对准姿态(AP 出错)：放回转盘再收臂。原来直接夹着物料收臂，下一个物料 OBS RING O 一张开爪子它就掉在半路上。"""
+        """取出物料以后回不到对准姿态(AP 出错)：放回转盘再收臂。原来直接夹着物料收臂，下一个物料 OBS RING O 一张开爪子它就掉在半路上。
+        (10-23)AP 偶尔一次没回话会重发一次：这里连着两次都出错。"""
         w = SimWorld(seed=12, code=self.CODE)
         h = make(w)
-        st = self._fail_after_take(w, ['AP'])
+        st = self._fail_after_take(w, ['AP', 'AP'])
         run_mission(w, h)
         self.assertEqual(st['left'], [])
         self.assertEqual(w.loose, 0, '物料掉在半路上了')
@@ -1380,10 +1384,10 @@ class MissionSimTests(unittest.TestCase):
         self.assertEqual(w.tray, {1: None, 2: None, 3: None})   # 放回转盘的那个后来在暂存区照常放了
 
     def test_put_back_failure_keeps_claw_closed_and_stops_arm_work(self):
-        """放回转盘也失败了：爪子保持夹紧收臂，本轮不再夹放(不再张开爪子)。"""
+        """放回转盘也失败了：爪子保持夹紧收臂，本轮不再夹放(不再张开爪子)。(10-23)AP、LIFT 都会重发一次：各连着两次出错。"""
         w = SimWorld(seed=12, code=self.CODE)
         h = make(w)
-        st = self._fail_after_take(w, ['AP', 'LIFT'])
+        st = self._fail_after_take(w, ['AP', 'AP', 'LIFT', 'LIFT'])
         n_obs = []
         orig = w._handle
 
@@ -1809,8 +1813,8 @@ class ZoneFlowTests(unittest.TestCase):
         orig = w._handle
         st = {'n': 0}
 
-        def handle(text):                                       # 暂存区第一次 TAKE 的时候 STM32 出错：那个物料留在车上
-            if text.startswith('TAKE') and w.zone == 'TEMP' and st['n'] == 0:
+        def handle(text):                                       # 暂存区第一次 TAKE(和收臂后再取的那一次)STM32 都出错：那个物料留在车上
+            if text.startswith('TAKE') and w.zone == 'TEMP' and st['n'] < 2:
                 st['n'] += 1
                 return False, 'ERR TIMEOUT', []
             return orig(text)
@@ -4574,6 +4578,64 @@ class PreArmTests(unittest.TestCase):
         h.maybe_holding = '测试'
         self.assertFalse(h.pre_arrive('RAW', w.link, lines.append))    # 爪子里可能有东西：不动
         self.assertFalse([q for q in w.requests if q.startswith('PRE')])
+
+class SingleGlitchTests(unittest.TestCase):
+    """(10-23 查全项目)STM32 某条指令偶尔一次没回话/出错(串口、总线舵机)：整场照样 6 个都抓、12 个都放，不撞、不掉、不夹空。
+    以前：开头 GET / LIFT? 一次没回话整轮不夹不放；放下以后抬起来出错当成还夹着、放回转盘(程序以为物料在车上、环是空的，
+    后面平放砸在它上面、码垛码在空环上)；取回时夹紧以后出错整轮 ERR HOLD；原料区(最近那格)下爪出错这一批后面的全记没夹到。"""
+    CODE = '156+123+516+231'
+
+    def _full(self, fail_cmd, seed=1):
+        w = SimWorld(seed=seed, code=self.CODE, fail_cmd=fail_cmd)
+        lines = []
+        h = make(w, dict(round_s=1e9), log=lines.append)
+        run_mission(w, h, log=lines.append, nav=dict(pre=True))
+        return w, h, '\n'.join(lines)
+
+    def test_full_mission_survives_one_glitch(self):
+        for fc in (('GET', 1), ('LIFT?', 1), ('LIFT', 1), ('LIFT', 3), ('LIFT', 5), ('APZ', 1), ('AP', 2), ('CLAW', 2),
+                   ('TAKE', 1), ('TAKE', 2, 'closed'), ('PICK', 1), ('PICK', 1, 'closed'), ('PICK', 3, 'closed'),
+                   ('GRAB', 1), ('STOW', 2), ('OBS', 2), ('PRE', 1)):
+            w, h, text = self._full(fc)
+            self.assertGreaterEqual(w.count.get(fc[0], 0), fc[1], fc)          # 真的出过错
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), (fc, text[-3000:]))
+            self.assertIsNone(h.disabled, (fc, text[-3000:]))
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), (fc, text[-3000:]))
+
+    def test_lift_after_release_counts_as_placed(self):
+        """松手以后抬起来连着两次出错：物料已经在环上了(算放了)，只收臂，不当还夹着放回转盘。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        orig = w._handle
+        st = {'n': 0}
+
+        def handle(text):
+            if w.requests[-2:-1] == ['CLAW O'] and text.startswith('LIFT') and st['n'] < 2 and w.zone == 'ROUGH':
+                st['n'] += 1
+                return False, 'ERR TIMEOUT', []
+            if st['n'] == 1 and text.startswith('LIFT') and w.zone == 'ROUGH' and w.requests[-2:-1] == [text]:
+                st['n'] += 1
+                return False, 'ERR TIMEOUT', []
+            return orig(text)
+        w._handle = handle
+        lines = []
+        h = make(w, dict(round_s=1e9), log=lines.append)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertEqual(st['n'], 2, text[-2000:])
+        self.assertIn('已经放在环', text)
+        self.assertNotIn('先放回转盘', text)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+
+    def test_raw_near_slot_survives_one_glitch(self):
+        t = RawNearSlotTests()
+        for fc in (('GRAB', 1), ('GRAB', 2), ('GRAB', 1, 'closed'), ('A?', 3), ('LIFT', 2)):
+            for seed in (1, 2):
+                w, h, text = t._near_run(seed, fail_cmd=fc)
+                self.assertGreaterEqual(w.count.get(fc[0], 0), fc[1], fc)
+                self.assertEqual(sum(1 for v in w.tray.values() if v), 3, (fc, seed, text[-3000:]))
+                self.assertEqual((w.loose, w.collisions), (0, 0), (fc, seed, text[-3000:]))
+
 
 if __name__ == '__main__':
     args = sys.argv[1:]
