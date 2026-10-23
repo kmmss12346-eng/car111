@@ -51,7 +51,8 @@ class RealRouteTests(unittest.TestCase):
         p = car.pose()
         self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 8.0, p)
         self.assertTrue(auto_run.in_rect(p, auto_run.START_RECTS[zone]))
-        self.assertGreaterEqual(sum('雷达定位：车在' in l for l in logs), 8)
+        # (10-23)到站不再用雷达定位(用户要求)：只剩转弯前离东西近时和回家时定位，以前每个停车点都定位、至少 8 次
+        self.assertGreaterEqual(sum('雷达定位：车在' in l for l in logs), 3)
 
     def test_zone2(self):
         car, logs, worst, goal = self.run_zone(2, dict(scale=0.015, drift_deg=0.08, resid_deg=0.3, slip=0.01))

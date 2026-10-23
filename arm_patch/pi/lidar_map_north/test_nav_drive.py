@@ -242,6 +242,9 @@ def edge_min(trace, cfg=None):
 ZONE2 = (2250.0, 150.0, 90.0)
 CFG = dict(car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40, lidar_forward_mm=22.5, lidar_left_mm=134.8,
            route_speed_rpm=150, strafe_speed_rpm=140, reloc_slow_rpm=60, home_fix_rpm=60)
+# (10-23 用户"整个流程过程中不要靠雷达定位了，除了回到启停区域")默认只在回家前和启停区定位(转弯前离东西近时也定位)；
+# 下面测"每个停车点、转弯后都定位"这些做法本身的测试，配置里照以前打开
+OLD_RELOC = dict(reloc_stops=None, reloc_after_turn=True)
 
 
 class FlattenTests(unittest.TestCase):
@@ -315,7 +318,7 @@ class DriveTests(unittest.TestCase):
         stops = [('QR', (2100.0, 1200.0, 90.0)), ('RAW', (1200.0, 2100.0, 180.0)), ('ROUGH', (1200.0, 340.0, 0.0)),
                  ('TEMP', (340.0, 1200.0, -90.0))]
         self.drive(car, ctx, route((2100.0, 150.0, 90.0), stops), hooks=h, start=dict(est=(2100.0, 150.0, 90.0), ref=(2100.0, 150.0, 90.0)),
-                   caps={'rdec': True})
+                   caps={'rdec': True}, cfg=OLD_RELOC)
         self.assertEqual([n for n, _ in h.at], [n for n, _ in stops])
         for (name, goal), (_, p) in zip(stops, h.at):
             a = math.radians(goal[2])
@@ -324,6 +327,26 @@ class DriveTests(unittest.TestCase):
             self.assertLess(abs(wrap(p[2] - goal[2])), 1.0, f'{name} 车头还差 {wrap(p[2]-goal[2]):.2f}°')
         self.assertTrue(any(c == 'R' and v != int(v) for c, v, _ in car.sent), '新固件应该发 0.1° 的车头修正')
         self.assertTrue(any('雷达定位' in l for l in self.logs))
+
+    def test_default_no_reloc_at_stations_only_home(self):
+        """(10-23 用户"整个流程过程中不要靠雷达定位了，除了回到启停区域")默认：QR、原料区、粗加工区、暂存区都不用雷达定位，
+        也不按雷达挪车。"""
+        car = SimCar((2100.0, 150.0, 90.0), scale=0.01, drift_deg=0.05, resid_deg=0.2, slip=0.0, rdec=True)
+        ctx = SimCtx(car)
+        asked = []
+        real = ctx.relocalize
+
+        def reloc(*a, **kw):
+            asked.append(tuple(round(v) for v in car.pose()[:2]))
+            return real(*a, **kw)
+        ctx.relocalize = reloc
+        h = Hooks(car)
+        stops = [('QR', (2100.0, 1200.0, 90.0)), ('ROUGH', (1200.0, 340.0, 0.0))]
+        self.drive(car, ctx, route((2100.0, 150.0, 90.0), stops), hooks=h, start=dict(est=(2100.0, 150.0, 90.0), ref=(2100.0, 150.0, 90.0)),
+                   caps={'rdec': True}, cfg=dict(reloc_before_turn=False))
+        self.assertEqual([n for n, _ in h.at], ['QR', 'ROUGH'])
+        self.assertEqual(asked, [], '到站不该用雷达定位')
+        self.assertFalse(any('雷达定位：车在' in l for l in self.logs), self.logs)
 
     def test_longitudinal_error_merged_into_next_forward(self):
         # 停车点上前后偏 30mm(下一条是同方向的前进)：不单独修，并进下一条
@@ -337,7 +360,7 @@ class DriveTests(unittest.TestCase):
             def task(self, stop, link, log):
                 Hooks.task(self, stop, link, log)
                 car.scale = 0.0
-        self.drive(car, ctx, legs, hooks=H(car))
+        self.drive(car, ctx, legs, hooks=H(car), cfg=OLD_RELOC)
         fs = [(c, v) for c, v, _ in car.sent if c == 'F']
         self.assertEqual(fs[0], ('F', 500))
         self.assertTrue(460 <= fs[1][1] <= 475, fs)          # 第二条前进少走了约 30mm
@@ -348,7 +371,7 @@ class DriveTests(unittest.TestCase):
         ctx = SimCtx(car)
         legs = [dict(stop='A', goal=(1200.0, 1500.0, 90.0), cmds=[('F', 500)])]
         car.x += 25                                           # 起步就偏了 25mm(向右)
-        self.drive(car, ctx, legs, hooks=Hooks(car), start=dict(est=(1200.0, 1000.0, 90.0), ref=(1200.0, 1000.0, 90.0)))
+        self.drive(car, ctx, legs, hooks=Hooks(car), start=dict(est=(1200.0, 1000.0, 90.0), ref=(1200.0, 1000.0, 90.0)), cfg=OLD_RELOC)
         s = [(v, sp) for c, v, sp in car.sent if c == 'S']
         self.assertEqual(len(s), 1)
         self.assertTrue(20 <= abs(s[0][0]) <= 30, s)
@@ -426,7 +449,7 @@ class MiscDriveTests(unittest.TestCase):
         logs = []
         h = Hooks(car)
         auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=h, speeds={}, motion=None,
-                       cfg=dict(CFG, reloc_min_travel_mm=500, reloc_split_mm=1200),
+                       cfg=dict(CFG, reloc_min_travel_mm=500, reloc_split_mm=1200, **OLD_RELOC),
                        start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
         self.assertTrue(any('转弯后、长直行前雷达定位' in l for l in logs))
         corr = [(c, v, sp) for c, v, sp in car.sent if sp == 60]
@@ -438,7 +461,7 @@ class MiscDriveTests(unittest.TestCase):
         ctx = SimCtx(car)
         legs = [dict(stop='A', goal=(2100.0, 830.0, 90.0), cmds=[('F', 900), ('R', 90), ('F', 500)])]
         auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
-                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500),
+                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500, **OLD_RELOC),
                        start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
         self.assertEqual(ctx.calls, 1)
 
@@ -470,7 +493,7 @@ class MiscDriveTests(unittest.TestCase):
         legs = route((1200.0, 1000.0, 90.0), [('A', (1200.0, 1600.0, 90.0)), ('B', (1200.0, 1900.0, 90.0))])
         logs = []
         auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
-                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500),
+                       motion=None, cfg=dict(CFG, reloc_min_travel_mm=500, **OLD_RELOC),
                        start=dict(est=(1200.0, 1000.0, 90.0), ref=(1200.0, 1000.0, 90.0)), caps={'rdec': False})
         self.assertEqual(ctx.calls, 1, 'A 走了 600mm 定位；B 只走了 300mm 不定位')
         self.assertTrue(any('不到 reloc_min_travel_mm' in l for l in logs))

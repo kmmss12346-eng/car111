@@ -891,7 +891,9 @@ class _Drive:
         g = self.cfg.get
         self.stops = g('stops') or {}
         self.rescan = {str(s).upper() for s in g('rescan_stops', ['QR'])}
-        rs = g('reloc_stops')
+        # (10-23 用户"整个流程过程中不要靠雷达定位了，除了回到启停区域")默认只在回家前(PREHOME)和启停区用雷达定位；
+        # 配置里写 "reloc_stops": null = 每个停车点都定位(以前的做法)
+        rs = g('reloc_stops', ['PREHOME', 'START'])
         self.reloc_stops = None if rs is None else {str(s).upper() for s in rs}
         self.reloc_on = bool(g('reloc_enabled', True)) and hasattr(ctx, 'relocalize')
         self.reloc_frames = int(g('reloc_frames', 4))   # (10-20 用户嫌每个停车点定位太花时间)8 -> 4 帧：一帧 600 多个点，4 帧也比 ICP 用的 reloc_points(600)多
@@ -1071,6 +1073,8 @@ class _Drive:
         转的时候车角就可能扫到黄区/工位区/转盘/场地边。按推算的位置算，扫过的地方离它们比"可能差的距离"还近：先用雷达定位，
         把车修回计划的转弯点再转。"""
         g = self.cfg.get
+        # (10-23)用户要"整个流程不要靠雷达定位，除了回启停区"；到站已经都不定位了，这一处保留：仿真里全关掉，推算误差一路累积，
+        # 车身压进黄区/工位区 29~63mm(规则：出车道本轮结束)；只在转弯前离东西近的时候定位，最近离禁区 8.8~9.8mm。配置 false 可以关
         if not (self.nav.world and self.reloc_on and g('reloc_before_turn', True)):
             return
         if self.travel < float(g('reloc_before_turn_min_mm', 300)):
@@ -1111,7 +1115,7 @@ class _Drive:
         前一条长直行走多走少的误差，转弯以后就变成了横向偏差，一路带着往黄区/工位区那边偏；在这里修掉
         (车头和横向偏差马上修，沿着下一条方向的偏差并进下一条)。"""
         g = self.cfg.get
-        if not (self.nav.world and self.reloc_on and g('reloc_after_turn', True)):
+        if not (self.nav.world and self.reloc_on and g('reloc_after_turn', False)):    # (10-23)默认不用：只有回启停区才用雷达定位
             return
         nxt = None
         for j in range(self.k + 1, len(self.seq)):
@@ -1281,11 +1285,13 @@ class _Drive:
                     raise Abort(f'{stop} 扫到新障碍物后规划不出剩下的路线：{res.get("reason")}，车停在这里')
                 self._splice(res['legs'], '已换成新路线')
             meas = (res or {}).get('reloc')
+            if meas is not None and not self._reloc_here(up):
+                meas = None                                     # (10-23)站点扫描只用来找障碍物：这里不按雷达挪车
+                self.log('    (站点扫描只用来找障碍物：这里不用雷达定位，只有回启停区才用)')
             if meas is not None:
                 self._count(meas)
             self.log(f'    站点扫描用时 {time.monotonic()-t_s:.1f} 秒')
-        elif self.reloc_on and (self.reloc_stops is None or up in self.reloc_stops or
-                                any(up.startswith(s) for s in self.reloc_stops)):
+        elif self._reloc_here(up):
             if self.travel < self.min_travel and not up.startswith('PREHOME'):
                 self.log(f'    (上次定位以后才走了 {self.travel:.0f}mm，不到 reloc_min_travel_mm={self.min_travel:.0f}，这里不定位)')
             else:
@@ -1304,6 +1310,11 @@ class _Drive:
             else:
                 self.log(f"    ◆ 雷达定位没成功：{meas.get('why')}。按推算的位置走{took.replace('，', '(', 1) + ')' if took else ''}。")
         return meas
+
+    def _reloc_here(self, up):
+        """这个停车点用不用雷达定位(reloc_stops 里有它，或者它的名字以里面的某一个开头；reloc_stops 是 null = 都用)。"""
+        return self.reloc_on and (self.reloc_stops is None or up in self.reloc_stops or
+                                  any(up.startswith(s) for s in self.reloc_stops))
 
     def _next_axis(self):
         """离开这个停车点后第一条平移是 F 还是 S(中间先转弯就算 None：车头变了，方向对不上)。"""
@@ -1363,11 +1374,12 @@ class _Drive:
                 sg = 1.0 if v >= 0 else -1.0
                 if any(sg*(ux*wx + uy*wy) > 0.5 for wx, wy in self.leg_cuts):
                     home = is_pre or str(stop).upper().startswith('START')
+                    why = '没定位成功' if meas is not None else '这里不用雷达定位'
                     if home or not g('fill_cut_no_reloc', True):
-                        self.log(f'    (没定位成功：刚才离边线/区域太近少走的 {c} {v:+d} 不按推算补，宁短不长)')
+                        self.log(f'    ({why}：刚才离边线/区域太近少走的 {c} {v:+d} 不按推算补，宁短不长)')
                         continue
                     # (10-11 用户：规划怎么走就怎么走，要停到规定的点)工位停车点：定位没成功也按推算补上少走的那段
-                    self.log(f'    (没定位成功：按推算把刚才少走的 {c} {v:+d} 补上，停到规定的停车点)')
+                    self.log(f'    ({why}：按推算把刚才少走的 {c} {v:+d} 补上，停到规定的停车点)')
             if self.nav.world:
                 v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
                 if v2 != v:
