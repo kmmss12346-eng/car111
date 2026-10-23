@@ -1262,6 +1262,34 @@ int main(void) {
         run("LIFT 60");
     }
 
+    /* ---- (10-23 用户"一键启动是一个物理的上电开关、整车的电闸")上电就开跑：树莓派开机要几十秒，
+     *      上电以后、树莓派发来第一条机械臂指令之前，每 6 秒升降往上 4mm 再回来(最多 90 秒) ---- */
+    {
+        int k, bobs = 0;
+        const char *q;
+
+        run("LIFT 60"); clear(); Arm_Init(); clear();
+        Arm_Poll();
+        CHECK(!has("L+") && !has("L-"), "上电保活：刚开机(不到 6 秒)不动");
+        now += 6000; Arm_Poll();
+        CHECK(at("L+320;") >= 0 && at("L-320;") > at("L+320;"), "上电保活：6 秒还没收到机械臂指令，升降往上 4mm(320 脉冲)再回来");
+        clear(); now += 3000; Arm_Poll();
+        CHECK(!has("L+") && !has("L-"), "上电保活：两次之间隔 6 秒");
+        clear(); run("LIFT?"); now += 7000; Arm_Poll(); now += 7000; Arm_Poll();
+        CHECK(!has("L+320;") && !has("L-320;"), "上电保活：收到第一条机械臂指令(树莓派接手了)以后不再动");
+        /* 一直没有树莓派(调试时开着电不开程序)：90 秒以后不再动 */
+        clear(); Arm_Init(); clear();
+        for (k = 0; k < 130; k++) { now += 1000; Arm_Poll(); }
+        for (q = ev; (q = strstr(q, "L+320;")) != 0; q++) bobs++;
+        CHECK(bobs >= 12 && bobs <= 15, "上电保活：最多 90 秒(每 6 秒一次，大约 13 次)");
+        clear(); for (k = 0; k < 20; k++) { now += 1000; Arm_Poll(); }
+        CHECK(!has("L+") && !has("L-"), "上电保活：90 秒以后不再动");
+        /* 已经在最高处：往下 4mm 再回来 */
+        clear(); Arm_Init(); Arm_Param_Set("LFMAX", 62); clear(); now += 6500; Arm_Poll();      /* 开机停在 60，最高只能到 62 */
+        CHECK(at("L-320;") >= 0 && at("L+320;") > at("L-320;"), "上电保活：往上 4mm 会超过最高点(LFMAX)就往下 4mm 再回来");
+        Arm_Param_Set("LFMAX", 115); run("LIFT 60");
+    }
+
     /* ---- GET/SET 用的接口 ---- */
     clear();
     Arm_Param_Dump();

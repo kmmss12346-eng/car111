@@ -769,3 +769,15 @@ git_log.txt                ← 分支最近 120 条提交记录
      急停时已经发出去的转动不会停(最多再转一秒左右)。
   测试：STM32 主机 338/222/42；树莓派 649 个(3 跳过)只有 test_ringdet 那一项(环境)。
   检查 hex 是不是这一版：`python3 -c "import binascii;d=b''.join(binascii.unhexlify(l[9:-2]) for l in open('/home/zstu/car_2027.hex').read().split() if l[7:9]=='00');print('新固件(有 A2GB、PRE)' if b'A2GB\x00' in d else '旧固件')"`
+- **10-23 晚 屏幕和一键启动(任务清单第 16~18 项，更新包 tasks_1023e.zip 包含 1023d 的全部内容，arm.c 要烧录)：**
+  - 屏(用户"字太小、屏原来自带的东西容易点到、抓取放置要中文、排版要整齐、一开始不要绿色大字")：用户自己用 USART HMI 做新工程替换屏里的出厂演示：
+    横屏 480x320、page0 黑底不放控件；字库 0 = 字高 120(指定字符 0123456789+)，字库 1 = 字高 72 GB2312(指定字符 抓取放置0123456789)，
+    program.s 里 baud 改成 9600(新版软件默认 115200)。固件 scr_box：t0/t7 整宽两行大字，t2/t3 最下一行左右两半中字，
+    Screen_Text 取文字里最后一个数，前面加 GB2312 "抓取"(D7A5C8A1)/"放置"(B7C5D6C3)；t1/t4/t5/t6 不再画。
+    树莓派 _show_stats 跑的时候不写(screen_stats_live=false)，_start 回到启停区才写 GRAB n / PLACE n。竖屏没做(放不下 8 个 120 像素的大字)。
+  - race：race_start 默认 'now' = ZONE LOCK 清屏、不出 START，切区直接开跑(和 zone n + go 一样，开跑后扫描、规划)；'screen' = 以前屏上按 START。
+  - 一键启动 = 整车电闸(用户"一键启动是一个物理的上电开关""这个电就是整车的电闸")：固件 Boot_Keepalive(上电后、第一条机械臂指令之前每 6 秒升降上下 4mm，
+    最多 90 秒)；树莓派 `bootrace 1|2|off` 存配置 boot_race/start_zone(start_zone 改 zone_snap 才写得进文件)，install_boot_race.sh 装
+    ~/.config/autostart/car_boot_race.desktop -> boot_race.sh -> run_live.sh --boot；--boot 时 boot_race 没开就马上退出，开了就先关掉(只用一次)再 race。
+    **风险：** 树莓派开机 + 程序启动要几十秒(没实测)，3 分钟里少了这一段；"15 秒不动"靠升降上下保活，裁判认不认要用户确认。
+    更好的接法是树莓派单独供电一直开着、电闸只管 STM32 和电机(还没做：要等 STM32 上电的 READY 才开跑)。

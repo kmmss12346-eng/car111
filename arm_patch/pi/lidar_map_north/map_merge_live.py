@@ -131,8 +131,15 @@ def main():
     ap.add_argument('--stop-wait',type=float,default=3.0,help='每个停车点停多久(秒)，代替抓取/放置等任务')
     ap.add_argument('--stm-port',default='/dev/serial0',help='和 STM32 通信的串口（指令+YAW100）；none=不连 STM32')
     ap.add_argument('--zone',type=int,choices=(1,2),default=None,help='启停区(不写就用配置里的 start_zone；比赛时用 race 1 / race 2 选)')
+    ap.add_argument('--boot',action='store_true',help='(10-23)开机自启动用(install_boot_race.sh 装的)：配置里 boot_race=true 才按 start_zone 直接开跑，'
+                    '开跑时自动关掉 boot_race(只用一次)；没打开就马上退出(不占雷达和串口)')
     args=ap.parse_args()
     raw_cfg=json.loads(Path(args.config).read_text(encoding='utf-8'))
+    if args.boot and not raw_cfg.get('boot_race',False):
+        # (10-23)开机自启动，但没打开开机自动比赛(调试时)：马上退出，雷达、串口留给手动开的程序
+        print('开机自动比赛没打开：程序退出(调试照常手动 bash run_live.sh)。要比赛：开程序输入 bootrace 1 或 bootrace 2，关电，'
+              '裁判说开始时打开电闸就开跑。',flush=True)
+        return 0
     raw_cfg.setdefault('second_relative_moves',dict(DEFAULT_SECOND_MOVES))
     zone_snap=zone_snapshot(raw_cfg)              # 配置文件里和启停区有关的原值：写回文件时恢复它，文件内容不跟着切换走
     zs=apply_zone(raw_cfg,int(args.zone or raw_cfg.get('start_zone',2) or 2),zone_snap)
@@ -195,6 +202,14 @@ def main():
     def file_cfg():
         """写回配置文件的内容：和启停区有关的键保持文件里原来的值(切换启停区只在内存里)。"""
         out=copy.deepcopy(raw_cfg);zone_restore(out,zone_snap);return out
+    def save_cfg_keys(updates):
+        """(10-23)把几个配置项存进配置文件(第一次改之前备份成 .json.bak)。start_zone 存进文件(这次运行的启停区不跟着变)。"""
+        for k_,v_ in updates.items():
+            if k_=='start_zone':zone_snap[k_]=v_
+            else:raw_cfg[k_]=v_
+        p=Path(args.config);bak=p.with_suffix('.json.bak')
+        if not bak.exists():bak.write_text(p.read_text(encoding='utf-8'),encoding='utf-8')
+        p.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
     def mission_cfg():
         mc=dict(raw_cfg);mc.update(car_length_mm=config.get('car_length_mm',290),car_width_mm=config.get('car_width_mm',260))
         return mc
@@ -870,6 +885,16 @@ def main():
             sync_now()
             from mission_cli import handle_cli
             handle_cli(k,parts,link=link,raw_cfg=raw_cfg,state=state,log=lambda m:print(m,flush=True));return
+        if k=='bootrace':
+            # (10-23 用户"一键启动是一个物理的上电开关、整车的电闸")上电就开跑：先在这里选好区、打开，关电；上电以后程序自己开跑
+            if len(parts)!=2 or parts[1].lower() not in ('1','2','off'):
+                raise ValueError('格式：bootrace 1 / bootrace 2(下次上电按这个启停区直接开跑，只用一次) / bootrace off(关掉)')
+            if parts[1].lower()=='off':
+                save_cfg_keys({'boot_race':False});print('已关掉开机自动比赛：上电以后程序不自己跑。',flush=True);return
+            z_=int(parts[1]);save_cfg_keys({'boot_race':True,'start_zone':z_})
+            print(f'已打开开机自动比赛：启停区 {z_}。现在可以 q 退出、关电，把车放进启停区 {z_}；裁判说开始时打开电闸，'
+                  '树莓派开机以后自己开跑(只用这一次：开跑时自动关掉，下一轮再输 bootrace)。'
+                  '开机自启动还没装就先运行一次 bash install_boot_race.sh。',flush=True);return
         if k in ('go','drive','p2','race'):
             if link is None:raise ValueError('没有连接 STM32（--stm-port），不能用 '+k)
             if state['auto']:raise ValueError('一键流程正在运行；输入 abort 可以中止')
@@ -1139,7 +1164,16 @@ def main():
     print('v10 运动调试：send F 1000 = 单条指令；fix F 1000 985 = 距离校准；cal = 横移校准；get / set 名字 数值 = 看/改 STM32 参数；sync = 把配置里的参数重新发给 STM32；r2off 前后 左右 = 对准 2 号环时故意对偏(毫米)。',flush=True)
     if args.sim:print('【桌面模拟模式】',flush=True)
     threading.Thread(target=terminal,daemon=True).start();redraw()
-    if raw_cfg.get('race_auto',False) and link is not None:commands.put('race')
+    if args.boot:
+        # (10-23)开机自动比赛：只用一次(先关掉再开跑，跑的中途断电重启也不会再自己跑)
+        z_=int(zone_snap.get('start_zone',2) or 2)
+        try:save_cfg_keys({'boot_race':False})
+        except Exception as e:print('关掉 boot_race 失败：',repr(e),flush=True)
+        if link is None:print('★ 开机自动比赛：STM32 没连上，跑不了',flush=True)
+        else:
+            print(f'★ 开机自动比赛：启停区 {z_}，直接开跑(boot_race 已关掉，下一轮再输 bootrace)',flush=True)
+            commands.put(f'race {z_}')
+    elif raw_cfg.get('race_auto',False) and link is not None:commands.put('race')
     try:timer.start();plt.show()
     except KeyboardInterrupt:pass
     finally:

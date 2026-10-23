@@ -297,7 +297,7 @@ class LiveTests(unittest.TestCase):
     def setUp(self):
         WORLD.clear()
 
-    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same'):
+    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same', argv_extra=(), expect_done=True, end_on=None):
         with open(USER_CFG, encoding='utf-8') as f:
             raw = json.load(f)
         WORLD['mount'] = {k: raw[k] for k in ('lidar_forward_mm', 'lidar_left_mm', 'lidar_yaw_deg', 'sdk_y_sign')}
@@ -321,7 +321,7 @@ class LiveTests(unittest.TestCase):
         out = Out()
         self.out_text = out.text
         timers = []
-        state = {'done': False}
+        state = {'done': False, 'end_on': end_on}            # end_on：日志里出现这句就算跑完
 
         def show(*a, **k):
             t_end = time.monotonic() + timeout
@@ -361,7 +361,7 @@ class LiveTests(unittest.TestCase):
             mml.plan_mission = fake_plan_mission
             mml.home_route_legs = fake_home_route_legs
             sys.argv = ['map_merge_live.py', '--port', os.path.join(tmp, 'scan_bridge'), '--config', cfg_path, '--stm-port', 'sim',
-                        '--stop-wait', '0']
+                        '--stop-wait', '0'] + list(argv_extra)
             rc = mml.main()
         finally:
             builtins.input, sys.stdout, sys.argv = old
@@ -375,7 +375,8 @@ class LiveTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
         self.log = out.text()
         self.assertEqual(rc, 0)
-        self.assertTrue(state['done'], '一整轮没跑完：\n' + self.log[-3000:])
+        if expect_done:
+            self.assertTrue(state['done'], '一整轮没跑完：\n' + self.log[-3000:])
         return car
 
     def check_run(self, car, zone):
@@ -521,6 +522,33 @@ class LiveTests(unittest.TestCase):
         self.assertIn('启停区 2：直接开跑', log)
         self.assertNotIn('直接用开跑前规划好的路线', log)
         self.assertEqual(car.requests[-1], 'PARK')
+
+    def test_boot_race_once(self):
+        """(10-23 用户"一键启动是一个物理的上电开关、整车的电闸")开机自启动(--boot)：配置里 boot_race 打开了才按 start_zone 直接开跑，
+        开跑时先把 boot_race 关掉(只用一次)；没打开就马上退出(不占雷达、串口)。"""
+        car = self.run_live(1, dict(scale=0.01), cfg_extra=dict(race_auto=False, race_start='now', boot_race=True, start_zone=1),
+                            argv_extra=['--boot'], screen_zone=None)
+        log = self.log
+        self.assertIn('★ 开机自动比赛：启停区 1，直接开跑', log)
+        self.assertIn('路线全部走完', log, log[-3000:])
+        self.assertEqual(car.requests[0], 'ZONE LOCK')
+        self.assertIs(self.cfg_after.get('boot_race'), False, '只用一次：开跑时关掉')
+        self.assertEqual(self.cfg_after.get('start_zone'), 1)
+        car = self.run_live(2, dict(scale=0.0), cfg_extra=dict(race_auto=False, boot_race=False), argv_extra=['--boot'],
+                            screen_zone=None, expect_done=False)
+        self.assertIn('开机自动比赛没打开', self.log)
+        self.assertEqual(car.requests, [], '没打开：不连 STM32、不动')
+
+    def test_bootrace_command_saves_zone(self):
+        """bootrace 2：存进配置(boot_race=true、start_zone=2)，这次运行的启停区不变；bootrace off 关掉。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, start_zone=1),
+                      inputs=[(lambda: True, 'bootrace 2')], screen_zone=None, end_on='已打开开机自动比赛')
+        self.assertIn('已打开开机自动比赛：启停区 2', self.log)
+        self.assertEqual((self.cfg_after.get('boot_race'), self.cfg_after.get('start_zone')), (True, 2))
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, boot_race=True, start_zone=2),
+                      inputs=[(lambda: True, 'bootrace off')], screen_zone=None, end_on='已关掉开机自动比赛')
+        self.assertIs(self.cfg_after.get('boot_race'), False)
+        self.assertEqual(self.cfg_after.get('start_zone'), 2)
 
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)
