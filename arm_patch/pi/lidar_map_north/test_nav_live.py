@@ -455,6 +455,36 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(self.cfg_after['stops']['RAW'], [1200, 2155, 180])
         self.assertIn('路线全部走完', log, log[-3000:])
 
+    def test_go_step_jog_then_save_stop(self):
+        """(10-23 用户"在每一个区域之前能再自由调节车的位置，调到合适的位置之后我下一次就跑到这个新位置")go step 到 QR 停下：
+        F 20 慢慢往前挪 20mm，save 存成 QR 新的停车点(规划的 + 挪的，检查过再存，这一趟不重新规划)；n 继续以后
+        后面的路线按挪过的位置补，照样跑完回到启停区。"""
+        def said(t):
+            return lambda: t in self.out_text()
+
+        def waits(k):
+            return lambda: self.out_text().count('⏸ 分段调试') >= k or '路线全部走完' in self.out_text()
+        inputs = [(lambda: True, 'go step'), (waits(1), 'F 20'), (said('这一站一共挪了'), 'save'), (said('已改 QR'), 'n')]
+        inputs += [(waits(k), 'n') for k in range(2, 24)]
+        car = self.run_live(2, dict(scale=0.0), cfg_extra=dict(race_auto=False), inputs=inputs, screen_zone=None)
+        log = self.log
+        self.assertIn('这一站一共挪了：前进 +20mm、往左 +0mm、车头 +0.0°', log, log[-3000:])
+        self.assertIn('已改 QR：(2100,1200) 车头 90° → (2100,1220) 车头 90°', log, log[-3000:])
+        self.assertIn('这一趟后面照原来的路线走', log)
+        self.assertEqual(self.cfg_after['stops']['QR'][:2], [2100, 1220])
+        self.assertIn('分段调试时挪了 F +20', log)
+        self.assertIn('路线全部走完', log, log[-3000:])
+        goal = auto_run.inset_goal((2250.0, 150.0, 90.0), self.cfg_after)
+        p = car.pose()
+        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'挪过车以后没回到出发位置：{p}')
+
+    def test_jog_only_while_stopped_at_a_station(self):
+        """没在 go step 的站上停着：F 20 不当挪车(也不会发给 STM32)。"""
+        car = self.run_live(2, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'F 20'), (lambda: True, 'go')], screen_zone=None)
+        self.assertNotIn(('F', 20), [(c, v) for c, v, *_ in car.sent][:1])
+        self.assertIn('路线全部走完', self.log, self.log[-3000:])
+
     def test_abort_then_quit_does_not_park(self):
         def moving():
             c = WORLD.get('car')

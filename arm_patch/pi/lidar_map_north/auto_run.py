@@ -1228,7 +1228,8 @@ class _Drive:
             self.hooks.adjust(stop, self.link, self.log)        # 以后接摄像头：看地面标记
         skip = False
         if not is_pre and not is_start and role is not None and not self.homing:
-            skip = self._step(f'到达 {stop}，下一步做这一站的任务', allow_skip=True) == 'skip'
+            skip = self._step(f'到达 {stop}，下一步做这一站的任务', allow_skip=True, stop=stop,
+                              goal=tuple(self.nav.ref) if self.nav.world else None) == 'skip'
         if is_pre:
             pass                                                # PREHOME 只是回家前定位用的点，没有任务
         elif self.homing and not is_start and role is not None:
@@ -1249,14 +1250,27 @@ class _Drive:
                 self._step(f'{stop} 做完了，下一步开往下一站')
             self._time_check(stop, goal)
 
-    def _step(self, text, allow_skip=False):
+    def _step(self, text, allow_skip=False, stop=None, goal=None):
         """(10-16 用户)分段调试(go step)：停下等终端输入 n 继续 / skip 跳过这一站的任务。等的时间不算进比赛用时。
-        不是分段调试返回 'next'。"""
+        不是分段调试返回 'next'。
+        (10-23 用户"在每一个区域之前能再自由调节车的位置，调到合适的位置之后下一次就跑到这个新位置")停着的时候终端可以
+        F / S / R 挪车、save 存成这一站新的停车点：stop、goal(规划的停车点)告诉终端；等完把终端挪过的量(ctx.step_jog_take)
+        记进 est，后面的路线按挪过的位置补。"""
         fn = getattr(self.ctx, 'step_pause', None)
         if fn is None:
             return 'next'
+        where = getattr(self.ctx, 'step_where', None)
+        if where is not None:
+            where(stop, goal)
         t0 = time.monotonic()
         ans = fn(text, allow_skip) or 'next'
+        take = getattr(self.ctx, 'step_jog_take', None)
+        for c, v in (take() if take is not None else []):
+            if c == 'R':
+                self.nav.turned(wrap180(self.nav.est[2] + float(v)), float(v))
+            else:
+                self.nav.moved(c, float(v))
+            self.log(f'    (分段调试时挪了 {c} {float(v):+g}：后面的路线按挪过的位置补)')
         dt = time.monotonic() - t0
         if dt > 0.5:
             self.t_start += dt                                  # 等命令的时间不算用时(不然会以为时间不够、提前回家)

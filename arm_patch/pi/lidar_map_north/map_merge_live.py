@@ -20,6 +20,8 @@ from stm32_link import Stm32Link,FakeLink
 from auto_run import (run_mission,Abort,apply_zone,zone_snapshot,zone_restore,mission_names,race_flow,run_bg,park_arm,quit_park,
     home_route_legs,home_approach,Nav,firmware_caps,zone_request,DEFAULT_SECOND_MOVES)
 import reloc
+
+STOP_NAMES_LIVE = ('QR', 'RAW', 'ROUGH', 'TEMP')   # (10-23)go step 到这几站停下时能挪车、save 存停车点(和 route_plan.STOP_NAMES 一样)
 ROOT=Path(__file__).resolve().parent
 
 SIM=None   # 桌面模拟时由 --sim 设置
@@ -552,11 +554,22 @@ def main():
                 time.sleep(0.1)
             return bool(state['confirm'])
         def aborted(self):return state['abort']
+        def step_where(self,stop,goal):
+            """(10-23)分段调试停下的是哪一站、规划的停车点(世界坐标 x, y, 车头)：终端 save 按它 + 挪过的量算新停车点。"""
+            state['step_stop']=(str(stop).upper() if stop else None,tuple(float(v) for v in goal[:3]) if goal else None)
+        def step_jog_take(self):
+            """(10-23)这次停下时终端挪过的那几下 [(F/S/R, 数)]：交给 auto_run 记进车位，后面的路线按挪过的位置补。"""
+            j=list(state.get('step_jog') or []);state['step_jog']=[];return j
         def step_pause(self,text,allow_skip=False):
-            """(10-16)分段调试(go step)：停下等终端输入 n(继续) / skip(跳过这一站的任务) / abort。不是 go step 直接返回。"""
+            """(10-16)分段调试(go step)：停下等终端输入 n(继续) / skip(跳过这一站的任务) / abort。不是 go step 直接返回。
+            (10-23)到站停下时还能 F / S / R 挪车、save 存成这一站新的停车点。"""
             if not state.get('step_mode'):return 'next'
-            state['step_ans']=None;state['step_wait']=True
-            print(f'⏸ 分段调试：{text}。输入 n 继续'+('，skip 跳过这一站的任务' if allow_skip else '')+'，abort 停止',flush=True)
+            state['step_ans']=None;state['step_wait']=True;state['step_jog']=[];state['step_sum']=[0.0,0.0,0.0]
+            st_=state.get('step_stop') or (None,None)
+            jog=allow_skip and st_[0] in STOP_NAMES_LIVE and st_[1] is not None
+            state['step_can_jog']=jog
+            print(f'⏸ 分段调试：{text}。输入 n 继续'+('，skip 跳过这一站的任务' if allow_skip else '')+'，abort 停止'
+                  +('；F 20 / S -10 / R 2 = 慢慢挪车(前进、往左毫米，逆时针度，负数反过来)，挪好了 save = 存成这一站新的停车点(下一次 go 用)' if jog else ''),flush=True)
             try:
                 while state.get('step_ans') is None:
                     if state['abort']:raise Abort('收到 abort，已停止')
@@ -686,6 +699,10 @@ def main():
         if k in ('n','next','skip') and state.get('step_wait'):
             state['step_ans']='skip' if k=='skip' else 'next'
             return
+        if state.get('step_wait') and k in ('f','s','r') and len(parts)==2:
+            command_jog(k.upper(),parts[1]);return
+        if state.get('step_wait') and k=='save' and len(parts)==1:
+            command_jog_save();return
         if k in ('next','skip'):
             print('现在没有在等分段调试的命令(go step 开始分段调试)',flush=True);return
         # ---- 行驶/比赛线程让界面线程做的事
@@ -957,7 +974,35 @@ def main():
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
         raise ValueError('命令：race 1|2(比赛：终端选区、屏上按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
-    def command_stop(parts):
+    def command_jog(c,val):
+        """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
+        if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
+        if link is None:raise ValueError('没有连接 STM32（--stm-port）')
+        try:v=float(val)
+        except ValueError:raise ValueError(f'格式：{c} 20(前进/往左多少毫米，负数反过来) / R 2(逆时针转几度)')
+        lim=30.0 if c=='R' else 300.0
+        if not 0<abs(v)<=lim:raise ValueError(f'{c} 一次最多 {lim:g}'+('°' if c=='R' else 'mm'))
+        if c=='R':
+            v=round(v,1);ok_,rep_=link.request(f'R {v:.1f}',25.0)
+        else:
+            v=float(int(round(v)));ok_,rep_=link.move(c,int(v),int(raw_cfg.get('reloc_slow_rpm',60)))
+        if not (ok_ and str(rep_).startswith('DONE')):
+            print(f'{c} {v:+g} -> {rep_}：没走成，不记',flush=True);return
+        state.setdefault('step_jog',[]).append((c,v))
+        sm=state.setdefault('step_sum',[0.0,0.0,0.0]);sm['FSR'.index(c)]+=v
+        print(f'{c} {v:+g} -> {rep_}。这一站一共挪了：前进 {sm[0]:+.0f}mm、往左 {sm[1]:+.0f}mm、车头 {sm[2]:+.1f}°'
+              f'(挪好了输入 save 存成 {state["step_stop"][0]} 新的停车点；n 继续)',flush=True)
+    def command_jog_save():
+        """(10-23)分段调试到站停着、挪过车：规划的停车点 + 一共挪的量 = 新停车点，检查能不能停再存(下一次 go 才用，这一趟照原来的路线走)。"""
+        if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能 save 存停车点')
+        n_,g_=state['step_stop'];sm=state.get('step_sum') or [0.0,0.0,0.0]
+        a=math.radians(g_[2])
+        x_=g_[0]+sm[0]*math.cos(a)-sm[1]*math.sin(a);y_=g_[1]+sm[0]*math.sin(a)+sm[1]*math.cos(a)
+        h_=((g_[2]+sm[2]+180.0)%360.0)-180.0
+        print(f'{n_}：规划的停车点 ({g_[0]:.0f},{g_[1]:.0f}) 车头 {g_[2]:.0f}°，挪了 前进 {sm[0]:+.0f}mm、往左 {sm[1]:+.0f}mm、车头 {sm[2]:+.1f}°'
+              f' → 新停车点 ({x_:.0f},{y_:.0f}) 车头 {h_:.1f}°',flush=True)
+        command_stop(['stop',n_,f'{x_:.0f}',f'{y_:.0f}',f'{h_:.1f}'],replan=False)
+    def command_stop(parts,replan=True):
         """(10-20 用户"这四个停靠位置我需要自己输入选定合适位置")stop = 看四个停车点能不能停；stop 名字 X Y [车头] = 先检查再改。
         按真实车身(含雷达)查：不压黄色区/工位/原料转盘、不出场地；扫描过就再查障碍物(按真实大小，停车点附近最少留 goal_obstacle_min_margin_mm)。
         不能停就不改，给出最近能停的位置(stop 名字 X Y force 硬改)；工位/原料盘在车的左边、离得太远这类只提醒。
@@ -996,6 +1041,8 @@ def main():
         if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
         p_.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
         print(f'已改 {n}：({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}° → ({x_:.0f},{y_:.0f}) 车头 {stops[n][2]:.0f}°，存进 {p_.name}(原文件备份为 .json.bak)',flush=True)
+        if not replan:
+            print('  这一趟后面照原来的路线走；下一次 go 按新停车点规划',flush=True);return
         state['preplan_gen']=state.get('preplan_gen',0)+1
         state.update(preplan=None,legs=[],path=[],plan_key=None,plan_obj_key=None,home_routes={},legs_partial=False,reason='停车点改了：route 重新规划')
         if history.views:
@@ -1084,6 +1131,7 @@ def main():
     print(f"启停区 {zs['zone']}：起点车中心=({c_['car_x_mm']:.0f}, {c_['car_y_mm']:.0f})，车头 {c_['car_yaw_deg']:.0f}°（90=朝北，180=朝西）；雷达 前{config['lidar_forward_mm']:.1f} 左{config['lidar_left_mm']:.1f}mm。",flush=True)
     print('比赛：输入 race 1 或 race 2(抽到几区就输几；配置 race_auto=true 开机自动，用配置里的启停区)→ 车放好不动，自动扫描、预先规划，终端说可以按 START → 按屏上 START 开跑，之后不用碰电脑。屏上只显示任务码、抓取数、放置数。',flush=True)
     print('调试：zone 1 / zone 2 切换启停区；go = 一键全流程(不再问 y)；park = 收臂、升降停 60mm；abort = 急停(急停后不自动收臂)。',flush=True)
+    print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)
