@@ -752,3 +752,20 @@ git_log.txt                ← 分支最近 120 条提交记录
   map_merge_live.py、mission_hooks.py)。
 
 
+- **10-23 晚 按 docs/任务清单_1023.md 做完程序第 1~6 项(更新包 tasks_1023d.zip：arm.c 要烧录；arm_calib.py、arm_link.py、auto_run.py、
+  map_merge_live.py、mission_hooks.py、vlive.py)：**
+  1. arm_calib 看原料画面的几步输入 `g 左右 上下`(像素)挪绿十字(vision_cal.json 的 claw_px.RAW)，vlive 发现文件变了就重读。挪完要重新 `rteach RAW near 颜色号`。
+  2. 固件参数 A2GB：原料盘上夹紧、直着抬 OVCLR 以后一边升到 ZHI 一边缩回到 A2GB(ID1 不转)，再去车上转盘；0 = 不缩。arm_calib 在 ZGRAB 后面加了 A2GB 一步。
+  3. 原料区只靠摄像头：外圈半径和示教时差 ±15%、物料圆差 ±20% 的圆不认；认准了才放大挪车范围；V? 每 0.5 秒才读一次；
+     找圆心加对准最多 raw_near_find_s=30 秒(用户说 20，仿真里画面里什么都看不到时 20 秒 6 次有 4 次找不到，改成 30，要告诉用户)。
+  4. 到站不用雷达定位(reloc_stops 默认 ['PREHOME','START'])，QR 站点扫描只找障碍物；转弯前离东西近时的雷达定位保留(仿真里全关会压进禁区 29~63mm)。
+     测"到站雷达修正"机制的测试(test_nav_drive、test_route_goal_obstacle)用 OLD_RELOC 照以前打开。
+  5. `go step` 到站停下时终端 `F 数`、`S 数`、`R 数` 挪车(F/S 最多 300mm、R 最多 30°)，`save` 存成这一站新的停车点(下一次 go 才用)，
+     后面的路线按挪过的量补。
+  6. 新固件指令 `PRE RAW|RING`(Seq_Pre)：开往原料区/粗加工区/暂存区的最后一段直线(到停车点不再转弯)之前，auto_run._pre_arm 调
+     hooks.pre_arrive：手臂升到 ZHI、照 OBS 的路线转向观察姿态，绕电池盒那几步照样看着 ID1 角度发(Sweep/Stages 里 pre_nowait)，
+     指令发完就回 DONE，剩下的舵机自己转完；不降到观察高度。到了照常 OBS(已经在姿态上只 Hold)。这一站用不上手臂不发；
+     分段调试 skip 这一站调 pre_cancel 收臂；旧固件 ERR CMD 就这一轮不再发；mission_cfg pre_arm=false 可关。底盘代码没改。
+     急停时已经发出去的转动不会停(最多再转一秒左右)。
+  测试：STM32 主机 338/222/42；树莓派 649 个(3 跳过)只有 test_ringdet 那一项(环境)。
+  检查 hex 是不是这一版：`python3 -c "import binascii;d=b''.join(binascii.unhexlify(l[9:-2]) for l in open('/home/zstu/car_2027.hex').read().split() if l[7:9]=='00');print('新固件(有 A2GB、PRE)' if b'A2GB\x00' in d else '旧固件')"`

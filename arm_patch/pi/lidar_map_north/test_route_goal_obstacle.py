@@ -256,7 +256,8 @@ class GoalObstacleDriveTests(unittest.TestCase):
         car = tnd.SimCar(start, scale=0.01)
         ctx = tnd.SimCtx(car, obstacles=obs)
         logs = []
-        c = dict(tnd.CFG, **(cfg or {}))
+        # (10-23)比赛默认到站不用雷达定位(只有回启停区用)：这里测的是"到站雷达修正会不会被旁边的障碍物限幅"，照以前打开
+        c = dict(tnd.CFG, **dict(tnd.OLD_RELOC, **(cfg or {})))
         hooks = tnd.Hooks(car)
         hooks.offsets = []
         hooks.stop_offset = lambda stop, f, l: hooks.offsets.append((stop, f, l))
