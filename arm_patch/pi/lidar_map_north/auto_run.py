@@ -919,6 +919,7 @@ class _Drive:
         self.leg_cuts = []                      # 这一段里因为离边线/区域太近少走的方向(世界坐标单位向量)
         self.n_fix = [0, 0, 0]                  # 雷达定位：次数、没成功的次数；按定位修正的小动作条数
         self.turn_extra = float(g('turn_extra_s', 0.8))
+        self._pre_for = None                    # (10-23)已经为哪个停车点(路线里的下标)提前摆过臂：每段路只摆一次
 
     # ------------------------------------------------------------ 工具
     def _recut(self):
@@ -1054,9 +1055,22 @@ class _Drive:
         if v != val and not label:
             label = f'(原 {_fmt(val)}，补上偏差)'
         speed = self.fine if abs(v) <= self.slow_below else self.speeds.get(cmd)
+        self._pre_arm()
         self._send(cmd, v, speed, label)
         self.nav.moved(cmd, v)
         self.nav.ref = ref_next
+
+    def _pre_arm(self):
+        """(10-23 用户"到原料区、粗加工区、暂存区之前机械臂提前转到需要的姿态，节省时间")开往下一个停车点的最后一段直线
+        (从这一条到停车点不再转弯)发第一条之前：叫钩子让手臂在最高处边开车边转向观察姿态(钩子看这一站用不用手臂)。
+        时间不够往回走的路上不做。每段路只叫一次。"""
+        if self.homing or self.hooks is None or not hasattr(self.hooks, 'pre_arrive'):
+            return
+        j = self._next_marker(self.k)
+        if j is None or self._pre_for == j or any(self.seq[i][1] == 'R' for i in range(self.k + 1, j)):
+            return
+        self._pre_for = j
+        _call(self.hooks, 'pre_arrive', self.seq[j][0], self.link, self.log)
 
     def _count(self, meas):
         self.n_fix[0] += 1
@@ -1183,6 +1197,7 @@ class _Drive:
 
     # ------------------------------------------------------------ 停车点
     def _stop(self, stop, info):
+        self._pre_for = None
         self.nav.sync_rest(info.get('rest'))
         g = info.get('goal')
         if self.nav.world and g is not None:
@@ -1234,8 +1249,10 @@ class _Drive:
             pass                                                # PREHOME 只是回家前定位用的点，没有任务
         elif self.homing and not is_start and role is not None:
             self.log(f'    时间不够，{stop} 不做任务，直接往回走')
+            _call(self.hooks, 'pre_cancel', stop)
         elif skip:
             self.log(f'    (分段调试)跳过 {stop} 的任务')
+            _call(self.hooks, 'pre_cancel', stop)          # (10-23)提前摆了臂：收好再开走
         elif self.hooks is not None and hasattr(self.hooks, 'task'):
             self.hooks.task(stop, self.link, self.log)
         elif self.stop_wait > 0:

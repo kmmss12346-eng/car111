@@ -33,6 +33,7 @@ _KEEP_TRK = ('APN', 'A?', 'GET', 'SET', 'SCR', 'SCMD', 'QR', 'QR?', 'LIFT?', 'PI
 MEASURE_S = 0.35
 SWEEP_HIT_MM = 40.0     # (10-23)夹着的物料(底 φ50)离两层垛(顶 φ30)的中心不到 25 + 15 毫米就碰上
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
+PRE_WAIT_S = 0.4                        # (10-23)PRE 在车上转盘上方出发：绕电池盒那几条要看着角度发，发完才回 DONE(实车约 0.3~0.5 秒)
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
 
 
@@ -176,6 +177,8 @@ class SimWorld:
         self.side_fw = True                                    # STM32 认识 SIDE(新程序)
         self.claw3_fw = True                                   # STM32 认识 CLAW OR / CLAW OT(10-20 夹爪三个张开角度)
         self.claw_log = []                                     # 每次张开爪子：(用的指令 O/OR/OT, 那一刻夹着物料没有)
+        self.pre_fw = True                                     # (10-23)STM32 认识 PRE(提前摆臂，新程序)
+        self.pre_n = 0                                         # 收到几次 PRE
         self.link = SimLink(self)
         self.vision = SimVision(self)
 
@@ -632,7 +635,9 @@ class SimWorld:
             return True, 'DONE', info
 
         # ---- 下面是夹放流程：要求已标定、已回零
-        if verb in ('OBS', 'GRAB', 'PICK', 'TAKE', 'DROP', 'STOW'):
+        if verb == 'PRE' and not self.pre_fw:
+            return False, 'ERR CMD', info                      # 旧程序不认识
+        if verb in ('OBS', 'GRAB', 'PICK', 'TAKE', 'DROP', 'STOW', 'PRE'):
             if P['ARMOK'] < 0.5:
                 return False, 'ERR NOCAL', info
             if not self.lift_known:
@@ -653,6 +658,24 @@ class SimWorld:
                 self.a1 += float(self.rng.uniform(-1.0, 1.0)) * self.obs_err_deg
                 self.a2 += float(self.rng.uniform(-1.0, 1.0)) * self.obs_err_deg * 10.0
             self._lift_to(P['ZOBRNG'] if ring else P['ZOBRAW'])
+            return True, 'DONE', info
+        if verb == 'PRE':
+            # (10-23)arm.c Seq_Pre：张开爪子、升到 ZHI，舵机转向观察姿态不等转完(车同时开过去：时间往前走时舵机跟着转，同 APN)
+            if len(parts) != 2 or parts[1] not in ('RAW', 'RING'):
+                return False, 'ERR ARG', info
+            if self.claw_hold:
+                return False, 'ERR HOLD', info
+            ring = parts[1] == 'RING'
+            self.side = 'RING' if ring else 'RAW'
+            self.a1_ref = P['A1P'] if ring else P['A1G']
+            self.a2_ref = P['A2P'] if ring else P['A2E']
+            self._open_claw()
+            self._lift_to(P['ZHI'])
+            self.pre_n += 1
+            near = abs(self.a1 - P['A1D']) <= 15.0
+            self.trk = [self.a1_ref, self.a2_ref, P['ASPD'], P['ASPD']]
+            if near:
+                self.advance(PRE_WAIT_S)
             return True, 'DONE', info
         if verb in ('GRAB', 'PICK'):
             slot = int(parts[1])
@@ -1011,6 +1034,7 @@ class SimVision:
 # ======================================================================================================
 def run_mission(world, hooks, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lambda m: None, nav=None):
     """按停车点顺序把 hooks.task 跑一遍。返回实际去了哪些停车点。
+    nav['pre'] = True：(10-23)每段路开了 6 成(最后一段直线之前)叫 hooks.pre_arrive(提前摆臂)。
     nav：模拟新的导航(dict)，不给 = 和以前一样只调 task。给了：一开始 prepare(nav['prepare'] 默认 True)、start_clock；
       开到每个停车点按 leg_s 秒；到了先 set_home_eta(home_s[角色])；开往下一个停车点之前问 go_home_now，回 True 就直接回家。
       例：nav=dict(leg_s=10, home_s={'QR': 25, 'RAW': 30, 'ROUGH': 22, 'TEMP': 25})"""
@@ -1029,7 +1053,13 @@ def run_mission(world, hooks, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'RAW', 'ROUGH
         role = role_of(stop)
         if nav is not None:
             prev = role_of(done[-1]) if done else None
-            world.advance(float(home_s.get(prev, 25.0)) if (role == 'START' and prev) else leg)   # 开过来
+            t_leg = float(home_s.get(prev, 25.0)) if (role == 'START' and prev) else leg
+            if nav.get('pre') and hasattr(hooks, 'pre_arrive'):
+                world.advance(t_leg * 0.6)                     # 前面几段(有转弯)
+                hooks.pre_arrive(stop, world.link, log)         # (10-23)最后一段直线之前：手臂提前转(车开的同时舵机在转)
+                world.advance(t_leg * 0.4)
+            else:
+                world.advance(t_leg)                            # 开过来
             hooks.set_home_eta(0.0 if role == 'START' else float(home_s.get(role, 25.0)))
         visits[role] = visits.get(role, 0) + 1
         world.arrive(role, visits[role])
@@ -4456,6 +4486,79 @@ class StackCarryTests(unittest.TestCase):
         self.assertGreater(i, takes[11], r0[i - 3:i + 3])                      # 最后一次码垛(去环3 要经过两层的环1、环2)从车上转盘出发才不一样
         self.assertTrue(r1[i].startswith(('AP', 'APZ')), r1[i - 2:i + 6])
 
+
+
+class PreArmTests(unittest.TestCase):
+    """(10-23 用户"到原料区、粗加工区、暂存区之前机械臂提前转到需要的姿态，节省时间")开往这三个区的最后一段直线之前发 PRE，
+    车开的同时手臂转向观察姿态；到了 OBS 只补最后一点。这一站用不上手臂就不提前转；STM32 是旧程序(不认识 PRE)就不用。"""
+    CODE = '156+123+516+231'
+
+    def _run(self, seed, pre=True, pre_fw=True, **kw):
+        w = SimWorld(seed=seed, code=self.CODE, **kw)
+        w.pre_fw = pre_fw
+        lines = []
+        h = make(w, dict(pre_arm=pre, round_s=1e9), log=lines.append)          # 不限时：整场跑完比用时
+        done = run_mission(w, h, log=lines.append, nav=dict(leg_s=10.0, pre=True))
+        return w, h, done, '\n'.join(lines)
+
+    def test_pre_saves_time_same_result(self):
+        for seed in range(3):
+            w0, h0, d0, t0 = self._run(seed, pre=False)
+            w1, h1, d1, t1 = self._run(seed)
+            self.assertEqual(w0.pre_n, 0)
+            self.assertEqual(w1.pre_n, 6, t1)                    # 原料区、粗加工区、暂存区各两次
+            self.assertEqual(d0, d1)
+            for w, h, text in ((w0, h0, t0), (w1, h1, t1)):
+                self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+                self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            o0, o1 = w0.time_by_verb.get('OBS', 0.0), w1.time_by_verb.get('OBS', 0.0)
+            self.assertLess(o1, o0 * 0.7, (o0, o1))                # 每个工位第一次 OBS 几乎不花时间(后面放第 2、3 个的 OBS 照旧)
+            self.assertLess(w1.t, w0.t - 3.0, (w0.t, w1.t))
+            # PRE 以后、到这一站第一条 OBS 之前不再有别的动手臂的指令(开车时手臂就停在观察姿态上)
+            r = w1.requests
+            for i, q in enumerate(r):
+                if q.startswith('PRE'):
+                    nxt = [x for x in r[i + 1:] if x.split()[0] in ('OBS', 'STOW', 'AP', 'APZ', 'TAKE', 'GRAB', 'PICK', 'PARK')]
+                    self.assertTrue(nxt and nxt[0].startswith('OBS ' + q.split()[1]), (q, nxt[:3]))
+            print(f'\n  [提前摆臂 seed {seed}] 整场 {w0.t:.0f} 秒 → {w1.t:.0f} 秒；OBS 一共 {o0:.1f} 秒 → {o1:.1f} 秒')
+
+    def test_old_firmware_falls_back_once(self):
+        w, h, done, text = self._run(0, pre_fw=False)
+        self.assertEqual(sum(1 for q in w.requests if q.startswith('PRE')), 1, text)
+        self.assertIn('不认识 PRE', text)
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+
+    def test_no_code_no_pre(self):
+        w, h, done, text = self._run(0, qr_present=False)
+        self.assertFalse([q for q in w.requests if q.startswith('PRE')], text[-2000:])
+
+    def test_cancel_stows(self):
+        w = SimWorld(seed=0, code=self.CODE)
+        lines = []
+        h = make(w, log=lines.append)
+        h.prepare(w.link, lines.append)
+        h._use_code(self.CODE)
+        self.assertTrue(h.pre_arrive('RAW', w.link, lines.append))
+        self.assertEqual(w.requests[-1], 'PRE RAW')
+        self.assertFalse(h.pre_arrive('RAW', w.link, lines.append))     # 已经摆了：不重复发
+        h.pre_cancel('RAW')
+        self.assertEqual(w.requests[-1], 'STOW')
+        self.assertIsNone(h._pre_pending)
+        n = len(w.requests)
+        h.pre_cancel('RAW')                                            # 没摆过：什么都不做
+        self.assertEqual(len(w.requests), n)
+
+    def test_holding_or_empty_tray_no_pre(self):
+        w = SimWorld(seed=0, code=self.CODE)
+        lines = []
+        h = make(w, log=lines.append)
+        h.prepare(w.link, lines.append)
+        h._use_code(self.CODE)
+        self.assertFalse(h.pre_arrive('ROUGH', w.link, lines.append))  # 转盘里没有物料：粗加工区用不上手臂
+        self.assertFalse(h.pre_arrive('QR', w.link, lines.append))
+        h.maybe_holding = '测试'
+        self.assertFalse(h.pre_arrive('RAW', w.link, lines.append))    # 爪子里可能有东西：不动
+        self.assertFalse([q for q in w.requests if q.startswith('PRE')])
 
 if __name__ == '__main__':
     args = sys.argv[1:]

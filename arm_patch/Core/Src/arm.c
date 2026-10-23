@@ -1445,6 +1445,18 @@ static int Detour_Get(Detour *d)
     return 0;
 }
 
+/* (10-23)PRE(提前摆臂)：1 = Sweep / Stages 里要看着角度发的那几条指令都发出去了就返回，不等舵机转完(车同时开过去) */
+static uint8_t pre_nowait = 0;
+
+/* (10-23)PRE 用：只发转动指令不等。已经在目标上(ATOLC 以内)就只在原地保持(和 Servos_To 一样，不白白往前多给补偿) */
+static void Servo_Go(uint8_t id, float target, float spd)
+{
+    float a;
+
+    if (Servo_ReadAngle(id, &a) && Absf(a - target) <= g_atolc)  Servo_Hold(id, a);
+    else                                                          (void)Servo_Start(id, &target, spd);
+}
+
 /* (10-19 用户：伸缩的时候 ID1 不要停，一直转)ID1 一口气转到 a1_end；转过 at1 时 ID2 开始走到 b1(伸长)，
  * 转过 at2 时 ID2 开始走到 b2(缩回)。ID1 先到了还没转过的那一段就接着做。升降不动(调用前升到最高)。spd2 = ID2 的速度 */
 static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2, float spd2)
@@ -1469,6 +1481,7 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2,
         {
             b = b2;  tmax += Servo_Start(2, &b, spd2);  ph = 2;  ok2 = 0;          /* 转过 A1T2：开始缩回 */
         }
+        if (pre_nowait && ph == 2)  return NULL;   /* (10-23)PRE：最后一条伸缩指令也发了，剩下的让舵机自己转完 */
         if (!ok2 && Servo_ReadAngle(2, &c) && Servo_Arrived(2, c, g_atolc))  { ok2 = 1; Servo_Hold(2, c); }
         if (ok1 && ok2 && ph == 2)  break;
         if ((HAL_GetTick() - t0) > tmax + 3000u)  break;
@@ -1502,6 +1515,11 @@ static const char *Stages(float p1, float l1, float p2, float l2, float a1_end, 
     }
     Servo_Move(2, l2, spd2, g_atolc, SERVO_EXTRA_MS);
     if (car_abort)  return NULL;
+    if (pre_nowait)
+    {
+        Servo_Go(1, a1_end, Big_Spd(1));           /* (10-23)PRE：最后这一转不等(车同时开过去) */
+        return NULL;
+    }
     Servo_Move(1, a1_end, Big_Spd(1), g_atolc, SERVO_EXTRA_MS);
     return NULL;
 }
@@ -1571,6 +1589,51 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
     }
     GO(Leave_Tray(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e));
     GO(Move_Over(ring ? g_a1p : g_a1g, ring ? g_a2p : g_a2e, 2, ring ? g_zobrng : g_zobraw));
+    return NULL;
+}
+
+/* (10-23 用户"到原料区、粗加工区、暂存区之前让机械臂提前转到需要的姿态，节省时间")PRE RAW / PRE RING：
+ * 树莓派在车开往这个工位的最后一段直线(后面不再转弯)之前发。手臂照 OBS 的路线(先升到 ZHI；在车上转盘上方就照样绕电池盒)
+ * 转向观察姿态，但不等转完：要看着 ID1 角度发的那几条(绕电池盒的伸缩)发完就回 DONE，剩下的舵机自己转完，车同时开过去。
+ * 不降到观察高度：开车时爪子留在最高处 ZHI(OBS 也是在 ZHI 转过去的，比原料盘上的物料、障碍物都高)。
+ * 到了树莓派照常发 OBS：已经在姿态上就只核对一下、补最后一点，再降到观察高度。爪子里夹着物料不做(ERR HOLD)。
+ * 车走的时候来了急停：已经发出去的转动不会停下(最多再转一秒左右，转到观察姿态) */
+static const char *Seq_Pre(uint8_t ring)
+{
+    float a1 = ring ? g_a1p : g_a1g;
+    float a2 = ring ? g_a2p : g_a2e;
+    float a;
+    Detour d;
+    const char *e = Seq_Ready();
+
+    if (e) return e;
+    if (claw_hold)  return "ERR HOLD";
+    g_side = ring;                                 /* 之后去/离开车上转盘按这一边的绕电池盒参数走(和 OBS 一样) */
+    if (ring)  Claw_O();
+    else       Claw_OAt(CLAW_AT_RAW);
+    GO(Lift_Goto(g_zhi));                          /* 先升到最高再转；收臂停在最高处时不动 */
+    if (Servo_ReadAngle(1, &a) && Absf(a - g_a1d) <= 15.0f && Detour_Get(&d))
+    {
+        pre_nowait = 1;                            /* 在车上转盘上方：和 OBS 一样绕电池盒，最后一条指令发了就返回 */
+        e = Leave_Tray(a1, a2);
+        pre_nowait = 0;
+        return e;
+    }
+    if (g_para > 0.5f)
+    {
+        Servo_Go(1, a1, Big_Spd(1));               /* 两个一起转，都不等 */
+        Servo_Go(2, a2, Big_Spd(2));
+        return NULL;
+    }
+    {
+        uint8_t ext = Ext_Id();
+        uint8_t rot = (uint8_t)(3 - ext);
+
+        /* PARA=0：和 OBS 一样先转好再伸缩，伸缩这一步不等 */
+        Servo_Move(rot, (rot == 1) ? a1 : a2, Big_Spd(rot), g_atolc, SERVO_EXTRA_MS);
+        if (car_abort)  return NULL;
+        Servo_Go(ext, (ext == 1) ? a1 : a2, Big_Spd(ext));
+    }
     return NULL;
 }
 
@@ -2834,6 +2897,19 @@ int Arm_Command(const char *cmd, char *err, int errlen)
             open_claw = 1;
         }
         r = Seq_Obs(ring, open_claw);
+        if (r)  FAIL(r);
+        return 1;
+    }
+
+    /* ---- (10-23)提前摆臂：PRE RAW|RING。车开往工位的最后一段直线之前发：手臂转向观察姿态，不等转完就回 DONE(见 Seq_Pre) ---- */
+    if (strcmp(v, "PRE") == 0 && n == 2)
+    {
+        uint8_t ring;
+
+        if (strcmp(t[1], "RAW") == 0)        ring = 0;
+        else if (strcmp(t[1], "RING") == 0)  ring = 1;
+        else                                 FAIL("ERR ARG");
+        r = Seq_Pre(ring);
         if (r)  FAIL(r);
         return 1;
     }

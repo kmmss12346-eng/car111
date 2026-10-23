@@ -294,6 +294,37 @@ class DriveTests(unittest.TestCase):
         self.logs = logs
         return seq
 
+    def test_pre_arm_before_last_straight(self):
+        """(10-23 用户"到原料区、粗加工区、暂存区之前机械臂提前转到需要的姿态")开往停车点的最后一段直线(到停车点不再转弯)
+        发第一条之前叫 hooks.pre_arrive，每段路一次；分段调试跳过这一站叫 pre_cancel(收臂再开走)。"""
+        car = SimCar((1200.0, 1100.0, 90.0))
+        ev = []
+
+        class H(Hooks):
+            def pre_arrive(self, stop, link, log):
+                ev.append(('pre', stop, len(car.sent)))
+
+            def pre_cancel(self, stop):
+                ev.append(('cancel', stop))
+
+            def task(self, stop, link, log):
+                ev.append(('task', stop, len(car.sent)))
+        legs = [dict(stop='RAW', goal=None, cmds=[('F', 300), ('R', 90), ('F', 400), ('S', 120)]),
+                dict(stop='ROUGH', goal=None, cmds=[('F', 200)]),
+                dict(stop='TEMP', goal=None, cmds=[('R', 90), ('F', 150)])]
+        ctx = types.SimpleNamespace(aborted=lambda: False)
+        self.drive(car, ctx, legs, hooks=H(car), start=None)
+        self.assertEqual(ev, [('pre', 'RAW', 2), ('task', 'RAW', 4), ('pre', 'ROUGH', 4), ('task', 'ROUGH', 5),
+                              ('pre', 'TEMP', 6), ('task', 'TEMP', 7)], self.logs)
+        # 分段调试(go step)到了 ROUGH 输入 skip：不做任务，收臂
+        car = SimCar((1200.0, 1100.0, 90.0))
+        ev.clear()
+        ctx = types.SimpleNamespace(aborted=lambda: False, step_pause=lambda text, allow_skip: 'skip' if allow_skip and 'ROUGH' in text else 'next')
+        self.drive(car, ctx, legs, hooks=H(car), start=None)
+        self.assertIn(('cancel', 'ROUGH'), ev)
+        self.assertNotIn(('task', 'ROUGH', 5), ev)
+        self.assertEqual([e for e in ev if e[0] == 'pre'], [('pre', 'RAW', 2), ('pre', 'ROUGH', 4), ('pre', 'TEMP', 6)])
+
     def test_exact_arrival_without_lidar(self):
         # 没有雷达定位(ctx 没有 relocalize)：车按指令推算，到停车点前补上不到 20mm 的零头，车真的停在停车点上
         car = SimCar((1200.0, 1100.0, 90.0))

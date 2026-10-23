@@ -40,7 +40,7 @@ import time
 
 import numpy as np
 
-from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort
+from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort, unknown_cmd
 from task_plan import parse_code, TaskError, role_of, Stats, COLOR_NAMES
 from visual_servo import VisualServo, JacStore
 from vision import Vision, VisionError, apply_vision_cal, load_vision_cal
@@ -364,6 +364,9 @@ DEFAULTS = dict(
     pickback_order='code',              # 粗加工区取回的顺序：'code'=按任务码顺序(最符合规则)；'reverse'=倒序；'near'=就近(底盘走得最少，省时间)
     learn_pick=False,                   # True = 还没量过 claw_px.PICK 时，放下第一个物料后回去再拍一张量一次(要多花几秒)；默认不量，取回按圆环对准
     stow_at_start=True,                 # go 开始时先把手臂收到待机姿态(STOW)
+    # (10-23 用户"到原料区、粗加工区、暂存区之前机械臂提前转到需要的姿态，节省时间")车开往这三个区的最后一段直线(后面不再转弯)
+    #   之前发 PRE RAW / PRE RING：手臂在最高处(ZHI)边开车边转向观察姿态，到了 OBS 只补最后一点。要新固件(旧的不认识就自动不用)
+    pre_arm=True,
     return_tol_deg=0.4,                 # 回到记下的姿态后回读，差得比这个多就再转一次
     return_bias=False,                   # 回到记下的姿态时，按前几次"转回来总是多转/少转几度"提前补上(省掉"再转一次")
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
@@ -698,6 +701,8 @@ class MissionHooks:
         self._t_alive = -1e9                # 上一次 keepalive 摆手臂的时刻
         self.holding = None                 # 爪子里现在夹着的物料(从转盘取出来、还没放下)
         self.maybe_holding = None           # 不为 None = 爪子里可能还夹着东西(原因)：不降升降、不张爪子
+        self._pre_pending = None            # (10-23)提前摆了臂(PRE)、还没收臂的停车点：到了没做任务就收臂
+        self._pre_off = False               # (10-23)STM32 不认识 PRE(旧程序)：这次不再提前摆臂
         self._aborted = False               # 急停过：park() 不自动做(人手可能在附近)
         self._boot_asked = False            # 为了看 STM32 是不是新程序(屏上任务码带不带 +)问过 LIFT? 了
         self._plus_warned = False
@@ -781,6 +786,8 @@ class MissionHooks:
                     and self.cfg.get('qr_retry_at_stops', True)):
                 self._qr_again()                    # QR 点没读到码：STM32 可能在路上读到了，再问一次
             self.run_role(role, self.visits[role])
+            if self._pre_pending:
+                self.pre_cancel(stop)               # (10-23)提前摆了臂，这一站却没用手臂(没码、时间到…)：收臂再开走
         except Abort:
             self._aborted = True
             raise
@@ -796,6 +803,57 @@ class MissionHooks:
             self._learn_t(self.base_t, role, max(0.0, dt - self._items_t))
         if role != 'START':
             self.log(f'    ({stop} 用了 {dt:.0f} 秒；从出发算已用 {self.elapsed():.0f} 秒)')
+
+    # ------------------------------------------------------------------ (10-23)到站前提前摆臂
+    def pre_arrive(self, stop, link=None, log=None):
+        """(10-23 用户"到原料区、粗加工区、暂存区之前让机械臂提前转到需要的姿态，节省时间")导航在车开往这个停车点的最后一段直线
+        (到停车点之前不再转弯)之前调用：STM32 的 PRE RAW / PRE RING 让手臂在最高处(ZHI)边开车边转向观察姿态，不降到观察高度；
+        到了照常 OBS，已经在姿态上就只补最后一点、降到观察高度。这一站用不上手臂(没任务码、转盘里没有要放的…)就不提前转。
+        到了却没做任务(分段调试跳过)：导航调 pre_cancel 收臂。返回是否提前摆了。"""
+        if log is not None:
+            self.log = log
+        if not self.cfg.get('pre_arm', True) or self.arm is None or self._pre_off or self._pre_pending:
+            return False
+        role = role_of(stop, self.cfg.get('stop_aliases'))
+        if role not in ('RAW', 'ROUGH', 'TEMP') or not self._pre_useful(role):
+            return False
+        kind = 'RAW' if role == 'RAW' else 'RING'
+        try:
+            ok, reply, _ = self.arm.request(f'PRE {kind}')
+        except ArmAbort as ex:
+            self._aborted = True
+            raise Abort(str(ex))
+        except ArmError as ex:
+            self.log(f'    (提前摆臂出错：{ex}；到了再摆)')
+            return False
+        if not ok:
+            if unknown_cmd(reply):
+                self._pre_off = True
+                self.log('    (STM32 还是旧程序，不认识 PRE：到了再摆臂。烧了新固件才能边开车边摆臂)')
+            else:
+                self.log(f'    (提前摆臂没做：{reply}；到了再摆)')
+            return False
+        self._pre_pending = str(stop)
+        self.log(f'    手臂提前转向看{"原料盘" if kind == "RAW" else "圆环"}的姿态(在最高处转)，车同时开过去')
+        return True
+
+    def pre_cancel(self, stop=None):
+        """提前摆了臂、到了却没用手臂(分段调试跳过这一站、没任务码…)：收臂，带着伸出的手臂开往下一站不安全。"""
+        if not self._pre_pending:
+            return
+        self.log(f'    (提前摆了臂，{self._pre_pending} 没用上：收臂再开走)')
+        self._pre_pending = None
+        if self.arm is not None:
+            self._stow_quiet()
+
+    def _pre_useful(self, role):
+        """到这个工位会用手臂吗：有任务码、没关掉夹放、爪子里没东西；原料区这一批有要抓的，粗加工区/暂存区转盘里有物料。"""
+        if self.disabled or self.plan is None or self.maybe_holding or self.holding is not None:
+            return False
+        if role == 'RAW':
+            visit = self.visits.get('RAW', 0) + 1
+            return visit <= 2 and bool(self.plan.items(1 if visit <= 1 else 2))
+        return any(v is not None for v in self.in_tray.values())
 
     # ------------------------------------------------------------------ 给导航的接口：准备、计时、时间判断、保活、收臂停 60
     def prepare(self, link, log=None):
@@ -1291,6 +1349,7 @@ class MissionHooks:
     def _recover(self, why):
         """单个物料出错后：尽量把手臂收好。收不好就停下整个路线(带着伸出的手臂乱走不安全)。"""
         self.log(f'    ★ {why}；收臂')
+        self._pre_pending = None
         if 'ERR HOLD' in str(why):
             # (10-21)STM32 记着爪子里还夹着物料(上一个没放下)，不让 TAKE/GRAB/PICK 先张开爪子：本轮不再夹放，免得它掉在半路
             self.maybe_holding = 'STM32 说爪子里还夹着物料(上一个没放下)'
@@ -8608,6 +8667,7 @@ class MissionHooks:
     def _stow_quiet(self):
         """每个工位做完收臂(开车前手臂要收好)。收不好就停下(带着伸出的手臂开车不安全)。"""
         self._ring_ready = self._at_obs = False
+        self._pre_pending = None
         try:
             self._stow_retry()
         except ArmAbort:

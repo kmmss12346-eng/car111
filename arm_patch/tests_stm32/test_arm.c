@@ -20,6 +20,17 @@ void Link_RxRestart(void) { }
 static uint32_t now = 0;
 static int abort_at = -1;
 static float ang[3] = {0, 323.0f, -862.0f};
+/* (10-23)slow = 1：舵机按发的速度慢慢转(时间在 HAL_Delay 里走)，测 PRE 发完指令就回、不等转完；0 = 一发就到(以前的测试) */
+static int slow = 0;
+static float sgoal[3], sspd[3];
+static void servo_tick(uint32_t ms) {
+    int id;
+    if (!slow) return;
+    for (id = 1; id <= 2; id++) {
+        float d = sgoal[id] - ang[id], st = sspd[id] * (float)ms / 1000.0f;
+        if (d > st) ang[id] += st; else if (d < -st) ang[id] -= st; else ang[id] = sgoal[id];
+    }
+}
 static char ev[8192];                 /* 事件记录：每个动作追加一小段文字，测试里用 strstr / 下标比较顺序 */
 static char pi[4096];                 /* STM32 发给树莓派的文字 */
 static char scr[8192];                /* 发给串口屏的文字(每条后面加 |) */
@@ -36,7 +47,7 @@ static int fails = 0, checks = 0;
 
 uint32_t HAL_GetTick(void) { return now; }
 static void lift_tick(uint32_t ms);
-void HAL_Delay(uint32_t ms) { now += ms; if (abort_at >= 0 && (int)now >= abort_at) car_abort = 1; lift_tick(ms); }
+void HAL_Delay(uint32_t ms) { now += ms; if (abort_at >= 0 && (int)now >= abort_at) car_abort = 1; lift_tick(ms); servo_tick(ms); }
 void Delay_Report(uint32_t ms) { HAL_Delay(ms); }
 static char qrtx[2048];                /* 发给扫码模块(UART5)的字节，十六进制 "7E 00 07 ..." 每条后面加 | */
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *b, uint16_t n, uint32_t t) {
@@ -68,7 +79,7 @@ void Servo_Report(uint8_t id) { EV("rep%u;", id); }
 void Servo_SetPower(uint16_t mw) { EV("pow%u;", mw); }
 void Servo_SetComp(uint8_t id, float deg) { EV("comp%u=%.1f;", id, deg); }
 void Servo_SetLimits(uint8_t id, float lo, float hi) { EV("lim%u=%.0f,%.0f;", id, lo, hi); }
-void Servo_Hold(uint8_t id, float a) { EV("H%u:%.1f;", id, a); }
+void Servo_Hold(uint8_t id, float a) { EV("H%u:%.1f;", id, a); if (slow) sgoal[id] = a; }
 void Servo_Track(uint8_t id, float a, float spd) { EV("T%u:%.1f@%.0f;", id, a, spd); }
 static float fgoal[3];
 int Servo_Arrived(uint8_t id, float a, float tol) { float e = a - fgoal[id]; return (e < 0 ? -e : e) <= tol; }
@@ -81,11 +92,12 @@ int Servo_WriteParam(uint8_t id, const char *name, long v) {
 }
 static float clampa(uint8_t id, float a) { float lo = id == 1 ? 44.0f : -1220.0f, hi = id == 1 ? 440.0f : -300.0f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
-    float d; *a = clampa(id, *a); fgoal[id] = *a; d = *a - ang[id]; if (d < 0) d = -d; ang[id] = (id == 1 && *a > block1) ? block1 : *a;
+    float d; *a = clampa(id, *a); fgoal[id] = *a; d = *a - ang[id]; if (d < 0) d = -d;
+    if (slow) { sgoal[id] = *a; sspd[id] = spd; } else ang[id] = (id == 1 && *a > block1) ? block1 : *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
 }
 void Servo_Move(uint8_t id, float a, float spd, float tol, uint32_t extra) {
-    (void)extra; a = clampa(id, a); EV("M%u:%.1f@%.0f/%.2f;", id, a, spd, tol); ang[id] = a; now += 300;
+    (void)extra; a = clampa(id, a); EV("M%u:%.1f@%.0f/%.2f;", id, a, spd, tol); ang[id] = a; sgoal[id] = a; now += 300;
 }
 static void away(void) { ang[1] = 300.0f; ang[2] = -700.0f; }   /* 手臂先摆到别处，下一个动作一定要转 */
 void Emm_V5_En_Control(uint8_t a, bool s, bool f) { (void)a; (void)s; (void)f; }
@@ -1179,6 +1191,72 @@ int main(void) {
     clear();
     CHECK(run("TAKE 1") == 1, "开机以后不算夹着");
     run("CLAW O"); run("LIFT 60");
+
+    /* ---- (10-23 用户"到原料区、粗加工区、暂存区之前机械臂提前转到需要的姿态，节省时间")PRE RAW / PRE RING：
+     *      车开往工位的最后一段直线之前发；照 OBS 的路线转(绕电池盒)，要看着角度发的指令发完就回，不等转完；不降到观察高度 ---- */
+    {
+        uint32_t t0;
+
+        Arm_Param_Set("OVLAP", 1); Arm_Param_Set("PARA", 1); Arm_Param_Set("ZHI", 100); Arm_Param_Set("ZOBRAW", 90); Arm_Param_Set("ZOBRNG", 90);
+        Arm_Param_Set("ASPD", 90); Arm_Param_Set("ROTSPD", 0); Arm_Param_Set("EXTSPD", 0); Arm_Param_Set("A1D", 323); Arm_Param_Set("A2R", -862);
+        Arm_Param_Set("A1G", 100); Arm_Param_Set("A2E", -950); Arm_Param_Set("A1P", 200); Arm_Param_Set("A2P", -800);
+        Arm_Param_Set("A1T1", 150); Arm_Param_Set("A2T", -700); Arm_Param_Set("A1T2", 280); Arm_Param_Set("A2SPD", 400); Arm_Param_Set("A2STG", 0);
+        Arm_Param_Set("R1T1", 230); Arm_Param_Set("R2T", -650); Arm_Param_Set("R1T2", 300); Arm_Param_Set("R2SPD", 500); Arm_Param_Set("R2STG", 0);
+        run("CLAW O"); run("LIFT 100");
+        slow = 1; ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear(); t0 = now;
+        CHECK(run("PRE RAW") == 1, "PRE RAW：回 DONE");
+        CHECK(at("S1:100.0") >= 0 && at("S2:-950.0@400") > at("S1:100.0") && !has("S2:-700.0"),
+              "PRE RAW 在车上转盘上方：和 OBS 一样 ID1 一直转，转过 A1T2 伸缩直接到 A2E");
+        CHECK(ang[1] > 200.0f && now - t0 < 1500u && !has("H1:"), "PRE RAW：伸缩指令发了就回，不等 ID1 转完(还在半路，没停住)");
+        CHECK(has("O;") && !has("L+") && !has("L-"), "PRE RAW：张开夹爪；本来在 ZHI，升降不动、不降到观察高度");
+        HAL_Delay(3000);                                  /* 车开过去的这段时间舵机自己转完 */
+        CHECK(ang[1] == 100.0f && ang[2] == -950.0f, "车开过去的路上手臂转到了观察姿态");
+        clear();
+        CHECK(run("OBS RAW O") == 1 && !has("S1:") && !has("S2:") && has("H1:") && has("H2:") && has("L-800;"),
+              "到了再 OBS RAW：已经在姿态上，舵机只原地保持，只降到观察高度");
+        /* 圆环那组：转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P，这一条发了就回 */
+        run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear(); t0 = now;
+        CHECK(run("PRE RING") == 1 && at("S1:200.0") >= 0 && at("S2:-650.0@500") > at("S1:200.0") && at("S2:-800.0@500") > at("S2:-650.0@500"),
+              "PRE RING 在车上转盘上方：ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P");
+        CHECK(ang[1] > 205.0f && ang[1] <= 231.0f && !has("H1:"), "PRE RING：转过 R1T1 发完最后一条伸缩就回(ID1 还没到 A1P)");
+        /* 不在车上转盘上方：两个一起发，马上回 */
+        HAL_Delay(3000); ang[1] = sgoal[1] = 120.0f; ang[2] = sgoal[2] = -862.0f;
+        clear(); t0 = now;
+        CHECK(run("PRE RING") == 1 && has("S1:200.0@90") && has("S2:-800.0@90") && now - t0 < 100u && ang[1] < 125.0f,
+              "PRE RING 不在车上转盘上方：ID1、ID2 一起发，不等就回");
+        /* 已经在姿态上的那个只原地保持 */
+        HAL_Delay(3000); clear();
+        CHECK(run("PRE RING") == 1 && !has("S1:") && !has("S2:") && has("H1:200.0") && has("H2:-800.0"), "PRE：已经在姿态上就只原地保持");
+        /* 升降不在最高处：先升到 ZHI 再转 */
+        run("LIFT 60"); ang[1] = sgoal[1] = 120.0f; clear();
+        CHECK(run("PRE RAW") == 1 && at("L+3200;") >= 0 && at("S1:100.0") > at("L+3200;"), "PRE：升降不在最高处，先升到 ZHI 再转");
+        /* 分段走(A2STG=1)：前面几段照样一段一段等，最后一转不等 */
+        HAL_Delay(3000); Arm_Param_Set("A2STG", 1); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f; clear();
+        CHECK(run("PRE RAW") == 1 && at("M1:280.0") >= 0 && at("M2:-950.0@400") > at("M1:280.0") && at("S1:100.0") > at("M2:-950.0@400")
+              && !has("M1:100.0") && ang[1] > 250.0f, "PRE 分段走：只转到 A1T2 -> 伸缩 -> 最后转到 A1G 这一下不等");
+        Arm_Param_Set("A2STG", 0);
+        /* PARA=0：先转好再伸缩(伸缩不等) */
+        HAL_Delay(3000); Arm_Param_Set("PARA", 0); ang[1] = sgoal[1] = 120.0f; ang[2] = sgoal[2] = -862.0f; clear();
+        CHECK(run("PRE RING") == 1 && at("M1:200.0") >= 0 && at("S2:-800.0") > at("M1:200.0") && !has("M2:"), "PRE PARA=0：先转 ID1(等)，再发伸缩(不等)");
+        Arm_Param_Set("PARA", 1);
+        HAL_Delay(3000); slow = 0;
+        /* 不做的情况 */
+        clear();
+        CHECK(run("PRE FOO") == -1 && pis("ERR ARG") && run("PRE") == 0, "PRE 参数不对：ERR ARG；PRE 不带参数不是机械臂指令");
+        Arm_Param_Set("ARMOK", 0); clear();
+        CHECK(run("PRE RAW") == -1 && pis("ERR NOCAL") && !has("S1:"), "ARMOK=0：PRE 拒绝");
+        Arm_Param_Set("ARMOK", 1);
+        away(); run("TAKE 1"); clear();
+        CHECK(run("PRE RAW") == -1 && pis("ERR HOLD") && !has("S1:") && !has("O;"), "爪子里夹着物料：PRE 不做(不张开、不转)");
+        run("CLAW O");
+        Arm_Param_Set("OVLAP", 0); Arm_Param_Set("ZHI", 0); Arm_Param_Set("ZOBRAW", 0); Arm_Param_Set("ZOBRNG", 0);
+        Arm_Param_Set("A1G", 323); Arm_Param_Set("A2E", -862); Arm_Param_Set("A1P", 323); Arm_Param_Set("A2P", -862);
+        Arm_Param_Set("A1T1", 0); Arm_Param_Set("A2T", 0); Arm_Param_Set("A1T2", 0); Arm_Param_Set("A2SPD", 0);
+        Arm_Param_Set("R1T1", 0); Arm_Param_Set("R2T", 0); Arm_Param_Set("R1T2", 0); Arm_Param_Set("R2SPD", 0);
+        run("LIFT 60");
+    }
 
     /* ---- GET/SET 用的接口 ---- */
     clear();
