@@ -208,11 +208,17 @@ DEFAULTS = dict(
     raw_near_away_mm=80.0,              #   往外最多 80mm、
     raw_near_along_mm=120.0,            #   前后最多 ±120mm；按地图查过：会出场地、离黄色区/障碍物太近的那边少挪
     raw_near_wait_s=4.0,                #   到了先原地看几秒(外圈、物料都看不到才开始挪着找；看到一个物料马上往那边挪)
-    raw_near_find_s=90.0,               #   找 + 对准一共最多多少秒(跟丢了停下接着找，不放弃；到时间还没对上才这一批不抓)
+    raw_near_find_s=30.0,               #   找 + 对准一共最多多少秒(跟丢了停下接着找；到时间还没对上才这一批不抓)。(10-23 以前 90 秒；
+                                        #   说好的 20 秒在仿真里不够：车停偏 6cm、一开始什么都看不到时要 22~30 秒才找得到，20 秒会三个都不夹)
     raw_near_lost_s=4.0,                #   对准时连着几秒认不出圆心算跟丢了
     raw_near_step_mm=40.0,              #   都看不到时挪着找：每隔多少毫米看一处
     raw_near_max_mm=150.0,              #   认出圆心以后：对准的地方(就是示教时车停的地方)在上面的范围外也挪过去，但最多离示教时停的地方这么远
     raw_center_mats_every=5,            #   对准时认出外圈以后每几帧才认一次物料(只认外圈快得多)
+    raw_rim_tol=0.15,                   # (10-23)比赛时认出的原料盘外圈半径和示教时差多少以内才算认对(比例)：差得多 = 认成了别的圆，这一帧不用
+                                        #   (10-23 实车认成了半径 102mm、85mm 的圆，示教时约 135mm，车追着它横挪了几十秒，三个都没夹)
+    raw_orbit_tol=0.2,                  # (10-23)只靠物料算圆心时：物料所在圆的半径和示教时差多少以内才算认对(比例)
+    raw_meas_every_s=0.5,               # (10-23 用户"识别慢")对准时车在走：每隔多久读一次 STM32 的 V?(一次要 0.2 秒左右)，中间按发的速度推算。
+                                        #   以前每帧都读，一秒只认 2 帧；测车轮和画面的对应关系时还是每帧都读(要准)
     raw_vel_back_mm=160.0,              # 原料区做完：离停车点这么多毫米以内只用 V 挪回去(不转车头)，再远才用 S/F
     raw_frame_thread=True,              # (10-18)对准圆心车在走时，认一帧放在后台线程，这边每 raw_vel_keep_s 秒给 STM32 续一次速度
     raw_vel_keep_s=0.15,                #   (STM32 0.4 秒收不到新的 V 就停车，实车上认一帧要零点几秒到一秒多：不续的话车走一下停一下)
@@ -2598,12 +2604,14 @@ class MissionHooks:
         self.log(f'    车轮：横移 1mm 画面动 {np.linalg.norm(J[:, 0]):.2f} 像素，前进 1mm 动 {np.linalg.norm(J[:, 1]):.2f} 像素(已存)')
         return J, m2[0]
 
-    def _raw_center_frame(self, colors, claw, near, hints=None, mats=True):
+    def _raw_center_frame(self, colors, claw, near, hints=None, mats=True, ref=None):
         """这一帧画面里认圆心(车在走也行：同一帧里的物料一起算)：看到 3 个以上拟合外接圆，相邻 2 个按隔 120° 算(两个解取离 near 近的)。
         返回 (圆心, 半径, 看到几个)；认不出圆心返回 (None, None, 看到几个)。
         hints：(10-20)猜的圆心 [(x, y, 外圈半径), ...]，外圈照原来的办法认不出时按露出来的那段投票找、按它们找(圆心在画面外也行，
         Vision.plate_scan)；按猜的找到的外圈，画面里看到的物料要在物料所在的圆上(差 30% 以内)才算(防认错)；外圈只露出一小段、
-        只算得出大概的圆心：不当认出来，放在 self._rc_coarse(找的时候往那边挪)。mats=False：这一帧不认物料(只认外圈，快)。"""
+        只算得出大概的圆心：不当认出来，放在 self._rc_coarse(找的时候往那边挪)。mats=False：这一帧不认物料(只认外圈，快)。
+        ref(10-23)：比赛时示教存的 (外圈半径, 物料所在圆半径) 像素：认出的外圈半径和它差 raw_rim_tol 以上、只靠物料算的圆半径差
+        raw_orbit_tol 以上，都当认错(认成了别的圆)，这一帧不用；self._rc_wide_ok = 这一帧认得够确定，可以放大挪车范围。"""
         sc = float(self.vision.scale('RAW'))
         plate = None
         cols = list(colors) if mats else []
@@ -2617,6 +2625,14 @@ class MissionHooks:
             errs = self.vision.material_errors(cols)
         P = [claw + np.asarray(q, float) for q in errs.values() if q is not None]
         self._rc_coarse = None
+        self._rc_wide_ok = False
+        rim0, orb0 = (ref or (None, None))[:2]
+        if plate is not None and rim0:
+            r_now = float(plate.get('r_now', plate['r']))
+            if abs(r_now - float(rim0)) > float(self.cfg.get('raw_rim_tol', 0.15)) * float(rim0):
+                self._rc_rej_rim = getattr(self, '_rc_rej_rim', 0) + 1    # 外圈大小和示教时对不上：认成了别的圆，不用(也不往那边挪)
+                self._rc_rej_rim_px = r_now
+                plate = None
         if plate is not None and plate.get('coarse'):
             self._rc_coarse = np.asarray(plate.get('c_now', plate['c']), float)   # 外圈只露出一小段：大概的圆心(只够知道往哪挪)
             plate = None
@@ -2633,6 +2649,7 @@ class MissionHooks:
         # 照原来的办法认出的外圈算数；按猜的圆心找到的要物料确认过才算(往原料盘那边多挪要它)
         self._rc_sure = plate is not None and (not plate.get('seek') or bool(getattr(self, '_rc_conf', False)))
         if plate is not None:
+            self._rc_wide_ok = bool(self._rc_sure)
             self._rc_rim = float(plate.get('r_now', plate['r']))
             # 10-18：用这一帧的外圈(c_now)。plate['c'] 是最近 3 帧的中值，车在走时落后一两帧，测车轮和画面的对应关系就测小了
             c = np.asarray(plate.get('c_now', plate['c']), float)
@@ -2652,6 +2669,10 @@ class MissionHooks:
         self._rc_pts = P                                       # 这一帧看到的物料(只看到一个时对准用它 + 已知半径推圆心)
         if got is None or not (10.0 * sc <= got[1] <= 250.0 * sc):
             return None, None, len(P)
+        if orb0 and abs(float(got[1]) - float(orb0)) > float(self.cfg.get('raw_orbit_tol', 0.2)) * float(orb0):
+            self._rc_rej_orb = getattr(self, '_rc_rej_orb', 0) + 1        # 物料所在圆的大小和示教时对不上：认错了物料，不用
+            return None, None, len(P)
+        self._rc_wide_ok = bool(orb0) and len(P) >= 3             # 三个物料都看到、圆的大小也对：够确定
         self._rc_note(t_cap, got[0], claw, errs)
         return got[0], got[1], len(P)
 
@@ -2936,6 +2957,17 @@ class MissionHooks:
         keep_s = float(cfg.get('raw_vel_keep_s', 0.15))
         threaded = bool(cfg.get('raw_frame_thread', True))
         self._rc_last = dict(ok=False, err_mm=None, why='')
+        ref_px = None
+        if search:                                             # (10-23)比赛时：认出的外圈、物料圆要和示教时一样大才用
+            ref_px = (float(search['rim_px']) if search.get('rim_px') else None,
+                      float(search['orbit_px']) if search.get('orbit_px') else None)
+            if ref_px[0]:
+                self._rc_rim = ref_px[0]                       # 按示教时的外圈大小猜、找(不用上一次认出的：上一次可能认错过)
+            if ref_px[1]:
+                self._rc_orbit = ref_px[1]
+        self._rc_rej_rim = self._rc_rej_orb = 0
+        self._rc_ref_last = ref_px                             # 对准以后等原料盘时顺便看车有没有被带偏(_raw_ct_watch)：也按它查大小
+        meas_every = float(cfg.get('raw_meas_every_s', 0.5))
         base = np.array([float(act.disp['S']), float(act.disp['F'])])
         rc = np.zeros(2) if rng_c is None else np.asarray(rng_c, float)[:2]
         lo, hi = -np.array([smax, fmax]), np.array([smax, fmax])        # 车轮能挪的范围(相对 rc)：[横移, 前进] 的下限、上限
@@ -2953,7 +2985,8 @@ class MissionHooks:
         if not act.vel(0.0, 0.0):
             return 'nofw'
         v0 = None if v0 is None else np.array(v0, float)
-        st = dict(p=np.zeros(2), tp=self.now(), cmd=np.zeros(2), stop_at=None, clamped=False)   # p：车走了多少(相对开始时)，tp：那时的时刻
+        st = dict(p=np.zeros(2), tp=self.now(), cmd=np.zeros(2), stop_at=None, clamped=False,   # p：车走了多少(相对开始时)，tp：那时的时刻
+                  t_meas=-1e9, t_cmd=self.now(), wide_told=False)  # t_meas：上次真读 V? 的时刻；t_cmd：速度上次变的时刻
         tm = dict(ser=0.0, mat=0.0, rim=0.0, n=0)                     # 每秒那行日志里报：串口读车走了多少、认物料、认外圈各花多少
         try:
             v.live_goal = (float(tgt(goalp, 0.0)[0]), float(tgt(goalp, 0.0)[1])) if tdir is None else None
@@ -2980,7 +3013,17 @@ class MissionHooks:
             if p is None:
                 p = pos_est()
             st['p'], st['tp'] = p, self.now()
+            st['t_meas'] = self.now()
             return p
+
+        def pos_cap(exact=False):
+            """(10-23 用户"识别慢")拍这一帧时车走了多少：测车轮和画面的对应关系(exact)、刚停下还没读过、离上次读超过 raw_meas_every_s
+            才真读 V?(一次 0.2 秒左右)，其余按发的速度推算。以前每帧都读，一秒只认 2 帧。"""
+            stopped = float(np.linalg.norm(st['cmd'])) < 1e-9
+            if (exact or meas_every <= 0.0 or self.now() - st['t_meas'] >= meas_every
+                    or (stopped and st['t_meas'] < st['t_cmd'])):
+                return pos_meas()
+            return pos_est()
 
         def send(vs, vf, run_s=None):
             """发车轮速度(到范围边上的方向不再走，st['clamped'] 记下)。run_s：最多走这么久就停(下一帧认得慢也不会走过头)。"""
@@ -2993,6 +3036,8 @@ class MissionHooks:
             if (pf >= hi[1] and vf > 0) or (pf <= lo[1] and vf < 0):
                 vf, clamped = 0.0, True
             act.vel(vs, vf)
+            if float(np.linalg.norm(np.array([vs, vf], float) - st['cmd'])) > 1e-9:
+                st['t_cmd'] = self.now()
             st['cmd'], st['clamped'] = np.array([vs, vf], float), clamped
             moving = abs(vs) > 1e-9 or abs(vf) > 1e-9
             st['stop_at'] = (self.now() + float(run_s)) if (moving and run_s is not None) else None
@@ -3025,11 +3070,14 @@ class MissionHooks:
         def recog(near, hints, mats):
             if hints is None and mats:
                 return self._raw_center_frame(colors, claw, near)            # 和以前一样(测试里有换掉它的)
-            return self._raw_center_frame(colors, claw, near, hints, mats)
+            if ref_px is None:
+                return self._raw_center_frame(colors, claw, near, hints, mats)
+            return self._raw_center_frame(colors, claw, near, hints, mats, ref_px)
 
-        def frame(near, hints=None, mats=True):
-            """认一帧圆心，返回 (圆心, 半径, 看到几个物料, 拍这一帧时车走了多少)。车在走：识别放后台线程，这边每 keep_s 秒续一次速度。"""
-            p_cap = pos_meas()
+        def frame(near, hints=None, mats=True, exact=False):
+            """认一帧圆心，返回 (圆心, 半径, 看到几个物料, 拍这一帧时车走了多少)。车在走：识别放后台线程，这边每 keep_s 秒续一次速度。
+            exact：拍这一帧时车走了多少要真读 STM32(测车轮和画面的对应关系时)。"""
+            p_cap = pos_cap(exact)
             if not threaded or float(np.linalg.norm(st['cmd'])) < 1e-9:
                 cc, rr, n = recog(near, hints, mats)
             else:
@@ -3067,6 +3115,21 @@ class MissionHooks:
             tm.update(ser=0.0, mat=0.0, rim=0.0, n=0)
             return out
 
+        rej_seen = [0, 0]
+
+        def rej_text():
+            """(10-23)上一行日志以后，因为大小和示教时对不上扔掉了几帧(认成了别的圆)。"""
+            a, b = int(getattr(self, '_rc_rej_rim', 0)), int(getattr(self, '_rc_rej_orb', 0))
+            da, db = a - rej_seen[0], b - rej_seen[1]
+            rej_seen[:] = [a, b]
+            out = []
+            if da and ref_px and ref_px[0]:
+                out.append(f'外圈大小不对 {da} 帧(认成半径 {float(getattr(self, "_rc_rej_rim_px", 0.0)) / sc:.0f}mm 的圆，'
+                           f'示教时 {ref_px[0] / sc:.0f}mm)')
+            if db:
+                out.append(f'物料所在圆大小不对 {db} 帧')
+            return ('  扔掉：' + '、'.join(out)) if out else ''
+
         def clampv(d, lim):
             n = float(np.linalg.norm(d))
             return d if n <= lim else d * (lim / n)
@@ -3082,7 +3145,7 @@ class MissionHooks:
                 t_lim = self.now() + 2.5 * pmm / spd + 3.0
                 while True:
                     self._check_abort()
-                    cc, _r, _n, pc = frame(c)
+                    cc, _r, _n, pc = frame(c, exact=True)
                     if cc is not None and float(np.linalg.norm(cc - c)) < 40.0 * sc:
                         X.append(pc)
                         Y.append(np.asarray(cc, float))
@@ -3095,7 +3158,7 @@ class MissionHooks:
                         break                                  # 到范围边上走不动了
                 send(0.0, 0.0)
                 moved.append(float(np.linalg.norm(pos_meas() - p0)))
-            cc, _r, _n, pc = frame(c)                          # 停稳以后再看一帧
+            cc, _r, _n, pc = frame(c, exact=True)              # 停稳以后再看一帧
             if cc is not None and float(np.linalg.norm(cc - c)) < 40.0 * sc:
                 X.append(pc)
                 Y.append(np.asarray(cc, float))
@@ -3151,6 +3214,11 @@ class MissionHooks:
             """认出圆心了：对准时车该停的地方就是示教时车停的地方(相对原料盘一样，不会碰到原料盘)。它在能挪的范围外(导航停偏了)
             就把范围放大到包住它(多 10mm)，最多离示教时停的地方 max_mm；再远说明导航停车点偏太多了，挪到边上为止。
             往原料盘那边超出原来的范围：外圈要是照原来的办法认出的、或者看到的物料在物料圆上(确认没认错)才放大(认错了会撞原料盘)。"""
+            if not getattr(self, '_rc_wide_ok', True):
+                if not st['wide_told']:                        # (10-23)认得不确定(外圈是按露出来的一段找的、物料也没对上)：不放大，挪近了认清楚再说
+                    st['wide_told'] = True
+                    self.log('    认出的圆心还不确定(外圈只露出一段、画面里的物料也没对上)：先不放大挪车范围，挪近了认清楚再说')
+                return
             need = (base + p_) - np.linalg.solve(sk_J[0], tgt(c_, r_) - goalp) - rc      # 对准时车该在哪(相对 rc)
             cap = float(sk.get('max_mm', 150.0))
             want = np.clip(need, -cap, cap)
@@ -3447,7 +3515,7 @@ class MissionHooks:
                     dt = self.now() - t_log
                     self.log(f'      {frames / dt:.1f} 帧/秒(认出圆心 {src["2+"]}、一个物料修正 {src["1"]}、推算 {src["推算"]})  '
                              f'{what}还偏 {em:.1f}mm  车轮 横移 {st["cmd"][0]:+.0f}、前进 {st["cmd"][1]:+.0f}mm/s'
-                             + (f'  {timing()}' if search else ''))
+                             + (f'  {timing()}' if search else '') + rej_text())
                     t_log, frames, src = self.now(), 0, {'2+': 0, '1': 0, '推算': 0}
             finish()
             c = c + J @ (st['p'] - p_c)                        # 停下的地方
@@ -4426,7 +4494,13 @@ class MissionHooks:
             if scan:
                 plate, errs = v.plate_scan(watch)
                 if plate is not None and not plate.get('coarse'):
-                    centers.append(np.asarray(plate.get('c_now', plate['c']), float))
+                    ref = getattr(self, '_rc_ref_last', None)
+                    r_now = float(plate.get('r_now', plate['r']))
+                    if ref and ref[0] and abs(r_now - float(ref[0])) > float(cfg.get('raw_rim_tol', 0.15)) * float(ref[0]):
+                        self._rc_rej_rim = getattr(self, '_rc_rej_rim', 0) + 1   # (10-23)外圈大小和示教时对不上：认错了，不拿它判断车有没有被带偏
+                        self._rc_rej_rim_px = r_now
+                    else:
+                        centers.append(np.asarray(plate.get('c_now', plate['c']), float))
             else:
                 errs = v.material_errors(watch)
             px = {c: claw + np.asarray(q, float) for c, q in errs.items() if q is not None}
@@ -4703,6 +4777,10 @@ class MissionHooks:
                 raise
             m = None
             self.log(f'    ★ 对准原料盘中心出错：{ex}')
+        nrej = int(getattr(self, '_rc_rej_rim', 0)) + int(getattr(self, '_rc_rej_orb', 0))
+        if nrej >= 5:                                          # (10-23)认出的大小老是和示教时对不上：多半是示教过时了
+            self.log(f'    ★ 这次有 {nrej} 帧认出的原料盘外圈或物料圆大小和示教时对不上(当认错扔掉了)。'
+                     '手臂、摄像头、看原料盘的高度(ZOBRAW)、A1G/A2E 改过的话，要重新 rteach RAW near')
         if m is None:
             return give_up('认不出原料盘中心、车轮对不准：这次不抓(示教的角度是按对准以后的位置记的，没对准就下爪会砸到物料)')
         info = getattr(self, '_rc_last', None) or {}

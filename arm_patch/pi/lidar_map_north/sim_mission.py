@@ -3402,8 +3402,65 @@ class RawNearSlotTests(unittest.TestCase):
                     return {k: None for k in out} if w.off_s > st['x'] - 30.0 else out
                 vis.material_errors = mats
             w, h, text, _n0 = self._far_run(seed, side=-90.0, hook=hook)
-            self.assertIn('没有物料确认', text)
+            self.assertIn('认出的圆心还不确定', text)                   # (10-23)没确认之前一点都不放大(以前往原料盘那边先只挪 40mm)
             self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_wrong_size_rim_is_thrown_away(self):
+        """(10-23 实车：比赛时认成了半径 102mm、85mm 的圆(示教时约 135mm)，车追着它横挪了几十秒，三个都没夹)
+        外圈大小和示教时差 15% 以上当认错扔掉：不追着它挪车、不按它放大范围；真的外圈认出来以后照样对准，三个都夹到。"""
+        for seed in (1, 2):
+            def hook(w, h):
+                vis = h.vision
+                orig = vis.plate_scan
+                n = dict(k=0)
+
+                def scan(colors, hints=None):                          # 前 25 帧认成一个小三成、偏到右上方的圆
+                    pc, out = orig(colors, hints)
+                    n['k'] += 1
+                    if n['k'] <= 25:
+                        cl = vis.claw('RAW')
+                        fake = (cl[0] + 120.0, cl[1] - 60.0)
+                        r = 0.7 * w.scale['RAW'] * (w.plate_r + 60.0)
+                        pc = dict(c=fake, r=r, stable=True, rms=1.0, c_now=fake, r_now=r)
+                    return pc, out
+                vis.plate_scan = scan
+            w, h, text, _n0 = self._far_run(seed, side=-20.0, hook=hook)
+            self.assertIn('外圈大小不对', text)
+            self.assertNotIn('能挪的范围放大', text)                    # 没有按认错的圆放大范围、追过去
+            self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
+
+    def test_v_read_not_every_frame(self):
+        """(10-23 用户"识别慢")对准时车在走：不再每认一帧就读一次 STM32 的 V?(实车一次要 0.2 秒)，
+        0.5 秒读一次，中间按发的速度推算；照样对准，三个都夹到。"""
+        cnt = dict(v=0, f=0, on=False)
+
+        def hook(w, h):
+            orig = w.handle
+
+            def handle(text):
+                if text.strip() == 'V?' and cnt['on']:
+                    cnt['v'] += 1
+                return orig(text)
+            w.handle = handle
+            real = h._raw_center_frame
+
+            def frame(*a):
+                cnt['f'] += int(cnt['on'])
+                return real(*a)
+            h._raw_center_frame = frame
+            align = h._raw_center_align_smooth
+
+            def align2(*a, **kw):                                     # 只数对准原料盘中心这一段里的(挪回停车点那些另算)
+                cnt['on'] = True
+                try:
+                    return align(*a, **kw)
+                finally:
+                    cnt['on'] = False
+            h._raw_center_align_smooth = align2
+        w, h, text, _n0 = self._far_run(1, side=-60.0, hook=hook)
+        self.assertGreater(cnt['f'], 20, text[-2000:])
+        self.assertLess(cnt['v'], 0.6 * cnt['f'], (cnt, text[-2000:]))
+        self.assertEqual((h.stats.grab_ok, w.air, w.loose, w.collisions), (3, 0, 0, 0), text[-3000:])
 
     def test_near_box_from_map(self):
         """能挪的范围按地图查：停车点离场地北边近(原料盘在北边)，往原料盘那边少挪一点；前后没东西挡着照旧 ±120mm；
