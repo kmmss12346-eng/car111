@@ -796,3 +796,8 @@ git_log.txt                ← 分支最近 120 条提交记录
     上面不够 15mm 少走一点，不够 4mm 才往下 4mm。跑的过程中的保活(keepalive_lift_mm=4，mission_cfg 里可调)没改。
   - `_bail_out`(停车点里意外出错)清掉提前摆臂标记(d2b76b1)：爪子里可能有东西不收臂时，以前后面每一站都不再提前摆臂。
   - 任务命题文档第五版交给用户(第四版第 1 部分 290 字超了 200 字限制，作废)。字数按正文+表题+表格逐字数。
+  - 配置、示教文件防断电写坏(74c7f97)：一键启动 = 整车电闸，bootrace / save / 示教完可能马上关电。配置(map_merge_live、arm_calib)、
+    place_adj.json(mission_hooks.save_json、mission_cli)改成临时文件 + fsync + 改名；vision_cal.json、servo_cal.json 加 fsync。
+    boot_race.sh 的日志同时存 logs/boot_月日_时分秒.log。部署包 tasks_1023h(= 1023g + 这些)。
+  - **注意：车上的 apply_mission_config.py(10-22 备份)比仓库旧**(没有 _migrated 那套"每条升级只做一次"、qr_fallback_code 删除)。
+    仓库版会按迁移表改 mission_cfg 里的值(比如 raw_track_s)，所以 1023h 没带它；要换先和用户确认。
