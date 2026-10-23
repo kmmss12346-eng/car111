@@ -741,5 +741,14 @@ git_log.txt                ← 分支最近 120 条提交记录
   看圆环那几步说一句红十字是什么；A1P、R1、R3 的说明加了"把圆环中心对到红十字上，用红十字对就别降低高度"。
   红十字是爪子相对摄像头的真实位置，手臂转到 1、3 号环也照样准(摄像头装在爪子上)，但要在 ZOBRNG 的高度看(降低了有视差)。
   车上的 J、r2off -15/30：红十字在绿十字 (-1, +34) 像素。更新包 calib_1023b.zip(arm_calib.py、vlive.py)。
+- **10-23 屏幕只显示赛规要的字(用户"不需要显示那个什么启停区域1还是2了，按要求帮我显示好必要的字")：** 赛规(附件2-1/2-2，用户发的 PDF 和
+  docs/rules 里的一样)：读到码后一直显示任务码(字高≥12mm)，回家后显示正确抓取数、正确放置数；一键启动要有明确标识。
+  固件 arm.c：开机只清屏(不再显示选区页、不写 READY)；准备页(ZONE 1|2)只画大 START(不写 ZONE n、没有状态行和 BACK，右上角按了不算)；
+  ZONE MSG 只记不画(选区页 ZONE ASK 留着给旧流程)。树莓派：`race 1` / `race 2` 在终端选区(不写用配置 start_zone；race_auto 也用它)，
+  race_flow 发 ZONE n 不再发 ZONE ASK，ZONE? 回 0 区(STM32 重启)每 2 秒再发 ZONE n；mission_hooks `screen_show`(默认 code/code2/grab/place)
+  之外的 _ui 都不写屏，_show_stats 只写做成的个数(GRAB 3、PLACE 5)，prepare 先 ZONE LOCK 清屏(不再写 ---)。
+  用户说一键启动是"整车电闸"：已告诉用户按"15 秒不动本轮结束"树莓派开机来不及，建议电一直开着用屏上 START 或另接按键；用户说先别管线，先改屏幕。
+  测试：STM32 主机 317/222/42，树莓派 634 个(3 跳过)只有 test_ringdet 那一项(环境)。更新包 screen_1023c.zip(arm.c 要烧录；auto_run.py、
+  map_merge_live.py、mission_hooks.py)。
 
 

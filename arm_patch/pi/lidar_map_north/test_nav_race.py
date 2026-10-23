@@ -1,4 +1,4 @@
-"""比赛流程(屏幕选区 -> 扫描、预先规划 -> 按 START 一键开跑)、手臂轻摆保活、退出收臂停 60mm、开跑后不再问 y 的测试(1010)。
+"""比赛流程((10-23)终端 race 1|2 选区、屏上只有 START -> 扫描、预先规划 -> 按 START 一键开跑)、手臂轻摆保活、退出收臂停 60mm、开跑后不再问 y 的测试(1010)。
 python3 -m unittest test_nav_race"""
 import threading
 import time
@@ -55,13 +55,13 @@ class RaceCtx:
         return self.still(self.clock.t)
 
 
-def run_race(script, ctx_kw=None, park='ok'):
+def run_race(script, ctx_kw=None, park='ok', zone=None, logs=None):
     clock = Clock()
     car = SimCar((2250.0, 150.0, 90.0), zone_script=script)
     ctx = RaceCtx(clock, **(ctx_kw or {}))
     runs = []
-    st = auto_run.race_flow(ctx, car, lambda m: None, {'race_check_s': 0}, lambda z, sc: runs.append((z, sc)),
-                            now=clock.now, sleep=clock.sleep)
+    st = auto_run.race_flow(ctx, car, (logs.append if logs is not None else (lambda m: None)), {'race_check_s': 0},
+                            lambda z, sc: runs.append((z, sc)), now=clock.now, sleep=clock.sleep, zone=zone)
     return st, car, ctx, runs, clock
 
 
@@ -70,7 +70,8 @@ class RaceTests(unittest.TestCase):
         script = [(0, 0)] * 3 + [(2, 0)] * 15 + [(2, 1)]
         st, car, ctx, runs, clock = run_race(script)
         self.assertEqual(st, 'started')
-        self.assertEqual(car.requests[0], 'ZONE ASK')
+        self.assertEqual(car.requests[0], 'ZONE 2', '(10-23)不再发 ZONE ASK(选区页)：直接发配置里的启停区，屏上只有 START')
+        self.assertNotIn('ZONE ASK', car.requests)
         self.assertEqual([c[0] for c in ctx.calls], ['zone', 'scan', 'preplan'])
         self.assertEqual(ctx.calls[0], ('zone', 2))
         msgs = [r for r in car.requests if r.startswith('ZONE MSG')]
@@ -120,12 +121,30 @@ class RaceTests(unittest.TestCase):
         self.assertEqual([c[0] for c in ctx.calls].count('scan'), 2)
         self.assertEqual(runs, [(2, True)])
 
-    def test_back_and_rechoose_rescans_new_zone(self):
-        script = [(2, 0)] * 15 + [(0, 0)] * 3 + [(1, 0)] * 15 + [(1, 1)]
+    def test_zone_lost_then_changed_rescans_new_zone(self):
+        """(10-23)STM32 那边的区没了(重启过)：再发一次 ZONE 2；之后终端 zone 1 改了区：按 1 区重新扫描。"""
+        script = [(2, 0)] * 15 + [(0, 0)] * 10 + [(1, 0)] * 15 + [(1, 1)]
         st, car, ctx, runs, clock = run_race(script)
         self.assertEqual([c for c in ctx.calls if c[0] == 'zone'], [('zone', 2), ('zone', 1)])
         self.assertEqual([c[0] for c in ctx.calls].count('scan'), 2)
+        self.assertGreaterEqual(car.requests.count('ZONE 2'), 2, '区没了要再发一次 ZONE 2(屏上重新出 START)')
         self.assertEqual(runs, [(1, True)])
+
+    def test_zone_from_race_command(self):
+        """(10-23)race 1：发 ZONE 1(屏上只出 START，不显示区号)，按 1 区扫描、开跑；终端里说清楚是几区。"""
+        logs = []
+        st, car, ctx, runs, clock = run_race([(1, 0)] * 15 + [(1, 1)], zone=1, logs=logs)
+        self.assertEqual(car.requests[0], 'ZONE 1')
+        self.assertEqual(runs, [(1, True)])
+        self.assertTrue(any('启停区 1' in l and 'race 1 或 race 2' in l for l in logs), logs[:3])
+        self.assertTrue(any('可以按屏上的 START' in l for l in logs), logs)
+
+    def test_zone_lost_for_long_resends_every_two_seconds(self):
+        """STM32 一直回 0 区：每 2 秒再发一次 ZONE n，不是每次问都发(串口别刷屏)。"""
+        st, car, ctx, runs, clock = run_race([(0, 0)] * 40 + [(2, 1)], zone=2)
+        n = car.requests.count('ZONE 2')
+        self.assertTrue(4 <= n <= 8, n)
+        self.assertEqual(runs, [(2, False)])
 
     def test_start_before_scan(self):
         st, car, ctx, runs, clock = run_race([(2, 1)])

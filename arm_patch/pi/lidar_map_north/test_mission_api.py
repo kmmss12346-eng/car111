@@ -26,14 +26,16 @@ def f_moves(w, zone=None):
 
 class PrepareTests(unittest.TestCase):
     def test_prepare_inits_arm_clears_old_code_and_screen(self):
-        """出发后马上 prepare：机械臂初始化 + 收臂、清掉 STM32 里存着的旧码、屏上任务码写 ---；再调一次什么也不重做。"""
+        """出发后马上 prepare：机械臂初始化 + 收臂、清掉 STM32 里存着的旧码；(10-23)清屏(ZONE LOCK)，屏上只写 GRAB 0、PLACE 0
+        (任务码读到再写，阶段/提示/B1 B2 都不写)；再调一次什么也不重做。"""
         w = SimWorld(seed=1, code=CODE, qr_stale='111+222+333+123')
         h, lines = hooks(w)
         self.assertTrue(h.prepare(w.link, lines.append))
         self.assertIn('STOW', w.requests)
         self.assertIn('QR CLR', w.requests)
         self.assertIsNone(w.qr_code)                                 # 旧码清掉了
-        self.assertEqual((w.screen['t0'], w.screen['t7']), ('---', '---'))
+        self.assertIn('ZONE LOCK', w.requests)
+        self.assertEqual(w.screen, {'t2': 'GRAB 0', 't3': 'PLACE 0'})
         n = len(w.requests)
         self.assertTrue(h.prepare(w.link, lines.append))
         self.assertEqual(len(w.requests), n)                         # 做过的不再做
@@ -61,7 +63,7 @@ class PrepareTests(unittest.TestCase):
                 self.fail(f'{kw}: prepare 抛了 {ex!r}')
             if 'armok' in kw:
                 self.assertFalse(ok)
-                self.assertEqual(w.screen.get('t4'), 'ARM OFF')
+                self.assertNotIn('t4', w.screen)                      # (10-23)屏上不写提示(ARM OFF 只在终端日志里)
         w = SimWorld(seed=2, code=CODE)
         h, lines = hooks(w)
         h.vision.open = lambda: (_ for _ in ()).throw(RuntimeError('没有 /dev/video0'))
@@ -190,7 +192,7 @@ class ClockTests(unittest.TestCase):
         self.assertEqual(done[-1], 'START1')
         self.assertLess(len(done), 8, done)                          # 第二批做不完：中途直接回家
         self.assertLessEqual(w.t, 180.0, text)                       # 按估计的路上时间，3 分钟内回到启停区
-        self.assertEqual(w.screen['t1'], 'DONE')
+        self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})   # (10-23)屏上只有任务码、抓取数、放置数(不写阶段 DONE)
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
 
     def test_rough_without_time_for_temp_leaves_materials(self):
@@ -335,7 +337,7 @@ class ErrorTests(unittest.TestCase):
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
         text = '\n'.join(lines)
         self.assertIn('出了意外的错', text)
-        self.assertEqual(w.screen['t1'], 'DONE')
+        self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})   # (10-23)屏上只有任务码、抓取数、放置数(不写阶段 DONE)
         self.assertEqual(rings_placed(w, 'ROUGH'), 0)                # 粗加工区没做
         self.assertEqual(len([p for p in w.placed if p[0] == 'TEMP']), 3)   # 物料还在车上：暂存区照常放
         self.assertIn('底盘挪回停车点：前进 -37mm', text)             # 出错前挪过的底盘挪回去了
@@ -347,7 +349,7 @@ class ErrorTests(unittest.TestCase):
         h, lines = hooks(w)
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
         self.assertIn('再收一次', '\n'.join(lines))
-        self.assertEqual(w.screen['t1'], 'DONE')
+        self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})   # (10-23)屏上只有任务码、抓取数、放置数(不写阶段 DONE)
 
 
 def rings_placed(w, zone):
@@ -618,7 +620,7 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(h2.prepare(w2.link, lines2.append))         # 机械臂没准备好：返回 False，不抛异常
         self.assertIn('QR CLR', w2.requests)                         # 旧码照样清掉
         self.assertIsNone(w2.qr_code)
-        self.assertEqual(w2.screen.get('t0'), '---')
+        self.assertIsNone(w2.screen.get('t0'))                       # (10-23)清屏：旧任务码擦掉，读到码再写
 
     def test_prepare_after_abort_does_nothing_else(self):
         w = SimWorld(seed=2, code=CODE, qr_stale='111+222+333+123', abort_at=('STOW', 1))

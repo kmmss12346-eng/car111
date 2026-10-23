@@ -362,7 +362,9 @@ DEFAULTS = dict(
     return_bias=False,                   # 回到记下的姿态时，按前几次"转回来总是多转/少转几度"提前补上(省掉"再转一次")
     return_preload_deg=[0.0, 0.0],      # 回到记下的姿态前，先从反方向多转这些度(ID1, ID2)再回来，消除齿轮间隙；0=不用
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
-    screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
+    screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),
+    screen_show=('code', 'code2', 'grab', 'place'),   # (10-23 用户"按要求显示必要的字")屏上只写这几样：任务码两行、抓取数、放置数
+                                        #   (赛规：一直显示任务码，回家后显示正确抓取数、正确放置数)；阶段、提示、B1/B2 只在终端日志里   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
 
 
@@ -793,10 +795,10 @@ class MissionHooks:
     def prepare(self, link, log=None):
         """一键出发以后马上调(第二站动作之前)：把开跑前能做的先做掉，到了 QR 点就不用再等。
           机械臂初始化 + 收臂(STOW)、同步参数(和第一次 task 一样)；
-          QR CLR：清掉 STM32 里存的旧任务码(上一轮/调试时扫过的)，屏上任务码写 ---(STM32 的 QR CLR 不清屏)；
+          QR CLR：清掉 STM32 里存的旧任务码(上一轮/调试时扫过的)；(10-23)清屏(ZONE LOCK)，屏上先只写 GRAB 0、PLACE 0；
           打开摄像头。
         调多次没关系(做成过的不再做)；出错只记日志、不抛异常(导航照常走；到 QR 点 task 会再初始化)。返回机械臂是否就绪。
-        要在 ZONE LOCK(屏回到比赛画面、清屏)之后调：这里写的 --- 才不会被清掉。"""
+        比赛(race)时在 ZONE LOCK 之后调；这里自己也清一次屏(go 的时候屏上还留着上一次的字)。"""
         if log is not None:
             self.log = log
         if self._aborted:
@@ -830,15 +832,10 @@ class MissionHooks:
                     self.log(f'  开跑前扫码器刚读到任务码 {u.get()}：到 QR 点直接用它')
                 if ok is False:
                     raise ArmError('QR CLR 没有回 DONE')
-                self.arm.screen_reset()             # 屏可能刚清过(ZONE LOCK)：每个控件都重新写
-                self._ui('code', '---')
-                self._ui('code2', '---')
-                self._ui('b1', 'B1 ---')
-                self._ui('b2', 'B2 ---')
-                self._ui('stage', 'RUN')
+                self._screen_clear()                # (10-23)清屏：上一次的任务码擦掉，读到码再写；屏上先只有 GRAB 0、PLACE 0
                 self._show_stats()
                 self._prep['qr'] = True
-                self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上任务码先显示 ---')
+                self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上的字也清了(读到任务码再显示)')
             except Exception as ex:
                 if isinstance(ex, ArmAbort):
                     self._aborted = True
@@ -1245,9 +1242,21 @@ class MissionHooks:
     def _ui(self, key, text):
         if self.arm is None:
             return
+        if key not in (self.cfg.get('screen_show') or ()):   # (10-23)屏上只写赛规要的：任务码、抓取数、放置数
+            return
         obj = self.cfg['screen'].get(key)
         if obj:
             self.arm.screen(obj, text)
+
+    def _screen_clear(self):
+        """(10-23)清屏回到比赛布局(STM32 的 ZONE LOCK)：上一次跑留下的任务码、旧的字都擦掉。旧固件不认 ZONE 就算了。"""
+        try:
+            self.arm.request('ZONE LOCK', 2.0)
+        except ArmAbort:
+            raise
+        except Exception:
+            pass
+        self.arm.screen_reset()                     # 清过屏：每个控件都重新写
 
     def _check_abort(self):
         if self.ctx is not None and hasattr(self.ctx, 'aborted') and self.ctx.aborted():
@@ -1269,8 +1278,9 @@ class MissionHooks:
         return True
 
     def _show_stats(self):
-        self._ui('grab', self.stats.grab_text())
-        self._ui('place', self.stats.place_text())
+        # (10-23)屏上只写做成的个数(GRAB 3、PLACE 5)，和回家以后一样：赛规要显示"正确抓取数量和正确放置数量"，3/6 这种裁判看不懂
+        self._ui('grab', self.stats.final_grab_text())
+        self._ui('place', self.stats.final_place_text())
 
     def _recover(self, why):
         """单个物料出错后：尽量把手臂收好。收不好就停下整个路线(带着伸出的手臂乱走不安全)。"""

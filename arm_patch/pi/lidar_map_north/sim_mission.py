@@ -524,6 +524,8 @@ class SimWorld:
                 info.append(f'ZONE {int(self.zone_fw[0])} {int(self.zone_fw[1])}')
             elif len(parts) >= 2 and parts[1] in ('1', '2'):
                 self.zone_fw = (int(parts[1]), 0)
+            elif len(parts) >= 2 and parts[1] == 'LOCK':
+                self.screen = {}                                   # arm.c ZONE LOCK：清屏回到比赛布局
             return True, 'DONE', info
         if verb == 'PARK':
             if not self.park_cmd:
@@ -1134,14 +1136,13 @@ class MissionSimTests(unittest.TestCase):
         h = make(w)
         run_mission(w, h)
         s = w.screen
-        self.assertEqual((s['t0'], s['t7']), ('156+123+', '516+231'))     # 屏上的任务码带上两组之间的 +
-        self.assertEqual(s['t2'], 'GRAB 6')                                # 回家以后只显示做成的个数
-        self.assertEqual(s['t3'], 'PLACE 12')
-        self.assertEqual(s['t1'], 'DONE')
-        self.assertEqual(s['t5'], 'B1 RED1 BLK2 LBL3')
-        self.assertEqual(s['t6'], 'B2 BLK2 RED3 LBL1')
-        self.assertTrue(s['t4'].startswith('T='))
+        # (10-23 用户"按要求帮我显示好必要的字")屏上只有：任务码两行、正确抓取数、正确放置数；阶段、提示、B1/B2 都不写
+        self.assertEqual(s, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 6', 't3': 'PLACE 12'})
         self.assertTrue(all(all(ord(ch) < 128 for ch in v) for v in s.values()))
+        scr = [r for r in w.requests if r.startswith('SCR ')]
+        self.assertTrue(scr)
+        self.assertEqual({r.split()[1] for r in scr}, {'t0', 't7', 't2', 't3'}, scr)
+        self.assertFalse([r for r in scr if '/' in r], '跑的过程中也只写做成的个数(GRAB 3，不写 GRAB 3/6)')
 
     def test_chassis_returns_to_stop_point(self):
         w = SimWorld(seed=2, code=self.CODE)
@@ -1164,7 +1165,7 @@ class MissionSimTests(unittest.TestCase):
         run_mission(w, h)
         self.assertEqual(w.air, 0)
         self.assertEqual([r for r in w.requests if r.split()[0] in ('OBS', 'GRAB', 'PICK', 'TAKE', 'DROP')], [])
-        self.assertEqual(w.screen.get('t4', '')[:2], 'T=')
+        self.assertEqual(w.screen, {'t2': 'GRAB 0', 't3': 'PLACE 0'})      # (10-23)没读到码：任务码空着，只有抓取数、放置数
         self.assertEqual(h.stats.grab_total, 0)
 
     def test_bad_qr_code(self):
@@ -1284,7 +1285,7 @@ class MissionSimTests(unittest.TestCase):
         h = make(w, dict(time_limit_s=60.0))
         run_mission(w, h)
         self.assertLess(h.stats.place_total, 12)
-        self.assertEqual(w.screen['t1'], 'DONE')
+        self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})          # (10-23)屏上不写阶段(DONE)
 
     def test_noisy_camera_still_places_within_ring2(self):
         """摄像头噪声大(1.5 像素)、停车误差 15mm：平放的照样在 2 环以内(<4mm)；码垛容差本来就是 2.5mm(不掉下来就得分)，放宽到 6mm。"""

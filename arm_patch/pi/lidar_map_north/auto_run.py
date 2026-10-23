@@ -1782,11 +1782,13 @@ def zone_msg(link, text):
     return zone_request(link, 'ZONE MSG ' + t)[0]
 
 
-def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sleep):
+def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sleep, zone=None):
     """比赛流程(一键启动，开始后不再碰车和电脑)：
-    1 发 ZONE ASK：屏上显示"选启停区 1 / 2"；
-    2 一直问 ZONE?：选了区就切换到那个区，等车放好、不动了(陀螺仪 ~2 秒稳定)，先做第一次扫描并预先规划，
-      屏上状态行显示 SCAN / PLAN / READY / ERR…；车又被挪动(陀螺仪变了 >2° 或雷达看到挪了)或者按了 BACK 重新选，就重新扫描；
+    1 (10-23 用户"不需要显示启停区1还是2")启停区在终端选：race 1 / race 2(zone，不写就用配置里的 start_zone)。
+      发 ZONE n：屏上只出一个大 START(不显示区号)；
+    2 一直问 ZONE?：选了区就切换到那个区，等车放好、不动了(陀螺仪 ~2 秒稳定)，先做第一次扫描并预先规划(进度只在终端里说；
+      ZONE MSG 照样发，新固件不显示)；车又被挪动(陀螺仪变了 >2° 或雷达看到挪了)或者终端 zone 1/2 改了区，就重新扫描；
+      STM32 重启过(ZONE? 回 0 区，START 没了)：再发一次 ZONE n；
     3 屏上按 START：ZONE LOCK，start_run(区, 扫过没有) 开跑，之后不再问任何问题。
     固件不认识 ZONE(回 ERR)：返回 'nozone'，用配置里的 start_zone 和终端的 go 启动。"""
     g = (cfg or {}).get
@@ -1795,13 +1797,21 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
     still_deg = float(g('race_still_deg', 0.3))
     move_deg = float(g('race_move_deg', 2.0))
     check_s = float(g('race_check_s', 5.0))
-    ok, rep, _ = zone_request(link, 'ZONE ASK')
+    try:
+        want = int(zone if zone is not None else (g('start_zone', 2) or 2))
+    except (TypeError, ValueError):
+        want = 2
+    if want not in (1, 2):
+        want = 2
+    ok, rep, _ = zone_request(link, f'ZONE {want}')
     if not ok:
-        log(f'STM32 不认识 ZONE 指令({rep})：屏幕不能选启停区。用配置里的 start_zone={g("start_zone", 2)}，'
+        log(f'STM32 不认识 ZONE 指令({rep})：屏上没有 START。用配置里的 start_zone={g("start_zone", 2)}，'
             '终端输入 zone 1 / zone 2 选区，再输入 go 开始。')
         return 'nozone'
-    log('屏幕上选启停区(1 或 2)，把车放好，等屏上显示 READY 后按 START。终端输入 abort 取消。')
+    log(f'启停区 {want}(抽到别的区：abort 以后输入 race 1 或 race 2)。把车放好，等终端说"可以按 START"以后按屏上的 START。'
+        '终端输入 abort 取消。')
     zone = None
+    t_resend = now()
     scanned = False
     yaws = []
     t_zone = now()
@@ -1829,14 +1839,19 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
         fails = 0
         z, s = q
         if z == 0:
+            # (10-23)屏上不选区了：STM32 重启过(或者别处发了 ZONE ASK)，START 没了，再发一次本区的 ZONE n
             if zone is not None:
-                log('  屏上回到了选区页面：重新选启停区。')
+                log(f'  STM32 那边的启停区没了(重启过？)：重新显示 START(启停区 {zone})，车放好别动……')
+                want = zone
                 zone = None
                 scanned = False
+            if now() - t_resend >= 2.0:
+                t_resend = now()
+                zone_request(link, f'ZONE {want}')
             sleep(poll_s)
             continue
         if z != zone:
-            log(f'  屏上选了启停区 {z}。把车放好别动……')
+            log(f'  启停区 {z}。把车放好别动……')
             ctx.zone_select(z)
             zone = z
             scanned = False
@@ -1845,7 +1860,7 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
             plan_seen = None
             msg('PLACE CAR')
         if s == 1:
-            log(f'★ 屏上按了 START：启停区 {zone}，开跑！')
+            log(f'★ 按了 START：启停区 {zone}，开跑！')
             if not scanned:
                 log('  (还没扫描就按了 START：开跑后马上扫描)')
             zone_request(link, 'ZONE LOCK')
@@ -1890,7 +1905,7 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
             plan_seen = st
             if st == 'ok':
                 msg(f'READY Z{zone}')
-                log('  预先规划好了：屏上 READY，可以按 START。')
+                log('  预先规划好了：可以按屏上的 START 了。')
             else:
                 msg('PLAN ERR')
                 log(f'  预先规划失败：{st}(按 START 以后第二次扫描完再规划一次)')

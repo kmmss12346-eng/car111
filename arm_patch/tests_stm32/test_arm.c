@@ -180,9 +180,8 @@ int main(void) {
     Arm_Init();
     CHECK(has("pwm3;") && has("pwm2;"), "Arm_Init 启动了夹爪/转盘 PWM");
     CHECK(scr_armed && scr_starts == 1, "开机打开 USART2 接收(收屏的触摸)");
-    CHECK(scrs("sendxy=1|cls 0|") && scrs("xstr 0,0,240,48,0,65535,0,1,1,1,\"START ZONE 1 OR 2\"")
-          && scrs("xstr 0,52,236,268,1,65535,31,1,1,1,\"1\"") && scrs("xstr 244,52,236,268,1,65535,63488,1,1,1,\"2\"") && !scrs("READY"),
-          "开机显示选区页：先发 sendxy=1、清屏，左边大按钮 1(蓝)、右边大按钮 2(红)，不写 READY");
+    CHECK(scrs("cls 0|") && !scrs("xstr") && !scrs("START ZONE") && !scrs("READY") && !scrs("sendxy"),
+          "(10-23 用户\"不需要显示启停区1还是2\")开机只清屏：不再显示选区页、不写 READY");
     clear();
     CHECK(run("ZONE?") == 1 && pis("ZONE 0 0"), "开机还没选区：ZONE 0 0");
 
@@ -541,15 +540,18 @@ int main(void) {
     run("LIFT 0");
 
     /* ---- 选启停区：屏上触摸(USART2 收 67 帧)、ZONE 指令 ---- */
-    clear(); Arm_Init();                            /* 重新开机：选区页 */
+    clear(); Arm_Init();                            /* 重新开机：(10-23)只清屏 */
     CHECK(zone_is("ZONE 0 0"), "开机：ZONE 0 0");
+    clear(); tap(100, 200); tap(240, 250);
+    CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "(10-23)开机只清屏、不收触摸：屏上按哪里都不算");
+    run("ZONE ASK");                                /* 旧流程的选区页(ZONE ASK)还留着 */
     clear(); tap(100, 200);
-    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,0,320,80,1,65535,0,1,1,1,\"ZONE 1\"")
-          && scrs("xstr 336,8,136,64,0,65535,33808,1,1,1,\"BACK\"") && scrs("xstr 0,128,480,192,1,0,2016,1,1,1,\"START\"")
-          && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"\"") && !scrs("sendxy"),
-          "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页(ZONE 1、状态行、大 START、小 BACK)");
+    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,128,480,192,1,0,2016,1,1,1,\"START\"")
+          && !scrs("ZONE 1") && !scrs("BACK") && !scrs("xstr 0,84") && !scrs("sendxy"),
+          "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页：(10-23)只有大 START(不写 ZONE 1、没有状态行和 BACK)");
     clear(); tap(400, 30);
-    CHECK(zone_is("ZONE 0 0") && scrs("START ZONE 1 OR 2"), "准备页按 BACK：回选区页，选的区清掉");
+    CHECK(zone_is("ZONE 1 0") && scr[0] == 0, "(10-23)准备页右上角(以前的 BACK)按了不算");
+    run("ZONE ASK");
     clear(); touch(100, 200, 1); touch(400, 200, 0); Arm_Poll();
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "在按钮 1 按下、滑到按钮 2 松开：不算");
     touch(100, 200, 0); Arm_Poll();
@@ -557,21 +559,21 @@ int main(void) {
     tap(240, 200); tap(100, 20); tap(600, 200);
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "按在两个按钮中间的缝上、标题行、屏外的坐标：都不算");
     clear(); tap(470, 315);
-    CHECK(zone_is("ZONE 2 0") && scrs("\"ZONE 2\""), "按右边按钮：选 2 区");
+    CHECK(zone_is("ZONE 2 0") && scrs("\"START\"") && !scrs("\"ZONE 2\""), "按右边按钮：选 2 区(准备页不写 ZONE 2)");
     clear(); touch(240, 250, 1); Arm_Poll();
     CHECK(zone_is("ZONE 2 0") && scr[0] == 0, "START 只按下、还没松开：不算");
     touch(20, 310, 0); Arm_Poll();
-    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,1,0,65504,1,1,1,\"GO\"") && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"GO\"")
-          && scrs("xstr 336,8,136,64,0,0,0,1,1,1,\"\"") && !scrs("cls"),
-          "在 START 里按下、松开：s=1，START 换成 GO、状态行 GO、BACK 擦掉(不整页重画)");
+    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,1,0,65504,1,1,1,\"GO\"") && !scrs("xstr 0,84") && !scrs("xstr 336")
+          && !scrs("cls"),
+          "在 START 里按下、松开：s=1，START 换成 GO(不整页重画；(10-23)没有状态行、没有 BACK)");
     clear(); tap(400, 30); tap(240, 250); tap(100, 200);
-    CHECK(zone_is("ZONE 2 1") && scr[0] == 0, "按了 START 以后不再收触摸(BACK、START、别处都不算)");
+    CHECK(zone_is("ZONE 2 1") && scr[0] == 0, "按了 START 以后不再收触摸(START、别处都不算)");
     clear();
     CHECK(run("ZONE ASK") == 1 && zone_is("ZONE 0 0") && scrs("sendxy=1|cls 0|") && scrs("START ZONE 1 OR 2"),
           "ZONE ASK：发 sendxy=1、重画选区页，清掉选的区和 START");
     clear();
-    CHECK(run("ZONE 1") == 1 && zone_is("ZONE 1 0") && scrs("sendxy=1|cls 0|") && scrs("\"ZONE 1\"") && scrs("\"START\""),
-          "ZONE 1：和在屏上按 1 一样，画准备页");
+    CHECK(run("ZONE 1") == 1 && zone_is("ZONE 1 0") && scrs("sendxy=1|cls 0|") && !scrs("\"ZONE 1\"") && scrs("\"START\""),
+          "ZONE 1(树莓派 race 1)：画准备页，(10-23)只有 START");
     tap(240, 250);
     CHECK(zone_is("ZONE 1 1"), "ZONE 1 以后屏上按 START：s=1");
     /* 换页以后 0.5 秒内按下的不算：选区时手指抖一下/连按两下，不会顺手按到 START(START 就在按钮 1、2 的下半部分) */
@@ -590,14 +592,14 @@ int main(void) {
     touch(240, 250, 1); run("ZONE 2"); touch(240, 250, 0); Arm_Poll();
     CHECK(zone_is("ZONE 2 0"), "按下 START 以后页面重画了(换页)，再松开不算(按下的那一下属于上一页)");
     clear();
-    CHECK(run("ZONE MSG SCAN 1/2") == 1 && scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"SCAN 1/2\"") && !scrs("cls"),
-          "ZONE MSG：只写准备页的状态行(黄字)");
+    CHECK(run("ZONE MSG SCAN 1/2") == 1 && scr[0] == 0, "(10-23)准备页不显示状态行：ZONE MSG 只记下，不画");
+    run("ZONE ASK");
     clear(); run("ZONE MSG  a\"bcdefghijklmnopqrstuvwxyz");
     CHECK(scrs(",\"abcdefghijklmnopqrst\""), "ZONE MSG：去掉双引号和前面多的空格，最多 20 个字");
     clear(); run("ZONE MSG");
-    CHECK(scrs("xstr 0,84,480,40,0,65504,0,1,1,1,\"\""), "ZONE MSG 不带字：清空状态行");
-    run("ZONE MSG PLAN OK"); clear(); tap(400, 30);
-    CHECK(scrs("START ZONE 1 OR 2") && scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "BACK 回选区页：状态行清空(在右上角)");
+    CHECK(scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "ZONE MSG 不带字：清空状态行(选区页右上角)");
+    run("ZONE MSG PLAN OK"); clear(); run("ZONE ASK");
+    CHECK(scrs("START ZONE 1 OR 2") && scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "重新 ZONE ASK：选区页的状态行清空(在右上角)");
     clear(); run("ZONE MSG SCAN");
     CHECK(scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"SCAN\""), "选区页的状态行在右上角");
     clear();
@@ -655,7 +657,7 @@ int main(void) {
         static const uint8_t boot[] = { 0x88, 0xFF, 0xFF, 0xFF };
         run("ZONE 1"); clear();
         scr_in(boot, 4); Arm_Poll();
-        CHECK(scrs("sendxy=1|cls 0|") && scrs("\"ZONE 1\"") && scrs("\"START\"") && zone_is("ZONE 1 0"), "屏重新上电：再发 sendxy=1，整页重画(选的区不变)");
+        CHECK(scrs("sendxy=1|cls 0|") && !scrs("\"ZONE 1\"") && scrs("\"START\"") && zone_is("ZONE 1 0"), "屏重新上电：再发 sendxy=1，整页重画(选的区不变；(10-23)只有 START)");
         run("ZONE LOCK"); run("QR CLR"); clear();
         scr_in(boot, 4); Arm_Poll();
         CHECK(scr[0] == 0, "比赛布局时屏重新上电(还没读到码)：不画选区页，什么都不写");
@@ -678,9 +680,9 @@ int main(void) {
     qr_feed("999+888+777+666\r\n"); Arm_Poll();
     CHECK(pis("QR 999+888+777+666") && !scrs("999+888"), "选区页还在显示时扫到码：发给树莓派，但不写屏(不盖掉按钮)");
     run("QR CLR"); run("ZONE LOCK");
-    /* USART2 接收开不起来：和以前一样显示 READY，终端里照样能选区 */
+    /* USART2 接收开不起来：开机照样只清屏，终端里照样能选区 */
     scr_rxfail = 1; clear(); Arm_Init(); scr_rxfail = 0;
-    CHECK(scrs("cls 0|") && scrs("\"READY\"") && !scrs("START ZONE") && !scrs("sendxy"), "收不到触摸(USART2 接收开不起来)：开机和以前一样清屏、显示 READY");
+    CHECK(scrs("cls 0|") && !scrs("READY") && !scrs("START ZONE") && !scrs("sendxy"), "收不到触摸(USART2 接收开不起来)：开机只清屏((10-23)不写 READY)");
     scr_rxfail = 1;
     CHECK(zone_is("ZONE 0 0") && run("ZONE 2") == 1 && zone_is("ZONE 2 0"), "收不到触摸时终端里 ZONE 2 照样能选");
     scr_rxfail = 0;

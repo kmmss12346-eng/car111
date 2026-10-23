@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """两次扫描合并 + 全程A*路线 + 一键行驶（v10）。
 雷达识别障碍物(两次扫描合并)；1010：每个停车点再用雷达重定位(和出发时的扫描对齐，reloc.py)，修正车位后再做任务。
-比赛：race = 屏上选启停区 -> 车放好自动扫描、预先规划 -> 屏上按 START 一键跑完(开跑后不碰电脑)。"""
+比赛：race 1 / race 2 = 终端选启停区(屏上不显示区号) -> 车放好自动扫描、预先规划 -> 屏上按 START 一键跑完(开跑后不碰电脑)。"""
 import os
 for key in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):
     os.environ[key]='1'
@@ -128,7 +128,7 @@ def main():
     ap.add_argument('--gyro-port',default='/dev/serial0',help='（旧）只读 YAW100 的串口；有 --stm-port 时不用\n')
     ap.add_argument('--stop-wait',type=float,default=3.0,help='每个停车点停多久(秒)，代替抓取/放置等任务')
     ap.add_argument('--stm-port',default='/dev/serial0',help='和 STM32 通信的串口（指令+YAW100）；none=不连 STM32')
-    ap.add_argument('--zone',type=int,choices=(1,2),default=None,help='启停区(不写就用配置里的 start_zone；比赛时在屏上选)')
+    ap.add_argument('--zone',type=int,choices=(1,2),default=None,help='启停区(不写就用配置里的 start_zone；比赛时用 race 1 / race 2 选)')
     args=ap.parse_args()
     raw_cfg=json.loads(Path(args.config).read_text(encoding='utf-8'))
     raw_cfg.setdefault('second_relative_moves',dict(DEFAULT_SECOND_MOVES))
@@ -146,7 +146,7 @@ def main():
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle,Polygon,Circle
     fig,world=plt.subplots(figsize=(12,8));fig.subplots_adjust(bottom=.24,top=.88)
-    fig.suptitle('1010 | RACE: TOUCH ZONE + START ON SCREEN | LIDAR RELOC AT EVERY STOP | PREHOME',fontsize=11)
+    fig.suptitle('1010 | RACE 1|2 + START ON SCREEN | LIDAR RELOC AT EVERY STOP | PREHOME',fontsize=11)
     world.set(xlim=(0,2400),ylim=(0,2400),xlabel='MAP X / mm',ylabel='MAP Y / mm')
     world.set_aspect('equal');world.set_facecolor('#d4d6d9')
     for r in YELLOW_RECTS+[TEMP_ZONE,ROUGH_ZONE]:
@@ -666,12 +666,12 @@ def main():
     def mission_thread(first_scan):
         try:mission_body(first_scan)
         finally:state['auto']=False
-    def race_thread():
+    def race_thread(zone=None):
         try:
-            state['race']=True                              # 在等屏上选区/按 START(终端 zone 1|2 可以代替屏上选区)
+            state['race']=True                              # 在等按屏上的 START(终端 zone 1|2 可以改区)
             def start_run(z,scanned):
                 state['race']=False;mission_body(True,scanned)
-            st=race_flow(Ctx(),link,log,raw_cfg,start_run)
+            st=race_flow(Ctx(),link,log,raw_cfg,start_run,zone=zone)
             if st=='nozone':print('（race 没开始：用 zone 1 / zone 2 选区，go 开始）',flush=True)
         except Abort as e:print('★ 比赛流程已停止：',e,flush=True)
         except Exception as e:print('★ 比赛流程出错：',repr(e),flush=True)
@@ -867,9 +867,12 @@ def main():
                 sync_now()
                 print('第二站动作 ->',link.second_move(None if raw_cfg.get('second_use_p2',False) else rel,log=lambda m:print(m,flush=True)),flush=True);return
             if k=='race':
-                # 1010 比赛：屏上选启停区 -> 车放好自动扫描、预先规划 -> 屏上按 START 开跑(开跑后不再碰电脑)
+                # 比赛：(10-23)race 1 / race 2 在终端选启停区(屏上不显示区号) -> 车放好自动扫描、预先规划 -> 屏上按 START 开跑(开跑后不再碰电脑)
+                if len(parts)>2 or (len(parts)==2 and parts[1] not in ('1','2')):raise ValueError('格式：race 1 或 race 2(抽到几区就输几；不写就用现在的启停区)')
+                z_=int(parts[1]) if len(parts)==2 else int(raw_cfg.get('start_zone',2) or 2)
+                if len(parts)==1:print(f'race 没写启停区：用现在的启停区 {z_}(抽到别的区：abort 以后输入 race 1 或 race 2)',flush=True)
                 state['abort']=False;state['aborted']=False;state['confirm']=None;state['auto']=True
-                threading.Thread(target=race_thread,daemon=True).start();return
+                threading.Thread(target=race_thread,args=(z_,),daemon=True).start();return
             state['step_mode']=k in ('go','drive') and len(parts)>1 and parts[1].lower()=='step'
             if state['step_mode']:print('分段调试：每到一站先停下等你输入 n 才做任务，做完再等 n 才开往下一站(skip = 跳过这一站的任务)',flush=True)
             if k=='go' and history.views:raise ValueError('go 要从头开始：先 reset 清空历史，并把车放回起点')
@@ -885,14 +888,14 @@ def main():
             state['goal']=POINTS[{'3':'QR_SCAN','4':'RAW_STOP','5':'TEMP_STOP','6':'ROUGH_STOP'}[k]];redraw();return
         if k in ('save','s'):save();return
         if k=='zone' and state.get('race') and len(parts)==2 and parts[1] in ('1','2'):
-            # race 还在等屏上选区：从终端选(和在屏上按一样，桌上调试或屏的触摸不好用时)；START 还是要在屏上按
+            # race 还在等 START：改启停区(会重新扫描)；START 还是要在屏上按
             ok_,rep_,_=zone_request(link,'ZONE '+parts[1])
-            print(f'已让屏幕选启停区 {parts[1]}' if ok_ else f'STM32 不认 ZONE {parts[1]}：{rep_}',flush=True);return
+            print(f'已改成启停区 {parts[1]}(重新扫描)' if ok_ else f'STM32 不认 ZONE {parts[1]}：{rep_}',flush=True);return
         if state['busy']:raise ValueError('正在扫描，请等待完成')
         if k=='list':print_objects();return
         if state['auto'] and k!='pts':raise ValueError('一键流程正在运行(输入 abort 可以中止)，等结束再用 '+k)
         if k=='zone':
-            # 1010：切换启停区(只在第一次扫描之前；比赛时在屏上选，race 会自动切换)
+            # 1010：切换启停区(只在第一次扫描之前；比赛时用 race 1 / race 2 选，race 会自动切换)
             if len(parts)!=2 or parts[1] not in ('1','2'):raise ValueError('格式：zone 1 或 zone 2')
             if history.views:raise ValueError('切换启停区要在第一次扫描之前：先 reset 清空历史')
             select_zone(int(parts[1]));return
@@ -953,7 +956,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race(比赛：屏上选区、按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区、屏上按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_stop(parts):
         """(10-20 用户"这四个停靠位置我需要自己输入选定合适位置")stop = 看四个停车点能不能停；stop 名字 X Y [车头] = 先检查再改。
         按真实车身(含雷达)查：不压黄色区/工位/原料转盘、不出场地；扫描过就再查障碍物(按真实大小，停车点附近最少留 goal_obstacle_min_margin_mm)。
@@ -1079,7 +1082,7 @@ def main():
     fig.canvas.mpl_connect('close_event',close)
     c_=state['config']
     print(f"启停区 {zs['zone']}：起点车中心=({c_['car_x_mm']:.0f}, {c_['car_y_mm']:.0f})，车头 {c_['car_yaw_deg']:.0f}°（90=朝北，180=朝西）；雷达 前{config['lidar_forward_mm']:.1f} 左{config['lidar_left_mm']:.1f}mm。",flush=True)
-    print('比赛：输入 race(或配置 race_auto=true 开机自动)：屏上选启停区 1/2 → 车放好不动，自动扫描、预先规划，屏上显示 READY → 按屏上 START 开跑，之后不用碰电脑。',flush=True)
+    print('比赛：输入 race 1 或 race 2(抽到几区就输几；配置 race_auto=true 开机自动，用配置里的启停区)→ 车放好不动，自动扫描、预先规划，终端说可以按 START → 按屏上 START 开跑，之后不用碰电脑。屏上只显示任务码、抓取数、放置数。',flush=True)
     print('调试：zone 1 / zone 2 切换启停区；go = 一键全流程(不再问 y)；park = 收臂、升降停 60mm；abort = 急停(急停后不自动收臂)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)

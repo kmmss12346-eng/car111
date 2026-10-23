@@ -1796,9 +1796,8 @@ static void Screen_Clear(void)
 }
 
 /* ================= 选启停区(串口屏触摸) =================
- * 开机屏上先显示选区页：左半边大按钮 "1"、右半边大按钮 "2"(启停区 1 / 2)。
- * 选好进准备页：上面 "ZONE n"，中间一行状态(树莓派用 ZONE MSG 写，例如 SCAN、PLAN OK)，
- * 下面大按钮 START，右上角小按钮 BACK(回选区页重新选)。
+ * (10-23 用户"不需要显示启停区1还是2")开机只清屏；树莓派 race 1|2 发 ZONE 1|2 进准备页：只有下面一个大按钮 START
+ * (不写 "ZONE n"、没有状态行、没有 BACK)。ZONE ASK(旧流程)还会画选区页：左半边大按钮 "1"、右半边大按钮 "2"。
  * 按 START：s=1，状态显示 GO，以后不再收触摸(只启动一次)。
  * 树莓派用 ZONE? 查选了几区、按没按 START；开跑时发 ZONE LOCK：关掉触摸、清屏回到比赛布局。
  * 按下和松开都在同一个按钮里才算(按下去滑到别处再松开不算)。
@@ -1850,10 +1849,9 @@ static uint8_t Zone_Hit(uint8_t ui, uint16_t x, uint16_t y)
         if (x < ZP_BTN_W)          return ZBTN_1;
         if (x >= 480 - ZP_BTN_W)   return ZBTN_2;
     }
-    if (ui == ZUI_READY)
+    if (ui == ZUI_READY && y >= ZR_START_Y)
     {
-        if (y >= ZR_START_Y)                   return ZBTN_START;
-        if (x >= ZR_BACK_X - 6 && y < 80)      return ZBTN_BACK;
+        return ZBTN_START;                         /* (10-23)准备页只有 START，没有 BACK(右上角按了也不算) */
     }
     return 0;
 }
@@ -1937,30 +1935,24 @@ static void Zone_Box(int x, int y, int w, int h, int font, unsigned fg, unsigned
     Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,%u,1,1,1,\"%s\"", x, y, w, h, font, fg, bg, txt));
 }
 
-/* 状态行：选区页在右上角，准备页在 "ZONE n" 下面。比赛布局时只记下来，不画 */
+/* 状态行：只在选区页(ZONE ASK，旧流程)右上角画。(10-23 用户"按要求显示必要的字")准备页、比赛布局都不画，ZONE MSG 只记下来 */
 static void Zone_ShowMsg(void)
 {
     if (zone_ui == ZUI_PICK)
     {
         Zone_Box(240, 0, 240, 48, SCR_FONT_SMALL, 65504u, 0u, zone_msg);          /* 黄字 */
     }
-    else if (zone_ui != ZUI_OFF)
-    {
-        Zone_Box(0, 84, 480, 40, SCR_FONT_SMALL, 65504u, 0u, zone_msg);
-    }
 }
 
-/* 准备页下半部分：没按 START 时是绿色 START 和右上角 BACK；按了以后 BACK 擦掉、START 换成黄色 GO */
+/* 准备页下半部分：没按 START 时是绿色 START；按了以后换成黄色 GO。(10-23)不再有 BACK */
 static void Zone_ShowButtons(void)
 {
     if (zone_ui == ZUI_READY)
     {
-        Zone_Box(ZR_BACK_X, 8, 136, 64, SCR_FONT_SMALL, 65535u, 33808u, "BACK");                 /* 灰底白字 */
         Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 0u, 2016u, "START");      /* 绿底黑字 */
     }
     else
     {
-        Zone_Box(ZR_BACK_X, 8, 136, 64, SCR_FONT_SMALL, 0u, 0u, "");
         Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 0u, 65504u, "GO");        /* 黄底黑字 */
     }
 }
@@ -1994,9 +1986,7 @@ static void Zone_Show(uint8_t xy)
     }
     else
     {
-        snprintf(buf, sizeof(buf), "ZONE %d", (int)zone_sel);
-        Zone_Box(0, 0, 320, 80, SCR_FONT_BIG, 65535u, 0u, buf);
-        Zone_ShowButtons();
+        Zone_ShowButtons();                        /* (10-23)准备页只有 START：不写 "ZONE n"(启停区在终端 race 1|2 选) */
     }
     Zone_ShowMsg();
     zone_page_at = HAL_GetTick();                  /* 画完才开始算保护时间(画的时候按的也不算) */
@@ -2055,28 +2045,19 @@ static void Zone_Lock(void)
     Screen_Clear();
 }
 
-/* 开机：收得到触摸就显示选区页(选启停区 1 还是 2)；
- * USART2 接收没开起来(收不到触摸)就和以前一样：画模式清屏、t1 显示 READY(终端里还能用 ZONE 1 / ZONE 2 选) */
+/* 开机：(10-23 用户"不需要显示启停区1还是2，按要求显示必要的字")不再显示选区页，只清屏(黑底，什么字都没有)。
+ * 树莓派 race 1|2 发 ZONE 1|2 才出 START 页；开跑后屏上只有树莓派写的任务码、抓取数、放置数 */
 static void Screen_Boot(void)
 {
     zone_sel = 0;
     zone_go = 0;
     zone_msg[0] = 0;
-    if (scr_ok)
-    {
-        Zone_Page(ZUI_PICK, 0, 1);
-        return;
-    }
     __disable_irq();
     zone_ui = ZUI_OFF;
     scr_down = 0;
     scr_tap = 0;
     __enable_irq();
-    if (g_scrmode > 0.5f)
-    {
-        Screen_Clear();
-        Screen_Text("t1", "READY");
-    }
+    Screen_Clear();
 }
 
 /* ================= 二维码 (UART5) ================= */
@@ -2449,7 +2430,7 @@ void Arm_Init(void)
 
     HAL_Delay(300);                                /* 等屏上电启动 */
     scr_boot = 0;                                  /* 这之前屏发来的开机帧不用管：下面马上画；这之后再来说明屏又重启了，Arm_Poll 重画 */
-    Screen_Boot();                                 /* 选区页(选启停区 1 / 2) */
+    Screen_Boot();                                 /* (10-23)只清屏，不再显示选区页 */
 
     /* 升降：0 = 最低点，往上为正，最高 100mm(LFMAX)。开机读编码器找到准确高度，自动走到 60mm(见 Lift_Boot) */
     Lift_Boot();

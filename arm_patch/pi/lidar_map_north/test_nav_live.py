@@ -380,7 +380,8 @@ class LiveTests(unittest.TestCase):
     def check_run(self, car, zone):
         log = self.log
         self.assertIn('路线全部走完', log, log[-3000:])
-        self.assertEqual(car.requests[0], 'ZONE ASK')
+        self.assertEqual(car.requests[0], f'ZONE {zone}', '(10-23)不发 ZONE ASK(选区页)：直接发 race 选的区，屏上只有 START')
+        self.assertNotIn('ZONE ASK', car.requests)
         self.assertIn('ZONE LOCK', car.requests)
         self.assertNotIn('输入 y', log, '开跑后不能再要人输入 y')
         self.assertIn('直接用开跑前规划好的路线', log)
@@ -466,16 +467,20 @@ class LiveTests(unittest.TestCase):
         self.assertIn('急停过', self.log)
 
     def test_terminal_zone_during_race(self):
-        # 屏上没选(触摸不好用)：终端 zone 1 代替屏上选区，接着照常扫描、预先规划；START 还是在屏上按
+        # (10-23)race 开机自动按配置的 2 区开始；等 START 时终端 zone 1 改区：按 1 区重新扫描、预先规划；START 还是在屏上按
         def asked():
             c = WORLD.get('car')
-            return c is not None and 'ZONE ASK' in c.requests
+            return c is not None and 'ZONE 2' in c.requests
         car = self.run_live(1, dict(scale=0.0), inputs=[(asked, 'zone 1')], screen_zone=None)
         self.assertIn('ZONE 1', car.requests)
-        self.check_run(car, 1)
+        self.assertEqual(car.requests[0], 'ZONE 2')
+        self.assertNotIn('ZONE ASK', car.requests)
+        self.assertIn('已改成启停区 1', self.log)
 
     def test_race_zone1(self):
-        car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01))
+        # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)
+        car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'race 1')], screen_zone=None)
         self.check_run(car, 1)
         self.assertIn('启停区 1：起点 (2250,2250) 车头 90°', self.log)
 
