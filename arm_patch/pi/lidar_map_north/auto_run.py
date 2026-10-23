@@ -1583,7 +1583,14 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if not scanned:
             log('① 第一次扫描：车保持不动……')
             t_ph = time.monotonic()
-            ctx.scan()
+            try:
+                ctx.scan()
+            except Abort as e:
+                # (10-23 晚)race 默认直接开跑，第一次扫描在开跑以后做：雷达偶尔卡一下就整轮停在启停区太亏，和第二次扫描一样重扫一次
+                if getattr(ctx, 'aborted', lambda: False)():
+                    raise
+                log(f'  ★ 第一次扫描失败({e})：再扫一次……')
+                ctx.scan()
             log(f'  (第一次扫描用时 {time.monotonic() - t_ph:.1f} 秒)')
         else:
             log('① 第一次扫描开跑前已经做好了。')

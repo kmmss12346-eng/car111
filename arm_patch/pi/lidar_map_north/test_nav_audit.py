@@ -113,7 +113,8 @@ class RaceScanRetryTests(unittest.TestCase):
         car = SimCar((2250.0, 150.0, 90.0), zone_script=[(2, 0)] * 40 + [(2, 1)])
         ctx = Flaky(clock)
         runs = []
-        st = auto_run.race_flow(ctx, car, lambda m: None, {'race_check_s': 0}, lambda z, sc: runs.append((z, sc)),
+        # (10-23 晚)race 默认直接开跑(开跑后再扫描)；这里测的是以前屏上按 START 之前扫描失败要重扫，照以前打开
+        st = auto_run.race_flow(ctx, car, lambda m: None, {'race_check_s': 0, 'race_start': 'screen'}, lambda z, sc: runs.append((z, sc)),
                                 now=clock.now, sleep=clock.sleep)
         self.assertEqual(st, 'started')
         self.assertEqual([c[0] for c in ctx.calls].count('scan'), 2)
@@ -130,7 +131,7 @@ class RaceScanRetryTests(unittest.TestCase):
                 raise Abort('收到 abort')
         car = SimCar((2250.0, 150.0, 90.0), zone_script=[(2, 0)] * 40 + [(2, 1)])
         with self.assertRaises(Abort):
-            auto_run.race_flow(Aborting(clock), car, lambda m: None, {'race_check_s': 0}, lambda z, sc: None,
+            auto_run.race_flow(Aborting(clock), car, lambda m: None, {'race_check_s': 0, 'race_start': 'screen'}, lambda z, sc: None,
                                now=clock.now, sleep=clock.sleep)
 
 

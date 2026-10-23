@@ -385,6 +385,44 @@ class RunMissionTests(unittest.TestCase):
         self.assertTrue(h.threads, '规划时间长要调用 hooks.keepalive()')
         self.assertTrue(all(t == me for t in h.threads))
 
+    def test_first_scan_failure_rescans_once(self):
+        """(10-23 晚)race 默认直接开跑，第一次扫描在开跑以后：雷达卡一下(扫描失败)就重扫一次接着跑；急停了不重扫；连着失败两次才停。"""
+        calls = []
+
+        class Flaky(MissionCtx):
+            n = 0
+
+            def scan(self):
+                Flaky.n += 1
+                calls.append(('scan', Flaky.n))
+                if Flaky.n == 1:
+                    raise Abort('扫描失败，见上面的提示')
+        logs = []
+        auto_run.run_mission(Flaky(calls), RecLink(calls), log=logs.append, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual([c for c in calls if c[0] == 'scan'], [('scan', 1), ('scan', 2)])
+        self.assertTrue(any('第一次扫描失败' in l and '再扫一次' in l for l in logs), logs)
+
+        class Dead(MissionCtx):
+            def scan(self):
+                calls.append(('dead',))
+                raise Abort('扫描失败，见上面的提示')
+        calls.clear()
+        with self.assertRaises(Abort):
+            auto_run.run_mission(Dead(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual(calls.count(('dead',)), 2)
+
+        class Aborted(MissionCtx):
+            def aborted(self):
+                return True
+
+            def scan(self):
+                calls.append(('ab',))
+                raise Abort('收到 abort')
+        calls.clear()
+        with self.assertRaises(Abort):
+            auto_run.run_mission(Aborted(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual(calls.count(('ab',)), 1, '急停了不重扫')
+
     def test_race_skips_first_scan(self):
         calls = []
         auto_run.run_mission(MissionCtx(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0,
