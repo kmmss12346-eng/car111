@@ -373,6 +373,7 @@ DEFAULTS = dict(
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),
     screen_show=('code', 'code2', 'grab', 'place'),   # (10-23 用户"按要求显示必要的字")屏上只写这几样：任务码两行、抓取数、放置数
+    screen_stats_live=False,            # (10-23 晚)抓取数、放置数只在回到启停区以后写(新固件画成中文"抓取3  放置5")；true = 跑的时候也写
                                         #   (赛规：一直显示任务码，回家后显示正确抓取数、正确放置数)；阶段、提示、B1/B2 只在终端日志里   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
 
@@ -1342,7 +1343,11 @@ class MissionHooks:
         return True
 
     def _show_stats(self):
-        # (10-23)屏上只写做成的个数(GRAB 3、PLACE 5)，和回家以后一样：赛规要显示"正确抓取数量和正确放置数量"，3/6 这种裁判看不懂
+        # (10-23)屏上只写做成的个数(GRAB 3、PLACE 5)，和回家以后一样：赛规要显示"正确抓取数量和正确放置数量"，3/6 这种裁判看不懂。
+        # (10-23 晚用户"回启停区后显示中文抓取 n 放置 n")跑的时候不写(屏上只有任务码)，回到启停区(_start)才写；
+        #   新固件把 GRAB 3 画成"抓取3"。screen_stats_live=true 跑的时候也写
+        if not self.cfg.get('screen_stats_live', False):
+            return
         self._ui('grab', self.stats.final_grab_text())
         self._ui('place', self.stats.final_place_text())
 

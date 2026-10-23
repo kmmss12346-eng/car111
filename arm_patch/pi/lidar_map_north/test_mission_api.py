@@ -26,8 +26,8 @@ def f_moves(w, zone=None):
 
 class PrepareTests(unittest.TestCase):
     def test_prepare_inits_arm_clears_old_code_and_screen(self):
-        """出发后马上 prepare：机械臂初始化 + 收臂、清掉 STM32 里存着的旧码；(10-23)清屏(ZONE LOCK)，屏上只写 GRAB 0、PLACE 0
-        (任务码读到再写，阶段/提示/B1 B2 都不写)；再调一次什么也不重做。"""
+        """出发后马上 prepare：机械臂初始化 + 收臂、清掉 STM32 里存着的旧码；(10-23)清屏(ZONE LOCK)，(10-23 晚)屏上什么都不写
+        (任务码读到再写，抓取数、放置数回到启停区才写，阶段/提示/B1 B2 都不写)；再调一次什么也不重做。"""
         w = SimWorld(seed=1, code=CODE, qr_stale='111+222+333+123')
         h, lines = hooks(w)
         self.assertTrue(h.prepare(w.link, lines.append))
@@ -35,7 +35,7 @@ class PrepareTests(unittest.TestCase):
         self.assertIn('QR CLR', w.requests)
         self.assertIsNone(w.qr_code)                                 # 旧码清掉了
         self.assertIn('ZONE LOCK', w.requests)
-        self.assertEqual(w.screen, {'t2': 'GRAB 0', 't3': 'PLACE 0'})
+        self.assertEqual(w.screen, {})                               # (10-23 晚)开跑前屏上全黑
         n = len(w.requests)
         self.assertTrue(h.prepare(w.link, lines.append))
         self.assertEqual(len(w.requests), n)                         # 做过的不再做

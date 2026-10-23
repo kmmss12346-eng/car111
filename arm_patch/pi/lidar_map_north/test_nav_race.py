@@ -60,7 +60,7 @@ def run_race(script, ctx_kw=None, park='ok', zone=None, logs=None):
     car = SimCar((2250.0, 150.0, 90.0), zone_script=script)
     ctx = RaceCtx(clock, **(ctx_kw or {}))
     runs = []
-    st = auto_run.race_flow(ctx, car, (logs.append if logs is not None else (lambda m: None)), {'race_check_s': 0},
+    st = auto_run.race_flow(ctx, car, (logs.append if logs is not None else (lambda m: None)), {'race_check_s': 0, 'race_start': 'screen'},
                             lambda z, sc: runs.append((z, sc)), now=clock.now, sleep=clock.sleep, zone=zone)
     return st, car, ctx, runs, clock
 
@@ -116,7 +116,7 @@ class RaceTests(unittest.TestCase):
         car = SimCar((2250.0, 150.0, 90.0), zone_script=script)
         ctx = RaceCtx(clock, still=still)
         runs = []
-        auto_run.race_flow(ctx, car, lambda m: None, {'race_check_s': 3}, lambda z, sc: runs.append((z, sc)),
+        auto_run.race_flow(ctx, car, lambda m: None, {'race_check_s': 3, 'race_start': 'screen'}, lambda z, sc: runs.append((z, sc)),
                            now=clock.now, sleep=clock.sleep)
         self.assertEqual([c[0] for c in ctx.calls].count('scan'), 2)
         self.assertEqual(runs, [(2, True)])
@@ -166,7 +166,7 @@ class RaceTests(unittest.TestCase):
         car = Old((2250.0, 150.0, 90.0))
         ctx = RaceCtx(clock)
         logs = []
-        st = auto_run.race_flow(ctx, car, logs.append, {}, lambda z, s: None, now=clock.now, sleep=clock.sleep)
+        st = auto_run.race_flow(ctx, car, logs.append, {'race_start': 'screen'}, lambda z, s: None, now=clock.now, sleep=clock.sleep)
         self.assertEqual(st, 'nozone')
         self.assertEqual(ctx.calls, [])
         self.assertTrue(any('zone 1' in l and 'go' in l for l in logs))
@@ -174,6 +174,34 @@ class RaceTests(unittest.TestCase):
     def test_abort_while_waiting(self):
         with self.assertRaises(Abort):
             run_race([(0, 0)] * 100, dict(abort_at=105.0))
+
+    def test_race_now_starts_directly(self):
+        """(10-23 晚 用户"开跑前全黑、不出 START，race 2 直接开跑")默认：清屏(不发 ZONE n，屏上不出 START)，切到选的区马上开跑；
+        不等车静止、开跑前不扫描(开跑后再扫)；旧固件不认识 ZONE 也照样开跑。"""
+        for zone, want in ((2, 2), (1, 1), (None, 2)):
+            clock = Clock()
+            car = SimCar((2250.0, 150.0, 90.0))
+            ctx = RaceCtx(clock)
+            runs, logs = [], []
+            st = auto_run.race_flow(ctx, car, logs.append, {}, lambda z, sc: runs.append((z, sc)), now=clock.now,
+                                    sleep=clock.sleep, zone=zone)
+            self.assertEqual(st, 'started')
+            self.assertEqual(car.requests, ['ZONE LOCK'])
+            self.assertEqual(ctx.calls, [('zone', want)])
+            self.assertEqual(runs, [(want, False)])
+            self.assertEqual(clock.t, 100.0, '不等')
+            self.assertTrue(any(f'启停区 {want}：直接开跑' in l for l in logs), logs)
+        clock = Clock()
+
+        class Old(SimCar):
+            def request(self, text, timeout=None, collect=False):
+                self.requests.append(text)
+                return (False, 'ERR CMD', []) if collect else (False, 'ERR CMD')
+        car = Old((2250.0, 150.0, 90.0))
+        runs = []
+        st = auto_run.race_flow(RaceCtx(clock), car, lambda m: None, {'start_zone': 1}, lambda z, sc: runs.append((z, sc)),
+                                now=clock.now, sleep=clock.sleep)
+        self.assertEqual((st, runs), ('started', [(1, False)]))
 
 
 class ParkTests(unittest.TestCase):

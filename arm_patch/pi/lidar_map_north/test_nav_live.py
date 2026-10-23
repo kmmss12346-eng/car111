@@ -301,7 +301,8 @@ class LiveTests(unittest.TestCase):
         with open(USER_CFG, encoding='utf-8') as f:
             raw = json.load(f)
         WORLD['mount'] = {k: raw[k] for k in ('lidar_forward_mm', 'lidar_left_mm', 'lidar_yaw_deg', 'sdk_y_sign')}
-        raw.update(race_auto=True,
+        # (10-23 晚)比赛默认 race_start='now'(race 直接开跑)；这些测试测的是以前"屏上按 START"那一套(预先扫描、规划)，照以前打开
+        raw.update(race_auto=True, race_start='screen',
                    scan_frames=10, scan_settle_s=0.02, reloc_frames=4, reloc_settle_s=0.02, home_fix_frames=4,
                    race_still_s=0.4, race_poll_s=0.05, race_check_s=0.5, keepalive_s=1.0, mission_cfg={'enabled': False})
         raw.update(cfg_extra or {})
@@ -506,6 +507,20 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(car.requests[0], 'ZONE 2')
         self.assertNotIn('ZONE ASK', car.requests)
         self.assertIn('已改成启停区 1', self.log)
+
+    def test_race_now_starts_directly(self):
+        """(10-23 晚 用户"开跑前全黑、不出 START，race 2 直接开跑")默认 race_start='now'：终端 race 2 以后清屏(不出 START)直接开跑，
+        开跑后再扫描、规划，一整轮跑完回到启停区。"""
+        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False, race_start='now'),
+                            inputs=[(lambda: True, 'race 2')], screen_zone=None)
+        log = self.log
+        self.assertIn('路线全部走完', log, log[-3000:])
+        self.assertEqual(car.requests[0], 'ZONE LOCK')
+        self.assertNotIn('ZONE 2', car.requests, '屏上不出 START')
+        self.assertNotIn('ZONE ASK', car.requests)
+        self.assertIn('启停区 2：直接开跑', log)
+        self.assertNotIn('直接用开跑前规划好的路线', log)
+        self.assertEqual(car.requests[-1], 'PARK')
 
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)

@@ -575,7 +575,7 @@ int main(void) {
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "(10-23)开机只清屏、不收触摸：屏上按哪里都不算");
     run("ZONE ASK");                                /* 旧流程的选区页(ZONE ASK)还留着 */
     clear(); tap(100, 200);
-    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,128,480,192,1,0,2016,1,1,1,\"START\"")
+    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,128,480,192,0,0,2016,1,1,1,\"START\"")
           && !scrs("ZONE 1") && !scrs("BACK") && !scrs("xstr 0,84") && !scrs("sendxy"),
           "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页：(10-23)只有大 START(不写 ZONE 1、没有状态行和 BACK)");
     clear(); tap(400, 30);
@@ -592,7 +592,7 @@ int main(void) {
     clear(); touch(240, 250, 1); Arm_Poll();
     CHECK(zone_is("ZONE 2 0") && scr[0] == 0, "START 只按下、还没松开：不算");
     touch(20, 310, 0); Arm_Poll();
-    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,1,0,65504,1,1,1,\"GO\"") && !scrs("xstr 0,84") && !scrs("xstr 336")
+    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,0,0,65504,1,1,1,\"GO\"") && !scrs("xstr 0,84") && !scrs("xstr 336")
           && !scrs("cls"),
           "在 START 里按下、松开：s=1，START 换成 GO(不整页重画；(10-23)没有状态行、没有 BACK)");
     clear(); tap(400, 30); tap(240, 250); tap(100, 200);
@@ -626,11 +626,11 @@ int main(void) {
     clear(); run("ZONE MSG  a\"bcdefghijklmnopqrstuvwxyz");
     CHECK(scrs(",\"abcdefghijklmnopqrst\""), "ZONE MSG：去掉双引号和前面多的空格，最多 20 个字");
     clear(); run("ZONE MSG");
-    CHECK(scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "ZONE MSG 不带字：清空状态行(选区页右上角)");
+    CHECK(scrs("xstr 240,0,240,48,1,65504,0,1,1,1,\"\""), "ZONE MSG 不带字：清空状态行(选区页右上角)");
     run("ZONE MSG PLAN OK"); clear(); run("ZONE ASK");
-    CHECK(scrs("START ZONE 1 OR 2") && scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"\""), "重新 ZONE ASK：选区页的状态行清空(在右上角)");
+    CHECK(scrs("START ZONE 1 OR 2") && scrs("xstr 240,0,240,48,1,65504,0,1,1,1,\"\""), "重新 ZONE ASK：选区页的状态行清空(在右上角)");
     clear(); run("ZONE MSG SCAN");
-    CHECK(scrs("xstr 240,0,240,48,0,65504,0,1,1,1,\"SCAN\""), "选区页的状态行在右上角");
+    CHECK(scrs("xstr 240,0,240,48,1,65504,0,1,1,1,\"SCAN\""), "选区页的状态行在右上角");
     clear();
     CHECK(run("ZONE LOCK") == 1 && scrs("cls 0|") && !scrs("xstr") && zone_is("ZONE 0 0"), "ZONE LOCK：清屏回到比赛布局");
     clear(); tap(100, 200); tap(400, 300);
@@ -698,11 +698,11 @@ int main(void) {
     }
     /* 旧的树莓派程序不发 ZONE LOCK：写 SCR 时自动回到比赛布局 */
     run("ZONE ASK"); clear();
-    CHECK(run("SCR t1 QR SCAN") == 1 && scrs("cls 0|xstr 292,82,188,38,0,65535,0,0,1,1,\"QR SCAN\""),
+    CHECK(run("SCR t2 GRAB 0") == 1 && scrs("cls 0|xstr 0,240,240,80,1,65535,0,1,1,1,\"\xD7\xA5\xC8\xA1" "0\""),
           "选区页还在显示时写 SCR：先清屏回到比赛布局，再写字");
     clear(); tap(100, 200);
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "SCR 自动回到比赛布局以后，触摸也关了");
-    clear(); run("SCR t1 QR OK");
+    clear(); run("SCR t2 GRAB 1");
     CHECK(!scrs("cls"), "已经是比赛布局：SCR 不清屏");
     /* 选区页还在显示时扫到码：告诉树莓派，不写屏(不盖掉按钮) */
     run("ZONE ASK"); clear();
@@ -759,12 +759,16 @@ int main(void) {
         for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
         Arm_Poll();
     }
-    CHECK(strstr(scr, "xstr 0,0,322,80,1,65535,0,1,1,1,\"777+111+\"") && strstr(scr, "xstr 0,80,288,80,1,65535,0,1,1,1,\"222+333\""),
-          "画模式：任务码用大字(字库1)画在左上两行，组之间的 + 都在(t0 = 777+111+ 共 8 个大字 320 像素，框 322 宽)");
-    clear(); run("SCR t1 RAW 1/3");
-    CHECK(strstr(scr, "xstr 292,82,188,38,0,65535,0,0,1,1,\"RAW 1/3\""), "画模式：t1 阶段小字画在 t7 右边(188 宽，长的阶段文字放得下)");
-    clear(); run("SCR t5 B1 R1 G2 B3");
-    CHECK(strstr(scr, "xstr 326,2,154,38,0,65535,0,0,1,1,\"B1 R1 G2 B3\""), "画模式：t5 第一批小字画在右上(t0 右边)");
+    CHECK(strstr(scr, "xstr 0,0,480,120,0,65535,0,1,1,1,\"777+111+\"") && strstr(scr, "xstr 0,120,480,120,0,65535,0,1,1,1,\"222+333\""),
+          "(10-23)画模式：任务码用大字(字库 0，字高 120)整个宽度居中画两行，组之间的 + 都在(777+111+ 共 8 个大字 480 像素)");
+    clear(); run("SCR t2 GRAB 3");
+    CHECK(strstr(scr, "xstr 0,240,240,80,1,65535,0,1,1,1,\"\xD7\xA5\xC8\xA1" "3\""), "(10-23)抓取数：中字(字库 1)画在下面一行左半边，前面加中文\"抓取\"(GB2312)");
+    clear(); run("SCR t3 PLACE 12");
+    CHECK(strstr(scr, "xstr 240,240,240,80,1,65535,0,1,1,1,\"\xB7\xC5\xD6\xC3" "12\""), "(10-23)放置数：右半边，\"放置\" + 两位数");
+    clear(); run("SCR t3 5");
+    CHECK(strstr(scr, "\"\xB7\xC5\xD6\xC3" "5\""), "(10-23)树莓派只发数字也行");
+    clear(); run("SCR t1 RAW 1/3"); run("SCR t5 B1 R1 G2 B3");
+    CHECK(scr[0] == 0, "(10-23)以前的阶段、批次小字不再画(屏上只有赛规要的字)");
     clear(); run("SCR t9 X");
     CHECK(scr[0] == 0, "画模式：表里没有的名字不发");
     Arm_Param_Set("SCRMODE", 0);                    /* 下面测"写控件"模式 */

@@ -1826,7 +1826,10 @@ def zone_msg(link, text):
 
 
 def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sleep, zone=None):
-    """比赛流程(一键启动，开始后不再碰车和电脑)：
+    """比赛流程(一键启动，开始后不再碰车和电脑)。
+    (10-23 晚 用户"开跑前屏上全黑、不出 START，race 2 直接开跑")默认 race_start='now'：清屏(ZONE LOCK，屏上不出 START)，
+    切到 race 1 / race 2 选的启停区(不写就用配置里的 start_zone)，马上开跑(和 zone n + go 一样，开跑后先扫描、规划)。
+    race_start='screen' 是以前的做法(屏上按 START 才开跑)：
     1 (10-23 用户"不需要显示启停区1还是2")启停区在终端选：race 1 / race 2(zone，不写就用配置里的 start_zone)。
       发 ZONE n：屏上只出一个大 START(不显示区号)；
     2 一直问 ZONE?：选了区就切换到那个区，等车放好、不动了(陀螺仪 ~2 秒稳定)，先做第一次扫描并预先规划(进度只在终端里说；
@@ -1846,6 +1849,12 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
         want = 2
     if want not in (1, 2):
         want = 2
+    if str(g('race_start', 'now') or 'now').lower() != 'screen':
+        zone_request(link, 'ZONE LOCK')              # 清屏，屏上不出 START(旧固件不认识也照样开跑)
+        log(f'★ 启停区 {want}：直接开跑(抽到别的区：abort 以后输入 race 1 或 race 2)。开跑以后不要再碰车和电脑。')
+        ctx.zone_select(want)
+        start_run(want, False)
+        return 'started'
     ok, rep, _ = zone_request(link, f'ZONE {want}')
     if not ok:
         log(f'STM32 不认识 ZONE 指令({rep})：屏上没有 START。用配置里的 start_zone={g("start_zone", 2)}，'

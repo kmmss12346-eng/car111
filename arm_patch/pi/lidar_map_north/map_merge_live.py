@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """两次扫描合并 + 全程A*路线 + 一键行驶（v10）。
 雷达识别障碍物(两次扫描合并)；1010：每个停车点再用雷达重定位(和出发时的扫描对齐，reloc.py)，修正车位后再做任务。
-比赛：race 1 / race 2 = 终端选启停区(屏上不显示区号) -> 车放好自动扫描、预先规划 -> 屏上按 START 一键跑完(开跑后不碰电脑)。"""
+比赛：race 1 / race 2 = 终端选启停区，直接开跑(屏上开跑前全黑、不出 START；配置 race_start="screen" 才是以前的屏上按 START)。"""
 import os
 for key in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):
     os.environ[key]='1'
@@ -681,7 +681,7 @@ def main():
         finally:state['auto']=False
     def race_thread(zone=None):
         try:
-            state['race']=True                              # 在等按屏上的 START(终端 zone 1|2 可以改区)
+            state['race']=True                              # race_start=screen 时在等按屏上的 START(终端 zone 1|2 可以改区)
             def start_run(z,scanned):
                 state['race']=False;mission_body(True,scanned)
             st=race_flow(Ctx(),link,log,raw_cfg,start_run,zone=zone)
@@ -884,7 +884,7 @@ def main():
                 sync_now()
                 print('第二站动作 ->',link.second_move(None if raw_cfg.get('second_use_p2',False) else rel,log=lambda m:print(m,flush=True)),flush=True);return
             if k=='race':
-                # 比赛：(10-23)race 1 / race 2 在终端选启停区(屏上不显示区号) -> 车放好自动扫描、预先规划 -> 屏上按 START 开跑(开跑后不再碰电脑)
+                # 比赛：(10-23 晚)race 1 / race 2 在终端选启停区，直接开跑(屏上不出 START；race_start="screen" 才等屏上按 START)
                 if len(parts)>2 or (len(parts)==2 and parts[1] not in ('1','2')):raise ValueError('格式：race 1 或 race 2(抽到几区就输几；不写就用现在的启停区)')
                 z_=int(parts[1]) if len(parts)==2 else int(raw_cfg.get('start_zone',2) or 2)
                 if len(parts)==1:print(f'race 没写启停区：用现在的启停区 {z_}(抽到别的区：abort 以后输入 race 1 或 race 2)',flush=True)
@@ -973,7 +973,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race 1|2(比赛：终端选区、屏上按 START) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_jog(c,val):
         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
@@ -1129,7 +1129,7 @@ def main():
     fig.canvas.mpl_connect('close_event',close)
     c_=state['config']
     print(f"启停区 {zs['zone']}：起点车中心=({c_['car_x_mm']:.0f}, {c_['car_y_mm']:.0f})，车头 {c_['car_yaw_deg']:.0f}°（90=朝北，180=朝西）；雷达 前{config['lidar_forward_mm']:.1f} 左{config['lidar_left_mm']:.1f}mm。",flush=True)
-    print('比赛：输入 race 1 或 race 2(抽到几区就输几；配置 race_auto=true 开机自动，用配置里的启停区)→ 车放好不动，自动扫描、预先规划，终端说可以按 START → 按屏上 START 开跑，之后不用碰电脑。屏上只显示任务码、抓取数、放置数。',flush=True)
+    print('比赛：车放好，输入 race 1 或 race 2(抽到几区就输几)直接开跑，之后不用碰电脑(配置 race_auto=true 开机自动，用配置里的启停区)。屏上开跑前全黑，读到码显示任务码，回到启停区显示抓取数、放置数。',flush=True)
     print('调试：zone 1 / zone 2 切换启停区；go = 一键全流程(不再问 y)；park = 收臂、升降停 60mm；abort = 急停(急停后不自动收臂)。',flush=True)
     print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
