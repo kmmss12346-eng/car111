@@ -661,3 +661,45 @@ class R2offCrossTests(unittest.TestCase):
         wiz.run(STEP_KEYS.index('A1P'))
         self.assertTrue(any('--ring' in p.args and cfg in p.args for p in started), [p.args for p in started])
         self.assertTrue(any('红十字 = r2off(往前 -15.0mm、往左 +30.0mm)' in l for l in lines), lines[-12:])
+
+
+class GreenCrossTests(unittest.TestCase):
+    """(10-23 用户"把这个绿色的十字搞成可移动的…可以根据我的输入的数字改变这个绿色十字的位置")看原料盘的那几步输入 g 左右 上下：
+    原料的绿十字挪几个像素，存进 vision_cal.json(别的键不动)；看圆环的那几步不让用；挪出画面、一次挪太多都不存。"""
+
+    def _cfg(self):
+        d = tempfile.mkdtemp()
+        cal = os.path.join(d, 'vision_cal.json')
+        with open(cal, 'w', encoding='utf-8') as f:
+            json.dump({'claw_px': {'RAW': [300.0, 260.0], 'RING': [320.0, 240.0]}, 'r_px': 45}, f)
+        path = os.path.join(d, 'cfg.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'stops': {'QR': [1, 2, 90]}, 'stm32_params': {'FPPM': 12.9}, 'mission_cfg': {'vision_cal_file': cal}}, f)
+        return path, cal
+
+    def _run(self, cfg, items, step):
+        stm = FakeStm32()
+        lines = []
+        Wizard(stm, cfg, inp=Script(stm, items), out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index(step))
+        return lines
+
+    def test_g_moves_the_raw_cross_and_keeps_the_rest(self):
+        cfg, cal = self._cfg()
+        lines = self._run(cfg, ['g -16 -18', 'g', 'q'], 'A1G')
+        d = load(cal)
+        self.assertEqual(d['claw_px']['RAW'], [284.0, 242.0])        # 往左 16、往上 18
+        self.assertEqual(d['claw_px']['RING'], [320.0, 240.0])       # 圆环的不动
+        self.assertEqual(d['r_px'], 45)                              # 别的键不动
+        self.assertTrue(any('(300, 260) → (284, 242)' in l for l in lines), lines[-8:])
+        self.assertTrue(any('现在在 (284, 242)' in l for l in lines), lines[-8:])
+
+    def test_g_only_in_raw_steps_and_checks_input(self):
+        cfg, cal = self._cfg()
+        lines = self._run(cfg, ['g 5 5', 'q'], 'A1P')
+        self.assertEqual(load(cal)['claw_px']['RAW'], [300.0, 260.0])
+        self.assertTrue(any('g 只在看原料盘的那几步用' in l for l in lines), lines[-6:])
+        lines = self._run(cfg, ['g 5', 'g 500 0', 'g 200 0', 'g 200 0', 'q'], 'ZGRAB')
+        self.assertTrue(any('格式：g 左右 上下' in l for l in lines), lines)
+        self.assertTrue(any('一次最多挪 200 像素' in l for l in lines), lines)
+        self.assertTrue(any('出画面' in l for l in lines), lines)
+        self.assertEqual(load(cal)['claw_px']['RAW'], [500.0, 260.0])   # 第一次 +200 存了，第二次出画面没存

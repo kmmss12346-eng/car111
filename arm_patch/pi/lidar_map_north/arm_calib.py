@@ -20,6 +20,9 @@
     t             (车上转盘去圆环那几步 R1T2/R2T/R1T1/R2SPD)按 STM32 里已经保存的值真走一遍：去车上转盘 -> 去 2 号环 -> 回车上转盘
     v             打开/关掉摄像头画面(vlive.py 的窗口：看物料、圆环认得怎么样)。原料盘上方姿态、ZGRAB、ZOBRAW、
                   圆环上方姿态、ZPLC、ZOBRNG 这几步会自动打开(要在树莓派桌面的终端里运行向导)
+    g -16 -18     (看原料盘的那几步：A1G、ZGRAB、CLWOR、ZOBRAW)原料画面里的绿十字往左 16、往上 18 像素(往右、往下为正)，
+                  存进 vision_cal.json，画面里马上跟着动。画面上 off 后面那两个数 = 物料离绿十字差多少：
+                  先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。只输入 g = 看绿十字现在在哪
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
@@ -116,7 +119,9 @@ STEPS = [
     dict(key=('A1G', 'A2E'), kind='pose', title='原料盘上方的姿态', setup='raw',
          text='车按比赛时的位置停在原料盘前面，原料盘停着。把爪子移到原料盘上离车最近那一格(那个物料)的正上方：\n'
               '比赛时车就在这一格等，要的颜色转过来就夹(10-18 用户"最近那格"的做法)。用 2 +50 / 2 -50 调伸缩，1 +1 / 1 -1 调左右。\n'
-              '之后在 map_merge_live 里 rteach RAW near 颜色号，车轮会按摄像头再细对；齿条伸缩到头了、差一两厘米也没关系，车轮会补。'),
+              '之后在 map_merge_live 里 rteach RAW near 颜色号，车轮会按摄像头再细对；齿条伸缩到头了、差一两厘米也没关系，车轮会补。\n'
+              '(10-23)画面里的绿十字不在爪子真正夹的地方：先输入 c 看爪子能不能正好夹住，夹得住以后输入 g 加画面上 off 后面那两个数，\n'
+              '绿十字就挪到物料中心上了(rteach RAW near 就是把物料对到绿十字下面，所以要先把绿十字调准)。'),
     # (10-19 用户：电池盒挡着)夹起以后伸缩不动转到 A1T1 -> 伸到 A2T -> 伸着转到 A1T2 -> 缩回 A2R -> 转到车上转盘；伸缩都在两个圆盘外面
     dict(key='A1T1', kind='servo', sid=1, title='绕开电池盒①：开始伸长的角度 A1T1', setup='raw', needs_fw=True,
          text='夹起物料以后，伸缩先不动，手臂往车上转盘那边转，转到这个角度开始伸长(要已经离开原料盘那一块)。\n'
@@ -557,6 +562,40 @@ class Wizard:
         elif why:
             self.out(f'  ★ 设了 r2off，但{why}')
 
+    def _claw_shift(self, line):
+        """(10-23 用户"把这个绿色的十字搞成可移动的…可以根据我的输入的数字改变这个绿色十字的位置")g 左右 上下：
+        原料画面里的绿十字(爪子点 claw_px.RAW)挪几个像素(往右、往下为正)，存进 vision_cal.json，开着的 vlive 马上跟着动。
+        只在看原料盘的那几步用。"""
+        if getattr(self, '_step_mode', None) != 'raw':
+            raise CalError('g 只在看原料盘的那几步用(A1G 原料盘上方的姿态、ZGRAB、CLWOR、ZOBRAW)：挪的是原料画面里的绿十字')
+        parts = line.split()
+        if len(parts) == 1:
+            try:
+                from vision import Vision
+                from vlive import load_vision_cfg
+                u, v = Vision(load_vision_cfg(self.cfg_path)).claw('RAW')
+                self.out(f'  原料画面里的绿十字现在在 ({u:.0f}, {v:.0f}) 像素。')
+            except Exception as e:
+                self.out(f'  (读不出绿十字的位置：{e})')
+            self.out('  输入 g 左右 上下 挪它(像素，往右、往下为正)，例如 g -16 -18 = 往左 16、往上 18。\n'
+                     '  画面上 off 后面那两个数 = 物料离绿十字差多少：先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。')
+            return None
+        du, dv = (_num(parts[1]), _num(parts[2])) if len(parts) == 3 else (None, None)
+        if du is None or dv is None:
+            raise CalError('格式：g 左右 上下(像素，往右、往下为正)，例如 g -16 -18')
+        if abs(du) > 200 or abs(dv) > 200:
+            raise CalError('一次最多挪 200 像素')
+        try:
+            from vlive import claw_shift
+            old, new, path = claw_shift(self.cfg_path, du, dv)
+        except Exception as e:
+            raise CalError(f'绿十字没挪：{e}')
+        self.out(f'  原料的绿十字：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f}) 像素，已存进 {Path(path).name}'
+                 '(画面里马上跟着动；想挪回去就输入相反的数)。绿十字改了，原料区要重新 rteach RAW near')
+        if self._viewer is None or self._viewer.poll() is not None:
+            self.out('  (摄像头画面没开着：输入 v 打开看看)')
+        return None
+
     def _view_close(self):
         v = self._viewer
         self._viewer, self._view_mode = None, None
@@ -775,6 +814,8 @@ class Wizard:
             self._read_servos()
             self.out(f'  ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°')
             return None
+        if line == 'g' or line.startswith('g '):
+            return self._claw_shift(line)
         if k == 'choice':
             if line in ('w1', 'w2'):
                 sid = int(line[1])
