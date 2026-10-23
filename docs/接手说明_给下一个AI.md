@@ -735,5 +735,11 @@ git_log.txt                ← 分支最近 120 条提交记录
   注意：10-23 一度让用户 set LFCHK 0、LFACC 220、LFMRG 400，后来都改回 LFCHK 1.5、LFACC 0、LFMRG 200(LFCHK 关掉顶住了不停，更容易过载)；ZPLC 建议 6。
   r2off 每个方向上限 20 → 60(用户"这个20远远不够你放宽到60")：mission_hooks DEFAULTS ring2_off_max_mm、map_merge_live 的 r2off 检查。
   车上配置里没有 ring2_off_max_mm 这一项，给了用户一行 python 先写进配置(不用换程序就生效)。偏这么多多半是爪子点不准(还没做 vclaw RING)。
+- **10-23 arm_calib 画 r2off 红十字(用户"arm_calib 里也出现故意对偏的那个偏心十字，我手动把绿色的和红色十字对齐，再按对齐的位置调 1、3 号环")：**
+  vlive.py `r2off_px(cfg_path)`：和 mission_hooks._ring2_off_px 一样按 servo_cal.json 的 RING ch 把 r2off(F, S)换成像素；找圆环时在
+  绿十字 + 这个偏移画红十字(标 r2off)，左上角偏差改成圆环离红十字多少(选离红十字最近的环)。arm_calib 开 vlive 时带 --config(和向导同一份配置)，
+  看圆环那几步说一句红十字是什么；A1P、R1、R3 的说明加了"把圆环中心对到红十字上，用红十字对就别降低高度"。
+  红十字是爪子相对摄像头的真实位置，手臂转到 1、3 号环也照样准(摄像头装在爪子上)，但要在 ZOBRNG 的高度看(降低了有视差)。
+  车上的 J、r2off -15/30：红十字在绿十字 (-1, +34) 像素。更新包 calib_1023b.zip(arm_calib.py、vlive.py)。
 
 

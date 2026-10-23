@@ -562,3 +562,102 @@ class HelperTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)
+
+
+class R2offCrossTests(unittest.TestCase):
+    """(10-23 用户"arm_calib 里也故意出现那个故意对偏的偏心十字，我好手动把绿色的和红色十字对齐，再按对齐的位置调 1、3 号环")
+    看圆环时按 r2off 画红十字：位置和比赛时 2 号环对准用的(mission_hooks._ring2_off_px)一模一样。"""
+    J = [[-0.4476067621216748, -0.811142922202761], [0.9711641946870161, -0.3456511867383666]]   # 车上 servo_cal.json 的 RING ch
+
+    def _cfg(self, off=None, with_j=True):
+        d = tempfile.mkdtemp()
+        cal = os.path.join(d, 'servo_cal.json')
+        if with_j:
+            with open(cal, 'w', encoding='utf-8') as f:
+                json.dump({'RING': {'ch': self.J}}, f)
+        path = os.path.join(d, 'cfg.json')
+        mc = {'servo_cal_file': cal}
+        if off is not None:
+            mc['ring2_off_mm'] = {'F': off[0], 'S': off[1]}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'stops': {'QR': [1, 2, 90]}, 'stm32_params': {'FPPM': 12.9}, 'mission_cfg': mc}, f)
+        return path
+
+    def test_same_offset_as_the_race_alignment(self):
+        import numpy as np
+        import mission_hooks
+        from vlive import r2off_px
+        goal, fs, why = r2off_px(self._cfg((-15.0, 30.0)))
+        self.assertEqual((fs, why), ((-15.0, 30.0), ''))
+
+        class H:                                             # 比赛时对准 2 号环用的那个换算
+            def ring2_off(self):
+                return -15.0, 30.0
+
+            def log(self, m):
+                pass
+        want = mission_hooks.MissionHooks._ring2_off_px(H(), np.array(self.J))
+        self.assertAlmostEqual(goal[0], float(want[0]), places=6)
+        self.assertAlmostEqual(goal[1], float(want[1]), places=6)
+
+    def test_nothing_without_r2off_and_reason_without_vcal(self):
+        from vlive import r2off_px
+        self.assertEqual(r2off_px(self._cfg(None)), (None, None, ''))
+        goal, fs, why = r2off_px(self._cfg((5.0, 0.0), with_j=False))
+        self.assertIsNone(goal)
+        self.assertIn('vcal RING', why)
+
+    def test_red_cross_drawn_and_offset_measured_from_it(self):
+        import numpy as np
+        from vlive import annotate
+
+        class Det:
+            last = []
+
+        class Vis:
+            last_claw = None
+
+            def claw(self, kind):
+                return (320.0, 240.0)
+
+            def _rings_in_frame(self, fr):
+                return [(330.0, 250.0, 50.0)]
+
+            def _ring_det(self):
+                return Det()
+
+            def scale(self, kind):
+                return 1.25
+        fr = np.zeros((480, 640, 3), np.uint8)
+        out, msg = annotate(Vis(), fr, 'ring', 1, goal=(12.0, 8.0))
+        self.assertEqual(tuple(int(x) for x in out[248, 344]), (0, 0, 255))   # 红十字在 爪子点 + (12, 8)：中心 (332,248)，横的一笔
+        self.assertEqual(tuple(int(x) for x in out[260, 332]), (0, 0, 255))   # 竖的一笔
+        self.assertIn('red r2off', msg)
+        self.assertIn('-2,+2 px', msg)                                       # 圆环 (330,250) 离红十字 (332,248)
+        out, msg = annotate(Vis(), fr, 'ring', 1)
+        self.assertNotIn('red', msg)
+        self.assertIn('+10,+10 px', msg)                                     # 没设 r2off：照旧离绿十字算
+
+    def test_wizard_says_what_the_red_cross_is(self):
+        started = []
+
+        class FakeProc:
+            def __init__(self, args, **kw):
+                self.args, self.alive = args, True
+                started.append(self)
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def terminate(self):
+                self.alive = False
+
+            def wait(self, timeout=None):
+                return 0
+        stm = FakeStm32()
+        lines = []
+        cfg = self._cfg((-15.0, 30.0))
+        wiz = Wizard(stm, cfg, inp=Script(stm, ['q']), out=lines.append, view=True, popen=FakeProc)
+        wiz.run(STEP_KEYS.index('A1P'))
+        self.assertTrue(any('--ring' in p.args and cfg in p.args for p in started), [p.args for p in started])
+        self.assertTrue(any('红十字 = r2off(往前 -15.0mm、往左 +30.0mm)' in l for l in lines), lines[-12:])
