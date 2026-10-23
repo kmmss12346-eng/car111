@@ -193,6 +193,8 @@ class JacStore:
             tmp = self.path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())           # (10-23)示教完可能马上关电闸：先落盘再改名
             os.replace(tmp, self.path)
             self.dirty = False
         except Exception:

@@ -853,7 +853,7 @@ def _rteach_raw(h, link, parts, path, state, log):
     """(10-18 用户)原料区示教：车轮对准原料盘中心以后，三个停靠位各记一套抓取动作(手臂角度)。
     rteach RAW center [here] / rteach RAW 1~3 颜色号 / rteach RAW 1~3 save / rteach RAW 1~3 go / rteach RAW clear
     (10-18 用户)rteach RAW near 颜色号："最近那格"的做法——车轮把最近那一格上的这个颜色的物料对到爪子正下方，只在这一格夹"""
-    from mission_hooks import load_place_adj
+    from mission_hooks import load_place_adj, save_json
     sub = [p.lower() for p in parts[2:]]
     if sub == ['shift']:
         def go_shift():
@@ -892,8 +892,7 @@ def _rteach_raw(h, link, parts, path, state, log):
         gone = [k for k in ('RAW_CT', 'RAW') if k in d]
         for k in gone:
             del d[k]
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         log('已清掉原料区的示教' + ('' if gone else '(本来就没有)') + '：比赛时原料区用以前的做法')
         return None
     ok_n = len(sub) == 2 and sub[0] in ('1', '2', '3')
@@ -943,7 +942,7 @@ def _rteach_raw(h, link, parts, path, state, log):
 
 def _rteach(h, link, zone, ring, path, log):
     """示教：只动手臂对准最近的圆环，记下角度(2 号环)或者和 2 号环差多少度(1、3 号环)，存进 ring_teach.json。"""
-    from mission_hooks import load_place_adj
+    from mission_hooks import load_place_adj, save_json
     _tools(h, link)
     P = h.arm.params(refresh=True)
     if P.get('ARMOK', 0) < 0.5:
@@ -994,8 +993,7 @@ def _rteach(h, link, zone, ring, path, log):
             best = min(seen, key=lambda e: math.hypot(e[0] - pred[0], e[1] - pred[1]))
             z['e' + str(ring)] = best
         log(f'③ 记下 {ring} 号环：比 2 号环 ID1 {a1 - float(p2[0]):+.2f}°、ID2 {a2 - float(p2[1]):+.2f}°')
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False, indent=1)
+    save_json(path, d)
     h.__dict__.pop('_teach_all', None)
     left = [r for r in ('1', '3') if r not in z]
     log(f'   已存进 {path}。' + (f'还要示教 {"、".join(left)} 号环' if left else f'{zone} 示教完了：比赛时车只对准 2 号环一次，1、3 号环直接转过去'))

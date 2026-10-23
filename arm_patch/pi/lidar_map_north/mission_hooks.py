@@ -420,11 +420,29 @@ def load_place_adj(path):
         return {}
 
 
+def save_json(path, d, indent=1):
+    """(10-23)一键启动就是整车电闸，示教完可能马上就关电：先写临时文件、fsync，再改名替换。
+    断电时文件要么是旧的、要么是新的，不会只写了一半。"""
+    tmp = str(path) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(str(path))), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def save_place_adj(path, key, d1, d2):
     d = load_place_adj(path)
     d[key] = [round(float(d1), 2), round(float(d2), 2)]
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False, indent=1)
+    save_json(path, d)
     return d
 
 
@@ -4113,8 +4131,7 @@ class MissionHooks:
             r.clear()
         r['home'] = [round(home[0], 2), round(home[1], 2)]
         r.setdefault('slots', {})[str(int(n))] = dict(px=px, a=a)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         self.__dict__.pop('_raw_slots_cache', None)
         self.log(f'   停靠位 {n}：画面位置 {px}' + (f'，手臂 ID1 {a[0]:.2f}°、ID2 {a[1]:.2f}°(够得着)' if a else '，手臂够不着(只记位置)'))
         return a is not None
@@ -5352,8 +5369,7 @@ class MissionHooks:
                            c=[round(float(c[0]), 1), round(float(c[1]), 1)], r=round(rr, 1), slots={})
         if getattr(self, '_rc_rim', None):
             d['RAW_CT']['rim'] = round(float(self._rc_rim), 1)          # (10-20)外圈半径(像素)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         if self.store is not None:
             self.store.save()                                  # 刚测的车轮和画面的对应关系存进 servo_cal.json：比赛时直接用
         self.log(f'  记下了：原料盘中心在画面 ({c[0]:.0f}, {c[1]:.0f})(离爪子点 {dmm:.1f}mm)，'
@@ -5470,8 +5486,7 @@ class MissionHooks:
                            shift_mm=[round(float(act.disp['S']), 1), round(float(act.disp['F']), 1)])
         if getattr(self, '_rc_rim', None):
             d['RAW_CT']['rim'] = round(float(self._rc_rim), 1)          # (10-20)外圈半径(像素)：比赛时车停偏了按它投票找圆心
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         if self.store is not None:
             self.store.save()                                  # 刚测的车轮和画面的对应关系存进 servo_cal.json：比赛时直接用
         self.log(f'  记下了(最近那格的做法)：{name} 物料离爪子点 {dq:.1f}mm；原料盘中心在画面 ({c[0]:.0f}, {c[1]:.0f})，'
@@ -5631,8 +5646,7 @@ class MissionHooks:
         r_ = d.setdefault('RAW_CT', D)
         r_.setdefault('slots', {})[str(int(n))] = dict(px=[round(float(px[0]), 1), round(float(px[1]), 1)], a=a, color=int(color),
                                                        **({'guessed': True} if guessed else {}))
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         done = sorted(k for k, s in r_['slots'].items() if s.get('px'))
         self.log(f'   {n} 号停靠位：画面位置 ({px[0]:.0f}, {px[1]:.0f})' + (f'，抓取角度 ID1 {a[0]:.2f}°、ID2 {a[1]:.2f}°' if a else '，还没有抓取角度')
                  + f'。已示教 {"、".join(done)} 号位' + ('，三个都有了' if len(done) >= 3 else ''))
@@ -5793,8 +5807,7 @@ class MissionHooks:
             if isinstance(sv, dict) and sv.get('px'):
                 sv['px'] = [round(float(sv['px'][0] + dc[0]), 1), round(float(sv['px'][1] + dc[1]), 1)]
                 sv['a'] = None
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         good = [k for k in keys if mg[k][2][j] >= ok_mm]
         cols = {str(k): (sv or {}).get('color') for k, sv in (D.get('slots') or {}).items()}
         self.log(f'  记下了新的对准位置：原料盘中心在画面 ({c_new[0]:.0f}, {c_new[1]:.0f})(比赛时车轮对到这里)。抓取角度清掉了，'
@@ -5822,8 +5835,7 @@ class MissionHooks:
         if a[0] is None or a[1] is None:
             raise ArmError('读不到手臂角度，没保存')
         s['a'] = [round(float(a[0]), 2), round(float(a[1]), 2)]
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        save_json(path, d)
         self.log(f'   {n} 号停靠位的抓取角度记成现在的：ID1 {s["a"][0]:.2f}°、ID2 {s["a"][1]:.2f}°')
 
     def raw_ct_goto_slot(self, n, path):

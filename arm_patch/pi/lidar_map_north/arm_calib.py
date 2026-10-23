@@ -69,6 +69,24 @@ TIMEOUT.update(TRAY=40.0, APZ=40.0, SIDE=3.0)     # (10-21)试走车上转盘 <-
 HELP = __doc__.split('然后你输入下面的东西', 1)[1].split('保存 = ', 1)[0]
 
 
+def save_json(path, d, indent=2):
+    """(10-23)一键启动就是整车电闸，标定完可能马上就关电：先写临时文件、fsync，再改名替换(不会只写了一半)。"""
+    tmp = str(path) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(str(path))), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 class CalError(Exception):
     pass
 
@@ -396,7 +414,7 @@ class Wizard:
             sp = dict(cfg.get('stm32_params') or {})
             sp.update(values)
             cfg['stm32_params'] = sp
-            self.cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding='utf-8')
+            save_json(self.cfg_path, cfg)
         self.out('  已保存：' + '  '.join(f'{k}={v:g}' for k, v in values.items()))
 
     # ------------------------------------------------------------ 开始前检查
@@ -942,7 +960,7 @@ class Wizard:
                 z.pop('e' + str(st['ring']), None)         # 以前 rteach(摄像头)记的"画面里在哪"对不上了
                 z['src'] = 'arm_calib'
                 z['p2'] = [round(self.P['A1P'], 2), round(self.P['A2P'], 2)]
-            path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
+            save_json(path, d, indent=1)
             self.saved[st['key']] = (round(d1, 2), round(d2, 2))
             self.out(f'  已保存：{st["ring"]} 号环比 2 号环多转 ID1 {d1:+.2f}°、ID2 {d2:+.2f}°(存在 {path.name}，粗加工区、暂存区共用)')
         if self.released:

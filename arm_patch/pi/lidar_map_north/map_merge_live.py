@@ -24,6 +24,19 @@ import reloc
 STOP_NAMES_LIVE = ('QR', 'RAW', 'ROUGH', 'TEMP')   # (10-23)go step 到这几站停下时能挪车、save 存停车点(和 route_plan.STOP_NAMES 一样)
 ROOT=Path(__file__).resolve().parent
 
+def write_json_safe(p,obj):
+    """(10-23)一键启动就是整车电闸，存完配置(bootrace、save 停车点)可能马上就关电：先写临时文件、fsync，再改名替换。
+    断电时文件要么是旧的、要么是新的，不会只写了一半(读不出来程序就开不了)。"""
+    p=str(p);tmp=p+'.tmp'
+    with open(tmp,'w',encoding='utf-8') as f:
+        json.dump(obj,f,indent=2,ensure_ascii=False);f.flush();os.fsync(f.fileno())
+    os.replace(tmp,p)
+    try:
+        fd=os.open(os.path.dirname(os.path.abspath(p)),os.O_RDONLY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+    except OSError:pass
+
 SIM=None   # 桌面模拟时由 --sim 设置
 
 class GyroReader:
@@ -209,7 +222,7 @@ def main():
             else:raw_cfg[k_]=v_
         p=Path(args.config);bak=p.with_suffix('.json.bak')
         if not bak.exists():bak.write_text(p.read_text(encoding='utf-8'),encoding='utf-8')
-        p.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+        write_json_safe(p,file_cfg())
     def mission_cfg():
         mc=dict(raw_cfg);mc.update(car_length_mm=config.get('car_length_mm',290),car_width_mm=config.get('car_width_mm',260))
         return mc
@@ -637,7 +650,7 @@ def main():
         bak=p.with_suffix('.json.bak')
         if not bak.exists():bak.write_text(p.read_text(encoding='utf-8'),encoding='utf-8')
         sp_=dict(raw_cfg.get('stm32_params',{}));sp_.update(updates);raw_cfg['stm32_params']=sp_
-        p.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+        write_json_safe(p,file_cfg())
     synced=[False]
     def sync_now(force=False):
         """把配置里的 stm32_params 发给 STM32(STM32 断电重启后参数会回到编译进去的默认值)。每次运行程序第一次动车前自动做一次。"""
@@ -967,7 +980,7 @@ def main():
             mc_['ring2_off_mm']={'F':f_,'S':s_};raw_cfg['mission_cfg']=mc_
             p_=Path(args.config);bak=p_.with_suffix('.json.bak')
             if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
-            p_.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+            write_json_safe(p_,file_cfg())
             try:
                 import mission_cli as mcli
                 if mcli._S.get('hooks') is not None:mcli._S['hooks'].cfg['ring2_off_mm']={'F':f_,'S':s_}
@@ -981,7 +994,7 @@ def main():
                 if not state['calib']:raise ValueError('还没有标定结果，先 calib X Y ...')
                 bak=Path(args.config).with_suffix('.json.bak');bak.write_text(Path(args.config).read_text(encoding='utf-8'),encoding='utf-8')
                 raw_cfg.update({k2:state['calib'][k2] for k2 in ('lidar_yaw_deg','lidar_forward_mm','lidar_left_mm')})
-                Path(args.config).write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+                write_json_safe(args.config,file_cfg())
                 state['config']=validate_config(dict(state['config'],**{k2:state['calib'][k2] for k2 in ('lidar_yaw_deg','lidar_forward_mm','lidar_left_mm')}))
                 print('已写入配置（原文件备份为 .json.bak）。请 q 退出后重新 bash run_live.sh 再扫描。',flush=True);return
             if history.views:raise ValueError('标定要在第一次 scan 之前、车停在起点时做；已扫描请先 reset')
@@ -1064,7 +1077,7 @@ def main():
         stops[n]=[int(v) if float(v).is_integer() else round(v,1) for v in (x_,y_,h_)]
         p_=Path(args.config);bak=p_.with_suffix('.json.bak')
         if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
-        p_.write_text(json.dumps(file_cfg(),indent=2,ensure_ascii=False),encoding='utf-8')
+        write_json_safe(p_,file_cfg())
         print(f'已改 {n}：({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}° → ({x_:.0f},{y_:.0f}) 车头 {stops[n][2]:.0f}°，存进 {p_.name}(原文件备份为 .json.bak)',flush=True)
         if not replan:
             print('  这一趟后面照原来的路线走；下一次 go 按新停车点规划',flush=True);return

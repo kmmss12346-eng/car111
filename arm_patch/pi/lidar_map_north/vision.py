@@ -59,6 +59,8 @@ def save_vision_cal(kind, uv, path=None, extra=None):
     tmp = str(p) + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())                   # (10-23)标定完可能马上关电闸：先落盘再改名
     os.replace(tmp, p)
     return p
 
@@ -78,6 +80,8 @@ def forget_vision_cal(kinds=(), keys=(), path=None):
     tmp = str(p) + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())                   # (10-23)标定完可能马上关电闸：先落盘再改名
     os.replace(tmp, p)
     return True
 

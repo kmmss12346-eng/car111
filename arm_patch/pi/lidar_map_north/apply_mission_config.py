@@ -7,6 +7,7 @@
 只加不改：你已经有的值一个都不动，只补上缺的；原文件自动备份成 .json.bak_mission。
 """
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -89,7 +90,12 @@ def main(argv):
         shutil.copyfile(path, bak)
     cfg['mission_cfg'] = new
     cfg['_mission_cfg_note'] = NOTE
-    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding='utf-8')
+    tmp = path.with_name(path.name + '.tmp')          # (10-23)先写临时文件、落盘再改名：中途关电闸也不会只写一半
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
     added = [k for k in new if k not in old]
     print(f'已写入 {path}（原文件备份在 {bak.name}）')
     print(f'  mission_cfg.enabled = {new["enabled"]}')

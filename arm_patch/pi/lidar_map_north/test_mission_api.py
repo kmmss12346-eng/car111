@@ -776,5 +776,27 @@ class ArmLinkTests(unittest.TestCase):
         self.assertIn('车上转盘上方张开', claw_line_text('CLAWSET 1700 OT'))
 
 
+class SaveJsonTests(unittest.TestCase):
+    """(10-23)一键启动就是整车电闸：示教、bootrace 存完可能马上关电。先写临时文件、落盘再改名，写坏了原文件也还是完整的。"""
+
+    def test_atomic(self):
+        import json
+        import os
+        import tempfile
+        from mission_hooks import save_json
+        from arm_calib import save_json as save_json2
+        for fn in (save_json, save_json2):
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, 'place_adj.json')
+                fn(p, {'RING': [1, 2]})
+                with open(p, encoding='utf-8') as f:
+                    self.assertEqual(json.load(f), {'RING': [1, 2]})
+                self.assertEqual(os.listdir(d), ['place_adj.json'])                 # 临时文件改名成正式的了
+                with self.assertRaises(TypeError):
+                    fn(p, {'RING': [3, 4], 'bad': object()})                      # 写到一半出错
+                with open(p, encoding='utf-8') as f:
+                    self.assertEqual(json.load(f), {'RING': [1, 2]})              # 原文件没动、是完整的
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
