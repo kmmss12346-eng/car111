@@ -912,12 +912,12 @@ def main():
         if k=='route':state['plan_start']=None;state['replan_from']=None;plan_route();state['plan_key']=None;redraw();print_route();return
         if k=='stop':command_stop(parts);return
         if k=='r2off':
-            # (10-21 用户)对准 2 号环时故意对偏：r2off 前后 左右(毫米，往前/往左为正，各 ±20 以内)；r2off 看现在的；r2off 0 0 不偏
+            # (10-21 用户)对准 2 号环时故意对偏：r2off 前后 左右(毫米，往前/往左为正，各 ±60 以内，配置 ring2_off_max_mm)；r2off 看现在的；r2off 0 0 不偏
             mc_=dict(raw_cfg.get('mission_cfg') or {});o_=dict(mc_.get('ring2_off_mm') or {})
             if len(parts)==1:
                 print(f"对准 2 号环故意对偏：往前 {float(o_.get('F',0)):+.1f}mm、往左 {float(o_.get('S',0)):+.1f}mm(r2off 前后 左右 改)",flush=True);return
             if len(parts)!=3:raise ValueError('格式：r2off 前后 左右(毫米，往前/往左为正，例如 r2off 5 -3；r2off 0 0 = 不偏)')
-            f_,s_=float(parts[1]),float(parts[2]);lim_=float(mc_.get('ring2_off_max_mm',20.0))
+            f_,s_=float(parts[1]),float(parts[2]);lim_=float(mc_.get('ring2_off_max_mm',60.0))
             if abs(f_)>lim_ or abs(s_)>lim_:raise ValueError(f'每个方向最多 ±{lim_:g}mm')
             mc_['ring2_off_mm']={'F':f_,'S':s_};raw_cfg['mission_cfg']=mc_
             p_=Path(args.config);bak=p_.with_suffix('.json.bak')

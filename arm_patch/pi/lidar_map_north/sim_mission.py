@@ -3929,8 +3929,8 @@ class ZoneCalTests(unittest.TestCase):
 
     def test_ring2_deliberate_offset(self):
         """(10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，偏多少自己调")ring2_off_mm F=8：三个环放下的点都比圆环中心往前偏 8mm
-        (1、3 号环跟着 2 号环一起偏)；超过 ±20mm 按 20 算。"""
-        for f in (8.0, 35.0):
+        (1、3 号环跟着 2 号环一起偏)；超过 ±60mm 按 60 算((10-23)以前是 20)。"""
+        for f in (8.0, 75.0):
             w = self._world(5, park={'ROUGH': 10.0}, stop_err_mm=0.5)
             lines = []
             h = self._make(w, dict(ring2_off_mm=dict(F=f, S=0.0)), lines=lines)
@@ -3938,8 +3938,8 @@ class ZoneCalTests(unittest.TestCase):
             w.arrive('ROUGH', 1)
             h.task('ROUGH', w.link, lines.append)
             text = '\n'.join(lines)
-            if f > 20.0:
-                self.assertIn('往前 +20.0mm', text)                   # 超过 20 按 20
+            if f > 60.0:
+                self.assertIn('往前 +60.0mm', text)                   # 超过 60 按 60
                 continue
             self.assertIn('故意对偏', text)
             errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
@@ -3966,6 +3966,14 @@ class ZoneCalTests(unittest.TestCase):
                 self.assertAlmostEqual(float(d[1]), want[1], delta=1.5, msg=(f, sd, k, d))
                 got += 1
             self.assertEqual(got, 3)
+
+    def test_ring2_offset_limit_60mm(self):
+        """(10-23 用户"这个20远远不够你放宽到60")r2off 每个方向最多 ±60mm：-15/+30 原样用，超过 60 的按 60 算。"""
+        w = self._world(1)
+        h = self._make(w, dict(ring2_off_mm=dict(F=-15.0, S=30.0)))
+        self.assertEqual(h.ring2_off(), (-15.0, 30.0))
+        h.cfg['ring2_off_mm'] = dict(F=80.0, S=-75.0)
+        self.assertEqual(h.ring2_off(), (60.0, -60.0))
 
     def test_short_move_not_clamped_by_map_check(self):
         """(10-21 夜实车暂存区：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)规划的停车点离场地边很近、车沿圆环那一排

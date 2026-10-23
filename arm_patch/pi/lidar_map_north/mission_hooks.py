@@ -310,7 +310,7 @@ DEFAULTS = dict(
     zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
     ring2_off_mm=dict(F=0.0, S=0.0),     # (10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，可以自由调")对准 2 号环时爪子(放下的点)
                                         #   比圆环中心往前 F、往左 S 毫米(各 ±ring2_off_max_mm 以内)；run_live 里 r2off 前后 左右 改并存配置。1、3 号环跟着一起偏
-    ring2_off_max_mm=20.0,
+    ring2_off_max_mm=60.0,              #   (10-23 用户"这个20远远不够你放宽到60")r2off 每个方向最多偏多少毫米(以前 20)
     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
                                         #   观察姿态(A1P/A2P)一下都不动；只差一点、打滑、到能挪的边上、次数用完都不交给手臂补，车轮接着修
                                         #   (最多 zone_wheels_moves 次)，最后还差不到 accept_mm 照样放，不然这个区这次不放。False = 以前(剩下的手臂补)
@@ -7946,7 +7946,7 @@ class MissionHooks:
     def ring2_off(self):
         """(10-21)对准 2 号环时故意对偏多少：(往前 F, 往左 S) 毫米，各限在 ±ring2_off_max_mm。"""
         o = self.cfg.get('ring2_off_mm') or {}
-        lim = float(self.cfg.get('ring2_off_max_mm', 20.0) or 20.0)
+        lim = float(self.cfg.get('ring2_off_max_mm', 60.0) or 60.0)
         try:
             f, s = float(o.get('F', 0.0) or 0.0), float(o.get('S', 0.0) or 0.0)
         except (TypeError, ValueError, AttributeError):
