@@ -108,6 +108,9 @@ static float g_a1t1   = 0.0f;      /* A1T1   ID1 角度：转到这里开始伸�
 static float g_a2t    = 0.0f;      /* A2T    ID2 角度：伸到这么长转，碰不到电池盒 */
 static float g_a1t2   = 0.0f;      /* A1T2   ID1 角度：转过电池盒，到这里开始缩回(还没到车上转盘正上方) */
 static float g_a2spd  = 0.0f;      /* A2SPD  这几段伸长、缩回的速度(度/秒)；0 = 用 ASPD */
+/* (10-23 用户"原料区域抓取物料之后再新加上一个往回缩的动作，因为我怕这个爪子挡住其他物料")在原料盘上夹紧以后：
+ * 先直着抬 OVCLR 离开原料盘，再一边升到 ZHI 一边把伸缩缩回到 A2GB(ID1 不转)，然后照旧转去车上转盘。0 = 不缩(照旧) */
+static float g_a2gb   = 0.0f;      /* A2GB   ID2 角度：在原料盘夹起以后先缩回到这里 */
 /* (10-20 用户：夹着物料去地上圆环也怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组，意思和上面 A1T1~A2SPD 一样：
  * 从圆环往车上转盘转，转过 R1T1 伸到 R2T、转过 R1T2 缩回 A2R；离开车上转盘反过来走(转过 R1T2 伸到 R2T，
  * 转过 R1T1 再伸缩到圆环那边要的长度)。R2T = 0 = 这一组没调，照旧走原料区那组 */
@@ -196,6 +199,7 @@ static const ArmTun tun[] =
     { "A2T",    &g_a2t,    -5000.0f, 5000.0f },
     { "A1T2",   &g_a1t2,   -720.0f,  720.0f },
     { "A2SPD",  &g_a2spd,   0.0f,    1500.0f },
+    { "A2GB",   &g_a2gb,   -5000.0f, 5000.0f },
     { "R1T1",   &g_r1t1,   -720.0f,  720.0f },
     { "R2T",    &g_r2t,    -5000.0f, 5000.0f },
     { "R1T2",   &g_r1t2,   -720.0f,  720.0f },
@@ -1586,6 +1590,15 @@ static const char *Seq_PickHere(uint8_t slot, float z, uint8_t ring)
     if (!TT_WaitReady()) return NULL;              /* (10-21 实车"下降的时候不夹取，抬起来了再夹取")车上转盘还在转就先等它停：
                                                     * 下降只要半秒，转盘要 TTWAIT 才转完，两个舵机一起使劲时夹爪会慢半拍、合不上 */
     Claw_C();      claw_hold = 1;  WAIT(g_clwait); /* 夹紧 */
+    if (!ring && Absf(g_a2gb) > 0.5f && Ext_Id() == 2)
+    {
+        /* (10-23)原料盘上夹起以后先往回缩(A2GB)：直着抬 OVCLR、一边升到 ZHI 一边缩回，ID1 不转，爪子不从别的物料上面扫过去 */
+        float c1 = 0.0f;
+        if (Servo_ReadAngle(1, &c1))
+        {
+            GO(Move_Over(c1, g_a2gb, 1, g_zhi));
+        }
+    }
     GO(Go_Tray(g_zdrop));                          /* 抬起、缩回转到转盘上方、下降(OVLAP=1：边升边转、边转边降；A2T：伸着转过去) */
     if (!TT_WaitReady()) return NULL;              /* 转盘到位了才松手 */
     Claw_OAt(CLAW_AT_TRAY);  claw_hold = 0;  WAIT(g_clwait);   /* 松开：物料落进转盘((10-20)车上转盘上方张开用 CLWOT) */

@@ -251,6 +251,23 @@ int main(void) {
     away(); clear(); run("GRAB 2 H");
     CHECK(!has("S2:-800.0") && !has("M2:-800.0"), "A2T=0：照旧");
 
+    /* ---- (10-23 用户"原料区域抓取物料之后再新加上一个往回缩的动作，怕爪子挡住其他物料")A2GB：
+     *      原料盘上夹紧以后先抬起、缩回到 A2GB(ID1 不转)，再去车上转盘；圆环那边(PICK)不缩；A2GB=0 照旧 ---- */
+    Arm_Param_Set("A2GB", -1100);
+    away(); clear();
+    CHECK(run("GRAB 1 H") == 1, "A2GB：GRAB 1 H");
+    {
+        int close = at("C;"), hold = at("H1:300.0"), back = at("S2:-1100.0"), turn = at("S1:");
+        CHECK(close >= 0 && hold > close && back > close && turn > back && turn > hold,
+              "A2GB：夹紧 -> ID1 不转、伸缩缩回到 A2GB -> 才转去车上转盘");
+        CHECK(at("L-") > close && at("L-") < back, "A2GB：先直着抬起离开原料盘，再缩回");
+    }
+    away(); clear(); run("PICK 1 H");
+    CHECK(!has("S2:-1100.0") && !has("M2:-1100.0"), "A2GB：圆环那边(PICK)不缩");
+    Arm_Param_Set("A2GB", 0);
+    away(); clear(); run("GRAB 1 H");
+    CHECK(!has("S2:-1100.0") && !has("M2:-1100.0"), "A2GB=0：照旧");
+
     /* ---- PICK 用地面高度 ZPLC ---- */
     clear();
     CHECK(run("PICK 1 H") == 1 && has("L+6400;"), "PICK H 走到 ZPLC(80mm=6400 脉冲)");

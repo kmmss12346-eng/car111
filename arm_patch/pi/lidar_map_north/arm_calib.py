@@ -136,6 +136,11 @@ STEPS = [
     dict(key='ZGRAB', kind='lift', title='在原料盘上夹物料的高度 ZGRAB', setup='raw_down',
          text='爪子张开，用 -10 / -5 / -1 慢慢往下降，降到张开的爪子正好套住物料、夹下去能夹稳的位置。\n'
               '可以输入 c 试夹一下，再 o 张开。爪子不能碰到盘子。'),
+    # (10-23 用户"原料区域抓取物料之后再新加上一个往回缩的动作，因为我怕这个爪子挡住其他物料了")
+    dict(key='A2GB', kind='servo', sid=2, title='原料区夹起以后先往回缩 A2GB', setup='raw_gb', needs_fw=True,
+         text='比赛时在原料盘上夹紧以后：先直着抬一小段离开原料盘 → 一边升到最高一边把伸缩缩回到这里(ID1 不转) → 再转去车上转盘。\n'
+              '手臂现在在原料盘上方夹物料的姿态、升到了最高(可以输入 c 夹一个物料看)。往回缩输入负数(这辆车 ID2 越小越短)，\n'
+              '例如 -50；缩到爪子和物料都离开原料盘、转过去不会碰到别的物料，回车保存。不要这一下就输入 s 跳过(以后要关掉：set A2GB 0)。'),
     dict(key='CLWOR', kind='claw', title='夹爪在原料盘上方张开 CLWOR(夹原料之前)', setup='raw_open_down', needs_fw=True,
          text='手臂在原料盘上方、降到了 ZGRAB。调爪子张开的大小：要能套住物料，又不会碰到旁边的物料和盘子。\n'
               '用 +50 / -50 调；c = 夹住看看，o = 回到正在调的张开。满意了回车。不用单独调(和 CLWO 一样)就输入 s。'),
@@ -189,7 +194,7 @@ STEPS = [
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
-CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'CLWOR': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
+CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'A2GB': 'raw', 'CLWOR': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
 REMOVED_STEPS = ('PL1', 'PL2')          # (10-20 用户"把 28、29 步的补偿去掉")以前的第一层/第二层放置补偿，比赛时也不再用
 OPEN_KEYS = ('CLWO', 'CLWOR', 'CLWOT')  # 夹爪张开的三个角度(10-20)：其他地方 / 原料盘上方 / 车上转盘上方
 RING_TEACH_FILE = 'ring_teach.json'     # 和 mission_cfg.ring_teach_file 一样：R1/R3 两步把 1、3 号环比 2 号环多转多少存在这里
@@ -438,6 +443,8 @@ class Wizard:
             self.tt_to(P[f'TT{slot}'])
         elif kind in ('raw', 'raw_down', 'raw_obs'):
             self.claw_to(self.claw_val('CLWOR'))
+            self.pose(P['A1G'], P['A2E'])
+        elif kind == 'raw_gb':                                # (10-23)A2GB：原料盘上方夹物料的姿态、升到最高(夹爪不动：夹着物料调)
             self.pose(P['A1G'], P['A2E'])
         elif kind == 'raw_open_down':                         # (10-20)CLWOR：在原料盘上方降到 ZGRAB 调张开
             self.pose(P['A1G'], P['A2E'])

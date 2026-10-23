@@ -14,11 +14,11 @@ RANGES = dict(LFMAX=(10, 105), ZHI=(0, 400), ZGRAB=(0, 400), ZDROP=(0, 400), ZPL
               A1P=(232, 417.6), A2E=(-1220, -503.5), A2R=(-1220, -503.5), A2P=(-1220, -503.5),
               CLWO=(500, 2910), CLWC=(500, 2910), CLWOR=(0, 2910), CLWOT=(0, 2910), TT1=(500, 2608), TT2=(500, 2608), TT3=(500, 2608),
               AEXT=(1, 2), ARMOK=(0, 1), FPPM=(1, 100), A2T=(-5000, 5000), A1T1=(-720, 720), A1T2=(-720, 720), A2SPD=(0, 1500),
-              R1T1=(-720, 720), R2T=(-5000, 5000), R1T2=(-720, 720), R2SPD=(0, 1500))
+              R1T1=(-720, 720), R2T=(-5000, 5000), R1T2=(-720, 720), R2SPD=(0, 1500), A2GB=(-5000, 5000))
 DEFAULTS = dict(LFMAX=100, ZHI=100, ZGRAB=20, ZDROP=60, ZPLC=0, ZSTK=60, ZOBRAW=100, ZOBRNG=100,
                 A1G=323, A1D=323, A1H=323, A1P=323, A2E=-862, A2R=-862, A2P=-862,
                 CLWO=2090, CLWC=2910, CLWOR=0, CLWOT=0, TT1=2608, TT2=1708, TT3=808, AEXT=2, ARMOK=0, FPPM=12.9, A2T=0, A1T1=0, A1T2=0, A2SPD=0,
-                R1T1=0, R2T=0, R1T2=0, R2SPD=0)
+                R1T1=0, R2T=0, R1T2=0, R2SPD=0, A2GB=0)
 LIM = {1: (232.0, 417.6), 2: (-1220.0, -503.5)}
 
 
@@ -158,6 +158,7 @@ FULL = [
     'u', ('hand', 350.2, -700.5),      # 原料盘：松开用手摆
     's', 's', 's', 's',                # 绕开电池盒 A1T1/A2T/A1T2/A2SPD 跳过
     '-80', '',                         # ZGRAB 100 -> 20
+    's',                               # A2GB 夹起以后往回缩：跳过(不缩)
     's',                               # CLWOR 跳过(和 CLWO 一样)
     's',                               # ZOBRAW 跳过
     '2 =-760', '',                     # 圆环：ID2 直接到 -760(= 开头 = 直接转到)
@@ -703,3 +704,26 @@ class GreenCrossTests(unittest.TestCase):
         self.assertTrue(any('一次最多挪 200 像素' in l for l in lines), lines)
         self.assertTrue(any('出画面' in l for l in lines), lines)
         self.assertEqual(load(cal)['claw_px']['RAW'], [500.0, 260.0])   # 第一次 +200 存了，第二次出画面没存
+
+
+class RetractAfterGrabTests(unittest.TestCase):
+    """(10-23 用户"原料区域抓取物料之后再新加上一个往回缩的动作，因为我怕这个爪子挡住其他物料了")ZGRAB 后面一步调 A2GB：
+    在原料盘上方夹物料的姿态、升到最高，输入 -50 往回缩，回车存进 STM32 和配置；旧固件没有 A2GB 就跳过。"""
+
+    def test_a2gb_step_saves_the_retract_angle(self):
+        stm = FakeStm32()
+        cfg = make_cfg()
+        lines = []
+        Wizard(stm, cfg, inp=Script(stm, ['-50', '-50', '', 'q']), out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index('A2GB'))
+        self.assertAlmostEqual(stm.P['A2GB'], stm.P['A2E'] - 100, delta=0.5)
+        self.assertAlmostEqual(load(cfg)['stm32_params']['A2GB'], stm.P['A2E'] - 100, delta=0.5)
+        self.assertEqual(STEP_KEYS[STEP_KEYS.index('ZGRAB') + 1], 'A2GB')
+        self.assertTrue(any('原料区夹起以后先往回缩 A2GB' in l for l in lines), lines[:6])
+
+    def test_a2gb_step_skipped_on_old_firmware(self):
+        stm = FakeStm32()
+        del stm.P['A2GB']
+        cfg = make_cfg()
+        lines = []
+        Wizard(stm, cfg, inp=Script(stm, ['q']), out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index('A2GB'))
+        self.assertNotIn('A2GB', load(cfg)['stm32_params'])
