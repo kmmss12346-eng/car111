@@ -323,6 +323,13 @@ DEFAULTS = dict(
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
+    stack_carry=True,                   # (10-23 用户"先放好三环我再去放1环的时候容易把三环放好的东西给撞掉")码垛时夹着物料从车上转盘去圆环，
+                                        #   路上要经过已经叠了两层的环：先缩着转(或从外侧绕)过那个环，在两个环中间改伸缩长度，最后伸到目标长度再转过去。
+                                        #   只管码垛；路上没有两层的环照旧走。False = 照旧(按目标环的长度一边转一边扫过去)
+    stack_carry_clear_mm=50.0,          #   夹着的物料中心离两层垛的中心至少这么远(物料底半径 25 + 垛顶半径 15 + 余量 10)
+    stack_carry_a2=None,                #   缩着转用的伸缩长度(ID2 度数)；None = 车上转盘上方的长度 A2R
+    stack_carry_outer=True,             #   缩到最短也离得不够远的环(一般是离转轴最近的 2 号环)从外侧绕过；False = 只缩着转
+    stack_carry_pre_deg=20.0,           #   从车上转盘出来先转到第一个要躲的环前面这么多度(伸缩已经改好)，再转过它
     place_adj_file='place_adj.json',    # pcal 1 / pcal 2 实测的放置补偿(第一层平放、第二层码垛各一组 ID1/ID2 度数)存在这里  # vclaw 实测的爪子像素(claw_px)存在这里，覆盖上面的 claw_px
     place_comp_on=False,                # (10-20 用户"把 28、29 步的补偿去掉")放置补偿(place_adj.json 里的 PL1/PL2、pcal 量的，还有 place_shift_mm)都不用：
                                         #   按摄像头对准的位置(1、3 号环按 arm_calib 调的角度)直接放。True = 照以前加补偿
@@ -414,6 +421,107 @@ def same_item(a, b):
     if a is None or b is None:
         return False
     return a is b or (a.batch, a.index, a.color, a.ring) == (b.batch, b.index, b.color, b.ring)
+
+
+def fit_arm_polar(poses, spacing):
+    """(10-23)按爪子在三个圆环正上方时的手臂角度 poses = {环号: (ID1, ID2)} 算手臂的几何(三个环在一条直线上、相邻隔 spacing 毫米)：
+    爪子离转轴 r = a + k * ID2 毫米，ID1 的度数就是手臂转过的角度。返回 (a, k, 残差 mm)；角度不全、算不出返回 None。"""
+    try:
+        th = {i: math.radians(float(poses[i][0])) for i in (1, 2, 3)}
+        x2 = {i: float(poses[i][1]) for i in (1, 2, 3)}
+        s = float(spacing)
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    want = ((1, 2, s), (2, 3, s), (1, 3, 2.0 * s))
+
+    def cost(a, k):
+        tot = 0.0
+        for i, j, d in want:
+            ri, rj = a + k * x2[i], a + k * x2[j]
+            dd = np.sqrt(np.maximum(ri * ri + rj * rj - 2.0 * ri * rj * math.cos(th[i] - th[j]), 0.0))
+            tot = tot + (dd - d) ** 2
+        ok = np.ones_like(tot, dtype=bool)
+        for i in (1, 2, 3):
+            ok &= (a + k * x2[i]) > 20.0                        # 爪子总在转轴外面
+        return np.where(ok & (np.abs(k) > 0.005), tot, np.inf)
+
+    a, k = np.meshgrid(np.linspace(-400.0, 1200.0, 801), np.linspace(-0.5, 0.5, 501))
+    c = cost(a, k)
+    i = np.unravel_index(np.argmin(c), c.shape)
+    a0, k0, da, dk = float(a[i]), float(k[i]), 2.0, 0.002
+    for _ in range(4):                                      # 在找到的地方附近再细找
+        a, k = np.meshgrid(np.linspace(a0 - 2 * da, a0 + 2 * da, 41), np.linspace(k0 - 2 * dk, k0 + 2 * dk, 41))
+        c = cost(a, k)
+        i = np.unravel_index(np.argmin(c), c.shape)
+        a0, k0, da, dk = float(a[i]), float(k[i]), da / 10.0, dk / 10.0
+    best = float(c[i])
+    if not math.isfinite(best):
+        return None
+    return a0, k0, math.sqrt(best / 3.0)
+
+
+def stack_carry_plan(start_a1, target, poses, tall, spacing, clear_mm, a2_in, a2_lim=(None, None), pre_deg=20.0,
+                     outer=True, fit_max_mm=6.0, avoid_a1=None):
+    """(10-23)码垛：夹着物料从车上转盘(手臂在 start_a1)转去 target = (ID1, ID2)，路上要经过 tall 里这几个已经叠了两层的环。
+    poses = {环号: (ID1, ID2)}：爪子在 1、2、3 号环正上方时的角度(算手臂几何、看路上经过哪几个环)。
+    返回 dict(wps=[(ID1, ID2)...] 路点, dodge=[(环号, '缩着'|'外侧', 离它中心多少 mm 或 None)], fit=(a, k, 残差) 或 None)；
+    路上一个两层的环都不经过返回 None(照旧走)。
+    走法：先转到第一个要躲的环前面 pre_deg 度(伸缩已经改成躲它的长度)，再转过它；在两个环中间(角度的一半)改伸缩长度躲下一个；
+    过了最后一个要躲的环，在它和目标中间伸到目标的长度，最后(调用的人)转到目标。每一段只动一个舵机：转的时候伸缩不变，伸缩的时候不转。
+    avoid_a1：绕电池盒开始缩回的角度(R1T1)：第一个路点不早于它(过了电池盒才改伸缩长度)。"""
+    a1t, a2t = float(target[0]), float(target[1])
+    start_a1 = float(start_a1)
+    lo, hi = sorted((start_a1, a1t))
+    cross = [r for r in tall if r in poses and lo + 1.0 < float(poses[r][0]) < hi - 1.0]
+    if not cross:
+        return None
+    cross.sort(key=lambda r: abs(float(poses[r][0]) - start_a1))
+    fit = fit_arm_polar(poses, spacing)
+    if fit is not None and fit[2] > fit_max_mm:
+        fit = None                                          # 三个环的角度对不上一条直线：几何不可信，只缩着转
+    a2_min, a2_max = a2_lim
+
+    def clamp(v):
+        if a2_min is not None:
+            v = max(v, float(a2_min))
+        if a2_max is not None:
+            v = min(v, float(a2_max))
+        return v
+    a2_in = clamp(float(a2_in))
+    lens, dodge = [], []
+    for r in cross:
+        L, side, gap = a2_in, '缩着', None
+        if fit is not None:
+            a, k, _ = fit
+            R = a + k * float(poses[r][1])                     # 这个环离转轴多远
+            g_in = abs(R - (a + k * a2_in))
+            gap = g_in
+            if g_in < clear_mm and outer and (a + k * a2_in) < R:
+                L_out = clamp((R + clear_mm - a) / k)
+                g_out = (a + k * L_out) - R
+                if g_out > g_in:
+                    L, side, gap = L_out, '外侧', g_out
+        lens.append(L)
+        dodge.append((r, side, gap))
+    sgn = 1.0 if a1t > start_a1 else -1.0
+    first = float(poses[cross[0]][0])
+    pre = first - sgn * float(pre_deg)
+    if avoid_a1 is not None and (float(avoid_a1) - start_a1) * sgn > 0 and (first - float(avoid_a1)) * sgn > 0:
+        if (pre - float(avoid_a1)) * sgn < 0:
+            pre = float(avoid_a1) + sgn * 1.0                  # 还没过电池盒：转过 R1T1 再改伸缩长度
+    if (pre - start_a1) * sgn <= 0 or (first - pre) * sgn <= 0:
+        pre = (start_a1 + first) / 2.0
+    wps = [(pre, lens[0])]
+    marks = [float(p[0]) for p in poses.values()] + [a1t]
+    for n, r in enumerate(cross):
+        here = float(poses[r][0])
+        nxt = min((m for m in marks if (m - here) * sgn > 1.0), key=lambda m: abs(m - here), default=a1t)
+        mid = (here + nxt) / 2.0                            # 和下一个环(不管叠没叠)的中间改伸缩长度：改的时候爪子不在任何一个环上方
+        wps.append((mid, lens[n]))
+        nxt_len = lens[n + 1] if n + 1 < len(cross) else a2t
+        if abs(nxt_len - lens[n]) > 0.5:
+            wps.append((mid, nxt_len))
+    return dict(wps=wps, dodge=dodge, fit=fit)
 
 
 def _first(p, measure):
@@ -7170,6 +7278,68 @@ class MissionHooks:
             self.log(f'    环{k} 和示教时比偏了 {ek[0] - et[0]:+.0f},{ek[1] - et[1]:+.0f} 像素：多转 ID1 {d1:+.2f}°、ID2 {d2:+.1f}°')
         return fix
 
+    def _stack_carry(self, zone, ring, p2, T, a1t, a2t):
+        """(10-23 用户"先放好三环我再去放1环的时候容易把三环放好的东西给撞掉")码垛：夹着物料从车上转盘转去 ring 号环，路上要经过
+        已经叠了两层的环：升降最高 115 左右，夹着的物料底比两层垛顶只高一两毫米，照旧按目标环的长度一边转一边扫过去一定擦到。
+        改成先缩着转(缩到最短还离得不够远的环从外侧绕)过那个环，在两个环中间改伸缩长度，最后伸到目标长度再转过去(见 stack_carry_plan)。
+        走完了返回 True；路上没有两层的环、或者算不出各个环在哪，返回 False(调用的人照旧走)。"""
+        cfg = self.cfg
+        if not cfg.get('stack_carry', True):
+            return False
+        tall = [r for r in (1, 2, 3) if r != int(ring) and len(self.on_ring.get((zone, r)) or []) >= 2]
+        if not tall or not T:
+            return False
+        try:
+            poses = {2: (float(p2[0]), float(p2[1]))}
+            for r in (1, 3):
+                poses[r] = (float(p2[0]) + float(T[r][0]), float(p2[1]) + float(T[r][1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return False
+        P = self.arm.params() or {}
+
+        def num(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+        start, a2_in = num(P.get('A1D')), num(cfg.get('stack_carry_a2'))
+        if a2_in is None:
+            a2_in = num(P.get('A2R'))
+        if start is None or a2_in is None:
+            return False
+        lim_lo, lim_hi = num(P.get('S2MIN')), num(P.get('S2MAX'))
+        plan = stack_carry_plan(start, (a1t, a2t), poses, tall, float(cfg.get('ring_spacing_mm', 150.0)),
+                                float(cfg.get('stack_carry_clear_mm', 50.0)), a2_in,
+                                a2_lim=(None if lim_lo is None else lim_lo + 20.0, None if lim_hi is None else lim_hi - 20.0),
+                                pre_deg=float(cfg.get('stack_carry_pre_deg', 20.0)), outer=bool(cfg.get('stack_carry_outer', True)),
+                                avoid_a1=num(P.get('R1T1')))
+        if plan is None:
+            return False
+        clear = float(cfg.get('stack_carry_clear_mm', 50.0))
+        how = '、'.join(f'环{r}({side}' + ('' if gap is None else f'，离它中心 {gap:.0f}mm') + ')' for r, side, gap in plan['dodge'])
+        self.log(f'    码垛：去环{ring} 路上要经过已经叠了两层的 {how}：先缩着转，在两个环中间改伸缩长度，最后伸到环{ring} 再转过去')
+        if plan['fit'] is None:
+            self.log('    ★ 按三个环的角度算不出手臂的几何(或者对不上一条直线)：只缩着转，不知道够不够远')
+        else:
+            a, k, res = plan['fit']
+            near = [f'环{r} {gap:.0f}mm' for r, _s, gap in plan['dodge'] if gap is not None and gap < clear - 0.5]
+            if near:
+                self.log(f'    ★ 离两层垛还是不够远({"、".join(near)}，要 {clear:.0f}mm)：伸缩到头了，可能还会擦到')
+            self.log(f'      (按三个环的角度算：爪子离转轴 = {a:.0f} + {k:.4f}×ID2 毫米，对不上 {res:.1f}mm)')
+        wps = plan['wps']
+        z = None
+        if cfg.get('return_lower', True):
+            z = num(P.get('ZOBRNG'))                         # 和 _return_to_pose 一样：从车上转盘转出来时边转边到看圆环的高度
+        if z is not None:
+            self.arm.apz(wps[0][0], wps[0][1], z)            # 第一段从车上转盘出发：STM32 照旧按圆环那边的参数绕电池盒
+        else:
+            self.arm.ap(wps[0][0], wps[0][1])
+        for w1, w2 in wps[1:]:
+            self.arm.ap(w1, w2)
+        self._return_to_pose(a1t, a2t, from_tray=False)
+        return True
+
     def _place_item_arm(self, item, zone, ring, stack, label, T):
         """zone_reach='arm'：车只在 2 号环前对准一次，1、3 号环按示教/环距算的角度只转手臂过去；(10-19)转过去以后空爪只动手臂
         用摄像头对准这个环再放(zone_arm_fine；码垛时下面的环被物料盖着，按第一批对准时量的角度放)。
@@ -7241,7 +7411,9 @@ class MissionHooks:
             held = True
             self.holding = item
             adj = self.place_adj(key)
-            self._return_to_pose(a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0), from_tray=True)
+            ta1, ta2 = a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0)
+            if not (stack and self._stack_carry(zone, ring, p2, T, ta1, ta2)):
+                self._return_to_pose(ta1, ta2, from_tray=True)
             self._drop(stack)
             held = False
             self.holding = None

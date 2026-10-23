@@ -31,6 +31,7 @@ from task_plan import parse_code, role_of
 DUR = dict(GET=0.3, SCR=0.02, SET=0.02, QR=0.02, SCMD=0.02, LIFT=0.0, A=0.03, APN=0.02)
 _KEEP_TRK = ('APN', 'A?', 'GET', 'SET', 'SCR', 'SCMD', 'QR', 'QR?', 'LIFT?', 'PING', 'ZONE', 'ZONE?', 'SIDE')   # 这些指令不动舵机
 MEASURE_S = 0.35
+SWEEP_HIT_MM = 40.0     # (10-23)夹着的物料(底 φ50)离两层垛(顶 φ30)的中心不到 25 + 15 毫米就碰上
 CLAW_CLOSE_S = 0.15                     # 发出"合上"到夹爪真的夹住要多久
 FRAME_S = 0.07                          # 跟踪原料盘上的物料时，认一帧要多久
 
@@ -103,6 +104,7 @@ class SimWorld:
         self.placed = []                      # 每次放置：(区, 环, 颜色, 误差mm, 是否码垛)
         self.air = 0
         self.collisions = 0
+        self.sweep_hits = 0                   # (10-23)夹着物料转的路上离两层的垛太近(真车上会把垛撞倒)，见 _sweep_check
         self.loose = 0                        # 夹着物料在不该松手的地方张开了爪子(物料掉在半路上)
         self.off_s = self.off_f = 0.0
         self.stop_err = np.zeros(2)
@@ -216,8 +218,28 @@ class SimWorld:
     def _servo_t(d, speed):
         return abs(d) / speed + 0.2 + 0.03
 
+    def _sweep_check(self, a1, a2):
+        """(10-23 用户"先放好三环我再去放1环的时候容易把三环放好的东西给撞掉")夹着物料转的路上，物料中心离已经叠了两层的环不到
+        SWEEP_HIT_MM 就算撞倒了(真车升降最高 115 左右，夹着的物料底比两层垛顶只高一两毫米)。真车伸缩比转快很多：按先伸缩到位、再转过去查。"""
+        if self.held is None or self.zone not in ('ROUGH', 'TEMP') or not self.arm_r or self.a1_ref is None:
+            return
+        tall = [k for k in (1, 2, 3) if len(self.rings.get((self.zone, k)) or []) >= 2]
+        if not tall:
+            return
+        s1, s2 = self.a1, self.a2
+        path = [(s1, s2 + (a2 - s2) * i / 30.0) for i in range(31)] + [(s1 + (a1 - s1) * i / 30.0, a2) for i in range(31)]
+        try:
+            for self.a1, self.a2 in path:
+                c = self.claw()
+                if any(np.linalg.norm(c - self.ring_center(k)) < SWEEP_HIT_MM for k in tall):
+                    self.sweep_hits += 1
+                    break
+        finally:
+            self.a1, self.a2 = s1, s2
+
     def _servos_to(self, a1, a2, speed, fine=False):
         P = self.params
+        self._sweep_check(a1, a2)
         t1, t2 = self._servo_t(a1 - self.a1, speed), self._servo_t(a2 - self.a2, speed)
         self.advance(max(t1, t2) if P['PARA'] > 0.5 else t1 + t2)
         if fine:                                           # AP：到位误差 0.3°，实际重复精度更好
@@ -684,11 +706,11 @@ class SimWorld:
                 return False, 'ERR HOLD', info                     # arm.c：上一个没放下
             self.take_sides.append((self.zone, self.side))
             self._open_claw()                                      # arm.c 一开始就张开爪子
-            self.held = self.tray[slot]
-            self.tray[slot] = None
             self._tt_go(slot)
             self._lift_to(P['ZHI'])
-            self._servos_to(P['A1D'], P['A2R'], P['ASPD'])
+            self._servos_to(P['A1D'], P['A2R'], P['ASPD'])        # 空爪转回车上转盘(_sweep_check：路上爪子里没物料)
+            self.held = self.tray[slot]
+            self.tray[slot] = None
             self._tt_wait()
             self._lift_to(P['ZDROP'])
             self._claw_wait()
@@ -4263,6 +4285,110 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual(h.stats.place_ok, 2, text[-3000:])                     # 放回去的那个这次不放，另外两个照样放
         self.assertIn('已放回转盘', text)
         self.assertIn(('OT', True), w.claw_log)                                  # (10-20)放回转盘松开用车上转盘上方的张开角度
+
+
+class StackCarryTests(unittest.TestCase):
+    """(10-23 用户"先放好三环我再去放1环的时候容易把三环放好的东西给撞掉"，"只改码垛的时候的动作")码垛时夹着物料从车上转盘去圆环，
+    路上经过已经叠了两层的环：先缩着转(离转轴最近、缩到最短也不够远的环从外侧绕)，在两个环中间改伸缩长度，最后伸到目标再转过去。"""
+    # 用户 10-23 齿条重装后 arm_calib 存的：2 号环 A1P/A2P、1/3 号环多转的度数(R1/R3)、车上转盘 A1D/A2R、绕电池盒开始缩回 R1T1
+    A1P, A2P, A1D, A2R, R1T1 = 53.7, -1023.5, 236.6, -1212.9, 177.4
+    POSES = {1: (53.7 - 43.4, -1023.5 + 288.2), 2: (53.7, -1023.5), 3: (53.7 + 39.0, -1023.5 + 597.7)}
+
+    def _plan(self, target, tall):
+        from mission_hooks import stack_carry_plan
+        return stack_carry_plan(self.A1D, self.POSES[target], self.POSES, tall, 150.0, 50.0, self.A2R,
+                                a2_lim=(-1280.0, -270.0), avoid_a1=self.R1T1)
+
+    def test_geometry_from_the_car_angles(self):
+        """按三个环的角度算出手臂几何：三个环隔 150mm 在一条线上(对不上 1mm 以内)；齿条重装后每度约 0.086mm。"""
+        from mission_hooks import fit_arm_polar
+        a, k, res = fit_arm_polar(self.POSES, 150.0)
+        self.assertLess(res, 1.5)
+        self.assertAlmostEqual(k, 0.0857, delta=0.002)
+        r = {i: a + k * self.POSES[i][1] for i in (1, 2, 3)}
+        self.assertAlmostEqual(r[2], 189.0, delta=3.0)                          # 2 号环离转轴最近
+        self.assertTrue(r[1] > r[2] and r[3] > r[2])
+
+    def test_plan_on_the_car_to_ring1_past_stacked_3_and_2(self):
+        """车上的角度：去 1 号环要先经过 3 号环、再经过 2 号环。3 号环缩着转就离它 67mm；2 号环缩到 A2R 只离它 16mm，从外侧绕(50mm)。
+        每一段只动一个舵机；第一段过了绕电池盒(R1T1)、停在 3 号环前面；改伸缩长度都在两个环中间。"""
+        p = self._plan(1, [2, 3])
+        dodge = {r: (side, gap) for r, side, gap in p['dodge']}
+        self.assertEqual(dodge[3][0], '缩着')
+        self.assertGreaterEqual(dodge[3][1], 60.0)
+        self.assertEqual(dodge[2][0], '外侧')
+        self.assertGreaterEqual(dodge[2][1], 49.9)
+        wps = p['wps']
+        self.assertTrue(self.POSES[3][0] < wps[0][0] < self.R1T1, wps)
+        self.assertAlmostEqual(wps[0][1], self.A2R, delta=0.1)
+        pts = [(self.A1D, self.A2R)] + wps + [self.POSES[1]]
+        for (p1, q1), (p2, q2) in zip(pts[1:], pts[2:]):
+            self.assertTrue(abs(p1 - p2) < 1e-6 or abs(q1 - q2) < 1e-6, (p1, q1, p2, q2))    # 只转或者只伸缩
+        mids = {round((self.POSES[3][0] + self.POSES[2][0]) / 2.0, 1), round((self.POSES[2][0] + self.POSES[1][0]) / 2.0, 1)}
+        for (p1, q1), (p2, q2) in zip(wps, wps[1:]):
+            if abs(q1 - q2) > 1e-6:
+                self.assertIn(round(p1, 1), mids)                               # 伸缩只在两个环中间改
+        self.assertGreater(min(q for _p, q in wps), -1280.0)
+        self.assertLess(max(q for _p, q in wps), -270.0)                        # 在限位里面
+
+    def test_plan_only_when_a_two_layer_stack_is_on_the_way(self):
+        """路上没有两层的环(去 3 号环什么也不经过；1 号环在 2 号环后面)：返回 None，照旧走。去 2 号环只经过 3 号环：缩着转。"""
+        self.assertIsNone(self._plan(3, [1, 2]))
+        self.assertIsNone(self._plan(2, [1]))
+        self.assertIsNone(self._plan(1, []))
+        p = self._plan(2, [3])
+        self.assertEqual([(r, side) for r, side, _g in p['dodge']], [(3, '缩着')])
+        self.assertAlmostEqual(p['wps'][-1][1], self.POSES[2][1], delta=0.01)    # 在 3、2 号环中间伸到 2 号环的长度
+
+    @staticmethod
+    def _world(seed, arm_r=300.0, params=None):
+        w = SimWorld(seed=seed, code=ZoneCalTests.CODE, arm_r_mm=arm_r, params=params)
+        w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
+        return w
+
+    def _run(self, w, on):
+        lines = []
+        h = ZoneCalTests('test_full_course_ring2_once_then_car_still')._make(w, dict(stack_carry=on), lines=lines)
+        run_mission(w, h, log=lines.append)
+        return h, '\n'.join(lines)
+
+    def test_full_course_stacking_no_longer_sweeps_over_two_layer_stacks(self):
+        """整场两批(暂存区码垛顺序 环2 → 环1 → 环3)：以前去最后一个环时夹着物料从两层的垛上扫过去(模拟里算撞倒)，现在一次也没有；
+        12 个照样放准、叠对。"""
+        for seed in range(3):
+            w = self._world(seed)
+            h, text = self._run(w, False)
+            self.assertGreaterEqual(w.sweep_hits, 1, f'seed {seed}：以前的走法模拟里应该会扫到两层的垛')
+            w = self._world(seed)
+            h, text = self._run(w, True)
+            self.assertEqual(w.sweep_hits, 0, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-3000:])
+            self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
+            self.assertEqual(text.count('路上要经过已经叠了两层的'), 1, text[-3000:])
+
+    def test_middle_ring_too_close_goes_round_the_outside(self):
+        """像车上一样 2 号环离转轴近(缩到最短也只离它 17mm)：经过 2 号环从外侧绕(50mm)，别的环缩着转；不扫到、都放对。"""
+        for seed in range(2):
+            w = self._world(seed, arm_r=189.0, params=dict(A1D=400.0, A2R=-877.0))
+            h, text = self._run(w, True)
+            self.assertIn('环2(外侧', text)
+            self.assertEqual(w.sweep_hits, 0, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual(h.stats.place_ok, 12, text[-3000:])
+
+    def test_nothing_else_changes(self):
+        """(用户"不要把其他的东西改乱了")粗加工区、暂存区第一批、路上没有两层垛的那两次码垛，发给 STM32 的指令和以前一模一样。"""
+        w0 = self._world(1)
+        self._run(w0, False)
+        w1 = self._world(1)
+        self._run(w1, True)
+        r0, r1 = w0.requests, w1.requests
+        i = next(n for n, (a, b) in enumerate(zip(r0, r1)) if a != b)
+        takes = [n for n, q in enumerate(r0) if q.split()[0] == 'TAKE']     # 每放一个先 TAKE：粗加工 3、暂存 3、粗加工 3、码垛 3
+        self.assertEqual(len(takes), 12, r0[-40:])
+        self.assertGreater(i, takes[11], r0[i - 3:i + 3])                      # 最后一次码垛(去环3 要经过两层的环1、环2)从车上转盘出发才不一样
+        self.assertTrue(r1[i].startswith(('AP', 'APZ')), r1[i - 2:i + 6])
 
 
 if __name__ == '__main__':
