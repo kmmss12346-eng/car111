@@ -4602,6 +4602,27 @@ class SingleGlitchTests(unittest.TestCase):
             self.assertIsNone(h.disabled, (fc, text[-3000:]))
             self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), (fc, text[-3000:]))
 
+    def test_init_retried_at_next_stop(self):
+        """开头 GET 连着两次没回话(初始化时多问的那一次也没回)：到下一站再初始化一次，照样 6 个全抓、12 个全放。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        orig = w._handle
+        st = {'k': 0}
+
+        def handle(text):
+            if text == 'GET':
+                st['k'] += 1
+                if st['k'] <= 2:
+                    return False, 'ERR TIMEOUT', []
+            return orig(text)
+        w._handle = handle
+        lines = []
+        h = make(w, dict(round_s=1e9), log=lines.append)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('到这一站再试一次', text)
+        self.assertIsNone(h.disabled, text[-2000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+
     def test_lift_after_release_counts_as_placed(self):
         """松手以后抬起来连着两次出错：物料已经在环上了(算放了)，只收臂，不当还夹着放回转盘。"""
         w = SimWorld(seed=1, code=self.CODE)

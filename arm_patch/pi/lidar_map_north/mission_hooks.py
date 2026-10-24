@@ -1232,6 +1232,14 @@ class MissionHooks:
 
     def _ensure(self, link):
         if self._inited:
+            if (self.disabled and self.disabled == getattr(self, '_init_fail', None)
+                    and not getattr(self, '_init_again', False)):
+                # (10-23)开头初始化时 GET / LIFT? 连着没回话(串口偶尔不稳)：到下一站再初始化一次，别整轮都不夹不放
+                self._init_again = True
+                self.log(f'  (开头初始化机械臂没成：{self.disabled}；到这一站再试一次)')
+                self.disabled = None
+                self._init_arm()
+                self.sync_params()
             return
         cfg = self.cfg
         self._ensure_arm_only(link)
@@ -1317,8 +1325,11 @@ class MissionHooks:
             raise Abort(str(ex))
         except (ArmError, Exception) as ex:
             self.disabled = f'初始化机械臂出错：{ex}'
+        # (10-23)这几种可能只是串口偶尔没回话：记下来，到下一站再初始化一次(_ensure)
+        retry = self.disabled and (self.disabled.startswith(('STM32 里没有机械臂参数', '升降位置不知道了', '初始化机械臂出错')))
+        self._init_fail = self.disabled if retry else None
         if self.disabled:
-            self.log(f'★ 本轮不做夹取/放置：{self.disabled}')
+            self.log(f'★ 本轮不做夹取/放置：{self.disabled}' + ('(到下一站再试一次初始化)' if retry and not getattr(self, '_init_again', False) else ''))
             self._ui('msg', 'ARM OFF')
         else:
             self.log('  机械臂就绪。')
