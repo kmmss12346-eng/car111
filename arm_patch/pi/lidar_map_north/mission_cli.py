@@ -537,6 +537,19 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
             h.ctx = type('C', (), {'aborted': staticmethod(lambda: bool(state.get('abort')))})()
             state['abort'] = False
             h._aborted = False
+            if h.disabled and what in ('RAW', 'ROUGH', 'TEMP'):
+                # (10-24 用户 mtest TEMP 1 force 一下就结束、什么也没说)以前出过错记了"本轮不再夹放"：说出来，重新检查一遍机械臂再试
+                log(f'  ★ 上一次记着本轮不再夹放：{h.disabled}')
+                h.disabled = None
+                try:
+                    h.arm.params(refresh=True)                  # 中间 set 过 ARMOK 之类：按 STM32 现在的参数查
+                except Exception:
+                    pass
+                h._init_arm()
+                if h.disabled:
+                    log(f'  ★ 重新检查机械臂还是不行：{h.disabled}')
+                    return
+                log('  重新检查了机械臂(参数、升降高度)，没问题：接着测')
             if what in ('RAW', 'ROUGH', 'TEMP'):
                 h.maybe_holding = h.holding = None       # 一开始就会张开爪子(OBS … O)：不再当成夹着东西
             if hasattr(h, 'start_clock'):

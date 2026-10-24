@@ -1441,6 +1441,7 @@ class MissionHooks:
 
     def _can_work(self):
         if self.disabled:
+            self.log(f'    ★ 本轮不做夹放：{self.disabled}')           # (10-24)以前一声不吭就跳过这一站
             return False
         if self.plan is None:
             self.log('    没有任务码，不能做夹取/放置')
