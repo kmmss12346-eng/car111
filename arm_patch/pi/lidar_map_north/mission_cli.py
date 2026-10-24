@@ -819,7 +819,7 @@ def _zone_preflight(h, zone, batch, force, log):
                 log('   ★ 程序里没有记着暂存区第一批的这些物料：' + '、'.join(f'环{lo.ring}{lo.color_name}' for lo in gone) +
                     '(码垛要叠在它们上面；没跑过 mtest TEMP 1 的话，手摆好第一批再加 force)')
     if 'RING' not in (cal.get('claw_px') or {}):
-        log('   ★ 还没做 vclaw RING：放的位置按估计的爪子点，可能偏几毫米')
+        log('   ★ 圆环这边的爪子点(红十字)还是估计的：放的位置可能偏几毫米。arm_calib --from A1P 那一步用 g 把红十字挪到 2 号环中心(或者 vclaw RING)')
     covered = zone == 'ROUGH' or batch == 2                 # 取回 / 码垛：圆环白心被物料盖住
     if covered and hasattr(h.vision, 'has_pick') and not h.vision.has_pick() and h.cfg.get('learn_pick', False):
         if zone == 'ROUGH':
@@ -1056,7 +1056,7 @@ def _rtest(h, link, arm_only, log):
         h.store.save()
     from vision import load_vision_cal
     if 'RING' not in (load_vision_cal(h.cfg.get('vision_cal_file')).get('claw_px') or {}):
-        log('   注意：还没做 vclaw RING，爪子点是配置里的估计值；对准的是这个点，真放的时候可能偏几毫米')
+        log('   注意：圆环这边的爪子点(红十字)还是配置里的估计值；对准的是这个点，真放的时候可能偏几毫米(arm_calib 看圆环那几步 g 挪它)')
     log('完成(没有取物料、没有放)。看看爪子是不是在圆环中心正上方；底盘挪过的话要自己推回去')
 
 

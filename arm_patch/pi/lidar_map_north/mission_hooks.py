@@ -325,9 +325,8 @@ DEFAULTS = dict(
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
     zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
-    ring2_off_mm=dict(F=0.0, S=0.0),     # (10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，可以自由调")对准 2 号环时爪子(放下的点)
-                                        #   比圆环中心往前 F、往左 S 毫米(各 ±ring2_off_max_mm 以内)；run_live 里 r2off 前后 左右 改并存配置。1、3 号环跟着一起偏
-    ring2_off_max_mm=60.0,              #   (10-23 用户"这个20远远不够你放宽到60")r2off 每个方向最多偏多少毫米(以前 20)
+    # (10-24 用户"故意对偏的那个红色十字去掉，把粗加工区域和暂存区域的十字中心做成可调节的")r2off(ring2_off_mm 故意对偏)去掉了：
+    #   2 号环对到圆环这边的爪子点 claw_px.RING(vlive 里的红十字)，在 arm_calib 看圆环的那几步 g 左右 上下 挪它。配置里还写着 ring2_off_mm 也不用
     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
                                         #   观察姿态(A1P/A2P)一下都不动；只差一点、打滑、到能挪的边上、次数用完都不交给手臂补，车轮接着修
                                         #   (最多 zone_wheels_moves 次)，最后还差不到 accept_mm 照样放，不然这个区这次不放。False = 以前(剩下的手臂补)
@@ -6860,14 +6859,11 @@ class MissionHooks:
             else:
                 self._obs_ring()
             kw = self._wheels_kw() if (wheels or cal) else self._zone_servo_kw()
-            Jw = self.store.get('RING', 'ch') if self.store is not None else None
-            r2 = self._ring2_off_px(Jw) if Jw is not None else None   # (10-21)一步一步对准也故意对偏(以前只有连续对准时偏)
             low = (self.on_ring.get((zone, 2)) or [None])[-1]
             if low is not None:                          # 暂存区第二批：2 号环上放着第一批的物料(白心被盖住)：认物料顶面/圆环外圈
-                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal),
-                                                ring_off=r2)
+                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal))
             else:
-                res = self.servo.run('RING', self._offset_measure(self._ring_measure(), r2), self.vision.scale('RING'),
+                res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'),
                                      cfg['tol_mm']['RING'], allow_chassis=True, label=f'{zone}对准2号环',
                                      bounds=self.vision.bounds('RING'), confirm=False, **kw)
             self.log(f'    2 号环对准结果：{res}')
@@ -6931,10 +6927,6 @@ class MissionHooks:
         off = self._place_shift_px()
         goal0 = claw + (np.asarray(off, float) if off is not None else 0.0)
         goalp = goal0
-        r2 = self._ring2_off_px(J0)
-        r2_mm = self.ring2_off() if r2 is not None else None   # (前后 F, 左右 S) 毫米
-        if r2 is not None:
-            goalp = goal0 + r2
         tol = float(cfg.get('zone_vel_tol_mm') or cfg['tol_mm']['RING'])
         acc = self._wheels_accept('RING')
         vmax = float(cfg.get('zone_vel_speed', 15.0))
@@ -7295,7 +7287,6 @@ class MissionHooks:
             要挪多少，S/F 一次挪过去；停稳再看：车实际走了多少、2 号环在画面里实际动了多少，按它修正对应关系，还差就再算再挪
             (最多 zone_calc_moves 次)。挪完反而更偏(对应关系不对)也不放弃，按实际的改过来再挪。
             返回 (对准了, 到范围边上了, 跟丢了, 车轮没走起来, 还差多少 mm, 剩下太少车轮挪不准)。"""
-            nonlocal goalp
             drv.finish()                                      # 不再用 V：V 走过的记进 act.disp
             a = np.array([float(act.disp['S']), float(act.disp['F'])])
             pts = still_rings()
@@ -7385,8 +7376,6 @@ class MissionHooks:
                 if Jn is not None:
                     J = Jn
                     Jc[0] = J
-                    if r2_mm is not None:                      # (10-21)对应关系修过(比如横移方向是反的)：故意对偏的像素也按新的算
-                        goalp = goal0 + J[:, 1] * float(r2_mm[0]) + J[:, 0] * float(r2_mm[1])
                     if pred_err >= 3.0 or len(moves) >= 2:
                         note['jsave'] = True
                     if pred_err >= 3.0:
@@ -8342,26 +8331,6 @@ class MissionHooks:
             self.log(f'    放下位置按 place_shift_mm 挪：前后 {f:+.0f}mm、左右 {sl:+.0f}mm(画面里 {off[0]:+.1f},{off[1]:+.1f} 像素)')
         return (float(off[0]), float(off[1]))
 
-    def ring2_off(self):
-        """(10-21)对准 2 号环时故意对偏多少：(往前 F, 往左 S) 毫米，各限在 ±ring2_off_max_mm。"""
-        o = self.cfg.get('ring2_off_mm') or {}
-        lim = float(self.cfg.get('ring2_off_max_mm', 60.0) or 60.0)
-        try:
-            f, s = float(o.get('F', 0.0) or 0.0), float(o.get('S', 0.0) or 0.0)
-        except (TypeError, ValueError, AttributeError):
-            return 0.0, 0.0
-        return max(-lim, min(lim, f)), max(-lim, min(lim, s))
-
-    def _ring2_off_px(self, J):
-        """ring2_off 换成画面里的像素：对准时"圆环 - 爪子点"该是多少(按车轮和画面的对应关系：放的点往前 F，车要多往前走 F 才对准)。"""
-        f, s = self.ring2_off()
-        if abs(f) < 0.05 and abs(s) < 0.05:
-            return None
-        J = np.asarray(J, float)
-        off = J[:, 1] * f + J[:, 0] * s
-        self.log(f'    对准 2 号环故意对偏(r2off)：放的点比圆环中心往前 {f:+.1f}mm、往左 {s:+.1f}mm(画面里 {off[0]:+.1f},{off[1]:+.1f} 像素)')
-        return off
-
     def _zone_servo_kw(self):
         """工位里对准的底盘限制：前后挪最多 ring_fix_max_mm；横移只在手臂伸缩够不着时用，离停车点累计不超过 ring_strafe_max_mm。"""
         cfg = self.cfg
@@ -8548,23 +8517,11 @@ class MissionHooks:
             raise DroppedError(f'{ex}(已经松手)') from ex
 
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
-    @staticmethod
-    def _offset_measure(measure, off):
-        """(10-21)对准用的测量减去 off(像素)：要让"圆环 - 爪子点"等于 off(故意对偏)。off=None 原样返回。"""
-        if off is None:
-            return measure
-
-        def shifted():
-            e = measure()
-            return None if e is None else (float(e[0]) - float(off[0]), float(e[1]) - float(off[1]))
-        return shifted
-
-    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None, ring_off=None):
+    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None):
         """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
         1 claw_px.PICK 量过、认得到这个颜色的物料：把物料顶面对到 PICK 点(最准，不用认圆环)
         2 否则认圆环(vclaw RING 量过圆环大小时，白心被盖住也能认最外圈)
         wheels=True：只动车轮(手臂不动)。arm_kw：(10-19)只动手臂、车不动(这些是给 servo.run 的参数，见 _arm_only_kw)。
-        ring_off：(10-21)认圆环对准时故意对偏多少像素(码垛时 r2off；认物料顶面对的是 PICK 点，量过的，不偏)。
         返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
         v, cfg = self.vision, self.cfg
         tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
@@ -8586,7 +8543,7 @@ class MissionHooks:
                 self.log(f'    按物料没对准({res.reason})，改认圆环')
             else:
                 self.log('    认不到圆环上的物料，改认圆环')
-        measure = self._offset_measure(self._ring_measure(), ring_off)
+        measure = self._ring_measure()
         e = measure()
         if e is None:
             return None, None

@@ -17,10 +17,10 @@
     q     退出
 
 画面上：
-    绿十字   爪子位置(vclaw 实测的 vision_cal.json 优先，没有就用配置里的 mission_cfg.claw_px)。
-             (10-23)arm_calib 看原料的那几步里输入 g 左右 上下 可以挪原料的绿十字；vision_cal.json 一变这里马上重新读
-    红十字   (10-23，找圆环时、设了 r2off)比赛时 2 号环对准后圆环中心真正要对到的点：绿十字按 r2off 故意对偏以后的位置
-             (和 mission_hooks 一样按 vcal RING 存的车轮和画面的对应关系换算)。这时左上角的偏差是圆环离红十字多少
+    绿十字   (找物料时)原料这边的爪子位置 claw_px.RAW(vision_cal.json 优先，没有就用配置里的 mission_cfg.claw_px)。
+             arm_calib 看原料的那几步里输入 g 左右 上下 挪它
+    红十字   (10-24 找圆环时)粗加工区、暂存区这边的爪子位置 claw_px.RING：比赛时 2 号环中心对到这里。和原料的绿十字分开存、互不影响，
+             arm_calib 看圆环的那几步(2 号环、1/3 号环、ZPLC、ZOBRNG)里输入 g 左右 上下 挪它。vision_cal.json 一变这里马上重新读
     红斜十字 + 青色圆  识别到的物料圆心和拟合出来的整个圆(被爪子挡住的部分也画出来)
     黄圈     识别到的圆环(每一圈都画出来，被爪子挡住的部分也画)；灰色细圈 = 认到了但大小不像圆环，被过滤掉了
              (vclaw RING 量过以后按量到的大小过滤；左上角 rmax 是最外圈半径像素)
@@ -150,48 +150,14 @@ def claw_shift(cfg_path, du, dv, kind='RAW'):
     return old, new, path
 
 
-def r2off_px(cfg_path):
-    """(10-23 用户"arm_calib 里也出现故意对偏的那个偏心十字")比赛时对准 2 号环按 r2off 故意对偏：圆环中心要对到 爪子点 + 这个偏移(像素)。
-    和 mission_hooks._ring2_off_px 一样：放的点往前 F、往左 S 毫米，按 vcal RING 存的车轮和画面的对应关系(servo_cal.json 的 RING ch)换成像素。
-    返回 ((du, dv) 或 None, (F, S) 或 None, 画不出来的原因)。没设 r2off 返回 (None, None, '')。"""
-    import numpy as np
-    from mission_hooks import DEFAULTS, deep_merge
-    from visual_servo import JacStore
-    raw = {}
-    if cfg_path is not None and Path(cfg_path).exists():
-        raw = json.loads(Path(cfg_path).read_text(encoding='utf-8'))
-    cfg = deep_merge(DEFAULTS, raw.get('mission_cfg'))
-    o = cfg.get('ring2_off_mm') or {}
-    lim = float(cfg.get('ring2_off_max_mm', 60.0) or 60.0)
-    try:
-        f, s = float(o.get('F', 0.0) or 0.0), float(o.get('S', 0.0) or 0.0)
-    except (TypeError, ValueError, AttributeError):
-        return None, None, ''
-    f, s = max(-lim, min(lim, f)), max(-lim, min(lim, s))
-    if abs(f) < 0.05 and abs(s) < 0.05:
-        return None, None, ''
-    name = cfg.get('servo_cal_file')
-    path = Path(name) if name else None
-    if path is not None and not path.is_absolute():
-        path = ROOT / path
-    J = JacStore(str(path) if path is not None else None).get('RING', 'ch')
-    if J is None:
-        return None, (f, s), '还没有 vcal RING 存的车轮和画面的对应关系(servo_cal.json)，画不出 r2off 红十字'
-    J = np.asarray(J, float)
-    off = J[:, 1] * f + J[:, 0] * s
-    return (float(off[0]), float(off[1])), (f, s), ''
-
-
-def annotate(vis, fr, mode, color, goal=None):
+def annotate(vis, fr, mode, color):
     """在一帧上画出爪子、识别结果和偏差，返回 (画好的图, 一行文字说明)。
-    goal = (du, dv)：找圆环时圆环中心要对到 爪子点 + goal(r2off 故意对偏，见 r2off_px)，画红十字，偏差按离红十字算。"""
+    (10-24)找物料时爪子点(claw_px.RAW)画绿十字，找圆环时爪子点(claw_px.RING)画红十字；偏差都按离这个十字算。"""
     import cv2
     out = fr.copy()
     kind = 'RAW' if mode == 'material' else 'RING'
     cu, cv_ = vis.claw(kind)
-    ru, rv = cu, cv_                                       # 偏差从哪里算：绿十字，或者(找圆环、设了 r2off)红十字
-    if mode != 'material' and goal is not None:
-        ru, rv = cu + float(goal[0]), cv_ + float(goal[1])
+    ru, rv = cu, cv_
     target = None
     extra = ''
     if mode == 'material':
@@ -235,17 +201,13 @@ def annotate(vis, fr, mode, color, goal=None):
         if best is not None:
             target = (best[0], best[1])
         what = f'rings: {len(rings)}'
-    cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
-    red = (ru, rv) != (cu, cv_)
-    if red:
-        cv2.drawMarker(out, (int(round(ru)), int(round(rv))), (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
-        cv2.putText(out, 'r2off', (int(round(ru)) + 8, int(round(rv)) + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    cv2.drawMarker(out, (int(round(cu)), int(round(cv_))), (0, 255, 0) if kind == 'RAW' else (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
     if target is None:
         msg = f'{what}: NOT FOUND'
     else:
         du, dv = target[0] - ru, target[1] - rv
         mm = (du * du + dv * dv) ** 0.5 / vis.scale(kind)
-        msg = f'{what}: off{" (red r2off)" if red else ""} {du:+.0f},{dv:+.0f} px  ~{mm:.1f} mm{extra}'
+        msg = f'{what}: off {du:+.0f},{dv:+.0f} px  ~{mm:.1f} mm{extra}'
         cv2.line(out, (int(round(ru)), int(round(rv))), (int(target[0]), int(target[1])), (255, 0, 255), 1)
     return out, msg
 
@@ -274,13 +236,7 @@ def main(argv=None):
         print(f'{ex}。map_merge_live 里用过 vdbg / gtest / mtest 的话，先把 map_merge_live 关掉再运行这个。')
         return 1
     print(f'配置：{cfg_path}')
-    print(f'爪子位置(绿十字)：原料 {vis.claw("RAW")}  圆环 {vis.claw("RING")}')
-    goal, fs, why = r2off_px(cfg_path)
-    if goal is not None:
-        print(f'r2off 往前 {fs[0]:+.1f}mm、往左 {fs[1]:+.1f}mm：找圆环时画红十字(绿十字 {goal[0]:+.1f},{goal[1]:+.1f} 像素)，'
-              '把圆环中心(黄十字)对到红十字上')
-    elif why:
-        print(why)
+    print(f'爪子位置：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}')
     print('按键：1~6 换颜色，r 切换物料/圆环，k 现场标定这个颜色(物料放在绿十字下面)，0 这个颜色恢复默认，s 存图，q 退出(先用鼠标点一下画面窗口)')
 
     mode = 'ring' if args.ring else 'material'
@@ -302,13 +258,13 @@ def main(argv=None):
                     from vision import apply_vision_cal
                     apply_vision_cal(vis.cfg, str(cal_p))
                     _reload_ranges(vis)
-                    print(f'绿十字更新了：原料 {vis.claw("RAW")}  圆环 {vis.claw("RING")}', flush=True)
+                    print(f'爪子位置更新了：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}', flush=True)
             fr = vis.camera.read()
             if fr is None:
                 time.sleep(0.05)
                 continue
             try:
-                out, msg = annotate(vis, fr, mode, color, goal=goal if mode == 'ring' else None)
+                out, msg = annotate(vis, fr, mode, color)
             except VisionError as ex:
                 out, msg = fr, f'ERROR: {ex}'
             now = time.monotonic()

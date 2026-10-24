@@ -1322,7 +1322,8 @@ class Vision:
             msg = f'{what}: ' + ('to goal' if goal is not None else 'off') + f' {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm'
         else:
             msg = f'{what}: NOT FOUND'
-        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
+        # (10-24 用户"粗加工区域和暂存区域的十字做成红色的")原料的爪子点绿十字，圆环那边(RING/PICK)红十字
+        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0) if kind == 'RAW' else (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
         lines = [msg + time.strftime('   %H:%M:%S')]
         if info.strip():
             lines.append(info.strip())                 # 第二行：半径、遮挡、看到几个物料(一行写不下)

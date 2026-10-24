@@ -25,6 +25,8 @@
     g -16 -18     (看原料盘的那几步：A1G、ZGRAB、CLWOR、ZOBRAW)原料画面里的绿十字往左 16、往上 18 像素(往右、往下为正)，
                   存进 vision_cal.json，画面里马上跟着动。画面上 off 后面那两个数 = 物料离绿十字差多少：
                   先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。只输入 g = 看绿十字现在在哪
+                  (10-24 看圆环的那几步：A1P、R1、R3、ZPLC、ZOBRNG)挪的是圆环画面里的红十字(粗加工区、暂存区的爪子点)，
+                  和原料的绿十字分开存、互不影响。爪子在 2 号环正上方时照抄画面上 off 后面那两个数，红十字就到 2 号环中心上了
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
@@ -172,17 +174,19 @@ STEPS = [
     dict(key=('A1P', 'A2P'), kind='pose', title='地上圆环上方的姿态(2 号环)', setup='ring',
          text='车按比赛时的位置停在 2 号环旁边(车身离工位色块的远近和比赛时停车点一样)，把爪子移到 2 号环中心的正上方。\n'
               '比赛时车轮先把 2 号环对到这里；接下来两步调 1、3 号环，这期间车别动。\n'
-              '(10-23)设了 r2off 的话，画面里有红十字(比赛时 2 号环对准以后真正要对的点)：把 2 号环中心(黄十字)对到红十字上再回车。'),
+              '(10-24)画面里的红十字 = 粗加工区、暂存区这边的爪子点：比赛时车轮把 2 号环中心(黄十字)对到红十字上。\n'
+              '爪子摆到 2 号环正上方以后，画面上 off 后面那两个数就是 2 号环离红十字多少：输入 g 加这两个数，红十字就挪到 2 号环中心上\n'
+              '(只改圆环这边的，原料的绿十字不动)；先 z -40 降低看准爪子在不在正上方，再升回来、在原来的高度挪红十字。'),
     # (10-20 用户)1、3 号环：车不动，只转手臂过去。存的是比 2 号环(A1P/A2P)多转多少，粗加工区、暂存区共用(两个区圆环一样摆)
     dict(key='R1', kind='ringpose', ring=1, title='1 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动(上一步爪子在 2 号环正上方)。把爪子移到 1 号环中心的正上方：1 +5 / 1 -5 转、2 +50 / 2 -50 伸缩，\n'
               '或者 u 松开舵机用手摆，摆好回车。存的是比 2 号环多转了多少度，粗加工区、暂存区都用它。\n'
               '比赛时车只对准 2 号环一次，1、3 号环按这里的角度直接转过去放、取，车不动。高处看不准可以先 z -40 降低一点再看。\n'
               '以前存过的话手臂先转到存过的位置，对就直接回车。要重调：python3 arm_calib.py --from A1P，先看爪子正对 2 号环再做这两步。\n'
-              '(10-23)画面里有红十字(设了 r2off)：把 1 号环中心(黄十字)对到红十字上；用红十字对就别降低，在原来的高度看(降低了红十字不准)。'),
+              '(10-24)红十字挪准了(上一步)的话，也可以在原来的高度看：把 1 号环中心(黄十字)对到红十字上。'),
     dict(key='R3', kind='ringpose', ring=3, title='3 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动。手臂转到了 2 号环上方(以前存过 3 号环就是存过的位置)：把爪子移到 3 号环中心的正上方(和上一步一样调)，摆好回车。\n'
-              '(10-23)画面里有红十字的话，把 3 号环中心(黄十字)对到红十字上(在原来的高度看)。'),
+              '(10-24)红十字挪准了的话，也可以在原来的高度看：把 3 号环中心(黄十字)对到红十字上。'),
     # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)。
     # (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调"；"ID1 连续转动，不要伸缩一下就停一下")按从车上转盘出去的顺序调；
     #   比赛时 ID1 一直转不停：转过 R1T2 开始伸到 R2T，转过 R1T1 开始缩到圆环那边要的长度；回车上转盘反过来(R2STG=1 才分段停下来走)。
@@ -608,7 +612,7 @@ class Wizard:
         self._view_close()
         args = [sys.executable, str(ROOT / 'vlive.py')] + (['--ring'] if mode == 'ring' else ['1'])
         if self.cfg_path is not None:
-            args += ['--config', str(self.cfg_path)]           # (10-23)和向导用同一份配置(r2off 红十字按它画)
+            args += ['--config', str(self.cfg_path)]           # (10-23)和向导用同一份配置(g 挪的十字存在它说的 vision_cal.json)
         try:
             with open(VIEW_LOG, 'w') as logf:              # 子进程自己拿着这个文件，这边可以关
                 self._viewer = self._popen(args, stdout=logf, stderr=subprocess.STDOUT, cwd=str(ROOT))
@@ -620,39 +624,31 @@ class Wizard:
         self.out('  摄像头画面已打开(另一个窗口' + ('，看圆环' if mode == 'ring' else '，看物料，窗口里按 1~6 换颜色') +
                  ')；输入 v 关掉/再打开')
         if mode == 'ring':
-            self._r2off_hint()
-
-    def _r2off_hint(self):
-        """(10-23 用户"arm_calib 里也出现故意对偏的那个偏心十字")看圆环的那几步：设了 r2off 就说一下画面里的红十字是什么、怎么对。"""
-        try:
-            from vlive import r2off_px
-            goal, fs, why = r2off_px(self.cfg_path)
-        except Exception as e:
-            self.out(f'  (算不出 r2off 红十字：{e})')
-            return
-        if goal is not None:
-            self.out(f'  红十字 = r2off(往前 {fs[0]:+.1f}mm、往左 {fs[1]:+.1f}mm)故意对偏以后，比赛时圆环中心真正要对到的点'
-                     f'(绿十字 {goal[0]:+.0f},{goal[1]:+.0f} 像素)：把圆环中心(黄十字)对到红十字上')
-        elif why:
-            self.out(f'  ★ 设了 r2off，但{why}')
+            self.out('  画面里的红十字 = 粗加工区、暂存区这边的爪子点(比赛时 2 号环中心对到它)：输入 g 左右 上下 挪它，原料的绿十字不动')
 
     def _claw_shift(self, line):
         """(10-23 用户"把这个绿色的十字搞成可移动的…可以根据我的输入的数字改变这个绿色十字的位置")g 左右 上下：
-        原料画面里的绿十字(爪子点 claw_px.RAW)挪几个像素(往右、往下为正)，存进 vision_cal.json，开着的 vlive 马上跟着动。
-        只在看原料盘的那几步用。"""
-        if getattr(self, '_step_mode', None) != 'raw':
-            raise CalError('g 只在看原料盘的那几步用(A1G 原料盘上方的姿态、ZGRAB、CLWOR、ZOBRAW)：挪的是原料画面里的绿十字')
+        看原料盘的那几步挪原料画面里的绿十字(爪子点 claw_px.RAW)；(10-24 用户"粗加工区域和暂存区域的十字中心做成可调节的……
+        两个互不干扰的独立的十字")看圆环的那几步挪圆环画面里的红十字(claw_px.RING)。往右、往下为正(像素)，只改这一个，
+        存进 vision_cal.json，开着的 vlive 马上跟着动。"""
+        mode = getattr(self, '_step_mode', None)
+        if mode not in ('raw', 'ring'):
+            raise CalError('g 只在看摄像头画面的那几步用：看原料盘的(A1G、ZGRAB、CLWOR、ZOBRAW)挪原料的绿十字，'
+                           '看圆环的(A1P、R1、R3、ZPLC、ZOBRNG)挪圆环的红十字')
+        kind, name = ('RAW', '原料的绿十字') if mode == 'raw' else ('RING', '圆环的红十字(粗加工区、暂存区)')
         parts = line.split()
         if len(parts) == 1:
             try:
                 from vision import Vision
                 from vlive import load_vision_cfg
-                u, v = Vision(load_vision_cfg(self.cfg_path)).claw('RAW')
-                self.out(f'  原料画面里的绿十字现在在 ({u:.0f}, {v:.0f}) 像素。')
+                u, v = Vision(load_vision_cfg(self.cfg_path)).claw(kind)
+                self.out(f'  {name}现在在 ({u:.0f}, {v:.0f}) 像素。')
             except Exception as e:
-                self.out(f'  (读不出绿十字的位置：{e})')
-            self.out('  输入 g 左右 上下 挪它(像素，往右、往下为正)，例如 g -16 -18 = 往左 16、往上 18。\n'
-                     '  画面上 off 后面那两个数 = 物料离绿十字差多少：先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。')
+                self.out(f'  (读不出{name}的位置：{e})')
+            self.out('  输入 g 左右 上下 挪它(像素，往右、往下为正)，例如 g -16 -18 = 往左 16、往上 18。\n' +
+                     ('  画面上 off 后面那两个数 = 物料离绿十字差多少：先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。'
+                      if kind == 'RAW' else
+                      '  画面上 off 后面那两个数 = 圆环离红十字差多少：爪子摆到 2 号环正上方以后照抄这两个数，红十字就到 2 号环中心上了。'))
             return None
         du, dv = (_num(parts[1]), _num(parts[2])) if len(parts) == 3 else (None, None)
         if du is None or dv is None:
@@ -661,11 +657,13 @@ class Wizard:
             raise CalError('一次最多挪 200 像素')
         try:
             from vlive import claw_shift
-            old, new, path = claw_shift(self.cfg_path, du, dv)
+            old, new, path = claw_shift(self.cfg_path, du, dv, kind=kind)
         except Exception as e:
-            raise CalError(f'绿十字没挪：{e}')
-        self.out(f'  原料的绿十字：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f}) 像素，已存进 {Path(path).name}'
-                 '(画面里马上跟着动；想挪回去就输入相反的数)。绿十字改了，原料区要重新 rteach RAW near')
+            raise CalError(f'{name}没挪：{e}')
+        self.out(f'  {name}：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f}) 像素，已存进 {Path(path).name}'
+                 '(画面里马上跟着动；想挪回去就输入相反的数)。' +
+                 ('绿十字改了，原料区要重新 rteach RAW near' if kind == 'RAW' else
+                  '比赛时车轮把 2 号环中心对到这里(1、3 号环按调的角度跟着转过去，不用重调)'))
         if self._viewer is None or self._viewer.poll() is not None:
             self.out('  (摄像头画面没开着：输入 v 打开看看)')
         return None

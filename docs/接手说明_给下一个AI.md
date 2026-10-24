@@ -841,3 +841,10 @@ git_log.txt                ← 分支最近 120 条提交记录
   用户重装齿条，ID2 限位让用户 set S2MIN -2000 / S2MAX 500 先放宽，调完再量两头设准；所有 ID2 姿态、rteach RAW near 要重调。
 - **10-24 用户"把这个上下动的这个程序直接给我删了"：** 固件上电保活(Boot_Keepalive，上电后每 5 秒升降往上 15mm)整个删掉(要烧固件)。
   已经提醒过用户：电闸一键启动时树莓派开机那几十秒车完全不动，有"15 秒不动本轮结束"的风险，用户坚持删。test_arm 345 项。
+- **10-24 圆环十字单独可调、去掉 r2off(用户"粗加工区域和暂存区域的十字中心做成可调节的，做个颜色区分……两个互不干扰的独立的十字，
+  故意对偏的那个红色十字去掉")：** 原料的绿十字(claw_px.RAW)不动。vlive 看圆环时爪子点(claw_px.RING)画红十字(看物料时绿十字)，
+  Vision.overlay(vview)同样按 kind 上色；arm_calib 看圆环的那几步(A1P/R1/R3/ZPLC/ZOBRNG)`g 左右 上下` 挪 claw_px.RING(vlive.claw_shift
+  kind='RING')，看原料的那几步挪 RAW，两个分开存在 vision_cal.json。r2off 去掉：mission_hooks 没有 ring2_off_mm/_ring2_off_px/_offset_measure，
+  2 号环直接对到 claw_px.RING；run_live 的 r2off 只说去掉了；vlive.r2off_px 删了。用户去掉前 r2off 已经是 0 0。
+  先说明过：原料的 g 一直只改 RAW，圆环十字不准是因为从来没量过(没做 vclaw RING，用的是配置估计值)。测试 RingCrossTests、
+  GreenCrossTests、sim test_ring_cross_sets_where_ring2_is_aligned。部署包 tasks_1024i(arm.c 和 1024h 一样)。

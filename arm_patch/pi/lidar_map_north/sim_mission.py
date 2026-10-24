@@ -4052,53 +4052,27 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual(h.stats.place_ok, 3, text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
 
-    def test_ring2_deliberate_offset(self):
-        """(10-21 用户"爪子和摄像头有误差，对准 2 号环时故意对偏一点，偏多少自己调")ring2_off_mm F=8：三个环放下的点都比圆环中心往前偏 8mm
-        (1、3 号环跟着 2 号环一起偏)；超过 ±60mm 按 60 算((10-23)以前是 20)。"""
-        for f in (8.0, 75.0):
+    def test_ring_cross_sets_where_ring2_is_aligned(self):
+        """(10-24 用户"粗加工区域和暂存区域的十字中心做成可调节的……故意对偏去掉")2 号环对到圆环这边的爪子点(红十字 claw_px.RING)：
+        红十字不在爪子真正放的地方(偏了 10mm)三个环都放偏 10mm；在 arm_calib 里挪到真正的地方就放准。以前配置里的 ring2_off_mm 不再起作用。"""
+        res = {}
+        for name, du in (('off', 14.6), ('fixed', 0.0)):
             w = self._world(5, park={'ROUGH': 10.0}, stop_err_mm=0.5)
             lines = []
-            h = self._make(w, dict(ring2_off_mm=dict(F=f, S=0.0)), lines=lines)
+            h = self._make(w, dict(ring2_off_mm=dict(F=8.0, S=0.0)), lines=lines)
+            h.vision.cfg['claw_px']['RING'] = [320.0 + du, 240.0]
             run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
             w.arrive('ROUGH', 1)
             h.task('ROUGH', w.link, lines.append)
             text = '\n'.join(lines)
-            if f > 60.0:
-                self.assertIn('往前 +60.0mm', text)                   # 超过 60 按 60
-                continue
-            self.assertIn('故意对偏', text)
+            self.assertNotIn('故意对偏', text)
             errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
             self.assertEqual(len(errs), 3, text[-3000:])
-            for e in errs:
-                self.assertAlmostEqual(e, 8.0, delta=2.0, msg=errs)
-
-    def test_ring2_deliberate_offset_in_temp_and_direction(self):
-        """(10-21 夜用户"暂存区域……故意对偏的问题")r2off 在暂存区也起作用、方向对：F=+8 放的点比圆环中心往车头方向偏 8mm，
-        S=+6 往车的左边(离工位远的那边)偏 6mm；1、3 号环跟着 2 号环一起偏，日志里写了故意对偏多少。"""
-        for f, sd, want in ((8.0, 0.0, (0.0, 8.0)), (0.0, 6.0, (-6.0, 0.0))):
-            w = self._world(5, park={'ROUGH': 10.0, 'TEMP': 10.0}, stop_err_mm=0.5)
-            lines = []
-            h = self._make(w, dict(ring2_off_mm=dict(F=f, S=sd)), lines=lines)
-            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
-            text = '\n'.join(lines)
-            self.assertEqual(text.count('故意对偏(r2off)'), 2, text[-3000:])      # 粗加工区、暂存区各一次
-            got = 0
-            for k in (1, 2, 3):
-                st = w.rings.get(('TEMP', k)) or []
-                self.assertTrue(st, f'TEMP {k} 号环没放')
-                d = np.asarray(st[0]['pos'], float) - np.array([0.0, w.ring_tan['TEMP'][k]])
-                self.assertAlmostEqual(float(d[0]), want[0], delta=1.5, msg=(f, sd, k, d))
-                self.assertAlmostEqual(float(d[1]), want[1], delta=1.5, msg=(f, sd, k, d))
-                got += 1
-            self.assertEqual(got, 3)
-
-    def test_ring2_offset_limit_60mm(self):
-        """(10-23 用户"这个20远远不够你放宽到60")r2off 每个方向最多 ±60mm：-15/+30 原样用，超过 60 的按 60 算。"""
-        w = self._world(1)
-        h = self._make(w, dict(ring2_off_mm=dict(F=-15.0, S=30.0)))
-        self.assertEqual(h.ring2_off(), (-15.0, 30.0))
-        h.cfg['ring2_off_mm'] = dict(F=80.0, S=-75.0)
-        self.assertEqual(h.ring2_off(), (60.0, -60.0))
+            res[name] = errs
+        for e in res['fixed']:
+            self.assertLess(e, 2.0, res)
+        for e in res['off']:
+            self.assertAlmostEqual(e, 10.0, delta=2.5, msg=res)
 
     def test_short_move_not_clamped_by_map_check(self):
         """(10-21 夜实车暂存区：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)规划的停车点离场地边很近、车沿圆环那一排

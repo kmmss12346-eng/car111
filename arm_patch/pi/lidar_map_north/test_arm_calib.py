@@ -564,79 +564,36 @@ class HelperTests(unittest.TestCase):
 
 
 
-class R2offCrossTests(unittest.TestCase):
-    """(10-23 用户"arm_calib 里也故意出现那个故意对偏的偏心十字，我好手动把绿色的和红色十字对齐，再按对齐的位置调 1、3 号环")
-    看圆环时按 r2off 画红十字：位置和比赛时 2 号环对准用的(mission_hooks._ring2_off_px)一模一样。"""
-    J = [[-0.4476067621216748, -0.811142922202761], [0.9711641946870161, -0.3456511867383666]]   # 车上 servo_cal.json 的 RING ch
+class RingCrossTests(unittest.TestCase):
+    """(10-24 用户"粗加工区域和暂存区域的十字中心做成可调节的，做个颜色区分……做成两个互不干扰的独立的十字，故意对偏去掉")
+    看圆环时爪子点(claw_px.RING)画红十字，看物料时(claw_px.RAW)画绿十字；偏差按离这个十字算；arm_calib 打开圆环画面时说红十字是什么。"""
 
-    def _cfg(self, off=None, with_j=True):
-        d = tempfile.mkdtemp()
-        cal = os.path.join(d, 'servo_cal.json')
-        if with_j:
-            with open(cal, 'w', encoding='utf-8') as f:
-                json.dump({'RING': {'ch': self.J}}, f)
-        path = os.path.join(d, 'cfg.json')
-        mc = {'servo_cal_file': cal}
-        if off is not None:
-            mc['ring2_off_mm'] = {'F': off[0], 'S': off[1]}
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'stops': {'QR': [1, 2, 90]}, 'stm32_params': {'FPPM': 12.9}, 'mission_cfg': mc}, f)
-        return path
+    class Vis:
+        last_claw = None
 
-    def test_same_offset_as_the_race_alignment(self):
-        import numpy as np
-        import mission_hooks
-        from vlive import r2off_px
-        goal, fs, why = r2off_px(self._cfg((-15.0, 30.0)))
-        self.assertEqual((fs, why), ((-15.0, 30.0), ''))
+        def claw(self, kind):
+            return (320.0, 240.0) if kind == 'RING' else (300.0, 260.0)
 
-        class H:                                             # 比赛时对准 2 号环用的那个换算
-            def ring2_off(self):
-                return -15.0, 30.0
+        def _rings_in_frame(self, fr):
+            return [(330.0, 250.0, 50.0)]
 
-            def log(self, m):
-                pass
-        want = mission_hooks.MissionHooks._ring2_off_px(H(), np.array(self.J))
-        self.assertAlmostEqual(goal[0], float(want[0]), places=6)
-        self.assertAlmostEqual(goal[1], float(want[1]), places=6)
+        def _ring_det(self):
+            class Det:
+                last = []
+            return Det()
 
-    def test_nothing_without_r2off_and_reason_without_vcal(self):
-        from vlive import r2off_px
-        self.assertEqual(r2off_px(self._cfg(None)), (None, None, ''))
-        goal, fs, why = r2off_px(self._cfg((5.0, 0.0), with_j=False))
-        self.assertIsNone(goal)
-        self.assertIn('vcal RING', why)
+        def scale(self, kind):
+            return 1.25
 
-    def test_red_cross_drawn_and_offset_measured_from_it(self):
+    def test_ring_cross_is_red_and_offset_measured_from_it(self):
         import numpy as np
         from vlive import annotate
-
-        class Det:
-            last = []
-
-        class Vis:
-            last_claw = None
-
-            def claw(self, kind):
-                return (320.0, 240.0)
-
-            def _rings_in_frame(self, fr):
-                return [(330.0, 250.0, 50.0)]
-
-            def _ring_det(self):
-                return Det()
-
-            def scale(self, kind):
-                return 1.25
         fr = np.zeros((480, 640, 3), np.uint8)
-        out, msg = annotate(Vis(), fr, 'ring', 1, goal=(12.0, 8.0))
-        self.assertEqual(tuple(int(x) for x in out[248, 344]), (0, 0, 255))   # 红十字在 爪子点 + (12, 8)：中心 (332,248)，横的一笔
-        self.assertEqual(tuple(int(x) for x in out[260, 332]), (0, 0, 255))   # 竖的一笔
-        self.assertIn('red r2off', msg)
-        self.assertIn('-2,+2 px', msg)                                       # 圆环 (330,250) 离红十字 (332,248)
-        out, msg = annotate(Vis(), fr, 'ring', 1)
-        self.assertNotIn('red', msg)
-        self.assertIn('+10,+10 px', msg)                                     # 没设 r2off：照旧离绿十字算
+        out, msg = annotate(self.Vis(), fr, 'ring', 1)
+        self.assertEqual(tuple(int(x) for x in out[240, 332]), (0, 0, 255))   # 红十字在圆环的爪子点 (320,240)：横的一笔
+        self.assertEqual(tuple(int(x) for x in out[228, 320]), (0, 0, 255))   # 竖的一笔
+        self.assertIn('+10,+10 px', msg)                                     # 圆环 (330,250) 离红十字 (320,240)
+        self.assertNotIn('r2off', msg)
 
     def test_wizard_says_what_the_red_cross_is(self):
         started = []
@@ -656,16 +613,25 @@ class R2offCrossTests(unittest.TestCase):
                 return 0
         stm = FakeStm32()
         lines = []
-        cfg = self._cfg((-15.0, 30.0))
+        cfg = make_cfg()
         wiz = Wizard(stm, cfg, inp=Script(stm, ['q']), out=lines.append, view=True, popen=FakeProc)
         wiz.run(STEP_KEYS.index('A1P'))
         self.assertTrue(any('--ring' in p.args and cfg in p.args for p in started), [p.args for p in started])
-        self.assertTrue(any('红十字 = r2off(往前 -15.0mm、往左 +30.0mm)' in l for l in lines), lines[-12:])
+        self.assertTrue(any('红十字 = 粗加工区、暂存区这边的爪子点' in l for l in lines), lines[-12:])
+
+    def test_old_r2off_in_config_is_ignored(self):
+        """以前存过 r2off(ring2_off_mm)：比赛时不再用，run_live 的 r2off 只说去掉了。"""
+        import mission_hooks
+        self.assertNotIn('ring2_off_mm', mission_hooks.DEFAULTS)
+        self.assertFalse(hasattr(mission_hooks.MissionHooks, '_ring2_off_px'))
+        import vlive
+        self.assertFalse(hasattr(vlive, 'r2off_px'))
 
 
 class GreenCrossTests(unittest.TestCase):
     """(10-23 用户"把这个绿色的十字搞成可移动的…可以根据我的输入的数字改变这个绿色十字的位置")看原料盘的那几步输入 g 左右 上下：
-    原料的绿十字挪几个像素，存进 vision_cal.json(别的键不动)；看圆环的那几步不让用；挪出画面、一次挪太多都不存。"""
+    原料的绿十字挪几个像素，存进 vision_cal.json(别的键不动)；挪出画面、一次挪太多都不存。
+    (10-24 用户"两个互不干扰的独立的十字")看圆环的那几步 g 挪的是圆环的红十字(claw_px.RING)，原料的不动；别的步不让用。"""
 
     def _cfg(self):
         d = tempfile.mkdtemp()
@@ -693,11 +659,25 @@ class GreenCrossTests(unittest.TestCase):
         self.assertTrue(any('(300, 260) → (284, 242)' in l for l in lines), lines[-8:])
         self.assertTrue(any('现在在 (284, 242)' in l for l in lines), lines[-8:])
 
-    def test_g_only_in_raw_steps_and_checks_input(self):
+    def test_g_in_ring_steps_moves_only_the_red_cross(self):
         cfg, cal = self._cfg()
-        lines = self._run(cfg, ['g 5 5', 'q'], 'A1P')
-        self.assertEqual(load(cal)['claw_px']['RAW'], [300.0, 260.0])
-        self.assertTrue(any('g 只在看原料盘的那几步用' in l for l in lines), lines[-6:])
+        lines = self._run(cfg, ['g 12 -7', 'g', 'q'], 'A1P')
+        d = load(cal)
+        self.assertEqual(d['claw_px']['RING'], [332.0, 233.0])       # 圆环的红十字往右 12、往上 7
+        self.assertEqual(d['claw_px']['RAW'], [300.0, 260.0])        # 原料的绿十字不动
+        self.assertTrue(any('圆环的红十字' in l and '(320, 240) → (332, 233)' in l for l in lines), lines[-8:])
+        self.assertTrue(any('现在在 (332, 233)' in l for l in lines), lines[-8:])
+        lines = self._run(cfg, ['g -4 4', 'q'], 'ZOBRNG')
+        self.assertEqual(load(cal)['claw_px']['RING'], [328.0, 237.0])
+        lines = self._run(cfg, ['g -16 -18', 'q'], 'A1G')            # 原料那几步挪原料的，圆环的不动
+        d = load(cal)
+        self.assertEqual((d['claw_px']['RAW'], d['claw_px']['RING']), ([284.0, 242.0], [328.0, 237.0]))
+
+    def test_g_only_in_camera_steps_and_checks_input(self):
+        cfg, cal = self._cfg()
+        lines = self._run(cfg, ['g 5 5', 'q'], 'ZHI')
+        self.assertEqual(load(cal)['claw_px'], {'RAW': [300.0, 260.0], 'RING': [320.0, 240.0]})
+        self.assertTrue(any('g 只在看摄像头画面的那几步用' in l for l in lines), lines[-6:])
         lines = self._run(cfg, ['g 5', 'g 500 0', 'g 200 0', 'g 200 0', 'q'], 'ZGRAB')
         self.assertTrue(any('格式：g 左右 上下' in l for l in lines), lines)
         self.assertTrue(any('一次最多挪 200 像素' in l for l in lines), lines)
