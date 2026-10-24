@@ -148,6 +148,85 @@ def fit_circle(pts, rmin, rmax, r_ref=None, thr=2.0, iters=160, seed=7):
     return cx, cy, r, len(inl), cov, inl
 
 
+# ---------------------------------------------------------------- (10-24)现场标定颜色
+def _in_ranges(hsv, ranges):
+    m = np.zeros(hsv.shape[:2], np.uint8)
+    for lo, hi in ranges:
+        m |= cv2.inRange(hsv, tuple(int(v) for v in lo), tuple(int(v) for v in hi))
+    return m
+
+
+def calibrate_color(frame, color_id, center, r_px, claw=None):
+    """(10-24 用户"黄色的物料识别不太准确，半天识别不出来")现场标定一种颜色的 HSV 范围。
+    物料放在 center(爪子点 / 认到的圆心)正下方：取 center 周围半径 r_px 以内(去掉爪子)的像素，按它们实际的色相、饱和度、亮度
+    定范围(顶面反光发白的地方饱和度低，固定的"饱和度 >= 60"就漏掉了)；再看画面别处(转盘、地面)有多少也落进这个范围，
+    多了就把饱和度下限往上提(物料本身至少还留 85%)。
+    返回 dict(ranges=[[lo, hi], …], keep=物料像素落在范围里的比例, fp=别处落在范围里的比例, text=说明)。像素太少抛 ValueError。"""
+    color_id = int(color_id)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
+    cx, cy, r = int(round(center[0])), int(round(center[1])), max(4, int(round(r_px)))
+    disk = np.zeros((h, w), np.uint8)
+    cv2.circle(disk, (cx, cy), r, 255, -1)
+    if claw is not None and claw.any():
+        disk[claw > 0] = 0
+    px = hsv[disk > 0].astype(np.float64)
+    if len(px) < 80:
+        raise ValueError(f'绿十字附近能用的像素太少({len(px)} 个)：物料放到绿十字正下方，别让爪子挡住')
+    H, S, V = px[:, 0], px[:, 1], px[:, 2]
+    bg = np.full((h, w), 255, np.uint8)                   # 别处：去掉物料(取样圈的 3 倍以内)、爪子
+    cv2.circle(bg, (cx, cy), int(3.0 * r), 0, -1)
+    if claw is not None and claw.any():
+        bg[claw > 0] = 0
+    n_bg = max(1, int(np.count_nonzero(bg)))
+    n_in = max(1, int(np.count_nonzero(disk)))
+
+    def score(rg):
+        m = _in_ranges(hsv, rg)
+        return (np.count_nonzero(cv2.bitwise_and(m, disk)) / float(n_in),
+                np.count_nonzero(cv2.bitwise_and(m, bg)) / float(n_bg))
+
+    def p(a, q):
+        return float(np.percentile(a, q))
+
+    if color_id == 5:                                     # 黑：只看亮度(多暗算黑)
+        vhi = int(min(200, p(V, 97) + 25))
+        ranges = [[[0, 0, 0], [180, 255, vhi]]]
+        while True:
+            keep, fp = score(ranges)
+            if fp <= 0.02 or vhi <= 40 or keep < 0.9:
+                break
+            vhi -= 5
+            ranges = [[[0, 0, 0], [180, 255, vhi]]]
+        text = f'亮度 V {p(V, 5):.0f}~{p(V, 95):.0f}：V <= {vhi} 算黑'
+    else:
+        if color_id == 1:                                 # 红色跨过 0/180：转半圈再算
+            hs = (H + 90.0) % 180.0
+            lo, hi = p(hs, 3) - 6.0 - 90.0, p(hs, 97) + 6.0 - 90.0
+        else:
+            lo, hi = max(0.0, p(H, 3) - 6.0), min(180.0, p(H, 97) + 6.0)
+        s_lo = int(max(25.0, p(S, 5) - 25.0))
+        v_lo = int(max(35.0, p(V, 5) - 45.0))
+
+        def make(s_lo_):
+            if lo < 0:
+                return [[[int(round(lo + 180)), s_lo_, v_lo], [180, 255, 255]], [[0, s_lo_, v_lo], [int(round(hi)), 255, 255]]]
+            if hi > 180:
+                return [[[int(round(lo)), s_lo_, v_lo], [180, 255, 255]], [[0, s_lo_, v_lo], [int(round(hi - 180)), 255, 255]]]
+            return [[[int(round(lo)), s_lo_, v_lo], [int(round(hi)), 255, 255]]]
+        ranges = make(s_lo)
+        keep, fp = score(ranges)
+        while fp > 0.02 and s_lo < 200:                     # 转盘、地面也被认成这个颜色：饱和度下限往上提
+            k2, f2 = score(make(s_lo + 5))
+            if k2 < 0.85:
+                break
+            s_lo += 5
+            ranges, keep, fp = make(s_lo), k2, f2
+        text = (f'色相 H {p(H, 5):.0f}~{p(H, 95):.0f}，饱和度 S {p(S, 5):.0f}~{p(S, 95):.0f}，亮度 V {p(V, 5):.0f}~{p(V, 95):.0f}')
+    keep, fp = score(ranges)
+    return dict(ranges=ranges, keep=float(keep), fp=float(fp), text=text)
+
+
 # ---------------------------------------------------------------- 检测器
 class MaterialDetector:
     def __init__(self, cfg=None, folder=None):
@@ -155,10 +234,7 @@ class MaterialDetector:
         c.update(cfg or {})
         self.cfg = c
         self.folder = Path(folder) if folder else ROOT
-        self.ranges = _ranges()
-        if c.get('no_lblue') and 3 in self.ranges and 6 in self.ranges:
-            self.ranges = dict(self.ranges)
-            self.ranges[3] = list(self.ranges[3]) + [r for r in self.ranges[6] if r not in self.ranges[3]]
+        self.set_ranges(c.get('ranges'))
         self.r_ref = {}                 # 颜色号 -> 学到的物料半径(像素)
         self._r_hist = {}
         self._claw_static = None
@@ -166,6 +242,19 @@ class MaterialDetector:
         self._auto_cache = None         # 找非蓝色物料时自动找到的爪子区域(爪子相对摄像头不动)，找蓝色物料时拿来用
         self.last = None                # 最近一次 detect 的结果(画图用)
         self.last_claw = None           # 最近一次用的爪子区域
+
+    def set_ranges(self, overrides=None):
+        """颜色范围：wuliao.py / 默认的，再用 overrides({颜色号: [[lo, hi], …]}，vlive 里按 k 现场标定、存在 vision_cal.json 的
+        color_ranges)盖掉那几种颜色。不认浅蓝(no_lblue)时浅蓝的范围并进蓝色。"""
+        rg = dict(_ranges())
+        for k, v in (overrides or {}).items():
+            try:
+                rg[int(k)] = [(tuple(int(x) for x in lo), tuple(int(x) for x in hi)) for lo, hi in v]
+            except (TypeError, ValueError):
+                continue
+        if self.cfg.get('no_lblue') and 3 in rg and 6 in rg:
+            rg[3] = list(rg[3]) + [r for r in rg[6] if r not in rg[3]]
+        self.ranges = rg
 
     def seed_radius(self, r_px, colors=None):
         """用标定时量到的物料半径(像素)当初始值(所有物料一样大)。被挡得多时用它固定半径拟合。"""

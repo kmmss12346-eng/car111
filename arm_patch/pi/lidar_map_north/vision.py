@@ -86,8 +86,31 @@ def forget_vision_cal(kinds=(), keys=(), path=None):
     return True
 
 
+def save_color_range(color_id, ranges, path=None):
+    """(10-24)vlive 里按 k 现场标定的颜色范围存进 vision_cal.json 的 color_ranges(只改这一种颜色)；ranges=None = 删掉(恢复默认)。"""
+    p = _cal_path(path)
+    d = load_vision_cal(p)
+    cr = dict(d.get('color_ranges') or {})
+    if ranges is None:
+        cr.pop(str(int(color_id)), None)
+    else:
+        cr[str(int(color_id))] = [[[int(v) for v in lo], [int(v) for v in hi]] for lo, hi in ranges]
+    if cr:
+        d['color_ranges'] = cr
+    else:
+        d.pop('color_ranges', None)
+    tmp = str(p) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    return p
+
+
 def apply_vision_cal(cfg, path=None):
-    """配置(dict)里的 claw_px 用 vision_cal.json 里实测的覆盖。返回同一个 dict。"""
+    """配置(dict)里的 claw_px 用 vision_cal.json 里实测的覆盖。返回同一个 dict。
+    (10-24)现场标定的颜色范围(color_ranges)放进 cfg['matdet']['ranges']，物料识别用它。"""
     cal = load_vision_cal(path).get('claw_px') or {}
     cp = dict(cfg.get('claw_px') or {})
     for k, v in cal.items():
@@ -103,6 +126,13 @@ def apply_vision_cal(cfg, path=None):
         cfg['ring_outer_diam_mm'] = float(cal['ring_outer_diam_mm'])   # vclaw RING 时输入的圆环外径(毫米)
     if cal.get('pick_r_px') and not cfg.get('pick_r_px'):
         cfg['pick_r_px'] = float(cal['pick_r_px'])            # 圆环上方观察时物料顶面的半径(像素)，和 claw_px.PICK 一起记下
+    md = dict(cfg.get('matdet') or {})                         # 新建一份，别改到默认配置里那一份
+    if '_cfg_ranges' not in md:                                # 配置里本来写的范围(多次 apply 时不和标定的混在一起)
+        md['_cfg_ranges'] = dict(md.get('ranges') or {})
+    rg = dict(md['_cfg_ranges'])
+    rg.update(cal.get('color_ranges') or {})
+    md['ranges'] = rg
+    cfg['matdet'] = md
     return cfg
 
 

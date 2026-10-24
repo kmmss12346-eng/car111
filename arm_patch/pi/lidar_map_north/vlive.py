@@ -10,6 +10,9 @@
     1~6   换颜色：1 红 2 黄 3 蓝 4 绿 5 黑 6 浅蓝
     r     切换：找物料 / 找地上圆环
     m     标定爪子区域(存 claw_mask.png)：爪子张开、爪子附近没有物料时按
+    k     (10-24)现场标定现在找的这个颜色：先按 1~6 选颜色，把这个颜色的物料放到绿十字正下方(爪子别挡住)再按。
+          按画面里它实际的颜色定范围，存进 vision_cal.json(color_ranges)，马上生效，比赛时也用它。光线换了(到比赛现场)再标一次
+    0     现在这个颜色恢复默认的范围(删掉 k 标定的)
     s     存一张当前画面到 vlive.png
     q     退出
 
@@ -54,6 +57,60 @@ def load_vision_cfg(cfg_path):
     if cfg.get('vision_cal_file'):
         apply_vision_cal(vc, cfg['vision_cal_file'])
     return vc
+
+
+def _reload_ranges(vis):
+    """vision_cal.json 里的颜色范围变了：正在用的物料识别马上换成新的。"""
+    md = vis.material_detector_obj()
+    if md is not None and hasattr(md, 'set_ranges'):
+        md.set_ranges((vis.cfg.get('matdet') or {}).get('ranges'))
+
+
+def calibrate_color_key(vis, color, cal_p, reset=False):
+    """(10-24)按 k：现场标定 color 这个颜色(物料放在绿十字正下方；认得到时按认到的圆心)；按 0：恢复默认范围。"""
+    from vision import apply_vision_cal, save_color_range
+    import matdet
+    md = vis.material_detector_obj()
+    if md is None:
+        print('现在用的不是 matdet 识别，不能标定颜色', flush=True)
+        return
+    name = COLOR_NAMES.get(color, str(color))
+    if reset:
+        p = save_color_range(color, None, path=str(cal_p) if cal_p else None)
+        apply_vision_cal(vis.cfg, str(p))
+        _reload_ranges(vis)
+        print(f'{name}色恢复默认范围：{md.ranges.get(color)}', flush=True)
+        return
+    fr = None
+    for _ in range(5):
+        f = vis.camera.read()
+        fr = f if f is not None else fr
+    if fr is None:
+        print('没有画面，没标定', flush=True)
+        return
+    last = md.detect(fr, color)
+    if last is not None:
+        center, r = last['center'], 0.6 * float(last['radius'])
+        where = '认到的物料圆心'
+    else:
+        r0 = md.r_ref.get(color) or vis.cfg.get('r_px_seed') or 40.0
+        center, r = vis.claw('RAW'), 0.55 * float(r0)
+        where = '绿十字'
+    old = md.ranges.get(color)
+    try:
+        res = matdet.calibrate_color(fr, color, center, r, claw=vis.claw_mask(fr))
+    except ValueError as ex:
+        print(f'没标定：{ex}', flush=True)
+        return
+    p = save_color_range(color, res['ranges'], path=str(cal_p) if cal_p else None)
+    apply_vision_cal(vis.cfg, str(p))
+    _reload_ranges(vis)
+    ok = md.detect(fr, color) is not None
+    print(f'{name}色标定好了(按{where}周围 {r:.0f} 像素取的颜色)：{res["text"]}\n'
+          f'  原来的范围 {old}\n  新的范围 {res["ranges"]}\n'
+          f'  物料上 {res["keep"] * 100:.0f}% 的点算{name}色，画面别处 {res["fp"] * 100:.1f}% 也算{name}色'
+          + ('(太多了：光线、转盘颜色和它太像，认的时候可能认到别处)' if res['fp'] > 0.03 else '')
+          + f'；这一帧{"认出来了" if ok else "还是没认出来(物料在不在绿十字下面？)"}。已存进 {p}', flush=True)
 
 
 def _cal_file(cfg_path):
@@ -224,7 +281,7 @@ def main(argv=None):
               '把圆环中心(黄十字)对到红十字上')
     elif why:
         print(why)
-    print('按键：1~6 换颜色，r 切换物料/圆环，s 存图，q 退出(先用鼠标点一下画面窗口)')
+    print('按键：1~6 换颜色，r 切换物料/圆环，k 现场标定这个颜色(物料放在绿十字下面)，0 这个颜色恢复默认，s 存图，q 退出(先用鼠标点一下画面窗口)')
 
     mode = 'ring' if args.ring else 'material'
     color = args.color
@@ -244,6 +301,7 @@ def main(argv=None):
                     cal_mt = mt
                     from vision import apply_vision_cal
                     apply_vision_cal(vis.cfg, str(cal_p))
+                    _reload_ranges(vis)
                     print(f'绿十字更新了：原料 {vis.claw("RAW")}  圆环 {vis.claw("RING")}', flush=True)
             fr = vis.camera.read()
             if fr is None:
@@ -261,7 +319,7 @@ def main(argv=None):
             cv2.putText(out, f'{msg}   {fps:.1f} fps', (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
             cv2.putText(out, f'{msg}   {fps:.1f} fps', (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             try:
-                cv2.imshow('vlive  (1-6 color, r ring/material, m claw mask, s save, q quit)', out)
+                cv2.imshow('vlive  (1-6 color, k calib color, r ring/material, m claw mask, s save, q quit)', out)
             except cv2.error:
                 print('显示不了窗口：要在树莓派桌面(VNC)里打开的终端运行，不能用 ssh；'
                       '或者装的是不带界面的 opencv(opencv-python-headless)。', flush=True)
@@ -294,6 +352,12 @@ def main(argv=None):
             elif key == ord('s'):
                 cv2.imwrite(str(ROOT / 'vlive.png'), out)
                 print(f'已存：{ROOT / "vlive.png"}', flush=True)
+            elif key in (ord('k'), ord('0')):
+                if mode != 'material':
+                    print('先按 1~6 选要标定的颜色(现在是找圆环)', flush=True)
+                else:
+                    calibrate_color_key(vis, color, cal_p, reset=(key == ord('0')))
+                    cal_mt = _mtime(cal_p)                   # 自己改的 vision_cal.json：不当成别处改的再读一遍
     except KeyboardInterrupt:
         pass
     finally:

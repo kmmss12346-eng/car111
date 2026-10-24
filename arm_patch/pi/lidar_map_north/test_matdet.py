@@ -297,5 +297,77 @@ class CalFileTests(unittest.TestCase):
             self.assertEqual(apply_vision_cal({'claw_px': {'RAW': [1, 2]}}, os.path.join(td, 'none.json'))['claw_px']['RAW'], [1, 2])
 
 
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
+class ColorCalibTests(unittest.TestCase):
+    """(10-24 用户"黄色的物料识别不太准确，半天识别不出来")vlive 里按 k 现场标定颜色。"""
+
+    def setUp(self):
+        import matdet
+        self.matdet = matdet
+
+    def pale_yellow(self, seed=0, tint=(0, 6, 12)):
+        """淡黄物料，顶面中间一大块反光发白(饱和度 ~45，低于默认的 60)；转盘白里带一点暖色。"""
+        im = scene([], seed=seed)
+        im = cv2.addWeighted(im, 1.0, np.full_like(im, tint), 1.0, 0)
+        cx, cy, r = 330, 230, 44
+        cv2.circle(im, (cx, cy), r, (150, 225, 240), -1, cv2.LINE_AA)
+        cv2.circle(im, (cx - 6, cy - 5), 26, (205, 245, 250), -1, cv2.LINE_AA)
+        rng = np.random.default_rng(seed)
+        return np.clip(im.astype(float) + rng.normal(0, 3, im.shape), 0, 255).astype(np.uint8), (cx, cy, r)
+
+    def test_pale_yellow_found_after_calibration(self):
+        for seed in range(3):
+            im, (cx, cy, r) = self.pale_yellow(seed)
+            self.assertIsNone(self.matdet.MaterialDetector(NO_MASK).detect(im, 2))       # 默认范围：反光那块不算黄，认不出来
+            res = self.matdet.calibrate_color(im, 2, (cx + 3, cy - 2), 0.55 * r)         # 绿十字差几个像素也行
+            self.assertGreater(res['keep'], 0.9, res)
+            self.assertLess(res['fp'], 0.03, res)
+            out = self.matdet.MaterialDetector(dict(NO_MASK, ranges={2: res['ranges']})).detect(im, 2)
+            self.assertIsNotNone(out, res)
+            self.assertLess(err(out, cx, cy), 2.0)
+
+    def test_yellowish_turntable_raises_saturation_floor(self):
+        """转盘偏黄(和物料反光处的颜色接近)：饱和度下限往上提，别把转盘认成黄色。"""
+        im, (cx, cy, r) = self.pale_yellow(0, tint=(0, 12, 26))
+        res = self.matdet.calibrate_color(im, 2, (cx, cy), 0.55 * r)
+        self.assertLess(res['fp'], 0.03, res)
+        out = self.matdet.MaterialDetector(dict(NO_MASK, ranges={2: res['ranges']})).detect(im, 2)
+        self.assertIsNotNone(out, res)
+
+    def test_red_wraps_hue(self):
+        im = scene([(1, 300, 240, 44)], seed=2)
+        res = self.matdet.calibrate_color(im, 1, (300, 240), 24)
+        self.assertEqual(len(res['ranges']), 2, res)                                   # 红色跨过 0/180：两段
+        out = self.matdet.MaterialDetector(dict(NO_MASK, ranges={1: res['ranges']})).detect(im, 1)
+        self.assertIsNotNone(out)
+        self.assertLess(err(out, 300, 240), 2.0)
+
+    def test_overrides_only_that_color(self):
+        d = self.matdet.MaterialDetector(dict(NO_MASK, ranges={'2': [[[10, 20, 30], [40, 255, 255]]]}))
+        self.assertEqual(d.ranges[2], [((10, 20, 30), (40, 255, 255))])
+        self.assertEqual(d.ranges[1], self.matdet.DEFAULT_RANGES[1])
+        self.assertTrue(any(r in d.ranges[3] for r in self.matdet.DEFAULT_RANGES[6]))  # 不认浅蓝：浅蓝照样并进蓝色
+
+    def test_too_few_pixels(self):
+        im = scene([], seed=0)
+        with self.assertRaises(ValueError):
+            self.matdet.calibrate_color(im, 2, (320, 240), 3)
+
+    def test_vision_cal_saves_and_resets(self):
+        import vision
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'vision_cal.json')
+            vision.save_vision_cal('RAW', (300, 200), path=p)
+            vision.save_color_range(2, [[[16, 30, 190], [38, 255, 255]]], path=p)
+            cfg = vision.apply_vision_cal({'matdet': {'r_px': [15, 170]}}, p)
+            self.assertEqual(cfg['matdet']['ranges'], {'2': [[[16, 30, 190], [38, 255, 255]]]})
+            self.assertEqual(cfg['claw_px']['RAW'], [300.0, 200.0])                      # 爪子点照样在
+            vision.save_color_range(2, None, path=p)                                      # 按 0：恢复默认
+            cfg = vision.apply_vision_cal(cfg, p)                                         # 同一个 cfg 再读一次(vlive 就是这样)
+            self.assertEqual(cfg['matdet']['ranges'], {})
+            self.assertNotIn('color_ranges', vision.load_vision_cal(p))
+            self.assertIn('claw_px', vision.load_vision_cal(p))
+
+
 if __name__ == '__main__':
     unittest.main()
