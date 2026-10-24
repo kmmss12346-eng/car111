@@ -812,3 +812,21 @@ git_log.txt                ← 分支最近 120 条提交记录
     部署包 tasks_1023j(= 1023i + 这两处)。**full 怎么选要用户按实测定**：3 分钟一到裁判就停，之后做的不算分。
   - 终端 `check`(66eb3cb，self_check.py)：比赛前自检，只发 PING / GET / LIFT? / PRE X(新固件回 ERR ARG，不动)，再看配置和示教文件、
     摄像头/雷达设备、开机自启动、SD 卡空间，每项 ✓/★。部署包 tasks_1024a(= 1023j + self_check.py + 比赛当天清单)。
+- **10-24 黄色物料认不出来：** vlive 里按 2(黄) 再按 k，把物料放在绿十字下面现场标定颜色(matdet.calibrate_color，存 vision_cal.json 的
+  color_ranges)，0 = 恢复配置里的范围。比赛场地灯光不一样，到了场地要重新标。部署包 tasks_1024b。
+- **10-24 码垛躲避改成"先缩 -> 缩着转到位 -> 再伸"(用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸"，要在 arm_calib 里能调)：**
+  10-23 的 stack_carry_plan 按几何走：3 号环缩着过、2 号环太近从外侧绕(伸到 -440)、两个环中间改长度，用户看着就是一会缩一会伸。
+  现在默认 `stack_carry_mode='in'`(mission_hooks `_stack_in` + `stack_in_plan`)：路上要经过已经叠了两层的环时，APZ 从车上转盘出发
+  (STM32 照旧按圆环那组绕电池盒：R1T2 伸到 R2T、转到 R1T1)停在往里缩的地方 `stack_carry_a1`(没调 = R1T1)，AP 只往里缩到
+  `stack_carry_a2`(没调 = A2R)，AP 缩着只转到目标环的 ID1，最后 _return_to_pose 只伸出去；一路在 ZHI。往里缩的地方不在 R1T1 和第一个
+  两层垛中间(调错了)就改在 R1T1 缩(没绕电池盒就在车上转盘和那个垛正中间)，日志 ★。路上出错要放回转盘：`_to_tray_detour(dodge=)`
+  先只缩、缩着转回往里缩的地方，再照常绕电池盒回去。`stack_carry_mode='plan'` 还能换回 10-23 的走法。
+  arm_calib 在 ZSTK 后面加两步 STKA2(往里缩到多短，在 2 号环上方调，屏上按 fit_arm_polar 算爪子离 3、2 号环中心多远)、
+  STKA1(在哪里往里缩，绕过电池盒以后；R1T1 前面或者到了第一个环不存)；这两个值存配置的 mission_cfg(stack_carry_a2/stack_carry_a1)，
+  不发给 STM32(STORE_KEYS)；`t` 按正在调的值走一遍码垛的路(TRAY -> APZ 到 STKA1 -> 缩 -> 转到最远的环 -> 伸 -> 原路缩着回来 -> TRAY)。
+  check 自检多一行说码垛躲避用的什么值。不用烧固件。
+  **要和用户说清楚：** 按 10-23 存的角度，2 号环离转轴 189mm，ID2 缩到最短(-1230)爪子中心也只离 2 号环中心 18mm 左右：
+  2 号环的垛还是要靠升降够高从垛顶上面过(ZHI 120 时夹着的物料底比两层垛顶高 7mm 左右)；3 号环缩着能离 70mm 左右。
+  出车上转盘先伸到 R2T 是绕电池盒(用户自己调的那组)，躲垛这一段只缩一次、伸一次。
+  测试：StackCarryTests(新加 in 的路线、往里缩的地方、整场每步只动一个舵机且伸缩只换一次方向、调短了不扫到、路上出错放回转盘先缩)、
+  test_arm_calib.StackDodgeTests、test_self_check。test_arm_calib.py 里 `if __name__` 挪到最后(以前 python3 test_arm_calib.py 跑不到后面几个类)。

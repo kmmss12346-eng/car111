@@ -18,6 +18,8 @@
     u             两个舵机松开，用手直接摆；摆好以后回车 = 读出角度并保存
     r             重新读一下两个舵机现在的角度
     t             (车上转盘去圆环那几步 R1T2/R2T/R1T1/R2SPD)按 STM32 里已经保存的值真走一遍：去车上转盘 -> 去 2 号环 -> 回车上转盘
+                  (码垛躲避那两步 STKA2/STKA1)按现在调的值走一遍码垛的路：去车上转盘 -> 绕电池盒到 STKA1 -> 往里缩到 STKA2
+                  -> 缩着转到最远的环 -> 伸出去 -> 原路缩回来 -> 回车上转盘
     v             打开/关掉摄像头画面(vlive.py 的窗口：看物料、圆环认得怎么样)。原料盘上方姿态、ZGRAB、ZOBRAW、
                   圆环上方姿态、ZPLC、ZOBRNG 这几步会自动打开(要在树莓派桌面的终端里运行向导)
     g -16 -18     (看原料盘的那几步：A1G、ZGRAB、CLWOR、ZOBRAW)原料画面里的绿十字往左 16、往上 18 像素(往右、往下为正)，
@@ -31,9 +33,11 @@
 
 保存 = 发给 STM32(SET) + 写进配置文件的 stm32_params(备份原文件为 .json.bak)。
 以后每次启动 map_merge_live 都会自动把这些值发给 STM32，不用重新烧录。
+(码垛躲避的 STKA1/STKA2 是树莓派自己用的：存进配置文件的 mission_cfg(stack_carry_a1/stack_carry_a2)，不发给 STM32。)
 
     python3 arm_calib.py --from ZGRAB    从某一步开始(只重调其中几项时用)
     python3 arm_calib.py --from A1P      只重调圆环那几步(2 号环、1 号环、3 号环上方的姿态……)
+    python3 arm_calib.py --from STKA2    只重调码垛躲避(往里缩到多短、在哪里往里缩)
     python3 arm_calib.py --config xxx.json --port /dev/serial0
 
 需要 STM32 里是带 CLWO/TT1/AEXT 参数的新程序(2026-10-08 以后的 arm.c)。
@@ -203,6 +207,21 @@ STEPS = [
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
          text='在已经放好的物料上面再放一个时的高度，一般 = ZPLC + 物料高度(60mm)。\n'
               '可以在圆环里放一个物料，夹着第二个物料往下降到刚好叠上去。'),
+    # (10-24 用户"第二层码放躲避的时候……往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")码垛时夹着物料去圆环，路上要经过
+    #   已经叠了两层的环：绕过电池盒在 STKA1 停下、往里缩到 STKA2，缩着转到要放的环，再只伸出去。路上没有两层的垛照旧走。
+    #   这两个值树莓派自己用：存进配置的 mission_cfg(store 是名字)，不发给 STM32
+    dict(key='STKA2', kind='servo', sid=2, store='stack_carry_a2', title='码垛躲避①：往里缩到多短 STKA2(ID2)', setup='stk_a2',
+         text='码垛(暂存区第二层)时去 1 号环，夹着物料要经过已经叠了两层的 3、2 号环。比赛时这样躲：绕过电池盒停下 -> 往里缩到这里 ->\n'
+              '缩着转到要放的环 -> 再只伸出去(只缩一次、伸一次)。手臂已经按这条路走到了 2 号环上方(离转轴最近、最难躲的环)，\n'
+              '缩在现在存的长度。爪子里没有物料就先 o 张开、塞一个物料、c 夹住；在 2 号环上叠两个物料看：用 2 -50 往里缩\n'
+              '(这辆车 ID2 越小越短)，缩到夹着的物料不会碰到垛(或者已经缩到头)。也可以 1 +10 / 1 -10 转到 3 号、1 号环上方看看，\n'
+              '回车只存伸缩(ID2)。下面"按三个环的角度算"是爪子中心离各个环中心多远：不到 50mm 的那个，物料要从垛顶上面过(升降够高才碰不到)。\n'
+              '输入 t：按现在调的长度把码垛的路真走一遍(不用先保存)。不用躲：s 跳过(没调过 = 缩到车上转盘上方的长度 A2R)。'),
+    dict(key='STKA1', kind='servo', sid=1, store='stack_carry_a1', title='码垛躲避②：在哪里往里缩 STKA1(ID1)', setup='stk_a1',
+         text='手臂夹着物料从车上转盘出来、绕过电池盒，停在往里缩的地方(没调过就是绕电池盒的最后一个角度 R1T1)，已经缩到上一步的长度。\n'
+              '看缩着的物料碰不碰电池盒：碰的话往圆环那边多转一点(1 +10 还是 1 -10 看下面那行)，要在第一个环前面；回车只存这里的 ID1。\n'
+              '比 R1T1 还靠车上转盘的地方不行(那一段还在绕电池盒)：要早点缩，先把"车上转盘去圆环③ R1T1"调早。\n'
+              '输入 t：按现在调的角度把码垛的路真走一遍(不用先保存)。'),
     dict(key='ZOBRNG', kind='lift', title='摄像头看圆环的高度 ZOBRNG', setup='ring_obs', optional=True,
          text='摄像头对准地上圆环时手臂停的高度。已经用 vcal 标定过的话输入 s 跳过。'),
     dict(key='A1H', kind='servo', sid=1, title='收起待命的姿态(ID1)', setup='stow',
@@ -210,6 +229,7 @@ STEPS = [
               '这一步只调 ID1(ID2 用转盘上方那一步的角度)。'),
 ]
 STEP_KEYS = [s['key'] if isinstance(s['key'], str) else s['key'][0] for s in STEPS]
+STORE_KEYS = {s['key']: s['store'] for s in STEPS if s.get('store')}   # (10-24)树莓派自己用的值 -> 配置 mission_cfg 里的名字
 
 # 这几步自动打开摄像头画面(vlive.py)：raw = 看物料，ring = 看圆环
 CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'A2GB': 'raw', 'CLWOR': 'raw', 'ZOBRAW': 'raw', 'A1P': 'ring', 'R1': 'ring', 'R3': 'ring', 'ZPLC': 'ring', 'ZOBRNG': 'ring'}
@@ -301,6 +321,8 @@ class Wizard:
         self.tt = None                   # 转盘现在的脉宽
         self.released = False            # 舵机松开了(用手摆)
         self.z_cmd = None                # 最后一次让升降去的高度(一样就不重复发)
+        self.store_unset = set()         # (10-24)配置 mission_cfg 里还没调过的码垛躲避值(STKA1/STKA2)：self.P 里放的是比赛时的默认
+        self.spacing = 150.0             # 相邻圆环中心距(mission_cfg.ring_spacing_mm)：算离各个环多远用
 
     # ------------------------------------------------------------ 和 STM32 说话
     def do(self, cmd, quiet=False):
@@ -402,19 +424,33 @@ class Wizard:
 
     # ------------------------------------------------------------ 保存
     def save(self, values):
-        for name, v in values.items():
+        stm = {k: v for k, v in values.items() if k not in STORE_KEYS}
+        mine = {k: v for k, v in values.items() if k in STORE_KEYS}     # (10-24)码垛躲避：树莓派自己用，不发给 STM32
+        for name, v in stm.items():
             self.do(f'SET {name} {v:g}', quiet=True)
             self.P[name] = v
             self.saved[name] = v
+        for name, v in mine.items():
+            self.P[name] = v
+            self.saved[name] = v
+            self.store_unset.discard(name)
         if self.cfg_path is not None:
             cfg = json.loads(self.cfg_path.read_text(encoding='utf-8'))
             bak = self.cfg_path.with_suffix('.json.bak')
             if not bak.exists():
                 bak.write_text(self.cfg_path.read_text(encoding='utf-8'), encoding='utf-8')
-            sp = dict(cfg.get('stm32_params') or {})
-            sp.update(values)
-            cfg['stm32_params'] = sp
+            if stm:
+                sp = dict(cfg.get('stm32_params') or {})
+                sp.update(stm)
+                cfg['stm32_params'] = sp
+            if mine:
+                mc = dict(cfg.get('mission_cfg') or {})
+                for name, v in mine.items():
+                    mc[STORE_KEYS[name]] = round(float(v), 2)
+                cfg['mission_cfg'] = mc
             save_json(self.cfg_path, cfg)
+        elif mine:
+            self.out('  ★ 没有配置文件：' + '、'.join(mine) + ' 存不下来(比赛时用不上)。用 --config 指定 map_merge_live 用的配置文件')
         self.out('  已保存：' + '  '.join(f'{k}={v:g}' for k, v in values.items()))
 
     # ------------------------------------------------------------ 开始前检查
@@ -439,6 +475,7 @@ class Wizard:
                         P[k] = float(v)
                     except CalError:
                         pass
+        self._load_store()
         z = self.lift_now()
         if z is None:
             raise CalError('升降现在位置不明(LIFT? 回 0)：先在 map_merge_live 里看 arm LIFT ENC?，或者重新上电让它自动回到 60mm。')
@@ -490,6 +527,13 @@ class Wizard:
             self._to_tray()
         elif kind in ('rtray1', 'rtray2', 'rtray3'):
             self._tray_stage(kind)
+        elif kind in ('stk_a1', 'stk_a2'):                     # (10-24)码垛躲避：按码垛的路走到这一步要看的地方(夹爪不动：夹着物料调)
+            for key in self.store_unset:                       # 没调过的跟着这次刚调的 R1T1、A2R、1/3 号环走
+                try:
+                    P[key] = self._store_default(key)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            self._stack_path(kind)
         if kind in ('raw_obs', 'ring_obs'):
             self.lift_to(P['ZOBRAW' if kind == 'raw_obs' else 'ZOBRNG'])
 
@@ -506,7 +550,12 @@ class Wizard:
             return (f'ID1={self.cur[1]:g}°  ID2={self.cur[2]:g}°   比 2 号环(A1P/A2P)多转 ID1 {d1:+.2f}° ID2 {d2:+.2f}°' +
                     (f'   (原来存的 {o[0]:+.2f} {o[1]:+.2f})' if o else '   (还没存过)'))
         if k == 'servo':
-            return f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   (原来 {st["key"]}={P[st["key"]]:g})'
+            key = st['key']
+            was = (f'原来没调：比赛时用 {self._store_default_text(key)}' if key in self.store_unset else f'原来 {key}={P[key]:g}')
+            line = f'ID{st["sid"]}={self.cur[st["sid"]]:g}°   ({was})'
+            if key == 'STKA2' and self.cur[2] is not None:
+                line += self._stack_gap_text(self.cur[2])
+            return line
         if k == 'claw':
             was = (f'原来 {st["key"]}=0，和 CLWO={P["CLWO"]:g} 一样' if st['key'] in ('CLWOR', 'CLWOT') and P[st['key']] < CLAW_RANGE[0]
                    else f'原来 {st["key"]}={P[st["key"]]:g}')
@@ -725,6 +774,192 @@ class Wizard:
         except CalError as e:
             self.out(f'  !! 回 2 号环上方失败：{e}')
 
+    # ------------------------------------------------------------ (10-24)码垛躲避 STKA1/STKA2(树莓派用，存在 mission_cfg)
+    def _load_store(self):
+        """从配置的 mission_cfg 读码垛躲避那两个值放进 self.P；没调过放比赛时的默认(和 mission_hooks 一样)，记在 store_unset。"""
+        mc = {}
+        if self.cfg_path is not None:
+            try:
+                mc = json.loads(self.cfg_path.read_text(encoding='utf-8')).get('mission_cfg') or {}
+            except Exception:
+                mc = {}
+        try:
+            self.spacing = float(mc.get('ring_spacing_mm') or 150.0)
+        except (TypeError, ValueError):
+            self.spacing = 150.0
+        self.store_unset = set()
+        for key, name in STORE_KEYS.items():
+            try:
+                v = float(mc.get(name))
+            except (TypeError, ValueError):
+                v = None
+            if v is None:
+                self.store_unset.add(key)
+                try:
+                    v = self._store_default(key)
+                except (KeyError, TypeError, ValueError):
+                    v = 0.0
+            self.P[key] = v
+
+    def _ring_set(self):
+        """圆环那组绕电池盒调过(R2T 不是 0，ID2 管伸缩)：从车上转盘去圆环要先伸到 R2T 转过电池盒。"""
+        P = self.P
+        return float(P.get('AEXT', 2.0) or 2.0) == 2.0 and abs(float(P.get('R2T', 0.0) or 0.0)) > 0.5
+
+    def _ring_poses(self):
+        """{环号: (ID1, ID2)}：爪子在 2 号环(A1P/A2P)和存过的 1、3 号环正上方时的角度。"""
+        P = self.P
+        out = {2: (float(P['A1P']), float(P['A2P']))}
+        for r in (1, 3):
+            o = self._ring_teach_now(r)
+            if o:
+                out[r] = (out[2][0] + o[0], out[2][1] + o[1])
+        return out
+
+    def _far_ring(self):
+        """离车上转盘最远的环(码垛去它要经过另外两个)：(环号, ID1, ID2)，和它路上要经过的环(先经过的在前)。"""
+        poses, a1d = self._ring_poses(), float(self.P['A1D'])
+        far = max(poses, key=lambda r: abs(poses[r][0] - a1d))
+        lo, hi = sorted((a1d, poses[far][0]))
+        passed = sorted((r for r in poses if r != far and lo + 1.0 < poses[r][0] < hi - 1.0), key=lambda r: abs(poses[r][0] - a1d))
+        return (far, poses[far][0], poses[far][1]), passed
+
+    def _a1_base(self):
+        """往里缩最早能在哪(ID1)：绕电池盒调过就是 R1T1(那一段还在绕电池盒)，不然是车上转盘上方 A1D。"""
+        P = self.P
+        t1 = float(P.get('R1T1', 0.0) or 0.0)
+        return t1 if self._ring_set() and abs(t1) > 0.5 else float(P['A1D'])
+
+    def _store_default(self, key):
+        P = self.P
+        if key == 'STKA2':
+            return float(P['A2R'])
+        base = self._a1_base()
+        if base != float(P['A1D']):
+            return base
+        (_r, f1, _f2), passed = self._far_ring()
+        first = self._ring_poses()[passed[0]][0] if passed else f1
+        return (float(P['A1D']) + first) / 2.0                   # 和 mission_hooks 一样：车上转盘和第一个环中间
+
+    def _store_default_text(self, key):
+        v = self._store_default(key)
+        if key == 'STKA2':
+            return f'车上转盘上方的长度 A2R={v:g}'
+        return (f'绕电池盒的最后一个角度 R1T1={v:g}' if self._a1_base() != float(self.P['A1D'])
+                else f'车上转盘和第一个环中间 {v:.1f}')
+
+    def _stka1_bad(self, v):
+        """STKA1 调在比赛时用不上的地方：说为什么；能用返回 None。"""
+        P = self.P
+        (far, f1, _f2), passed = self._far_ring()
+        base, a1d = self._a1_base(), float(P['A1D'])
+        sgn = 1.0 if f1 > a1d else -1.0
+        if (v - base) * sgn < 0.0:
+            return ('比绕电池盒的最后一个角度 R1T1 还靠车上转盘(那一段还在绕电池盒)' if base != a1d else '在车上转盘后面') + \
+                   f'，比赛时会改在 {self._store_default("STKA1"):.1f}° 缩'
+        if passed:
+            r = passed[0]
+            if (self._ring_poses()[r][0] - v) * sgn <= 2.0:
+                return f'已经到了(或者过了) {r} 号环，比赛时会改在 {self._store_default("STKA1"):.1f}° 缩'
+        return None
+
+    def _go(self, sid, deg):
+        """只转一个舵机到 deg(已经在那儿就不发)。"""
+        try:
+            if abs(self.angle(sid) - deg) <= 0.3:
+                return
+        except CalError:
+            pass
+        self.servo_to(sid, deg)
+
+    def _stack_path(self, kind, vals=None, hint=True):
+        """和比赛码垛时一样从车上转盘出发(夹爪不动：夹着物料调)：去车上转盘上方 -> 绕电池盒(只转到 R1T2 -> 只伸到 R2T)只转到往里缩的地方
+        STKA1 -> 只往里缩到 STKA2；stk_a2 再缩着只转到 2 号环上方。一段一段走(每段只动一个舵机，ARMOK=0 也能走)。
+        vals = {'STKA1': , 'STKA2': }：按这两个值走(t 试走完回到正在调的值)；不给按 self.P。"""
+        P = self.P
+        v = dict(STKA1=float(P['STKA1']), STKA2=float(P['STKA2']))
+        v.update(vals or {})
+        self._to_tray()
+        if self._ring_set():
+            t2 = float(P.get('R1T2', 0.0) or 0.0)
+            if abs(t2) > 0.5:
+                self._go(1, t2)
+            self._go(2, float(P['R2T']))
+        self._go(1, v['STKA1'])
+        self._go(2, v['STKA2'])
+        if kind == 'stk_a2':
+            self._go(1, float(P['A1P']))
+        if hint:
+            sign = '+' if float(P['A1P']) > float(P['A1D']) else '-'
+            self.out(f'  (往圆环那边转：1 {sign}10；往车上转盘那边：1 {"-" if sign == "+" else "+"}10)')
+
+    def _try_stack_path(self, st):
+        """t：按 STKA1/STKA2 真走一遍码垛的路，和比赛时一样：去车上转盘上方(TRAY) -> STM32 绕电池盒转到 STKA1(APZ) -> 只往里缩
+        -> 缩着只转到最远的环 -> 只伸出去；再原路回来(夹着物料：只缩 -> 缩着转回 STKA1 -> TRAY)，回到这一步开始的地方。
+        这一步正在调的值(还没回车)按现在舵机的角度算：调一下、t 试一下，满意了再回车。"""
+        P = self.P
+        (far, f1, f2), passed = self._far_ring()
+        vals = dict(STKA1=float(P['STKA1']), STKA2=float(P['STKA2']))
+        now = self.cur.get(st['sid']) if isinstance(getattr(self, 'cur', None), dict) else None
+        tuning = now is not None and abs(now - vals[st['key']]) > 0.2
+        if tuning:
+            vals[st['key']] = float(now)
+        a1, a2 = vals['STKA1'], vals['STKA2']
+        via = '、'.join(f'{r} 号' for r in passed) or '(没有)'
+        self.out(f'  试走(STKA1={a1:g} STKA2={a2:g}' + (f'，{st["key"]} 是正在调的、还没保存' if tuning else '') +
+                 f'，和比赛码垛时一样)：去车上转盘上方 -> 绕电池盒转到 STKA1 -> 往里缩 -> '
+                 f'缩着转到 {far} 号环(路上经过 {via}环) -> 伸出去 -> 原路缩回来 -> 回车上转盘上方')
+        if not self._to_tray():
+            self.out('  ★ 试走要新的 STM32 程序(TRAY 指令)，并且 ARMOK=1(最后一步打开，或者 run_live 里 set ARMOK 1)')
+            self._stack_path(st['setup'], vals, hint=False)
+            self._read_servos()
+            return
+        hold = float(P['R2T']) if self._ring_set() else float(P['A2R'])
+        if abs(a1 - float(P['A1D'])) > 1.0:
+            self.do(f'APZ {a1:g} {hold:g} {P["ZHI"]:g}')          # STM32 照比赛时绕电池盒
+        self._go(2, a2)
+        self._go(1, f1)
+        self._go(2, f2)
+        self.out(f'  到了 {far} 号环上方(比赛时在这里降到 ZSTK 码上去)。原路回去：')
+        self._go(2, a2)
+        self._go(1, a1)
+        self.do('TRAY')
+        self.z_cmd = None
+        self._stack_path(st['setup'], vals, hint=False)
+        self._read_servos()
+        self.out('  试走完了，回到这一步开始的地方' + ('(还是正在调的值，满意了回车保存)' if tuning else ''))
+
+    def _stack_gap_text(self, a2):
+        """缩到 ID2 = a2 转过去时，爪子中心离路上那几个环的中心多远(按三个环的角度算手臂几何，见 mission_hooks.fit_arm_polar)。"""
+        poses = self._ring_poses()
+        if len(poses) < 3:
+            return '\n  (1、3 号环还没调(R1/R3)：算不出离各个环多远)'
+        key = tuple(sorted(poses.items())) + (self.spacing,)
+        if getattr(self, '_fit_key', None) != key:
+            try:
+                from mission_hooks import fit_arm_polar
+                self._fit = fit_arm_polar(poses, self.spacing)
+            except Exception:
+                self._fit = None
+            self._fit_key = key
+        fit = self._fit
+        if fit is None or fit[2] > 6.0:
+            return '\n  (三个环的角度对不上一条直线：算不出离各个环多远)'
+        a, k, _res = fit
+        _far, passed = self._far_ring()
+        if not passed:
+            return ''
+        r_in = a + k * float(a2)
+        parts = [f'{r} 号环 {abs(a + k * poses[r][1] - r_in):.0f}mm' for r in passed]
+        out = '\n  按三个环的角度算，缩着转过去爪子中心离：' + '、'.join(parts) + '(不到 50mm 的，物料要从垛顶上面过)'
+        try:
+            zhi, zstk = float(self.P['ZHI']), float(self.P['ZSTK'])
+            out += (f'\n  从垛顶上面过：ZHI {zhi:g} - ZSTK {zstk:g} - 物料高 {MATERIAL_MM:g} = {zhi - zstk - MATERIAL_MM:.0f}mm'
+                    '(夹着的物料底比两层垛顶高这么多；ZSTK 时物料底正好在第一层顶上)')
+        except (KeyError, TypeError, ValueError):
+            pass
+        return out
+
     def _read_servos(self):
         """读两个舵机现在的角度。读不到(总线接触不好)：按刚才发的姿态算，不让整个向导停下。"""
         last = getattr(self, '_last_pose', None)
@@ -827,6 +1062,9 @@ class Wizard:
             return None
         if line == 't' and st['key'] in ('R1T2', 'R2T', 'R1T1', 'R2SPD'):
             self._try_ring_path(st)
+            return None
+        if line == 't' and st['key'] in ('STKA1', 'STKA2'):
+            self._try_stack_path(st)
             return None
         if line == 'v':
             if self._viewer is not None and self._viewer.poll() is None:
@@ -945,7 +1183,15 @@ class Wizard:
             self.save({n1: self.cur[1], n2: self.cur[2]})
         elif k == 'servo':
             self._read_servos()
-            self.save({st['key']: self.cur[st['sid']]})
+            key, v = st['key'], self.cur[st['sid']]
+            if key in self.store_unset and abs(v - self.P[key]) <= 0.3:
+                self.out(f'  没改：{key} 还是没调(比赛时用 {self._store_default_text(key)})')
+            else:
+                why = self._stka1_bad(v) if key == 'STKA1' else None
+                if why:                                    # 比赛时用不上(会改在别处缩)：不存
+                    self.out(f'  !! ID1 {v:g}° {why}：不存。往圆环那边转一点再回车')
+                    return None
+                self.save({key: v})
         elif k == 'ringpose':
             self._read_servos()
             d1, d2 = self.cur[1] - self.P['A1P'], self.cur[2] - self.P['A2P']
@@ -1015,8 +1261,11 @@ class Wizard:
         if self.saved:
             self.out('')
             self.out('这次保存的参数：' + '  '.join(f'{k}=' + ('/'.join(f'{x:g}' for x in v) if isinstance(v, tuple) else f'{v:g}') for k, v in self.saved.items()))
-            if self.cfg_path is not None and any(not isinstance(v, tuple) for v in self.saved.values()):
+            if self.cfg_path is not None and any(not isinstance(v, tuple) and k not in STORE_KEYS for k, v in self.saved.items()):
                 self.out(f'已写进 {self.cfg_path}(原文件备份为 .json.bak)，以后 map_merge_live 启动会自动发给 STM32。')
+            mine = [k for k in STORE_KEYS if k in self.saved]
+            if self.cfg_path is not None and mine:
+                self.out('码垛躲避(' + '、'.join(mine) + f')存在 {self.cfg_path.name} 的 mission_cfg 里(树莓派比赛时用，不发给 STM32)，重开 run_live 生效。')
             if any(k in self.saved for k in ('R1', 'R3')):
                 self.out(f'1、3 号环的角度存在 {self._ring_teach_path()}：比赛时车对准 2 号环以后不动，手臂直接按它转过去放、取'
                          '(粗加工区、暂存区共用)。重开 run_live 生效。')

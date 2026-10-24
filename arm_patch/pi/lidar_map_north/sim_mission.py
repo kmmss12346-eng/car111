@@ -4389,7 +4389,9 @@ class ZoneCalTests(unittest.TestCase):
 
 class StackCarryTests(unittest.TestCase):
     """(10-23 用户"先放好三环我再去放1环的时候容易把三环放好的东西给撞掉"，"只改码垛的时候的动作")码垛时夹着物料从车上转盘去圆环，
-    路上经过已经叠了两层的环：先缩着转(离转轴最近、缩到最短也不够远的环从外侧绕)，在两个环中间改伸缩长度，最后伸到目标再转过去。"""
+    路上经过已经叠了两层的环要躲。(10-24 用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")默认 'in'：绕过电池盒停下往里缩、
+    缩着转到目标环的角度、再只伸出去(缩回的地方、缩多短 arm_calib 的 STKA1/STKA2 调)。
+    'plan' = 10-23 的走法：缩着转(离转轴最近、缩到最短也不够远的环从外侧绕)，在两个环中间改伸缩长度，最后伸到目标再转过去。"""
     # 用户 10-23 齿条重装后 arm_calib 存的：2 号环 A1P/A2P、1/3 号环多转的度数(R1/R3)、车上转盘 A1D/A2R、绕电池盒开始缩回 R1T1
     A1P, A2P, A1D, A2R, R1T1 = 53.7, -1023.5, 236.6, -1212.9, 177.4
     POSES = {1: (53.7 - 43.4, -1023.5 + 288.2), 2: (53.7, -1023.5), 3: (53.7 + 39.0, -1023.5 + 597.7)}
@@ -4431,6 +4433,52 @@ class StackCarryTests(unittest.TestCase):
         self.assertGreater(min(q for _p, q in wps), -1280.0)
         self.assertLess(max(q for _p, q in wps), -270.0)                        # 在限位里面
 
+    @staticmethod
+    def _turns(q):
+        """伸缩一会缩一会伸换了几次方向(不动的那几段不算)。"""
+        steps = [b - a for a, b in zip(q, q[1:]) if abs(b - a) > 1e-6]
+        return sum(1 for x, y in zip(steps, steps[1:]) if x * y < 0)
+
+    def _in_plan(self, target, tall, a2_in=-1280.0, a1_in=None, hold=-1000.0):
+        from mission_hooks import stack_in_plan, fit_arm_polar
+        return stack_in_plan(self.A1D, self.POSES[target], self.POSES, tall, a2_in, a1_in=a1_in, after=self.R1T1, hold=hold,
+                             fit=fit_arm_polar(self.POSES, 150.0), a2_lim=(-1280.0, -270.0))
+
+    def test_in_plan_on_the_car_to_ring1(self):
+        """(10-24)车上的角度去 1 号环(路上 3、2 号环叠了两层)：绕过电池盒停在 R1T1(伸在 R2T)-> 只往里缩 -> 缩着只转到 1 号环 -> (再只伸)。
+        出了车上转盘以后伸缩只缩一次、伸一次；2 号环离转轴最近，缩到最短也只离它 20 多毫米(日志里提醒)。"""
+        p = self._in_plan(1, [2, 3])
+        self.assertEqual(p['cross'], [3, 2])                                    # 先经过 3 号环
+        self.assertFalse(p['moved'])
+        self.assertEqual(p['wps'], [(self.R1T1, -1000.0), (self.R1T1, -1280.0), (self.POSES[1][0], -1280.0)])
+        pts = [(self.A1D, self.A2R)] + p['wps'] + [self.POSES[1]]
+        for (p1, q1), (p2, q2) in zip(pts[1:], pts[2:]):
+            self.assertTrue(abs(p1 - p2) < 1e-6 or abs(q1 - q2) < 1e-6, (p1, q1, p2, q2))    # 只转或者只伸缩
+        q = [w[1] for w in pts[1:]]
+        self.assertEqual(self._turns(q), 1, q)                                  # 缩 -> 伸，只换一次方向
+        self.assertAlmostEqual(p['gaps'][2], 22.0, delta=3.0)
+        self.assertGreater(p['gaps'][3], 60.0)
+
+    def test_in_plan_where_to_retract(self):
+        """往里缩的地方：调了(STKA1)就按调的；调在车上转盘后面、还在绕电池盒的那一段里(R1T1 前面)、已经过了第一个两层垛(调错了)：
+        改在刚绕过电池盒的 R1T1 缩。没绕电池盒(不知道 R1T1)：在车上转盘和那个垛正中间缩；就在车上转盘上方缩时不先伸出去。
+        缩多短超出伸缩的限位：按限位。"""
+        p = self._in_plan(1, [2, 3], a1_in=140.0)
+        self.assertEqual((p['a1_in'], p['moved']), (140.0, False))
+        for bad in (300.0, 200.0, 92.0, 60.0):                                   # 车上转盘后面 / 还在绕电池盒 / 3 号环上 / 过了 3 号环
+            p = self._in_plan(1, [2, 3], a1_in=bad)
+            self.assertEqual((p['a1_in'], p['moved']), (self.R1T1, True), bad)
+        from mission_hooks import stack_in_plan
+        p = stack_in_plan(self.A1D, self.POSES[1], self.POSES, [2, 3], -1300.0, a2_lim=(-1280.0, -270.0))
+        self.assertAlmostEqual(p['a1_in'], (self.A1D + self.POSES[3][0]) / 2.0)
+        self.assertEqual(p['a2_in'], -1280.0)
+        self.assertEqual(len(p['wps']), 2)                                      # 没给 hold：出车上转盘就缩到 -1280，不再单独缩一下
+        p = stack_in_plan(self.A1D, self.POSES[1], self.POSES, [2, 3], -1280.0, a1_in=self.A1D, hold=-1000.0, a2_start=self.A2R)
+        self.assertEqual(p['wps'][:2], [(self.A1D, self.A2R), (self.A1D, -1280.0)])   # 在车上转盘上方缩：不先伸到 R2T
+        self.assertIsNone(self._in_plan(3, [1, 2]))                             # 去 3 号环什么也不经过
+        self.assertIsNone(self._in_plan(2, [1]))
+        self.assertEqual(self._in_plan(2, [3])['cross'], [3])
+
     def test_plan_only_when_a_two_layer_stack_is_on_the_way(self):
         """路上没有两层的环(去 3 号环什么也不经过；1 号环在 2 号环后面)：返回 None，照旧走。去 2 号环只经过 3 号环：缩着转。"""
         self.assertIsNone(self._plan(3, [1, 2]))
@@ -4446,11 +4494,25 @@ class StackCarryTests(unittest.TestCase):
         w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
         return w
 
-    def _run(self, w, on):
+    def _run(self, w, on, **kw):
         lines = []
-        h = ZoneCalTests('test_full_course_ring2_once_then_car_still')._make(w, dict(stack_carry=on), lines=lines)
+        h = ZoneCalTests('test_full_course_ring2_once_then_car_still')._make(w, dict(stack_carry=on, **kw), lines=lines)
         run_mission(w, h, log=lines.append)
         return h, '\n'.join(lines)
+
+    @staticmethod
+    def _last_carry(w):
+        """最后一次 TAKE(码垛去最后一个环)到 LIFT 降到 ZSTK 之间发的 AP(ID1, ID2)。"""
+        r = w.requests
+        i = max(n for n, q in enumerate(r) if q.startswith('TAKE'))
+        out = []
+        for q in r[i + 1:]:
+            v = q.split()
+            if v[0] == 'LIFT' and abs(float(v[1]) - w.params['ZSTK']) < 0.05:
+                break
+            if v[0] == 'AP':
+                out.append((float(v[1]), float(v[2])))
+        return out
 
     def test_full_course_stacking_no_longer_sweeps_over_two_layer_stacks(self):
         """整场两批(暂存区码垛顺序 环2 → 环1 → 环3)：以前去最后一个环时夹着物料从两层的垛上扫过去(模拟里算撞倒)，现在一次也没有；
@@ -4467,11 +4529,69 @@ class StackCarryTests(unittest.TestCase):
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
             self.assertEqual(text.count('路上要经过已经叠了两层的'), 1, text[-3000:])
 
-    def test_middle_ring_too_close_goes_round_the_outside(self):
-        """像车上一样 2 号环离转轴近(缩到最短也只离它 17mm)：经过 2 号环从外侧绕(50mm)，别的环缩着转；不扫到、都放对。"""
+    def test_full_course_retract_turn_extend(self):
+        """(10-24 用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")整场：最后一次码垛出了车上转盘先到往里缩的地方、只缩、
+        缩着只转到目标环、只伸出去；每一步只动一个舵机，伸缩只换一次方向。圆环那组绕电池盒调过时停在 R1T1 还伸在 R2T，在那里缩。"""
+        for seed in range(2):
+            w = self._world(seed, params=dict(R1T2=432.0, R2T=-1000.0, R1T1=436.0, AEXT=2.0))
+            h, text = self._run(w, True)
+            self.assertEqual(w.sweep_hits, 0, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertIn('停下往里缩到 ID2 -1100°', text)
+            aps = self._last_carry(w)
+            self.assertEqual(aps[0], (436.0, -1000.0), aps)                      # 绕过电池盒(R1T1)，还伸在 R2T
+            self.assertEqual(aps[1], (436.0, -1100.0), aps)                      # 只往里缩(没调 STKA2 = A2R)
+            self.assertEqual(aps[2][1], -1100.0)                                 # 缩着只转到目标环
+            self.assertEqual(self._turns([a[1] for a in aps]), 1, aps)          # 缩 -> 伸，只换一次方向
+            for (p1, q1), (p2, q2) in zip(aps, aps[1:]):
+                self.assertTrue(abs(p1 - p2) < 1e-6 or abs(q1 - q2) < 1e-6, aps)
+
+    def test_user_values_from_arm_calib(self):
+        """arm_calib 调的 STKA1/STKA2(存在 mission_cfg 的 stack_carry_a1/stack_carry_a2)：按它们缩。
+        像车上一样 2 号环离转轴近：没调(缩到 A2R)只离 2 号环 17mm，模拟里会擦到(日志提醒)；调短一点就碰不到了。"""
+        w = self._world(0, arm_r=189.0, params=dict(A1D=400.0, A2R=-877.0))
+        h, text = self._run(w, True)
+        self.assertIn('离环2 17mm', text)
+        self.assertGreaterEqual(w.sweep_hits, 1)
         for seed in range(2):
             w = self._world(seed, arm_r=189.0, params=dict(A1D=400.0, A2R=-877.0))
-            h, text = self._run(w, True)
+            h, text = self._run(w, True, stack_carry_a1=410.0, stack_carry_a2=-1100.0)
+            self.assertIn('转到 ID1 410.0° 停下往里缩到 ID2 -1100°', text)
+            self.assertNotIn('离环2', text)
+            self.assertEqual(w.sweep_hits, 0, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual(h.stats.place_ok, 12, text[-3000:])
+            self.assertEqual(self._last_carry(w)[:2], [(410.0, -877.0), (410.0, -1100.0)])
+
+    def test_put_back_on_the_way_retracts_first(self):
+        """(10-24)码垛躲两层垛：缩着转到了目标环、伸出去以后放不下去(下降出错)：放回转盘时先只往里缩、缩着转回往里缩的地方，
+        再回车上转盘(不夹着物料从两层的垛上扫回去)。"""
+        from arm_link import ArmError
+        w = self._world(1, arm_r=189.0, params=dict(A1D=400.0, A2R=-877.0))
+        lines = []
+        h = ZoneCalTests('test_full_course_ring2_once_then_car_still')._make(
+            w, dict(stack_carry=True, stack_carry_a2=-1100.0), lines=lines)
+        od = h._drop
+
+        def bad_drop(stack):
+            if h._dodge is not None:
+                raise ArmError('LIFT 40.0 失败：ERR TIMEOUT')
+            return od(stack)
+        h._drop = bad_drop
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('还在躲两层垛的那一段', text)
+        self.assertIn('已放回转盘', text)
+        self.assertEqual(w.sweep_hits, 0, text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        self.assertEqual(h.stats.place_ok, 11, text[-3000:])
+
+    def test_middle_ring_too_close_goes_round_the_outside(self):
+        """('plan'：10-23 的走法)像车上一样 2 号环离转轴近(缩到最短也只离它 17mm)：经过 2 号环从外侧绕(50mm)，别的环缩着转；不扫到、都放对。"""
+        for seed in range(2):
+            w = self._world(seed, arm_r=189.0, params=dict(A1D=400.0, A2R=-877.0))
+            h, text = self._run(w, True, stack_carry_mode='plan')
             self.assertIn('环2(外侧', text)
             self.assertEqual(w.sweep_hits, 0, text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])

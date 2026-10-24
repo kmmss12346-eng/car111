@@ -1,5 +1,6 @@
 """arm_calib.py(机械臂一次性标定向导)的测试：用假 STM32 把整个流程走一遍。python3 test_arm_calib.py"""
 import json
+import math
 import os
 import re
 import tempfile
@@ -166,6 +167,7 @@ FULL = [
     's', 's', 's', 's',                # 车上转盘去圆环绕开电池盒 R1T2/R2T/R1T1/R2SPD 跳过
     '5', '',                           # ZPLC 直接 5mm
     '65', '',                          # ZSTK 65
+    's', 's',                          # (10-24)码垛躲避 STKA2/STKA1 跳过(没调 = 比赛时用默认)
     's',                               # ZOBRNG 跳过
     '+20', '',                         # A1H 323 -> 343
     'y',                               # 打开 ARMOK
@@ -561,9 +563,6 @@ class HelperTests(unittest.TestCase):
         self.assertIn('--from A1P', buf.getvalue())
 
 
-if __name__ == '__main__':
-    unittest.main(verbosity=1)
-
 
 class R2offCrossTests(unittest.TestCase):
     """(10-23 用户"arm_calib 里也故意出现那个故意对偏的偏心十字，我好手动把绿色的和红色十字对齐，再按对齐的位置调 1、3 号环")
@@ -727,3 +726,130 @@ class RetractAfterGrabTests(unittest.TestCase):
         lines = []
         Wizard(stm, cfg, inp=Script(stm, ['q']), out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index('A2GB'))
         self.assertNotIn('A2GB', load(cfg)['stm32_params'])
+
+
+class StackDodgeTests(unittest.TestCase):
+    """(10-24 用户"第二层码放躲避的时候的这个躲避的过程也可以改成我可以自定义可以调节的……往里面缩去躲避然后到位置了再伸过去")
+    ZSTK 后面两步：STKA2 往里缩到多短(在 2 号环上方调)、STKA1 在哪里往里缩(绕过电池盒以后)。存进配置的 mission_cfg(树莓派用)，不发给 STM32；
+    t 按保存的值把码垛的路真走一遍。"""
+    # 手臂几何：爪子离转轴 r = 400 + 0.2 × ID2 毫米；三个环在离转轴 190mm 的一条线上，2 号环在垂足往前 20mm，环距 150mm
+    A, K, D = 400.0, 0.2, 190.0
+    A1OFF = 294.0                      # ID1 = 这个 + 爪子的方位角(度)
+
+    def _pose(self, t):
+        r = math.hypot(self.D, t)
+        return self.A1OFF + math.degrees(math.atan2(t, self.D)), (r - self.A) / self.K
+
+    def _setup(self, armok=0.0, mission=None):
+        stm = FakeStm32()
+        p2, p1, p3 = self._pose(20.0), self._pose(-130.0), self._pose(170.0)
+        stm.P.update(A1P=p2[0], A2P=p2[1], A1D=400.0, A2R=-1200.0, R1T2=395.0, R2T=-1000.0, R1T1=380.0, ARMOK=armok)
+        cfg = make_cfg()
+        with open(cfg, encoding='utf-8') as f:
+            c = json.load(f)
+        if mission:
+            c['mission_cfg'] = dict(mission)
+        with open(cfg, 'w', encoding='utf-8') as f:
+            json.dump(c, f)
+        with open(os.path.join(os.path.dirname(cfg), 'ring_teach.json'), 'w', encoding='utf-8') as f:
+            json.dump({z: {'1': [p1[0] - p2[0], p1[1] - p2[1]], '3': [p3[0] - p2[0], p3[1] - p2[1]], 'src': 'arm_calib'}
+                       for z in ('ROUGH', 'TEMP')}, f)
+        return stm, cfg, (p1, p2, p3)
+
+    def _run(self, stm, cfg, items, key='STKA2'):
+        lines = []
+        wiz = Wizard(stm, cfg, inp=Script(stm, items), out=lines.append, sleep=lambda s: None)
+        wiz.run(STEP_KEYS.index(key))
+        return wiz, lines
+
+    def test_steps_save_to_mission_cfg_not_stm32(self):
+        stm, cfg, (p1, p2, p3) = self._setup()
+        wiz, lines = self._run(stm, cfg, ['2 -10', '', '1 -15', '', 'q'])
+        mc = load(cfg).get('mission_cfg') or {}
+        self.assertAlmostEqual(mc['stack_carry_a2'], -1210.0, places=2)
+        self.assertAlmostEqual(mc['stack_carry_a1'], 365.0, places=2)
+        sp = load(cfg)['stm32_params']
+        self.assertNotIn('STKA1', sp)
+        self.assertNotIn('STKA2', sp)
+        self.assertFalse([c for c in stm.sent if c.startswith('SET STK')])        # 不发给 STM32
+        self.assertEqual(STEP_KEYS[STEP_KEYS.index('ZSTK') + 1:STEP_KEYS.index('ZSTK') + 3], ['STKA2', 'STKA1'])
+        text = '\n'.join(lines)
+        self.assertIn('码垛躲避(STKA2、STKA1)存在 cfg.json 的 mission_cfg 里', text)
+
+    def test_setup_walks_the_competition_path(self):
+        """STKA2：去车上转盘上方 -> 只转到 R1T2 -> 只伸到 R2T -> 只转到 STKA1(没调 = R1T1)-> 只往里缩(没调 = A2R)-> 缩着只转到 2 号环上方。
+        STKA1：一样走到往里缩的地方、缩好，停在那里。屏上说往圆环那边是 1 -10，算出爪子离 3、2 号环中心多远。"""
+        stm, cfg, (p1, p2, p3) = self._setup()
+        wiz, lines = self._run(stm, cfg, ['q'])
+        af = [c for c in stm.sent if c.startswith('AF ')]
+        self.assertEqual(af, ['AF 1 395', 'AF 2 -1000', 'AF 1 380', 'AF 2 -1200', f'AF 1 {p2[0]:g}'], af)
+        text = '\n'.join(lines)
+        self.assertIn('往圆环那边转：1 -10', text)
+        self.assertIn('原来没调：比赛时用 车上转盘上方的长度 A2R=-1200', text)
+        m = re.search(r'缩着转过去爪子中心离：3 号环 (\d+)mm、2 号环 (\d+)mm', text)
+        self.assertTrue(m, text[-800:])
+        r_in = self.A + self.K * -1200.0
+        self.assertAlmostEqual(int(m.group(2)), math.hypot(self.D, 20.0) - r_in, delta=1.5)
+        self.assertAlmostEqual(int(m.group(1)), math.hypot(self.D, 170.0) - r_in, delta=1.5)
+        stm.sent.clear()
+        wiz, lines = self._run(stm, cfg, ['q'], key='STKA1')
+        af = [c for c in stm.sent if c.startswith('AF ')]
+        self.assertEqual(af, ['AF 1 395', 'AF 2 -1000', 'AF 1 380', 'AF 2 -1200'], af)   # 停在往里缩的地方、缩好
+
+    def test_default_follows_r1t1_tuned_in_the_same_run(self):
+        """--from R1T1 调了 R1T1 以后接着调码垛躲避：没调过的 STKA1 跟着新的 R1T1。"""
+        stm, cfg, _ = self._setup()
+        wiz, lines = self._run(stm, cfg, ['1 =375', '', 's', 's', 's', 's', 's', 'q'], key='R1T1')
+        self.assertAlmostEqual(stm.P['R1T1'], 375.0, places=3)
+        self.assertTrue(any('原来没调：比赛时用 绕电池盒的最后一个角度 R1T1=375' in l for l in lines), lines)
+
+    def test_unchanged_default_is_not_saved(self):
+        """没调过、回车没改：不存(比赛时还用默认，以后改了 R1T1/A2R 跟着变)。"""
+        stm, cfg, _ = self._setup()
+        wiz, lines = self._run(stm, cfg, ['', '', 'q'])
+        self.assertNotIn('stack_carry_a2', load(cfg).get('mission_cfg') or {})
+        self.assertNotIn('stack_carry_a1', load(cfg).get('mission_cfg') or {})
+        self.assertTrue(any('没改：STKA2 还是没调' in l for l in lines), lines)
+
+    def test_stka1_where_the_run_would_not_use_it_is_refused(self):
+        """往里缩的地方调到 R1T1 前面(还在绕电池盒)或者到了 3 号环：比赛时用不上(会改在别处缩)，不存，说清楚为什么。"""
+        stm, cfg, (p1, p2, p3) = self._setup()
+        wiz, lines = self._run(stm, cfg, ['1 +10', '', '1 -25', '', 'q'], key='STKA1')
+        self.assertTrue(any('还靠车上转盘' in l and '不存' in l for l in lines), lines)
+        self.assertAlmostEqual(load(cfg)['mission_cfg']['stack_carry_a1'], 365.0, places=2)   # 转回来以后存了
+        stm, cfg, (p1, p2, p3) = self._setup()
+        wiz, lines = self._run(stm, cfg, [f'1 ={p3[0] - 1.0:g}', '', 'q', 'q'], key='STKA1')
+        self.assertTrue(any('已经到了(或者过了) 3 号环' in l for l in lines), lines)
+        self.assertNotIn('stack_carry_a1', load(cfg).get('mission_cfg') or {})
+
+    def test_t_walks_the_saved_path_and_back(self):
+        """t：TRAY -> APZ 到 STKA1(STM32 绕电池盒，还伸在 R2T) -> 只缩 -> 缩着只转到 1 号环 -> 只伸到 1 号环 -> 只缩 -> 缩着只转回 STKA1 -> TRAY。"""
+        stm, cfg, (p1, p2, p3) = self._setup(armok=1.0, mission=dict(stack_carry_a1=370.0, stack_carry_a2=-1210.0))
+        wiz, lines = self._run(stm, cfg, ['t', 'q'])
+        i = stm.sent.index('APZ 370 -1000 100')
+        moves = [c for c in stm.sent[i:] if c.startswith(('AF ', 'TRAY', 'APZ'))]
+        self.assertEqual(moves[:8], ['APZ 370 -1000 100', 'AF 2 -1210', f'AF 1 {p1[0]:g}', f'AF 2 {p1[1]:g}',
+                                     'AF 2 -1210', 'AF 1 370', 'TRAY', 'TRAY'], moves)
+        self.assertEqual(stm.sent[i - 1], 'TRAY')
+        self.assertTrue(any('试走完了' in l for l in lines), lines)
+        self.assertTrue(any('路上经过 3 号、2 号环' in l for l in lines), lines)
+
+    def test_t_uses_the_value_being_tuned(self):
+        """调了还没回车就 t：按正在调的值走，走完回到正在调的值(满意了再回车)。"""
+        stm, cfg, (p1, p2, p3) = self._setup(armok=1.0)
+        wiz, lines = self._run(stm, cfg, ['2 -15', 't', '', 'q'])
+        self.assertIn('APZ 380 -1000 100', stm.sent)
+        i = stm.sent.index('APZ 380 -1000 100')
+        self.assertEqual(stm.sent[i + 1:i + 3], ['A? 2', 'AF 2 -1215'])
+        self.assertTrue(any('STKA2 是正在调的、还没保存' in l for l in lines), lines)
+        self.assertAlmostEqual(load(cfg)['mission_cfg']['stack_carry_a2'], -1215.0, places=2)
+
+    def test_t_needs_armok(self):
+        stm, cfg, _ = self._setup(armok=0.0)
+        wiz, lines = self._run(stm, cfg, ['t', 'q'])
+        self.assertTrue(any('试走要新的 STM32 程序' in l for l in lines), lines)
+        self.assertFalse([c for c in stm.sent if c.startswith('APZ')])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=1)

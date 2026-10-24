@@ -2,7 +2,7 @@
 每一项打一行：✓ 没问题，★ 要处理(后面写怎么办)。最后说一共几项要处理。
 
 查的东西：STM32 连着没有、固件新不新(PRE、升降开机认高度)、机械臂参数、升降高度认没认准；
-配置里机械臂任务开没开、full on/off、开机自动比赛(bootrace)开没开、四个停车点；
+配置里机械臂任务开没开、full on/off、开机自动比赛(bootrace)开没开、码垛躲避(STKA1/STKA2)调没调、四个停车点；
 示教文件(原料区最近那格、1、3 号环、摄像头和手臂的对应关系、爪子点)；摄像头、雷达的设备在不在；开机自启动装没装；SD 卡剩多少空间。"""
 import glob
 import json
@@ -93,6 +93,15 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
         log(f'  · 开机自动比赛开着：下次开电闸按启停区 {raw_cfg.get("start_zone")} 直接开跑(只用一次)')
     else:
         log('  · 开机自动比赛没开(调试时这样)。比赛：剩 30 秒时输入 bootrace 1 或 bootrace 2，q，关电闸')
+    if not mc.get('stack_carry', True):
+        log('  · 码垛躲避关着(stack_carry=false)：码垛时照旧按目标环的长度一边转一边伸，可能擦到两层的垛')
+    elif str(mc.get('stack_carry_mode') or 'in') == 'plan':
+        log('  · 码垛躲避用的是 10-23 的几何走法(stack_carry_mode=plan，会一会缩一会伸)')
+    else:
+        a1s, a2s = mc.get('stack_carry_a1'), mc.get('stack_carry_a2')
+        log('  · 码垛躲避(路上有两层的垛时)：绕过电池盒在 ' + ('R1T1' if a1s is None else f'ID1 {float(a1s):g}°') + ' 往里缩到 ' +
+            ('A2R(车上转盘上方的长度)' if a2s is None else f'ID2 {float(a2s):g}°') + '，缩着转到要放的环再伸出去' +
+            ('。要调：python3 arm_calib.py --from STKA2' if a1s is None and a2s is None else '(arm_calib 调过)'))
     stops = (raw_cfg or {}).get('stops') or {}
     miss = [s for s in ('QR', 'RAW', 'ROUGH', 'TEMP') if s not in stops]
     if miss:
