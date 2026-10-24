@@ -3672,7 +3672,8 @@ class WheelsAlignTests(unittest.TestCase):
         self.assertEqual(D['align_by'], WHEELS_ALIGN)
         # 没示教时的这个做法：原料盘一开始就停着、不知道停了多久时马上下爪，可能正好赶上它转起来(见上面 test_raw_align_by_wheels_on_a_stop_go_plate)；
         # 10-22 固件 GRAB 等车上转盘转完才夹紧(下爪到夹住多约 0.4 秒)，seed 17 正好碰上，换成 19
-        for seed in (16, 18, 19):
+        # (10-24 等物料时不再每 12 秒动一下升降，时间线变了：seed 18 有两次下爪正好赶上转盘转起来(空夹、再夹一次也都夹到)，换成 20)
+        for seed in (16, 19, 20):
             w = plate_world(seed)
             lines = []
             live = {k: D[k] for k in LEGACY}                             # 不用老测试的写法，全按比赛默认
@@ -4772,7 +4773,8 @@ class SingleGlitchTests(unittest.TestCase):
         t = RawNearSlotTests()
         for fc in (('GRAB', 1), ('GRAB', 2), ('GRAB', 1, 'closed'), ('A?', 3), ('LIFT', 2)):
             for seed in (1, 2):
-                w, h, text = t._near_run(seed, fail_cmd=fc)
+                # (10-24)等物料时默认不再动升降(raw_keepalive_s=0)：LIFT 出错这一种打开它来试
+                w, h, text = t._near_run(seed, fail_cmd=fc, cfg=dict(raw_keepalive_s=12.0) if fc[0] == 'LIFT' else None)
                 self.assertGreaterEqual(w.count.get(fc[0], 0), fc[1], fc)
                 self.assertEqual(sum(1 for v in w.tray.values() if v), 3, (fc, seed, text[-3000:]))
                 self.assertEqual((w.loose, w.collisions), (0, 0), (fc, seed, text[-3000:]))
