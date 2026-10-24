@@ -77,7 +77,7 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
             if 'ERR ARG' in str(r[1]):
                 ok('固件是新的(认识 PRE：开往工位时提前摆臂)')
             else:
-                no(f'固件可能是旧的(PRE 回 {r[1]})：开往工位时不会提前摆臂、开机保活也是旧的。重新烧最新的 arm.c')
+                no(f'固件可能是旧的(PRE 回 {r[1]})：开往工位时不会提前摆臂。重新烧最新的 arm.c')
         except Exception as ex:
             no(f'问固件版本出错：{ex!r}')
 

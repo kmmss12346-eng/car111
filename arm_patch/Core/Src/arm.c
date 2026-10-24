@@ -2416,47 +2416,6 @@ static void QR_Draw(void)
     Screen_Text("t7", h2);
 }
 
-/* (10-23 用户"一键启动是一个物理的上电开关、整车的电闸")上电就开跑：树莓派开机、程序启动要几十秒，这段时间车一动不动会按
- * "停止运行 15 秒本轮结束"判掉。上电以后、树莓派发来第一条机械臂指令(之后树莓派自己保活)之前，每 BOOT_KA_MS 升降往上 BOOT_KA_MM
- * 再回来(手臂不左右动)，最多 BOOT_KA_MAX_MS(调试时开着电不开程序，过一会儿就不动了)。升降高度不知道(lift_known=0)不动。
- * (10-23 晚 命题解析："机器人 15 秒没有移动，本轮比赛结束")开机这段只有升降在动，4mm 裁判不一定看得出来：改成往上 15mm、每 5 秒一次。
- * 上面不够 15mm 就少走一点；不够 BOOT_KA_MIN_MM 才往下 BOOT_KA_MIN_MM(不会比原来低很多，碰不到车上的东西) */
-#define BOOT_KA_MS      5000u
-#define BOOT_KA_MAX_MS  90000u
-#define BOOT_KA_MM      15.0f
-#define BOOT_KA_MIN_MM  4.0f
-static uint8_t  boot_ka    = 0;           /* 1 = 上电以后还没收到过机械臂指令(Arm_Init 设、Arm_Command 清) */
-static uint32_t boot_ka_t0 = 0;           /* 上电(Arm_Init 做完)的时刻 */
-static uint32_t boot_ka_t  = 0;           /* 上次摆的时刻 */
-
-static void Boot_Keepalive(void)
-{
-    uint32_t t = HAL_GetTick();
-    float z = lift_mm;
-    float up = g_lmax - 0.5f - z;
-
-    if (!boot_ka)
-    {
-        return;
-    }
-    if (t - boot_ka_t0 > BOOT_KA_MAX_MS)
-    {
-        boot_ka = 0;
-        return;
-    }
-    if (t - boot_ka_t < BOOT_KA_MS || !lift_known || lift_pend >= 0.0f)
-    {
-        return;
-    }
-    boot_ka_t = t;
-    if (up > BOOT_KA_MM)  up = BOOT_KA_MM;
-    if (Lift_Goto((up >= BOOT_KA_MIN_MM) ? z + up : z - BOOT_KA_MIN_MM) == NULL && !car_abort)
-    {
-        (void)Lift_Goto(z);
-    }
-    boot_ka_t = HAL_GetTick();
-}
-
 void Arm_Poll(void)
 {
     char tmp[QR_BUF];
@@ -2523,7 +2482,6 @@ void Arm_Poll(void)
         }
         qr_said = 0;
     }
-    Boot_Keepalive();                              /* (10-23)上电就开跑：树莓派还没接手之前隔几秒动一下升降 */
 }
 
 /* ================= 初始化 ================= */
@@ -2572,8 +2530,6 @@ void Arm_Init(void)
     {
         Seq_Standby();                             /* 编码器找准了高度才自动动；没标定/读不到编码器就不动 */
     }
-    boot_ka = 1;                                   /* (10-23)上电保活：树莓派发来第一条机械臂指令之前隔几秒动一下升降 */
-    boot_ka_t0 = boot_ka_t = HAL_GetTick();
 }
 
 /* ================= 树莓派指令 ================= */
@@ -2655,7 +2611,6 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         return 0;
     }
     v = t[0];
-    boot_ka = 0;                                   /* (10-23)树莓派接手了：上电保活不再动 */
 
     /* ---- 夹爪：CLAW O / CLAW OR(原料盘上方张开) / CLAW OT(车上转盘上方张开) / CLAW C / CLAW <微秒> ---- */
     if (strcmp(v, "CLAW") == 0 && n == 2)
