@@ -18,6 +18,7 @@ void Link_RxRestart(void) { }
 #include "../Core/Src/hwt101.c"
 
 static uint32_t now = 0;
+static uint32_t t_up1 = 0, t_s1 = 0, t_s2 = 0;   /* (10-24)clear() 以后第一条往上的升降指令、第一次转 ID1 / ID2 的时刻(0 = 还没有) */
 static int abort_at = -1;
 static float ang[3] = {0, 323.0f, -862.0f};
 /* (10-23)slow = 1：舵机按发的速度慢慢转(时间在 HAL_Delay 里走)，测 PRE 发完指令就回、不等转完；0 = 一发就到(以前的测试) */
@@ -93,6 +94,8 @@ int Servo_WriteParam(uint8_t id, const char *name, long v) {
 static float clampa(uint8_t id, float a) { float lo = id == 1 ? 44.0f : -1220.0f, hi = id == 1 ? 440.0f : -300.0f; return a < lo ? lo : (a > hi ? hi : a); }
 uint32_t Servo_Start(uint8_t id, float *a, float spd) {
     float d; *a = clampa(id, *a); fgoal[id] = *a; d = *a - ang[id]; if (d < 0) d = -d;
+    if (id == 1 && !t_s1) t_s1 = now ? now : 1;
+    if (id == 2 && !t_s2) t_s2 = now ? now : 1;
     if (slow) { sgoal[id] = *a; sspd[id] = spd; } else ang[id] = (id == 1 && *a > block1) ? block1 : *a;
     EV("S%u:%.1f@%.0f;", id, *a, spd); return (uint32_t)(d / spd * 1000) + 200;
 }
@@ -137,6 +140,7 @@ int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
 void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) {
     double t;
     (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
+    if (!d && !t_up1) t_up1 = now ? now : 1;
     if (a != 5 || lift_dead) return;
     t = phys_mm + (d ? -1.0 : 1.0) * (double)clk / 80.0;
     if (t > phys_top) t = phys_top;
@@ -155,7 +159,7 @@ static int run(const char *c) {
     car_abort = 0;
     return r;
 }
-static void clear(void) { ev[0] = 0; pi[0] = 0; scr[0] = 0; }
+static void clear(void) { ev[0] = 0; pi[0] = 0; scr[0] = 0; t_up1 = t_s1 = t_s2 = 0; }
 static int at(const char *needle) { const char *p = strstr(ev, needle); return p ? (int)(p - ev) : -1; }
 static int has(const char *s) { return strstr(ev, s) != 0; }
 static int last(const char *needle) { int r = -1; const char *p = ev; while ((p = strstr(p, needle)) != 0) { r = (int)(p - ev); p++; } return r; }
@@ -875,8 +879,25 @@ int main(void) {
         Arm_Param_Set("A1D", 200);                 /* 转盘姿态和原料盘姿态不一样，ID1 才会转 */
         run("OBS RAW O"); clear();
         CHECK(run("GRAB 2 H") == 1, "OVLAP：GRAB 2 H");
-        c_ = at("C;"); up1 = at("L+1600;"); sw = at("S1:");
-        CHECK(c_ >= 0 && c_ < up1 && up1 < sw && at("L+4800;") < sw, "OVLAP：夹紧以后先直着升 20mm，再一边升到 ZHI 一边转(升降指令先发出去，舵机同时转)");
+        c_ = at("C;"); up1 = at("L+6400;"); sw = at("S1:");
+        q = strstr(ev + (up1 >= 0 ? up1 + 1 : 0), "L");
+        CHECK(c_ >= 0 && c_ < up1 && up1 < sw && (!q || (int)(q - ev) > sw), "OVLAP：夹紧以后一条指令升到 ZHI(中途不停、不再发第二条)，升过 20mm 才开始转");
+        CHECK(t_s1 >= t_up1 + 500 && t_s1 <= t_up1 + 650,
+              "(10-24 用户\"上升的过程中突然停顿一下\")直着升的 20mm 不单独停下核对：按 LFRPM 60 算 0.5 秒升过 20mm(加 LFMRG 一半)就开始转");
+        /* (10-24 用户"原料区抓住物料上升的过程中突然停顿一下，原料盘一转把物料甩飞")设了 A2GB(夹起以后往回缩)：同样一条指令升到 ZHI 不停 */
+        Arm_Param_Set("A2GB", -1100);
+        run("OBS RAW O"); clear();
+        CHECK(run("GRAB 1 H") == 1, "OVLAP + A2GB：GRAB 1 H");
+        {
+            int cl = at("C;"), up = at("L+6400;"), bk = at("S2:-1100.0");
+            const char *nx = strstr(ev + (up >= 0 ? up + 1 : 0), "L");
+            CHECK(cl >= 0 && cl < up && up < bk && (!nx || (int)(nx - ev) > bk) && t_s2 >= t_up1 + 500 && t_s2 <= t_up1 + 650,
+                  "OVLAP + A2GB：夹紧以后一条指令升到 ZHI(中途不停)，升过 OVCLR(0.5 秒)就开始缩回，还在接着升");
+        }
+        Arm_Param_Set("A2GB", 0);
+        run("OBS RAW O"); clear();
+        CHECK(run("GRAB 2 H") == 1, "OVLAP：再 GRAB 2 H");
+        sw = at("S1:"); c_ = at("C;");
         q = strstr(ev + (sw > 0 ? sw : 0), "L-");
         last_dn = q ? (int)(q - ev) : -1;
         q = strstr(ev + (c_ > 0 ? c_ : 0), "O;");
@@ -887,7 +908,7 @@ int main(void) {
         clear(); run("OBS RING"); clear();
         CHECK(run("DROP") == 1, "OVLAP：DROP");
         q = strstr(ev, "O;");
-        CHECK(q && strstr(q, "L+1600;") && has("M2:") == 0, "OVLAP：放下松爪后先直着升 20mm，再边升边缩回");
+        CHECK(q && strstr(q, "L+") && !strstr(strstr(q, "L+") + 1, "L+") && has("M2:") == 0, "OVLAP：放下松爪后一条指令升到 ZHI(中途不停)，边升边缩回");
         clear(); CHECK(run("APZ 340 -862 80") == 1 && has("S1:340.0") && at("L-") > at("S1:"), "APZ：转到 (340,-862) 并降到 80mm");
         CHECK(run("APZ 340 -862") != 1, "APZ 少参数：不执行");
         Arm_Param_Set("OVLAP", 0); Arm_Param_Set("A1D", 323);

@@ -379,6 +379,15 @@ static uint32_t Lift_Time_Ms(uint32_t pulses)
     return (uint32_t)((float)pulses / sps * 1000.0f) + (uint32_t)g_lmrg;
 }
 
+/* (10-24)Lift_Start 刚发出去：升降往上走 mm 毫米大约要多久(毫秒)。按 LFRPM 匀速算，再加 LFMRG 的一半(起步加速、指令在路上) */
+static uint32_t Lift_Rise_Ms(float mm)
+{
+    float sps = g_lrpm / 60.0f * g_lspr;
+
+    if (sps < 1.0f)  sps = 1.0f;
+    return (uint32_t)(mm * g_lppm / sps * 1000.0f) + (uint32_t)(0.5f * g_lmrg);
+}
+
 /* 发出去还没等完的升降(Lift_Start 发的)：目标、出发时的高度、预计到的时刻 */
 static float    lift_pend = -1.0f;
 static float    lift_from = 0.0f;
@@ -1343,7 +1352,7 @@ static const char *Move_Over(float a1, float a2, uint8_t order, float z_end)
 {
     float clr = g_ovclr;
     float z_mid = z_end + clr;
-    float zc;
+    float zc, rise;
     float a;
     uint32_t t1 = 0, t2 = 0, tmax, t0;
     uint8_t ok1 = 0, ok2 = 0, down = 0;
@@ -1361,14 +1370,15 @@ static const char *Move_Over(float a1, float a2, uint8_t order, float z_end)
     if (z_mid > g_zhi)  z_mid = g_zhi;
     zc = lift_mm + clr;                            /* 先直着升一小段 */
     if (zc > g_zhi)  zc = g_zhi;
-    if (zc > lift_mm + 0.05f)
-    {
-        e = Lift_Goto(zc);
-        if (e) return e;
-        if (car_abort) return NULL;
-    }
+    rise = zc - lift_mm;
     e = Lift_Start(g_zhi);                         /* 一边升一边转 */
     if (e) return e;
+    if (rise > 0.05f && lift_pend >= 0.0f)
+    {
+        /* (10-24 用户"抓住物料上升的过程中突然停顿一下，原料盘一转就把物料甩飞了")直着升的那一段不再单独走完、停下来核对(LFMRG + 编码器)：
+         * 一口气升到 ZHI，按升降的速度算出升过 OVCLR 的时刻，到了再开始转(还在接着升) */
+        if (!Wait_Ms(Lift_Rise_Ms(rise)))  return Lift_Finish();
+    }
     if (Servo_ReadAngle(1, &a) && Absf(a - a1) <= g_atolc)  { ok1 = 1; Servo_Hold(1, a); }  else  t1 = Servo_Start(1, &a1, Big_Spd(1));
     if (Servo_ReadAngle(2, &a) && Absf(a - a2) <= g_atolc)  { ok2 = 1; Servo_Hold(2, a); }  else  t2 = Servo_Start(2, &a2, Big_Spd(2));
     tmax = ((t1 > t2) ? t1 : t2) + SERVO_EXTRA_MS;

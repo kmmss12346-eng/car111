@@ -830,3 +830,12 @@ git_log.txt                ← 分支最近 120 条提交记录
   出车上转盘先伸到 R2T 是绕电池盒(用户自己调的那组)，躲垛这一段只缩一次、伸一次。
   测试：StackCarryTests(新加 in 的路线、往里缩的地方、整场每步只动一个舵机且伸缩只换一次方向、调短了不扫到、路上出错放回转盘先缩)、
   test_arm_calib.StackDodgeTests、test_self_check。test_arm_calib.py 里 `if __name__` 挪到最后(以前 python3 test_arm_calib.py 跑不到后面几个类)。
+- **10-24 原料区：夹起上升途中停一下被原料盘甩飞、认到以后下爪慢(用户原话"上升的过程中突然停顿一下……转盘开始转动就给物料甩飞出去了"、
+  "识别到了之后下达抓取命令或者识别的时候能不能快速一点")：** 原因是固件 Move_Over(OVLAP=1)先 Lift_Goto(OVCLR) 走完一段，
+  等 LFMRG(200ms) + 编码器核对，再 Lift_Start 升到 ZHI；设了 A2GB(夹起往回缩)的原料区夹取就走这里，停在离原料盘 20mm 的地方。
+  改成 Lift_Start(ZHI) 一条指令升到顶，按 Lift_Rise_Ms(OVCLR)(LFRPM 匀速 + LFMRG/2)的时刻再开始转/缩(要烧固件；test_arm 352 项)。
+  树莓派最近那格：已经在抓取的角度(最近那格就是看的姿态)不再发 AP；刚看着原料盘停下的那一帧(raw_seen_fresh_s 0.5 秒内)就按它查物料，
+  不再另拍一帧；下爪前算时间加上 _raw_clear_s(CLWAIT - raw_claw_close_s + 升 OVCLR 的时间，raw_need_clear)，剩的时间不够抬离原料盘就等下一次停。
+  其他提速只能用户自己权衡：LFRPM(现在 60，"实测 60 稳")、LFMRG 200、CLWAIT。仿真 12 个种子：每次夹少一条 AP，偶尔多等一次停(仿真不模拟甩飞)。
+  另外 10-24：raw_keepalive_s 12 -> 0(用户"把每隔 15s 动的动作去掉")；raw_near_recheck 默认关(用户"夹取过程中车不要再对准")；
+  用户重装齿条，ID2 限位让用户 set S2MIN -2000 / S2MAX 500 先放宽，调完再量两头设准；所有 ID2 姿态、rteach RAW near 要重调。

@@ -3259,6 +3259,25 @@ class RawNearSlotTests(unittest.TestCase):
             self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
             self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
+    def test_grab_right_after_the_stop_frame(self):
+        """(10-24 用户"识别到了之后下达抓取命令能不能快速一点")最近那格：看着原料盘停下以后直接 GRAB(已经在抓取的角度上，不再发 AP；
+        按停下那一帧查物料，不再另拍一帧)。(用户"上升停顿一下原料盘一转把物料甩飞")这次停下剩的时间要够下爪、夹紧、再抬离原料盘。"""
+        for seed in (1, 2):
+            w, h, text = self._near_run(seed)
+            r = w.requests
+            grabs = [i for i, q in enumerate(r) if q.startswith('GRAB')]
+            self.assertTrue(grabs)
+            for i in grabs:
+                self.assertFalse(r[i - 1].startswith('AP '), r[i - 3:i + 1])
+            self.assertEqual(sum(1 for v_ in w.tray.values() if v_), 3, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+        P = h.arm.params()
+        sps = P['LFRPM'] / 60.0 * P['LFSPR']
+        want = max(0.0, P['CLWAIT'] / 1000.0 - 0.15) + 20.0 * P['LFPPM'] / sps + 0.5 * P['LFMRG'] / 1000.0
+        self.assertAlmostEqual(h._raw_clear_s(), want, places=6)
+        h.cfg['raw_need_clear'] = False
+        self.assertEqual(h._raw_clear_s(), 0.0)
+
     def test_car_still_while_grabbing(self):
         """(10-24 用户"物料夹取过程中车不要再进行对准了啊太浪费时间了")默认：对准原料盘中心以后，夹的过程中车轮一下都不动，3 个照样夹到。"""
         for seed in (1, 2, 5):
