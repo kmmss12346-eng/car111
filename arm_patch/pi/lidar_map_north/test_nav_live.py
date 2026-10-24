@@ -550,6 +550,17 @@ class LiveTests(unittest.TestCase):
         self.assertIs(self.cfg_after.get('boot_race'), False)
         self.assertEqual(self.cfg_after.get('start_zone'), 2)
 
+    def test_full_command_saves_choice(self):
+        """(10-24)full off：存进配置 mission_cfg(full_course=false、150 秒、3 分钟)；full on 改回一直跑完全程。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'full off')], screen_zone=None, end_on='已设置 full off')
+        mc = self.cfg_after.get('mission_cfg') or {}
+        self.assertEqual((mc.get('full_course'), mc.get('time_limit_s'), mc.get('round_s'), mc.get('home_when_idle')),
+                         (False, 150.0, 180.0, True))
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'full on')], screen_zone=None, end_on='已设置 full on')
+        self.assertIs((self.cfg_after.get('mission_cfg') or {}).get('full_course'), True)
+
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)
         car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01), cfg_extra=dict(race_auto=False),

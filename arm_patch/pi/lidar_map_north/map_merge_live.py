@@ -969,6 +969,24 @@ def main():
             return
         if k=='route':state['plan_start']=None;state['replan_from']=None;plan_route();state['plan_key']=None;redraw();print_route();return
         if k=='stop':command_stop(parts);return
+        if k=='full':
+            # (10-24)比赛前选：full on = 一直跑完全程(用户 10-18 的要求，时间到了也接着做)；
+            #   full off = 3 分钟内回到启停区(拿"按时返回 2 分 + 显示统计 4 分"；做不完的不做了)
+            mc_=dict(raw_cfg.get('mission_cfg') or {})
+            if len(parts)==1:
+                on_=bool(mc_.get('full_course',True))
+                print(('现在：full on，一直跑完全程(超过 3 分钟也接着做，回不了家就没有按时返回、显示统计的分)' if on_ else
+                       f"现在：full off，3 分钟内回家(time_limit_s={float(mc_.get('time_limit_s',150)):g} 秒以后不再开始新的夹放)")
+                      +'。改：full on / full off',flush=True);return
+            if len(parts)!=2 or parts[1] not in ('on','off'):raise ValueError('格式：full on(全程跑完) / full off(3 分钟内回家)')
+            if parts[1]=='on':mc_['full_course']=True
+            else:mc_.update(full_course=False,home_when_idle=True,time_limit_s=150.0,round_s=180.0)
+            raw_cfg['mission_cfg']=mc_
+            p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+            if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+            write_json_safe(p_,file_cfg())
+            print('已设置 full on：一直跑完全程(下一次 go / race 起作用，存进配置)' if parts[1]=='on' else
+                  '已设置 full off：3 分钟内回家，150 秒以后不再开始新的夹放、来不及就直接回家(下一次 go / race 起作用，存进配置)',flush=True);return
         if k=='r2off':
             # (10-21 用户)对准 2 号环时故意对偏：r2off 前后 左右(毫米，往前/往左为正，各 ±60 以内，配置 ring2_off_max_mm)；r2off 看现在的；r2off 0 0 不偏
             mc_=dict(raw_cfg.get('mission_cfg') or {});o_=dict(mc_.get('ring2_off_mm') or {})
@@ -1169,6 +1187,7 @@ def main():
     print(f"启停区 {zs['zone']}：起点车中心=({c_['car_x_mm']:.0f}, {c_['car_y_mm']:.0f})，车头 {c_['car_yaw_deg']:.0f}°（90=朝北，180=朝西）；雷达 前{config['lidar_forward_mm']:.1f} 左{config['lidar_left_mm']:.1f}mm。",flush=True)
     print('比赛：车放好，输入 race 1 或 race 2(抽到几区就输几)直接开跑，之后不用碰电脑(配置 race_auto=true 开机自动，用配置里的启停区)。屏上开跑前全黑，读到码显示任务码，回到启停区显示抓取数、放置数。',flush=True)
     print('调试：zone 1 / zone 2 切换启停区；go = 一键全流程(不再问 y)；park = 收臂、升降停 60mm；abort = 急停(急停后不自动收臂)。',flush=True)
+    print('比赛前选：full on = 一直跑完全程 / full off = 3 分钟内回家(拿按时返回、显示统计的分)；full = 看现在是哪个。',flush=True)
     print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
