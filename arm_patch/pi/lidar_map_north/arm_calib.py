@@ -938,9 +938,9 @@ class Wizard:
         if getattr(self, '_fit_key', None) != key:
             try:
                 from mission_hooks import fit_arm_polar
-                self._fit = fit_arm_polar(poses, self.spacing)
-            except Exception:
-                self._fit = None
+            except Exception:                              # 少了 numpy 之类：不显示
+                return ''
+            self._fit = fit_arm_polar(poses, self.spacing)
             self._fit_key = key
         fit = self._fit
         if fit is None or fit[2] > 6.0:
