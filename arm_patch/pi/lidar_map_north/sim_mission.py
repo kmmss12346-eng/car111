@@ -3259,13 +3259,26 @@ class RawNearSlotTests(unittest.TestCase):
             self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
             self.assertAlmostEqual(h.act.disp['F'], 0.0, delta=1.0)
 
+    def test_car_still_while_grabbing(self):
+        """(10-24 用户"物料夹取过程中车不要再进行对准了啊太浪费时间了")默认：对准原料盘中心以后，夹的过程中车轮一下都不动，3 个照样夹到。"""
+        for seed in (1, 2, 5):
+            w, h, text = self._near_run(seed)
+            r = w.requests
+            i = next(n for n, q in enumerate(r) if q.startswith('GRAB'))
+            j = max(n for n, q in enumerate(r) if q.startswith('GRAB'))           # 夹完以后挪回停车点不算
+            moving = [q for q in r[i:j] if q.startswith('V ') and any(abs(float(x)) > 1e-9 for x in q.split()[1:3])]
+            self.assertEqual(moving, [], (seed, moving[:5]))
+            self.assertNotIn('车被带偏了', text)
+            self.assertEqual(sum(1 for v_ in w.tray.values() if v_), 3, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
     def test_bumped_after_a_grab_wheels_realign(self):
-        """夹完第一个，车被带偏了 7mm：回到看的姿态看一眼原料盘中心，车轮慢慢对回去，后面两个照样夹到(不夹空)。"""
+        """(raw_near_recheck=True 时)夹完第一个，车被带偏了 7mm：回到看的姿态看一眼原料盘中心，车轮慢慢对回去，后面两个照样夹到(不夹空)。"""
         import tempfile
         w = self._world(2)
         path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
         lines = []
-        h = self._make(w, path, lines)
+        h = self._make(w, path, lines, cfg=dict(raw_near_recheck=True))
         self._teach(w, h, path)
         orig, n = h.arm.grab_here, [0]
 
