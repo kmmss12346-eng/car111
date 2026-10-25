@@ -165,6 +165,15 @@ def main():
     else:
         if not (ROOT/'scan_bridge').is_file():ap.error('请先运行 bash build.sh')
         if not Path(args.port).exists():ap.error('雷达串口不存在')
+    # (10-25 用户"改完就报错")地图标题里有中文(比如"停车点改了：route 重新规划")，默认字体 DejaVu Sans 没有中文，每个字刷一行 Glyph 警告：
+    #   有中文字体就用它(图上能显示中文)，警告一律不刷
+    import warnings;warnings.filterwarnings('ignore',message=r'Glyph \d+ .*missing from')
+    try:
+        import matplotlib;from matplotlib import font_manager as _fm
+        _cjk=[f.name for f in _fm.fontManager.ttflist if any(s_ in f.name for s_ in ('CJK','WenQuanYi','Droid Sans Fallback','Source Han','AR PL','Noto Sans SC'))]
+        if _cjk:matplotlib.rcParams['font.sans-serif']=[_cjk[0]]+list(matplotlib.rcParams['font.sans-serif'])
+    except Exception:
+        pass                                          # 找字体出问题：照旧用默认字体(图上中文显示成方框，不影响跑)
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle,Polygon,Circle
     fig,world=plt.subplots(figsize=(12,8));fig.subplots_adjust(bottom=.24,top=.88)
@@ -1050,9 +1059,11 @@ def main():
               f' → 新停车点 ({x_:.0f},{y_:.0f}) 车头 {h_:.1f}°',flush=True)
         command_stop(['stop',n_,f'{x_:.0f}',f'{y_:.0f}',f'{h_:.1f}'],replan=False)
     def command_stop(parts,replan=True):
-        """(10-20 用户"这四个停靠位置我需要自己输入选定合适位置")stop = 看四个停车点能不能停；stop 名字 X Y [车头] = 先检查再改。
+        """(10-20 用户"这四个停靠位置我需要自己输入选定合适位置")stop = 看四个停车点能不能停；stop 名字 X Y [车头] = 改。
         按真实车身(含雷达)查：不压黄色区/工位/原料转盘、不出场地；扫描过就再查障碍物(按真实大小，停车点附近最少留 goal_obstacle_min_margin_mm)。
-        不能停就不改，给出最近能停的位置(stop 名字 X Y force 硬改)；工位/原料盘在车的左边、离得太远这类只提醒。
+        (10-25 用户"我想随便改这四个停靠点的位置而不要报错")输入什么就存什么，不再"不能停/没改"(不用 force)，只用 ⚠ 说跑的时候会怎样：
+        只是离区域比余量近 = 照样准确停在这里(那一段放宽)；车身压到区域/出场地/碰到障碍物 = 跑的时候自动停到最近停得下的位置。
+        只有车头不是横平竖直、或者压得太深(周围 goal_fix_max_mm 内都停不下，路线规划不出来)才不改。
         改了存进配置(先备份 .json.bak)，扫描过就马上重新规划，看路线能不能规划出来。"""
         from route_plan import check_stop,STOP_NAMES,DEFAULT_STOPS
         stops=raw_cfg.setdefault('stops',{})
@@ -1060,15 +1071,22 @@ def main():
         cfg_=mission_cfg()
         def say(n,p,r):
             head=f'  {n} ({p[0]:.0f},{p[1]:.0f}) 车头 {p[2]:.0f}°'
-            print(head+('：能停。'+r['gap'] if r['ok'] else '：★ 不能停：'+r['why']),flush=True)
+            if r['ok']:print(head+'：能停。'+r['gap'],flush=True)
+            elif '横平竖直' in r['why']:print(head+'：★ '+r['why'],flush=True)
+            elif r.get('moves'):
+                q=r['near'][0] if r['near'] else None
+                print(head+'：⚠ '+r['why']+(f'：跑的时候这一站自动停到最近停得下的 ({q[0]},{q[1]})(差 {q[3]}mm)' if q else '：周围也找不到停得下车身的位置'),flush=True)
+            else:
+                print(head+'：⚠ '+r['why'].replace('(要 ','(建议 ')+'：照样停在这里(开进去最后一段贴着走)',flush=True)
             for w in r['warn']:print('      ⚠ '+w,flush=True)
-            for q in r['near']:print(f'      最近能停的：({q[0]},{q[1]}) 车头 {q[2]:.0f}°(差 {q[3]}mm)  →  输入 stop {n} {q[0]} {q[1]}',flush=True)
+            if not r['ok'] and r['near'] and '横平竖直' not in r['why']:
+                q=r['near'][0];print(f'      想离远一点：stop {n} {q[0]} {q[1]}',flush=True)
         if len(parts)==1:
             print('停车点(车中心 x、y 毫米，车头 0 东 90 北 180 西 -90 南)；'+('按扫描到的障碍物一起查：' if obs else '还没扫描：只查了黄色区/工位/原料转盘/场地边，扫描以后再输入 stop 会连障碍物一起查：'),flush=True)
             for n in STOP_NAMES:
                 if n not in stops:print(f'  {n}：配置里没有',flush=True);continue
                 p=tuple(float(v) for v in stops[n][:3]);say(n,p,check_stop(cfg_,obs,n,p))
-            print('改停车点：stop 名字 X Y [车头]，例如 stop RAW 1200 2150(车头不写就不变)',flush=True);return
+            print('改停车点：stop 名字 X Y [车头]，例如 stop RAW 1200 2150(车头不写就不变；输入什么就存什么，⚠ 只是提醒跑的时候会怎样)',flush=True);return
         n=parts[1].upper()
         if n not in STOP_NAMES:raise ValueError('格式：stop RAW 1200 2150 [车头]；名字是 QR / RAW / ROUGH / TEMP。只输入 stop 看全部')
         vals=[a for a in parts[2:] if a.lower()!='force'];force=len(vals)!=len(parts)-2
@@ -1078,9 +1096,10 @@ def main():
         if not (-200<=x_<=FIELD_MM+200 and -200<=y_<=FIELD_MM+200):raise ValueError(f'({x_:g},{y_:g}) 不在场地里(0~{FIELD_MM})')
         r=check_stop(cfg_,obs,n,(x_,y_,h_))
         print(f'检查 {n}'+('(连扫描到的障碍物)' if obs else '(还没扫描，只查固定区域)')+'：',flush=True);say(n,(x_,y_,h_),r)
-        if not r['ok'] and not force:
-            print(f'  没改，{n} 还是 ({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}°。'+('选上面最近能停的位置再输入一次' if r['near'] else '换个位置再输入一次')+f'(确实要这样停：stop {n} {x_:g} {y_:g} {h_:g} force)',flush=True);return
-        if not r['ok']:print('  ★ 按 force 硬改了：规划时会自动挪到最近停得下的位置',flush=True)
+        if not r['ok'] and ('横平竖直' in r['why'] or (r.get('moves') and not r['near'] and not force)):
+            print(f'  没改，{n} 还是 ({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}°：'+
+                  ('车头只能是 0、90、180、-90' if '横平竖直' in r['why'] else '这里压得太深，周围也停不下，跑的时候路线规划不出来，换个位置'),flush=True);return
+        _=force                                       # (10-25)以前不能停要加 force 才改；现在输入什么就存什么，force 写了也不碍事
         h_=((h_+180.0)%360.0)-180.0
         if h_==-180.0:h_=180.0                        # 车头朝西照配置里的写法存 180
         stops[n]=[int(v) if float(v).is_integer() else round(v,1) for v in (x_,y_,h_)]

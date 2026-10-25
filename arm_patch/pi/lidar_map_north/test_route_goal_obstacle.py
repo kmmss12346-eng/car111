@@ -211,6 +211,24 @@ class StopInputTests(unittest.TestCase):
         self.assertLess(math.hypot(end[0] - L['goal'][0], end[1] - L['goal'][1]), 0.6)
         self.assertEqual(legs[1]['stop'], 'ROUGH')
 
+    def test_check_stop_says_whether_the_race_moves_it(self):
+        """(10-25 用户"我想随便改这四个停靠点的位置而不要报错")stop 输入什么就存什么：check_stop 的 moves 说跑的时候会不会挪走。
+        只是离区域比余量近 = 照样准确停在那里；压到区域/出场地 = 自动停到最近停得下的(和 plan_mission 真走的一样)。"""
+        r = rp.check_stop(CFG, [], 'ROUGH', (1200, 300, 0))            # 离粗加工区 20mm(余量 30)：不挪
+        self.assertFalse(r['ok'])
+        self.assertFalse(r['moves'])
+        cfg = dict(CFG, stops=dict(STOPS, ROUGH=[1200, 300, 0]))
+        legs, why, _ = rp.plan_mission(cfg, [], STOPS['QR'], ['ROUGH'])
+        self.assertEqual(why, 'OK')
+        self.assertEqual(tuple(legs[0]['goal']), (1200.0, 300.0, 0.0))  # 真的就停在输入的位置
+        r = rp.check_stop(CFG, [], 'RAW', (1200, 2210, 180))             # 压到原料转盘：挪
+        self.assertTrue(r['moves'])
+        cfg = dict(CFG, stops=dict(STOPS, RAW=[1200, 2210, 180]))
+        legs, why, _ = rp.plan_mission(cfg, [], STOPS['QR'], ['RAW'])
+        self.assertEqual(tuple(legs[0]['goal'][:2]), r['near'][0][:2])   # 挪到的就是 stop 说的那个位置
+        self.assertTrue(rp.check_stop(CFG, [], 'QR', (2350, 1200, 90))['moves'])   # 出场地：挪
+        self.assertFalse(rp.check_stop(CFG, [], 'QR', STOPS['QR'])['moves'])
+
     def test_check_stop(self):
         r = rp.check_stop(CFG, [], 'RAW', (1200, 2210, 180))
         self.assertFalse(r['ok'])

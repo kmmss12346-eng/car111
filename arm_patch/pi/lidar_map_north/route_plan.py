@@ -1640,9 +1640,11 @@ def check_stop(cfg, obstacles, name, pose):
     车身(含雷达)按硬余量不压黄色区/工位/原料转盘、不出场地；障碍物(扫描到的)按真实大小至少 goal_obstacle_min_margin_mm。
     还看任务上的事(不挡着存，只提醒)：工位/原料盘要在车的右边(手臂、摄像头那边)，离得比原来的停车点远太多手臂够不着，
     沿工位方向离 2 号环(工位中间)太远 2 号环可能不在摄像头里。
-    返回 dict(ok, why, warn=[提醒], near=[(x, y, 车头, 离输入的点多少mm)] 不能停时最近能停的几个位置, gap=(最近的区域说明))"""
+    返回 dict(ok, why, warn=[提醒], near=[(x, y, 车头, 离输入的点多少mm)] 不能停时最近能停的几个位置, gap=(最近的区域说明),
+    moves=(10-25)跑的时候规划会不会把它挪走：True = 车身压到区域/出场地/碰到障碍物，自动停到最近停得下的位置；
+    False = 只是离区域比硬余量近，照样准确停在这里(那一段放宽，见 Planner.leg))"""
     x, y, h = (float(v) for v in pose[:3])
-    out = dict(ok=True, why='', warn=[], near=[], gap='')
+    out = dict(ok=True, why='', warn=[], near=[], gap='', moves=False)
     if abs(wrap180(h - round(h / 90.0) * 90.0)) > 3.0:
         out.update(ok=False, why=f'车头 {h:g}° 要横平竖直(0 东、90 北、180 西、-90 南)')
         return out
@@ -1656,10 +1658,14 @@ def check_stop(cfg, obstacles, name, pose):
             g = pl._obs_real_gap(it, gaps[k])
             short = g < pl.goal_min - EPS_MM
             txt = f'真车(含雷达)离{it[0]}只有 {g:.0f}mm(最少要 {pl.goal_min:.0f}mm)' if g >= 0 else f'车身(含雷达)会碰到{it[0]}'
+            if short:
+                out['moves'] = True                        # Planner.leg：_shift_goal 挪开
         else:
             g = gaps[k]
             short = g < it[7] - EPS_MM
             txt = _what(it, g, False)
+            if short and (g < 0 or (it[1] == 'edge' and it[7] <= 0)):
+                out['moves'] = True                        # Planner.leg：压到区域/出场地 -> _fix_goal 挪到最近停得下的
         if short and (bad is None or g - (pl.goal_min if it[1] == 'obs' else it[7]) < bad[0]):
             bad = (g - (pl.goal_min if it[1] == 'obs' else it[7]), txt)
     if bad is not None:

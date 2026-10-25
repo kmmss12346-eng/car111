@@ -870,3 +870,11 @@ git_log.txt                ← 分支最近 120 条提交记录
   物料偏车尾 → `g 13 1`。这辆车画面左边是车头方向(环1 在左要前进)，物料偏车尾 = 红十字往右挪，每毫米约 1.24 像素(ZOBRNG 高度)。
   码垛第二层"不管先放哪个环，都在经过 3 号环之前缩到 STKA2、缩着转到目标环再伸出去"(现在只有路上有两层垛才这样)：已向用户复述，等用户确认
   ①放完空爪回转盘要不要也先缩 ②第一层/粗加工区不变，再改 mission_hooks._stack_carry(tall 为空也走 stack_in_plan，first 用 3 号环)。
+- **10-25 停车点随便改(用户"我想随便改这四个停靠点的位置而不要报错")：** run_live 的 `stop 名字 X Y [车头]` 输入什么就存什么，
+  不再"★ 不能停 / 没改 / force"：route_plan.check_stop 多返回 `moves`(跑的时候 Planner.leg 会不会挪走：压到区域/出场地 -> _fix_goal；
+  碰到障碍物 -> _shift_goal)。只是比硬余量近(moves=False)：说"照样停在这里"，Planner.leg 本来就只把那个区域放宽到它的距离、准确停在输入的点；
+  moves=True：说"跑的时候自动停到最近停得下的 (x,y)"。只有车头不是横平竖直、或者压得太深周围 200mm 都停不下才不改(force 照旧能硬存)。
+  用户那次：QR (2000,1350) 会压到黄色区，(2000,1250) 离黄色区 21mm，最后存了 (2010,1250)。
+  同时 map_merge_live 画图前过滤 `Glyph … missing from` 警告(地图标题"停车点改了：route 重新规划"的中文，DejaVu Sans 没有中文，每个字刷一行)，
+  有中文字体(CJK/WenQuanYi/Droid Sans Fallback…)就让 matplotlib 用它。测试 test_nav_live test_stop_command_saves_what_was_typed、
+  test_route_goal_obstacle test_check_stop_says_whether_the_race_moves_it。部署包 tasks_1025c。

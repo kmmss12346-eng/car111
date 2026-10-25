@@ -442,19 +442,27 @@ class LiveTests(unittest.TestCase):
         p = car.pose()
         self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'没回到出发位置：{p}')
 
-    def test_stop_command_checks_then_saves(self):
-        # (10-20 用户"这四个停靠位置我需要自己输入")stop RAW 1200 2210：压到原料转盘，不改，给出最近能停的 (1200,2155)；
-        # stop RAW 1200 2155：能停，存进配置文件；之后照常 go 跑完(规划用新的停车点)
+    def test_stop_command_saves_what_was_typed(self):
+        # (10-25 用户"我想随便改这四个停靠点的位置而不要报错")stop 输入什么就存什么，不再"不能停/没改"：
+        #   stop ROUGH 1200 300：离粗加工区只有 20mm(建议 30)，照样存、照样停在这里；
+        #   stop RAW 1200 2210：压到原料转盘，也存，说跑的时候自动停到最近停得下的 (1200,2155)；
+        #   只有车头不是横平竖直才不改。之后照常 go 跑完
         def said(t):
             return lambda: t in self.out_text()
-        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False),
-                            inputs=[(lambda: True, 'stop'), (said('改停车点：stop'), 'stop RAW 1200 2210'),
-                                    (said('没改'), 'stop RAW 1200 2155'), (said('已改 RAW'), 'go')], screen_zone=None)
+        self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'stop'), (said('改停车点：stop'), 'stop ROUGH 1200 300'),
+                              (said('已改 ROUGH'), 'stop RAW 1200 2210'), (said('已改 RAW'), 'stop TEMP 340 1200 -80'),
+                              (said('没改'), 'go')], screen_zone=None)
         log = self.log
-        self.assertIn('不能停', log)
-        self.assertIn('stop RAW 1200 2155', log)
-        self.assertIn('已改 RAW：(1200,2100) 车头 180° → (1200,2155) 车头 180°', log)
-        self.assertEqual(self.cfg_after['stops']['RAW'], [1200, 2155, 180])
+        self.assertNotIn('不能停', log)
+        self.assertIn('照样停在这里', log)
+        self.assertIn('已改 ROUGH：(1200,340) 车头 0° → (1200,300) 车头 0°', log)
+        self.assertIn('跑的时候这一站自动停到最近停得下的 (1200,2155)', log)
+        self.assertIn('已改 RAW：(1200,2100) 车头 180° → (1200,2210) 车头 180°', log)
+        self.assertIn('车头只能是 0、90、180、-90', log)
+        self.assertEqual(self.cfg_after['stops']['ROUGH'], [1200, 300, 0])
+        self.assertEqual(self.cfg_after['stops']['RAW'], [1200, 2210, 180])
+        self.assertEqual(self.cfg_after['stops']['TEMP'][:2], [340, 1200])
         self.assertIn('路线全部走完', log, log[-3000:])
 
     def test_go_step_jog_then_save_stop(self):
