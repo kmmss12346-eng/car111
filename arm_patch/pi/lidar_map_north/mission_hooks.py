@@ -204,6 +204,9 @@ DEFAULTS = dict(
     raw_a1_margin_deg=5.0,              # (10-18 实车)ID1 离限位这么多度以内算够不着：STM32 给 ID1 往前多给 5° 补偿摩擦，靠近限位时多给的被限位截掉，
                                         #   ID1 停在离限位四五度的地方(示教 3 号位时停在 48.3°，限位 44°)
     raw_ct_accept_mm=5.0,               # 比赛时对准圆心：到时间还没对到 raw_ct_tol_mm，但离示教的位置不到这么多毫米也照样抓；再远就这次不抓(会砸到物料)
+    raw_pose_follow=True,               # (10-25 用户"每一个地方都要做完")最近那格：看原料盘的姿态和示教时不一样(arm_calib 改过 A1G/A2E，比如重装齿条后 ID2 读数变了)
+                                        #   也照样做：车轮按画面对准(摄像头装在爪子上，伸缩差的长度车轮补)，夹的角度跟着挪同样多。False = 以前的：这次不抓
+    raw_pose_a1_tol_deg=3.0,            #   ID1 差超过这么多度(画面跟着转了，示教的位置对不上)才不做
     raw_near_teach_s_mm=100.0,          # (10-18 用户)"最近那格"的做法(rteach RAW near 颜色号)：示教时车轮最多挪这么多毫米(横移、前后)——
     raw_near_teach_f_mm=100.0,          #   arm_calib 里爪子摆不到那一格正上方(齿条不够长)时车轮补；比赛时车轮以示教时挪到的地方为中心挪 raw_center_s_mm/f_mm
     raw_near_iters=3,                   #   示教时最多对几轮(每轮按物料离爪子点还差多少再对一次)
@@ -219,8 +222,9 @@ DEFAULTS = dict(
     raw_near_away_mm=80.0,              #   往外最多 80mm、
     raw_near_along_mm=120.0,            #   前后最多 ±120mm；按地图查过：会出场地、离黄色区/障碍物太近的那边少挪
     raw_near_wait_s=4.0,                #   到了先原地看几秒(外圈、物料都看不到才开始挪着找；看到一个物料马上往那边挪)
-    raw_near_find_s=30.0,               #   找 + 对准一共最多多少秒(跟丢了停下接着找；到时间还没对上才这一批不抓)。(10-23 以前 90 秒；
+    raw_near_find_s=60.0,               #   找 + 对准一共最多多少秒(跟丢了停下接着找；到时间还没对上才这一批不抓)。(10-23 以前 90 秒；
                                         #   说好的 20 秒在仿真里不够：车停偏 6cm、一开始什么都看不到时要 22~30 秒才找得到，20 秒会三个都不夹)
+                                        #   (10-25 用户"把摄像头的识别时间改长，每一个地方都要做完")30 -> 60
     raw_near_lost_s=4.0,                #   对准时连着几秒认不出圆心算跟丢了
     raw_near_step_mm=40.0,              #   都看不到时挪着找：每隔多少毫米看一处
     raw_near_max_mm=150.0,              #   认出圆心以后：对准的地方(就是示教时车停的地方)在上面的范围外也挪过去，但最多离示教时停的地方这么远
@@ -310,9 +314,9 @@ DEFAULTS = dict(
     zone_vel_speed=15.0,                #   车轮最快多少毫米/秒(偏多少毫米就每秒走多少，越近越慢)
     zone_vel_min_speed=5.0,             #   最慢多少毫米/秒(太慢电机按 0 转/分算会不动)
     zone_vel_tol_mm=None,               #   车轮对到多少毫米以内算对准(停着拍 3 帧取平均)；None = tol_mm.RING
-    zone_find_s=40.0,                   #   找 + 对准一共最多多少秒
+    zone_find_s=60.0,                   #   找 + 对准一共最多多少秒((10-25 用户"识别时间改长，每一个地方都要做完")40 -> 60)
     zone_lost_s=3.0,                    #   对准时连着几秒认不出 2 号环算跟丢了：停下重新找(停着找 2 倍这么久)
-    zone_look_s=10.0,                   #   一开始停着找 2 号环最多多少秒(车没动，找不到多半是认不出：暂存区第二批 2 号环被物料盖住时改认物料)
+    zone_look_s=15.0,                   #   一开始停着找 2 号环最多多少秒(车没动，找不到多半是认不出：暂存区第二批 2 号环被物料盖住时改认物料)。(10-25)10 -> 15
     zone_settle_s=0.15,                 #   停车以后过这么久拍的才算"停着拍的"(刚停下车可能还在晃)
     zone_stall_s=6.0,                   #   车轮挪了这么多秒偏差都没小下去(打滑、没走起来、在容差边上来回)：不再磨，剩下的手臂补
     zone_calc=True,                     # (10-21 用户"不要一开始就往前运动，要根据实际情况来计算位置然后修正")找到 2 号环以后：车停着拍几帧
@@ -344,6 +348,9 @@ DEFAULTS = dict(
     stack_carry_mode='in',              # (10-24 用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")怎么躲：
                                         #   'in' = 绕过电池盒以后在 stack_carry_a1 停下、往里缩到 stack_carry_a2 -> 缩着转到目标环的角度 -> 只伸出去(只缩一次、伸一次)；
                                         #   'plan' = 10-23 的走法(按三个环的几何，缩着过、太近的从外侧绕，在两个环中间改长度)
+    stack_carry_always=True,            #   (10-25 用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")
+                                        #   'in'：第二层(码垛)每一个都这样走，路上有没有两层的垛都一样，在路上第一个环(一般是 3 号环)前面缩；
+                                        #   False = 以前的：只有路上有两层的垛才躲。放完空爪回车上转盘、第一层、粗加工区都不变
     stack_carry_a1=None,                #   'in'：在哪里往里缩(ID1 度数，arm_calib 的 STKA1 调)；None = 刚绕过电池盒的 R1T1(圆环那组没调 = 在车上转盘上方就缩)
     stack_carry_a2=None,                #   往里缩到多短(ID2 度数，arm_calib 的 STKA2 调；'plan' 也用它)；None = 车上转盘上方的长度 A2R
     stack_carry_clear_mm=50.0,          #   夹着的物料中心离两层垛的中心至少这么远(物料底半径 25 + 垛顶半径 15 + 余量 10)：'in' 只在日志里提醒，'plan' 按它绕
@@ -569,7 +576,7 @@ def stack_carry_plan(start_a1, target, poses, tall, spacing, clear_mm, a2_in, a2
 
 
 def stack_in_plan(start_a1, target, poses, tall, a2_in, a1_in=None, after=None, hold=None, fit=None, a2_lim=(None, None),
-                  margin_deg=2.0, a2_start=None):
+                  margin_deg=2.0, a2_start=None, always=False):
     """(10-24 用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")码垛：夹着物料从车上转盘(手臂在 start_a1)去 target = (ID1, ID2)，
     路上要经过 tall 里这几个已经叠了两层的环。只往里缩一次、往外伸一次：
       ① 从车上转盘出来(STM32 照旧绕电池盒)只转到 a1_in，伸缩停在 hold(绕电池盒伸的长度 R2T；不绕就是车上转盘上方的 A2R)；
@@ -577,17 +584,22 @@ def stack_in_plan(start_a1, target, poses, tall, a2_in, a1_in=None, after=None, 
     poses = {环号: (ID1, ID2)}：爪子在 1、2、3 号环正上方时的角度(看路上经过哪几个环)。after = 绕电池盒转过 R1T1 的角度(不知道 = None)。
     a1_in 要在绕过电池盒(after，不知道就是车上转盘)和第一个要经过的两层垛中间；没给、调错了：after 在中间就用 after，
     不然用车上转盘和那个垛的正中间。a1_in 就在车上转盘上方(没出车上转盘)：① 不动，伸缩还是 a2_start(A2R)。
+    (10-25 用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")always=True：路上有没有两层的垛
+    都这样走，往里缩的地方在路上第一个环(从车上转盘出来先经过的，一般是 3 号环；去的就是它就是目标环)前面。
     返回 dict(wps=[①②③ 的 (ID1, ID2)], cross=[经过的两层垛(先经过的在前)], a1_in=, a2_in=, moved=a1_in 换过没有,
-    gaps={环号: 缩着转过去离它中心多少 mm}(给了手臂几何 fit = (a, k, 残差) 才有))；路上一个两层的环都不经过返回 None(照旧走)。"""
+    first_ring=往里缩要赶在它前面的那个环(None = 目标环本身), gaps={环号: 缩着转过去离它中心多少 mm}(给了手臂几何 fit = (a, k, 残差) 才有))；
+    always=False 时路上一个两层的环都不经过返回 None(照旧走)。"""
     a1t, a2t = float(target[0]), float(target[1])
     start_a1 = float(start_a1)
     lo, hi = sorted((start_a1, a1t))
     cross = [r for r in tall if r in poses and lo + 1.0 < float(poses[r][0]) < hi - 1.0]
-    if not cross:
+    if not cross and not always:
         return None
     cross.sort(key=lambda r: abs(float(poses[r][0]) - start_a1))
     sgn = 1.0 if a1t > start_a1 else -1.0
-    first = float(poses[cross[0]][0])
+    on_way = sorted((r for r in poses if lo + 1.0 < float(poses[r][0]) < hi - 1.0), key=lambda r: abs(float(poses[r][0]) - start_a1))
+    first_ring = (cross or on_way or [None])[0] if not always else (on_way or [None])[0]
+    first = float(poses[first_ring][0]) if first_ring is not None else a1t
 
     def between(v, base):                               # 在 base(含)和第一个两层垛(离它 margin_deg 以上)中间
         return v is not None and (float(v) - base) * sgn >= 0.0 and (first - float(v)) * sgn > margin_deg
@@ -618,7 +630,7 @@ def stack_in_plan(start_a1, target, poses, tall, a2_in, a1_in=None, after=None, 
         a, k, _res = fit
         r_in = a + k * a2
         gaps = {r: abs(a + k * float(poses[r][1]) - r_in) for r in cross}
-    return dict(wps=wps, cross=cross, a1_in=a1, a2_in=a2, moved=moved, gaps=gaps)
+    return dict(wps=wps, cross=cross, a1_in=a1, a2_in=a2, moved=moved, gaps=gaps, first_ring=first_ring)
 
 
 def _first(p, measure):
@@ -1572,7 +1584,7 @@ class MissionHooks:
             d1, d2 = float(dodge[0]), float(dodge[1])
             sgn = 1.0 if (b1 or 0.0) > a1d else -1.0                # 手臂在车上转盘的哪一边
             if b1 is not None and (b1 - d1) * sgn > 1.0 and (d1 - a1d) * sgn >= -0.5:
-                self.log('    (还在躲两层垛的那一段：先往里缩、缩着转回往里缩的地方，再回车上转盘)')
+                self.log('    (还在码垛躲避的那一段：先往里缩、缩着转回往里缩的地方，再回车上转盘)')
                 self.arm.ap(b1, d2)
                 self.arm.ap(d1, d2)
         ring_set = abs(g('R2T')) > 0.5
@@ -4966,13 +4978,26 @@ class MissionHooks:
             self._recover(f'摆到看原料盘的姿态出错：{ex}')
             return give_up('摆不到看原料盘的姿态：这次不抓')
         if math.hypot(home[0] - D['home'][0], (home[1] - D['home'][1]) / 10.0) > 5.0:
-            if near_k:                                         # (10-21 夜用户"后面为什么还是乱动")最近那格：不改用以前的做法(会开着车到处找圆心)
+            d1, d2 = home[0] - D['home'][0], home[1] - D['home'][1]
+            if near_k and cfg.get('raw_pose_follow', True) and abs(d1) <= float(cfg.get('raw_pose_a1_tol_deg', 3.0)):
+                # (10-25 用户"每一个地方都要做完啊不然你搞个空车往回走也没用")重装齿条以后 arm_calib 重调了 A2E：同一个伸出长度读数变了。
+                #   摄像头装在爪子上，车轮按画面把原料盘中心对到示教的位置，爪子照样在最近那一格上方(伸缩差的长度车轮补)；
+                #   示教的抓取角度跟着挪同样多。ID1 差得多(画面跟着转了)才不做。下爪前照样看一眼物料在不在爪子下面(raw_ct_check)
+                D = dict(D, home=[float(home[0]), float(home[1])],
+                         slots={k: (dict(s, a=[float(s['a'][0]) + d1, float(s['a'][1]) + d2]) if s.get('a') else s)
+                                for k, s in D['slots'].items()})
+                comp = np.zeros(2)
+                self.log(f'    ★ 看原料盘的姿态(ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)和示教时不一样(ID1 差 {d1:+.1f}°、ID2 差 {d2:+.0f}°，'
+                         'arm_calib 改过 A1G/A2E，比如重装了齿条)：照样做——车轮按画面把原料盘中心对到示教的位置(摄像头装在爪子上，'
+                         '对准了爪子就在最近那一格上方)，夹的角度跟着挪同样多。有空重新 rteach RAW near 颜色号')
+            elif near_k:                                       # (10-21 夜用户"后面为什么还是乱动")最近那格：不改用以前的做法(会开着车到处找圆心)
                 return give_up(f'看原料盘的姿态(ID1 {home[0]:.1f}°、ID2 {home[1]:.1f}°)和示教时(ID1 {D["home"][0]:.1f}°、'
-                               f'ID2 {D["home"][1]:.1f}°)不一样(arm_calib 里改过 A1G/A2E)：这次不抓，车不动。'
-                               '原料盘停着、最近那格上放一个物料，重新 rteach RAW near 颜色号')
-            self.log('    ★ 看原料盘的姿态(ID1/ID2)和示教时不一样(改过 A1G/A2E？)：示教的停靠位用不了，这次照旧用以前的做法。'
-                     '要重新示教：rteach RAW center，再 rteach RAW 1/2/3 颜色号')
-            return False
+                               f'ID2 {D["home"][1]:.1f}°)不一样' + (f'(ID1 差 {d1:+.1f}°，画面跟着转了)' if abs(d1) > 0.05 else '') +
+                               '：这次不抓，车不动。原料盘停着、最近那格上放一个物料，重新 rteach RAW near 颜色号')
+            else:
+                self.log('    ★ 看原料盘的姿态(ID1/ID2)和示教时不一样(改过 A1G/A2E？)：示教的停靠位用不了，这次照旧用以前的做法。'
+                         '要重新示教：rteach RAW center，再 rteach RAW 1/2/3 颜色号')
+                return False
         self._ct_home, self._ct_t_arm = home, self.now()
         self._ct_stops, self._ct_used = [], None
         self._rc_hist = []                                     # (10-21)对准时每帧记下物料绕圆心的角度：看原料盘什么时候停下的
@@ -7619,12 +7644,15 @@ class MissionHooks:
         (10-24 用户"往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")stack_carry_mode='in'(默认)：绕过电池盒在 stack_carry_a1 停下、
         往里缩到 stack_carry_a2，缩着转到 ring 号环的角度，再只伸出去(见 stack_in_plan；两个值 arm_calib 的 STKA1/STKA2 调)，一路在搬运高度 ZHI。
         'plan' = 10-23 按三个环的几何算的走法(见 stack_carry_plan)。
-        走到了 (a1t, a2t) 返回 True；路上没有两层的环、或者算不出各个环在哪，返回 False(调用的人照旧走)。"""
+        (10-25 用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")'in' 默认第二层每一个都这样走，
+        路上有没有两层的垛都一样(stack_carry_always=False 才回到以前：只有路上有两层的垛才躲)。
+        走到了 (a1t, a2t) 返回 True；不用躲(always 关着、路上没有两层的环)、或者算不出各个环在哪，返回 False(调用的人照旧走)。"""
         cfg = self.cfg
         if not cfg.get('stack_carry', True):
             return False
         tall = [r for r in (1, 2, 3) if r != int(ring) and len(self.on_ring.get((zone, r)) or []) >= 2]
-        if not tall or not T:
+        always = str(cfg.get('stack_carry_mode') or 'in') != 'plan' and bool(cfg.get('stack_carry_always', True))
+        if (not tall and not always) or not T:
             return False
         try:
             poses = {2: (float(p2[0]), float(p2[1]))}
@@ -7649,7 +7677,7 @@ class MissionHooks:
         a2_lim = (None if lim_lo is None else lim_lo + 20.0, None if lim_hi is None else lim_hi - 20.0)
         clear = float(cfg.get('stack_carry_clear_mm', 50.0))
         if str(cfg.get('stack_carry_mode') or 'in') != 'plan':
-            return self._stack_in(ring, poses, tall, P, num, start, a2_in, a2_lim, clear, a1t, a2t)
+            return self._stack_in(ring, poses, tall, P, num, start, a2_in, a2_lim, clear, a1t, a2t, always=always)
         plan = stack_carry_plan(start, (a1t, a2t), poses, tall, float(cfg.get('ring_spacing_mm', 150.0)),
                                 clear, a2_in, a2_lim=a2_lim,
                                 pre_deg=float(cfg.get('stack_carry_pre_deg', 20.0)), outer=bool(cfg.get('stack_carry_outer', True)),
@@ -7679,8 +7707,9 @@ class MissionHooks:
         self._return_to_pose(a1t, a2t, from_tray=False)
         return True
 
-    def _stack_in(self, ring, poses, tall, P, num, start, a2_in, a2_lim, clear, a1t, a2t):
-        """_stack_carry 的 'in' 走法(10-24)：绕过电池盒 -> 停下往里缩 -> 缩着转到 ring 号环的角度 -> 只伸出去。"""
+    def _stack_in(self, ring, poses, tall, P, num, start, a2_in, a2_lim, clear, a1t, a2t, always=False):
+        """_stack_carry 的 'in' 走法(10-24)：绕过电池盒 -> 停下往里缩 -> 缩着转到 ring 号环的角度 -> 只伸出去。
+        always：(10-25)路上没有两层的垛也这样走，在路上第一个环(一般是 3 号环)前面缩。"""
         cfg = self.cfg
         ring_set = float(P.get('AEXT', 2.0) or 2.0) == 2.0 and abs(num(P.get('R2T')) or 0.0) > 0.5
         after = num(P.get('R1T1')) if ring_set else None             # 圆环那组绕电池盒：转过 R1T1 就过了电池盒
@@ -7692,15 +7721,18 @@ class MissionHooks:
         if fit is not None and fit[2] > 6.0:
             fit = None                                          # 三个环的角度对不上一条直线：不算离垛多远
         plan = stack_in_plan(start, (a1t, a2t), poses, tall, a2_in, a1_in=want if want is not None else after, after=after,
-                             hold=hold, fit=fit, a2_lim=a2_lim, a2_start=num(P.get('A2R')))
+                             hold=hold, fit=fit, a2_lim=a2_lim, a2_start=num(P.get('A2R')), always=always)
         if plan is None:
             return False
         a1, a2 = plan['a1_in'], plan['a2_in']
-        self.log(f'    码垛：去环{ring} 路上要经过已经叠了两层的' + '、'.join(f'环{r}' for r in plan['cross']) +
-                 f'：绕过电池盒转到 ID1 {a1:.1f}° 停下往里缩到 ID2 {a2:.0f}°，缩着转到环{ring}，再伸出去')
+        how = f'绕过电池盒转到 ID1 {a1:.1f}° 停下往里缩到 ID2 {a2:.0f}°，缩着转到环{ring}，再伸出去'
+        if plan['cross']:
+            self.log(f'    码垛：去环{ring} 路上要经过已经叠了两层的' + '、'.join(f'环{r}' for r in plan['cross']) + '：' + how)
+        else:
+            self.log(f'    码垛(第二层一律这样走)：去环{ring}，' + how)
         if plan['moved']:
             self.log(f'    ★ 往里缩的地方 stack_carry_a1={want:.1f}°(arm_calib 的 STKA1)不在' + ('绕过电池盒(R1T1)' if after is not None else '车上转盘') +
-                     f'和环{plan["cross"][0]} 中间：这次在 {a1:.1f}° 缩')
+                     f'和环{plan.get("first_ring") or ring} 中间：这次在 {a1:.1f}° 缩')
         near = [f'环{r} {g:.0f}mm' for r, g in plan['gaps'].items() if g < clear - 0.5]
         if near:
             zhi, zstk = num(P.get('ZHI')), num(P.get('ZSTK'))

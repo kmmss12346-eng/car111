@@ -5,7 +5,7 @@
 import os
 for key in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):
     os.environ[key]='1'
-import argparse,copy,json,math,queue,re,threading,time
+import argparse,copy,json,math,queue,re,sys,threading,time
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -1220,9 +1220,25 @@ def main():
     except KeyboardInterrupt:pass
     finally:
         stop.set();timer.stop()
-        try:quit_park(link,state.get('hooks'),log,running=state['auto'],aborted=state['aborted'],enabled=bool(raw_cfg.get('park_on_quit',True)) and not args.sim)
+        running_=bool(state['auto'])
+        # (10-25 实车：跑的时候按 q，退出时 terminate called without an active exception / Aborted)以前只给 STM32 发急停，流程线程不知道要停，
+        #   6 秒没等到它就往下收尾，Python 拆还在读摄像头的线程用着的摄像头，C++ 那边就崩了。现在：让流程马上停、等它停下、
+        #   先停摄像头读帧的线程关摄像头，再关雷达；流程线程还卡着就不走 Python 的收尾，直接退出
+        if running_:state['abort']=True
+        try:quit_park(link,state.get('hooks'),log,running=running_,aborted=state['aborted'],enabled=bool(raw_cfg.get('park_on_quit',True)) and not args.sim)
         except Exception as e:print('退出时收臂出错：',repr(e),flush=True)
-        if state['worker'] is not None:state['worker'].join(timeout=6)
+        if state['worker'] is not None:state['worker'].join(timeout=10)
+        if state.get('hooks') is not None:
+            try:state['hooks'].close()
+            except Exception:pass
         close_stream()
+        if state['worker'] is not None and state['worker'].is_alive() and not args.sim and getattr(args,'stm_port','')!='sim':
+            print('  (流程还没停下来：直接退出)',flush=True)
+            try:
+                import atexit;atexit._run_exitfuncs()        # 扫码器读取进程这些照样关掉
+            except Exception:pass
+            try:sys.stdout.flush();sys.stderr.flush()
+            except Exception:pass
+            os._exit(0)
     return 0
 if __name__=='__main__':raise SystemExit(main())

@@ -143,6 +143,8 @@ static float g_ovclr  = 20.0f;     /* OVCLR  边升边转之前先直着升多�
 static float g_ttwait = 800.0f;    /* TTWAIT 转盘转到新位置要等多久(毫秒) */
 static float g_armok  = 0.0f;      /* ARMOK  1 = 姿态都标定好了，允许夹放流程 */
 static float g_scrmode = 1.0f;     /* SCRMODE 串口屏：1 = 程序自己画字(屏工程里只要两个字库，不用放控件)；0 = 写控件 t0.txt=… */
+static float g_scrfg = 0.0f;       /* SCRFG  (10-25 用户"屏幕最好是白底字是黑的")画字模式的字色(RGB565：0 黑，65535 白) */
+static float g_scrbg = 65535.0f;   /* SCRBG  画字模式的底色(清屏、每个字的框都用它)：65535 白，0 黑(以前的黑底白字：set SCRBG 0、set SCRFG 65535) */
 static float g_clwo   = 2090.0f;   /* CLWO   夹爪张开的脉宽(微秒) */
 static float g_clwc   = 2910.0f;   /* CLWC   夹爪夹紧的脉宽(微秒)。太紧了舵机一直使劲会发烫：调到刚好夹稳 */
 static float g_clwor  = 0.0f;      /* CLWOR  (10-20 用户)在原料盘上方张开的脉宽(夹原料之前张开)；0 = 和 CLWO 一样 */
@@ -224,6 +226,8 @@ static const ArmTun tun[] =
     { "OVCLR",  &g_ovclr,   0.0f,    100.0f },
     { "ARMOK",  &g_armok,   0.0f,    1.0f },
     { "SCRMODE", &g_scrmode, 0.0f,   1.0f },
+    { "SCRFG",  &g_scrfg,   0.0f,    65535.0f },
+    { "SCRBG",  &g_scrbg,   0.0f,    65535.0f },
     { "CLWO",   &g_clwo,    500.0f,  2910.0f },  /* 范围 = main.c 里夹爪的限位 CLAW_MIN_US ~ CLAW_MAX_US */
     { "CLWC",   &g_clwc,    500.0f,  2910.0f },
     { "CLWOR",  &g_clwor,   0.0f,    2910.0f },  /* 0 = 用 CLWO；不是 0 就要在夹爪限位 500 ~ 2910 里面 */
@@ -1874,7 +1878,7 @@ static const char *Seq_Park(void)
 /* ================= 串口屏 ================= */
 /* 淘晶驰(TJC)串口屏，指令后面跟三个 0xFF。两种用法(参数 SCRMODE)：
  *  1(默认) 程序自己画字：用 xstr 指令把字画在固定位置。(10-23 用户"字太小、屏原来自带的东西容易点到、抓取放置要中文、排版要整齐")
- *          屏的工程(USART HMI 做)：横屏 480x320、page0 黑底、不放任何控件，只要两个字库：
+ *          屏的工程(USART HMI 做)：横屏 480x320、page0 不放任何控件，只要两个字库(底色、字色按 SCRBG/SCRFG，(10-25)默认白底黑字)：
  *            字库 0 = 大字，字高 120(任务码只用 0~9 和 +；数字、+ 一个 60 像素宽)，赛规任务码字高 >= 12mm
  *            字库 1 = 中字，字高 72，GB2312，要有"抓取放置"四个汉字和 0~9(汉字一个 72 宽、数字 36 宽)
  *  0       写控件：屏的工程里要放好名叫 t0、t7、t2、t3 的文本控件，发 t0.txt="文字"
@@ -1886,17 +1890,17 @@ static const char *Seq_Park(void)
  *   ├──────────────┬─────────────┤
  *   │    抓取6     │   放置12    │  t2 / t3：树莓派回到启停区以后写，程序在数字前面    y=240~319
  *   └──────────────┴─────────────┘     加上"抓取"/"放置"(树莓派发 GRAB 6 / 6 都行，只取数字)
- * 开机、开跑前屏上什么都没有(黑底)；读到任务码画 t0、t7。以前的 t1/t4/t5/t6 小字不再画(表里没有的名字画模式下不发) */
+ * 开机、开跑前屏上什么都没有(白底)；读到任务码画 t0、t7。以前的 t1/t4/t5/t6 小字不再画(表里没有的名字画模式下不发) */
 #define SCR_FONT_BIG   0
 #define SCR_FONT_MID   1
 #define SCR_FONT_SMALL SCR_FONT_MID        /* 以前的选区页(ZONE ASK，旧流程)用的小字：现在只有中字 */
 typedef struct { const char *obj; int16_t x, y, w, h; uint8_t font; uint16_t color; const char *label; } ScrBox;
 static const ScrBox scr_box[] =
 {
-    { "t0",   0,   0, 480, 120, SCR_FONT_BIG, 65535u, 0 },                     /* 白 */
-    { "t7",   0, 120, 480, 120, SCR_FONT_BIG, 65535u, 0 },
-    { "t2",   0, 240, 240,  80, SCR_FONT_MID, 65535u, "\xD7\xA5\xC8\xA1" },   /* GB2312 "抓取" */
-    { "t3", 240, 240, 240,  80, SCR_FONT_MID, 65535u, "\xB7\xC5\xD6\xC3" },   /* GB2312 "放置" */
+    { "t0",   0,   0, 480, 120, SCR_FONT_BIG, 0u, 0 },                         /* 字色、底色按 SCRFG/SCRBG */
+    { "t7",   0, 120, 480, 120, SCR_FONT_BIG, 0u, 0 },
+    { "t2",   0, 240, 240,  80, SCR_FONT_MID, 0u, "\xD7\xA5\xC8\xA1" },       /* GB2312 "抓取" */
+    { "t3", 240, 240, 240,  80, SCR_FONT_MID, 0u, "\xB7\xC5\xD6\xC3" },       /* GB2312 "放置" */
 };
 #define SCR_BOX_N  ((int)(sizeof(scr_box) / sizeof(scr_box[0])))
 
@@ -1943,8 +1947,8 @@ void Screen_Text(const char *obj, const char *text)
                     text = t;
                 }
                 /* xstr x,y,w,h,字库,字色,背景色,水平居中(1中),垂直居中(1中),背景方式(1=纯色，顺便擦掉旧字),"文字" */
-                Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,0,1,1,1,\"%s\"",
-                                          b->x, b->y, b->w, b->h, b->font, b->color, text));
+                Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,%u,1,1,1,\"%s\"",
+                                          b->x, b->y, b->w, b->h, b->font, (unsigned)g_scrfg, (unsigned)g_scrbg, text));
                 return;
             }
         }
@@ -1962,14 +1966,14 @@ static void Screen_Raw(const char *cmd)
     HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
 }
 
-/* 回到比赛布局：画模式清屏(黑底)；写控件模式重新载入 page 0(控件都回来) */
+/* 回到比赛布局：画模式清屏(底色 SCRBG，默认白)；写控件模式重新载入 page 0(控件都回来) */
 static void Screen_Clear(void)
 {
     char buf[16];
 
     if (g_scrmode > 0.5f)
     {
-        Screen_Send(buf, snprintf(buf, sizeof(buf), "cls 0"));
+        Screen_Send(buf, snprintf(buf, sizeof(buf), "cls %u", (unsigned)g_scrbg));
     }
     else
     {

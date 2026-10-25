@@ -102,7 +102,8 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
         log('  · 码垛躲避用的是 10-23 的几何走法(stack_carry_mode=plan，会一会缩一会伸)')
     else:
         a1s, a2s = mc.get('stack_carry_a1'), mc.get('stack_carry_a2')
-        log('  · 码垛躲避(路上有两层的垛时)：绕过电池盒在 ' + ('R1T1' if a1s is None else f'ID1 {float(a1s):g}°') + ' 往里缩到 ' +
+        when = '第二层每一个都这样走' if mc.get('stack_carry_always', True) else '路上有两层的垛时'   # (10-25)默认第二层一律缩着走
+        log(f'  · 码垛躲避({when})：绕过电池盒在 ' + ('R1T1' if a1s is None else f'ID1 {float(a1s):g}°') + ' 往里缩到 ' +
             ('A2R(车上转盘上方的长度)' if a2s is None else f'ID2 {float(a2s):g}°') + '，缩着转到要放的环再伸出去' +
             ('。要调：python3 arm_calib.py --from STKA2' if a1s is None and a2s is None else '(arm_calib 调过)'))
     stops = (raw_cfg or {}).get('stops') or {}

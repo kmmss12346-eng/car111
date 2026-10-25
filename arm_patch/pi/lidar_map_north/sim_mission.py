@@ -3148,8 +3148,24 @@ class RawNearSlotTests(unittest.TestCase):
             self.assertIn('车不动，直接下爪', text)
             self.assertNotIn('车轮挪 横移', text)
 
+    def test_id2_renumbered_still_grabs(self):
+        """(10-25 实车"看原料盘的姿态和示教时不一样……这次不抓"，用户"每一个地方都要做完")示教以后重装齿条、arm_calib 重调了 A2E
+        (同一个伸出长度读数少了 110°)：照样做——按现在的姿态看、车轮按画面对准，夹的角度跟着挪；三个都夹到。
+        raw_pose_follow=False 是以前的：这次不抓。"""
+        def hook(w, h):
+            w.params['A2E'] -= 110.0
+            h.arm.params(refresh=True)
+        w, h, text = self._near_run(1, hook=hook)
+        self.assertIn('照样做', text)
+        self.assertNotIn('这次不抓', text)
+        self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.collisions), (3, 3, 0), text[-3000:])
+        w, h, text = self._near_run(1, hook=hook, cfg=dict(raw_pose_follow=False))
+        self.assertIn('重新 rteach RAW near', text)
+        self.assertEqual(h.stats.grab_ok, 0)
+
     def test_pose_changed_in_near_mode_stops_without_driving(self):
-        """(10-21 夜实车)示教以后 arm_calib 里改了 A1G：最近那格不改用以前的做法(以前会开着车到处找圆心)，这次不抓、车不动，叫重新示教。"""
+        """(10-21 夜实车)示教以后 arm_calib 里改了 A1G：最近那格不改用以前的做法(以前会开着车到处找圆心)，这次不抓、车不动，叫重新示教。
+        (10-25)ID2 改了照样做(见上一个)；ID1 差得多(画面跟着转了)还是不做。"""
         def hook(w, h):
             w.params['A1G'] += 20.0
             h.arm.params(refresh=True)
@@ -4486,6 +4502,20 @@ class StackCarryTests(unittest.TestCase):
         self.assertIsNone(self._in_plan(2, [1]))
         self.assertEqual(self._in_plan(2, [3])['cross'], [3])
 
+    def test_in_plan_always_retracts_before_ring3(self):
+        """(10-25 用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")always：路上没有两层的垛也这样走。
+        去 3 号环(路上什么也不经过)：在 3 号环前面(刚绕过电池盒的 R1T1)缩、缩着转到 3 号环；去 2、1 号环：也在 3 号环前面缩。"""
+        from mission_hooks import stack_in_plan
+        for target, first in ((3, None), (2, 3), (1, 3)):
+            p = stack_in_plan(self.A1D, self.POSES[target], self.POSES, [], -1280.0, after=self.R1T1, hold=-1000.0,
+                              a2_lim=(-1280.0, -270.0), always=True)
+            self.assertEqual(p['cross'], [])
+            self.assertEqual(p['first_ring'], first)
+            self.assertEqual(p['wps'], [(self.R1T1, -1000.0), (self.R1T1, -1280.0), (self.POSES[target][0], -1280.0)], target)
+            self.assertTrue(self.POSES[3][0] < p['a1_in'] < self.A1D)            # 缩的地方在 3 号环和车上转盘中间
+        p = stack_in_plan(self.A1D, self.POSES[3], self.POSES, [], -1280.0, a1_in=80.0, after=self.R1T1, hold=-1000.0, always=True)
+        self.assertEqual((p['a1_in'], p['moved']), (self.R1T1, True))           # STKA1 调在 3 号环后面：改在 R1T1 缩
+
     def test_plan_only_when_a_two_layer_stack_is_on_the_way(self):
         """路上没有两层的环(去 3 号环什么也不经过；1 号环在 2 号环后面)：返回 None，照旧走。去 2 号环只经过 3 号环：缩着转。"""
         self.assertIsNone(self._plan(3, [1, 2]))
@@ -4580,15 +4610,17 @@ class StackCarryTests(unittest.TestCase):
         h = ZoneCalTests('test_full_course_ring2_once_then_car_still')._make(
             w, dict(stack_carry=True, stack_carry_a2=-1100.0), lines=lines)
         od = h._drop
+        st = {'n': 0}
 
         def bad_drop(stack):
-            if h._dodge is not None:
+            if h._dodge is not None and not st['n']:              # (10-25 第二层每个都缩着走)只让一次放不下去
+                st['n'] = 1
                 raise ArmError('LIFT 40.0 失败：ERR TIMEOUT')
             return od(stack)
         h._drop = bad_drop
         run_mission(w, h, log=lines.append)
         text = '\n'.join(lines)
-        self.assertIn('还在躲两层垛的那一段', text)
+        self.assertIn('还在码垛躲避的那一段', text)
         self.assertIn('已放回转盘', text)
         self.assertEqual(w.sweep_hits, 0, text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
@@ -4605,17 +4637,56 @@ class StackCarryTests(unittest.TestCase):
             self.assertEqual(h.stats.place_ok, 12, text[-3000:])
 
     def test_nothing_else_changes(self):
-        """(用户"不要把其他的东西改乱了")粗加工区、暂存区第一批、路上没有两层垛的那两次码垛，发给 STM32 的指令和以前一模一样。"""
+        """(用户"不要把其他的东西改乱了")粗加工区、暂存区第一批发给 STM32 的指令和以前一模一样。
+        (10-25)第二层(码垛)每一个都缩着走：第一次码垛从车上转盘出发就不一样；stack_carry_always=False(以前的)只有最后一次
+        (去环3 要经过两层的环1、环2)不一样。"""
         w0 = self._world(1)
         self._run(w0, False)
-        w1 = self._world(1)
-        self._run(w1, True)
-        r0, r1 = w0.requests, w1.requests
-        i = next(n for n, (a, b) in enumerate(zip(r0, r1)) if a != b)
+        r0 = w0.requests
         takes = [n for n, q in enumerate(r0) if q.split()[0] == 'TAKE']     # 每放一个先 TAKE：粗加工 3、暂存 3、粗加工 3、码垛 3
         self.assertEqual(len(takes), 12, r0[-40:])
-        self.assertGreater(i, takes[11], r0[i - 3:i + 3])                      # 最后一次码垛(去环3 要经过两层的环1、环2)从车上转盘出发才不一样
-        self.assertTrue(r1[i].startswith(('AP', 'APZ')), r1[i - 2:i + 6])
+        for always in (True, False):
+            w1 = self._world(1)
+            self._run(w1, True, stack_carry_always=always)
+            r1 = w1.requests
+            i = next(n for n, (a, b) in enumerate(zip(r0, r1)) if a != b)
+            if always:
+                self.assertTrue(takes[9] < i < takes[10], r0[i - 3:i + 3])      # 第一次码垛
+            else:
+                self.assertGreater(i, takes[11], r0[i - 3:i + 3])
+            self.assertTrue(r1[i].startswith(('AP', 'APZ')), r1[i - 2:i + 6])
+
+    def test_every_second_layer_retracts_before_ring3(self):
+        """(10-25 用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")第二层三个都是：
+        绕过电池盒停在 R1T1(还伸在 R2T) -> 只往里缩 -> 缩着只转到目标环 -> 只伸出去；每一步只动一个舵机，伸缩只换一次方向。"""
+        for seed in range(2):
+            w = self._world(seed, params=dict(R1T2=432.0, R2T=-1000.0, R1T1=436.0, AEXT=2.0))
+            h, text = self._run(w, True)
+            self.assertEqual(w.sweep_hits, 0, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertEqual(text.count('码垛(第二层一律这样走)') + text.count('路上要经过已经叠了两层的'), 3, text[-3000:])
+            takes = [n for n, q in enumerate(w.requests) if q.startswith('TAKE')]
+            for t in takes[-3:]:
+                aps = self._carry_from(w, t)
+                self.assertEqual(aps[0], (436.0, -1000.0), aps)
+                self.assertEqual(aps[1], (436.0, -1100.0), aps)
+                self.assertEqual(aps[2][1], -1100.0, aps)
+                self.assertEqual(self._turns([a[1] for a in aps]), 1, aps)
+                for (p1, q1), (p2, q2) in zip(aps, aps[1:]):
+                    self.assertTrue(abs(p1 - p2) < 1e-6 or abs(q1 - q2) < 1e-6, aps)
+
+    @staticmethod
+    def _carry_from(w, i):
+        """第 i 条指令(TAKE)以后、LIFT 降到 ZSTK 以前发的 AP(ID1, ID2)。"""
+        out = []
+        for q in w.requests[i + 1:]:
+            v = q.split()
+            if v[0] == 'LIFT' and abs(float(v[1]) - w.params['ZSTK']) < 0.05:
+                break
+            if v[0] == 'AP':
+                out.append((float(v[1]), float(v[2])))
+        return out
 
 
 

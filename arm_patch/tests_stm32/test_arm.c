@@ -213,7 +213,7 @@ int main(void) {
     Arm_Init();
     CHECK(has("pwm3;") && has("pwm2;"), "Arm_Init 启动了夹爪/转盘 PWM");
     CHECK(scr_armed && scr_starts == 1, "开机打开 USART2 接收(收屏的触摸)");
-    CHECK(scrs("cls 0|") && !scrs("xstr") && !scrs("START ZONE") && !scrs("READY") && !scrs("sendxy"),
+    CHECK(scrs("cls 65535|") && !scrs("xstr") && !scrs("START ZONE") && !scrs("READY") && !scrs("sendxy"),
           "(10-23 用户\"不需要显示启停区1还是2\")开机只清屏：不再显示选区页、不写 READY");
     clear();
     CHECK(run("ZONE?") == 1 && pis("ZONE 0 0"), "开机还没选区：ZONE 0 0");
@@ -653,7 +653,7 @@ int main(void) {
     clear(); run("ZONE MSG SCAN");
     CHECK(scrs("xstr 240,0,240,48,1,65504,0,1,1,1,\"SCAN\""), "选区页的状态行在右上角");
     clear();
-    CHECK(run("ZONE LOCK") == 1 && scrs("cls 0|") && !scrs("xstr") && zone_is("ZONE 0 0"), "ZONE LOCK：清屏回到比赛布局");
+    CHECK(run("ZONE LOCK") == 1 && scrs("cls 65535|") && !scrs("xstr") && zone_is("ZONE 0 0"), "ZONE LOCK：清屏回到比赛布局");
     clear(); tap(100, 200); tap(400, 300);
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "ZONE LOCK 以后屏上按什么都不算");
     clear(); run("ZONE MSG X");
@@ -719,7 +719,7 @@ int main(void) {
     }
     /* 旧的树莓派程序不发 ZONE LOCK：写 SCR 时自动回到比赛布局 */
     run("ZONE ASK"); clear();
-    CHECK(run("SCR t2 GRAB 0") == 1 && scrs("cls 0|xstr 0,240,240,80,1,65535,0,1,1,1,\"\xD7\xA5\xC8\xA1" "0\""),
+    CHECK(run("SCR t2 GRAB 0") == 1 && scrs("cls 65535|xstr 0,240,240,80,1,0,65535,1,1,1,\"\xD7\xA5\xC8\xA1" "0\""),
           "选区页还在显示时写 SCR：先清屏回到比赛布局，再写字");
     clear(); tap(100, 200);
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "SCR 自动回到比赛布局以后，触摸也关了");
@@ -732,7 +732,7 @@ int main(void) {
     run("QR CLR"); run("ZONE LOCK");
     /* USART2 接收开不起来：开机照样只清屏，终端里照样能选区 */
     scr_rxfail = 1; clear(); Arm_Init(); scr_rxfail = 0;
-    CHECK(scrs("cls 0|") && !scrs("READY") && !scrs("START ZONE") && !scrs("sendxy"), "收不到触摸(USART2 接收开不起来)：开机只清屏((10-23)不写 READY)");
+    CHECK(scrs("cls 65535|") && !scrs("READY") && !scrs("START ZONE") && !scrs("sendxy"), "收不到触摸(USART2 接收开不起来)：开机只清屏((10-23)不写 READY)");
     scr_rxfail = 1;
     CHECK(zone_is("ZONE 0 0") && run("ZONE 2") == 1 && zone_is("ZONE 2 0"), "收不到触摸时终端里 ZONE 2 照样能选");
     scr_rxfail = 0;
@@ -780,14 +780,18 @@ int main(void) {
         for (p = code; *p; p++) { *rxp = (uint8_t)*p; Arm_QR_RxCplt(); now += 1; }
         Arm_Poll();
     }
-    CHECK(strstr(scr, "xstr 0,0,480,120,0,65535,0,1,1,1,\"777+111+\"") && strstr(scr, "xstr 0,120,480,120,0,65535,0,1,1,1,\"222+333\""),
+    CHECK(strstr(scr, "xstr 0,0,480,120,0,0,65535,1,1,1,\"777+111+\"") && strstr(scr, "xstr 0,120,480,120,0,0,65535,1,1,1,\"222+333\""),
           "(10-23)画模式：任务码用大字(字库 0，字高 120)整个宽度居中画两行，组之间的 + 都在(777+111+ 共 8 个大字 480 像素)");
     clear(); run("SCR t2 GRAB 3");
-    CHECK(strstr(scr, "xstr 0,240,240,80,1,65535,0,1,1,1,\"\xD7\xA5\xC8\xA1" "3\""), "(10-23)抓取数：中字(字库 1)画在下面一行左半边，前面加中文\"抓取\"(GB2312)");
+    CHECK(strstr(scr, "xstr 0,240,240,80,1,0,65535,1,1,1,\"\xD7\xA5\xC8\xA1" "3\""), "(10-23)抓取数：中字(字库 1)画在下面一行左半边，前面加中文\"抓取\"(GB2312)");
     clear(); run("SCR t3 PLACE 12");
-    CHECK(strstr(scr, "xstr 240,240,240,80,1,65535,0,1,1,1,\"\xB7\xC5\xD6\xC3" "12\""), "(10-23)放置数：右半边，\"放置\" + 两位数");
+    CHECK(strstr(scr, "xstr 240,240,240,80,1,0,65535,1,1,1,\"\xB7\xC5\xD6\xC3" "12\""), "(10-23)放置数：右半边，\"放置\" + 两位数");
     clear(); run("SCR t3 5");
     CHECK(strstr(scr, "\"\xB7\xC5\xD6\xC3" "5\""), "(10-23)树莓派只发数字也行");
+    Arm_Param_Set("SCRBG", 0); Arm_Param_Set("SCRFG", 65535); clear(); run("SCR t3 5");
+    CHECK(strstr(scr, "xstr 240,240,240,80,1,65535,0,1,1,1,") != NULL,
+          "(10-25 用户\"屏幕最好是白底字是黑的\")默认白底黑字；set SCRBG 0、set SCRFG 65535 回到以前的黑底白字");
+    Arm_Param_Set("SCRBG", 65535); Arm_Param_Set("SCRFG", 0);
     clear(); run("SCR t1 RAW 1/3"); run("SCR t5 B1 R1 G2 B3");
     CHECK(scr[0] == 0, "(10-23)以前的阶段、批次小字不再画(屏上只有赛规要的字)");
     clear(); run("SCR t9 X");

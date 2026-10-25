@@ -53,7 +53,7 @@ class SelfCheckTests(unittest.TestCase):
             self.assertIn('原料区最近那格示教过', text)
             self.assertIn('ROUGH 的 1、3 号环调过手臂角度', text)
             self.assertTrue(any('雷达设备' in b for b in bad), bad)                   # 雷达设备文件不在
-            self.assertIn('码垛躲避(路上有两层的垛时)：绕过电池盒在 R1T1 往里缩到 A2R', text)
+            self.assertIn('码垛躲避(第二层每一个都这样走)：绕过电池盒在 R1T1 往里缩到 A2R', text)
             self.assertIn('自检完', text)
             cfg = self._cfg()
             cfg['mission_cfg'].update(stack_carry_a1=150.5, stack_carry_a2=-1230)

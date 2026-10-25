@@ -878,3 +878,20 @@ git_log.txt                ← 分支最近 120 条提交记录
   同时 map_merge_live 画图前过滤 `Glyph … missing from` 警告(地图标题"停车点改了：route 重新规划"的中文，DejaVu Sans 没有中文，每个字刷一行)，
   有中文字体(CJK/WenQuanYi/Droid Sans Fallback…)就让 matplotlib 用它。测试 test_nav_live test_stop_command_saves_what_was_typed、
   test_route_goal_obstacle test_check_stop_says_whether_the_race_moves_it。部署包 tasks_1025c。
+- **10-25 一起改的(用户确认"对你改吧")：**
+  ① 码垛第二层一律缩→转→伸(用户"不管是先放哪个环……在经过环3之前就缩回到指定位置然后到指定的环的位置然后再伸长出来")：
+  mission_hooks DEFAULTS `stack_carry_always=True`；_stack_carry 'in' 不再要求路上有两层的垛；stack_in_plan(always=True) 往里缩的地方
+  在路上第一个环(on_way 离车上转盘最近的，一般 3 号环；去的就是它就是目标环)前面，返回多了 first_ring。放完空爪回转盘、第一层、粗加工区不变；
+  'plan' 模式照旧只有两层的垛才躲。日志"码垛(第二层一律这样走)"；放回转盘那句改成"还在码垛躲避的那一段"。
+  ② 原料区"看原料盘的姿态和示教时不一样……这次不抓"(实车：重装齿条后 arm_calib 把 A2E 从 -1299.5 改成 -1190，最近那格示教作废，整批不抓)：
+  `raw_pose_follow=True`：最近那格、ID1 差不超过 `raw_pose_a1_tol_deg`(3°)就照样做——D.home 换成现在的姿态、每个停靠位的抓取角度
+  跟着挪同样多、comp 清零(摄像头装在爪子上，车轮按画面把原料盘中心对到示教的位置，爪子就在最近那格上方，伸缩差的长度车轮补)。
+  ID1 差得多(画面转了)照旧不做。sim RawNearSlotTests.test_id2_renumbered_still_grabs。
+  ③ 识别时间放长(用户"把摄像头的识别时间改长啊每一个地方都要做完")：raw_near_find_s 30→60、zone_find_s 40→60、zone_look_s 10→15
+  (10-22 车上配置 mission_cfg 没写这几项，用程序默认；raw_track_s 车上配置是 150)。
+  ④ 跑的时候 q 退出崩溃(terminate called without an active exception / Aborted)：以前只给 STM32 发急停，流程线程不知道要停(Ctx.aborted 看
+  state['abort'])，6 秒没等到就收尾，Python 拆还在被读帧线程用着的摄像头。map_merge_live finally：跑着就 state['abort']=True、join 10 秒、
+  hooks.close()(停读帧线程、关摄像头)、close_stream()；流程线程还活着(非 sim)就 atexit._run_exitfuncs() 后 os._exit(0)。
+  ⑤ 屏幕白底黑字(用户"屏幕最好是白底字是黑的现在字也太小了顺序也排的不对")：arm.c 加参数 SCRFG(默认 0 黑)/SCRBG(默认 65535 白)，
+  画字模式 cls 和 xstr 都按它们(要烧固件；以前的黑底白字 set SCRBG 0、set SCRFG 65535)。字小：字大小是屏工程里字库定的
+  (字库 0 字高 120、字库 1 字高 72，见 10-23 那条)，程序改不了；顺序不对：还不知道用户要什么顺序，等用户发屏的照片。test_arm 354 项。
