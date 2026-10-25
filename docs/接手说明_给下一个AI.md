@@ -864,3 +864,9 @@ git_log.txt                ← 分支最近 120 条提交记录
   测试桩：假升降按转速随时间走(mv_goal/mv_v，Stop_Now 停在原地，相对运动接着上一次的目标)；test_arm 353 项；TakeLikeRaceTests。部署包 tasks_1025a(要烧固件)。
   **让用户做：** 烧固件；`get` 看 LFCHK 不是 0、LFRPM(10-22 车上配置是 150、LFACC 0)；arm_calib --from ZPLC 用 take 重新量 ZPLC、ZSTK。
   碰地高度越来越高(5.8→25)的机械原因还是没查清(LFRPM 150 + LFACC 0 硬起硬停可能让带轮/皮带一点点滑)：新固件碰到就停，顶的力和时间都小很多。
+- **10-25 主程序里挪十字(用户"可不可以直接在主程序改")：** run_live 加 `g`(mission_cli._cross_shift，map_merge_live 转给 handle_cli)：
+  `g 13 1` = 红十字(claw_px.RING)往右 13、往下 1 像素，`g RAW 13 1` = 绿十字，`g` = 看两个十字在哪；存进 vision_cal.json，
+  同时改 h.vision.cfg(不用重开)。用户那次：车停的时候爪子本来对着 2 号环，日志 2 号环 (289,229)、红十字 (276,228)，车往后挪了 11mm，
+  物料偏车尾 → `g 13 1`。这辆车画面左边是车头方向(环1 在左要前进)，物料偏车尾 = 红十字往右挪，每毫米约 1.24 像素(ZOBRNG 高度)。
+  码垛第二层"不管先放哪个环，都在经过 3 号环之前缩到 STKA2、缩着转到目标环再伸出去"(现在只有路上有两层垛才这样)：已向用户复述，等用户确认
+  ①放完空爪回转盘要不要也先缩 ②第一层/粗加工区不变，再改 mission_hooks._stack_carry(tall 为空也走 stack_in_plan，first 用 3 号环)。

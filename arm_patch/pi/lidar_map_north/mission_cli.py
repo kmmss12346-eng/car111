@@ -15,6 +15,8 @@ vclaw RAW <颜色号>         实测"爪子夹物料时，物料在画面里的�
                              程序会降下去夹一下(物料会被夹正)、松开、升回观察高度，测出物料圆心
 vclaw RING [外径mm]        实测"放下的物料落在画面哪里"(claw_px.RING)：圆环纸摆好、物料拿走以后用(步骤见 README)；
                              后面写上用尺子量的黑环外径(毫米)，例如 vclaw RING 100，用来把像素换成毫米
+g 13 1                     (10-25)挪圆环的红十字(粗加工区、暂存区的爪子点)：往右 13、往下 1 像素(往左、往上用负数)，马上存进 vision_cal.json，
+                             不用退出主程序。g RAW 13 1 = 挪原料的绿十字；只输入 g = 看两个十字现在在哪。和 arm_calib 里的 g 存的是同一个地方
 vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小动作，测出"动作量 ↔ 画面移动量"，存进 servo_cal.json
 vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
                              只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
@@ -410,6 +412,9 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
         for b in (1, 2):
             log(f'  第{b}批放在转盘：' + '  '.join(f'{it.slot}号槽={it.color_name}({_rings_text(h.plan, it)})' for it in h.plan.items(b)))
         return None
+
+    if k == 'g':
+        return _cross_shift(h, parts, state, log)
 
     if k == 'vmask':
         def go():
@@ -1120,6 +1125,51 @@ def _forget_pick(h, log, what):
         h.store.save()
     log(f'  {what}物料顶面的爪子点 claw_px.PICK' + ('' if (gone or had) else '(本来就没有)') +
         '：下次 mtest ROUGH(或比赛里)第一个物料放下以后自动重新量')
+
+
+def _cross_shift(h, parts, state, log):
+    """(10-25 用户"可不可以直接在主程序改")和 arm_calib 的 g 一样挪十字(爪子点 claw_px)，不用退出主程序：
+    g 13 1 / g RING 13 1 = 圆环的红十字(粗加工区、暂存区)往右 13、往下 1 像素；g RAW 13 1 = 原料的绿十字。往右、往下为正。
+    马上存进 vision_cal.json，这个程序里也马上按新的对准(不用重开)。只输入 g = 看两个十字现在在哪。"""
+    args = list(parts[1:])
+    kind = 'RING'
+    if args and args[0].upper() in ('RING', 'RAW'):
+        kind = args.pop(0).upper()
+    h._ensure_vision()
+    vis = h.vision
+    if not args:
+        r, g = vis.claw('RING'), vis.claw('RAW')
+        log(f'红十字(圆环，粗加工区、暂存区) ({r[0]:.0f}, {r[1]:.0f})   绿十字(原料) ({g[0]:.0f}, {g[1]:.0f})。'
+            '挪红十字：g 13 1(往右 13、往下 1 像素，往左、往上用负数)；挪绿十字：g RAW 13 1')
+        return None
+    if len(args) != 2:
+        raise ValueError('格式：g 13 1(红十字往右 13、往下 1 像素) / g RAW 13 1(绿十字) / g(看两个十字在哪)')
+    try:
+        du, dv = float(args[0]), float(args[1])
+    except ValueError:
+        raise ValueError(f'看不懂 {" ".join(args)}：g 后面是两个数，例如 g 13 1、g -5 0') from None
+    if abs(du) > 200 or abs(dv) > 200:
+        raise ValueError('一次最多挪 200 像素(多半是输错了)')
+    if state.get('auto'):
+        raise ValueError('一键流程正在跑：停下来(abort)再挪十字')
+    old = vis.claw(kind)
+    new = (old[0] + du, old[1] + dv)
+    cam = vis.cfg.get('camera') or {}
+    w, hh = float(cam.get('width', 640) or 640), float(cam.get('height', 480) or 480)
+    if not (0.0 <= new[0] <= w and 0.0 <= new[1] <= hh):
+        raise ValueError(f'挪到 ({new[0]:.0f}, {new[1]:.0f}) 就出画面了(画面 {w:.0f}×{hh:.0f})，没改')
+    from vision import save_vision_cal
+    path = save_vision_cal(kind, new, h.cfg.get('vision_cal_file') or None)
+    vis.cfg.setdefault('claw_px', {})[kind] = [new[0], new[1]]
+    name = '红十字(圆环，粗加工区、暂存区)' if kind == 'RING' else '绿十字(原料)'
+    mm = ''
+    try:
+        mm = f'，约 {math.hypot(du, dv) / vis.scale(kind):.1f}mm'
+    except Exception:
+        pass
+    log(f'{name}：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f})，挪了 {du:+g}, {dv:+g} 像素{mm}。'
+        f'已存进 {path}，下次对准就按它(不用重开主程序)')
+    return None
 
 
 def _vclaw(h, link, kind, color, log):

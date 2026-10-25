@@ -381,6 +381,39 @@ class CliTests(unittest.TestCase):
             self.assertGreater(saved['ring_rmax_px'], 10)
             self.assertIn('ZOBRNG', saved)
 
+    def test_g_moves_the_cross_in_the_main_program(self):
+        """(10-25 用户"可不可以直接在主程序改")g 13 1 = 红十字(圆环)往右 13、往下 1 像素，马上存、这个程序里马上按它对准；
+        g RAW = 绿十字；只输入 g = 看两个十字在哪；输错不改。"""
+        with tempfile.TemporaryDirectory() as td:
+            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
+            self.h._ensure_vision()
+            r0, g0 = self.h.vision.claw('RING'), self.h.vision.claw('RAW')
+            self.lines.clear()
+            self.run_cli('g', 'g 13 1')
+            r1 = self.h.vision.claw('RING')
+            self.assertAlmostEqual(r1[0], r0[0] + 13, places=3)
+            self.assertAlmostEqual(r1[1], r0[1] + 1, places=3)
+            self.assertEqual(self.h.vision.claw('RAW'), g0)                       # 绿十字不动
+            saved = load(self.h.cfg['vision_cal_file'])['claw_px']
+            self.assertAlmostEqual(saved['RING'][0], r0[0] + 13, places=2)
+            self.assertNotIn('RAW', saved)
+            self.assertIn('红十字', '\n'.join(self.lines))
+            self.run_cli('g', 'g RAW -5 3')
+            self.assertAlmostEqual(self.h.vision.claw('RAW')[0], g0[0] - 5, places=3)
+            self.assertAlmostEqual(self.h.vision.claw('RING')[0], r0[0] + 13, places=3)
+            self.lines.clear()
+            self.run_cli('g', 'g')
+            self.assertIn('绿十字', '\n'.join(self.lines))
+            for bad in ('g 13', 'g a b', 'g 999 0', 'g 1 2 3'):
+                with self.assertRaises(ValueError):
+                    mission_cli.handle_cli('g', bad.split(), link=self.w.link, raw_cfg={}, state={}, log=self.log)
+            self.h.vision.cfg['claw_px']['RING'] = [10.0, 240.0]
+            with self.assertRaises(ValueError):                                  # 挪出画面：不改
+                mission_cli.handle_cli('g', ['g', '-20', '0'], link=self.w.link, raw_cfg={}, state={}, log=self.log)
+            self.assertEqual(self.h.vision.claw('RING'), (10.0, 240.0))
+            with self.assertRaises(ValueError):                                  # 一键流程在跑：不改
+                mission_cli.handle_cli('g', ['g', '5', '0'], link=self.w.link, raw_cfg={}, state={'auto': True}, log=self.log)
+
     def test_vclaw_bad_args_and_needs_zero(self):
         for bad in ('vclaw', 'vclaw RAW', 'vclaw RAW 9', 'vclaw XYZ'):
             with self.assertRaises(ValueError):
