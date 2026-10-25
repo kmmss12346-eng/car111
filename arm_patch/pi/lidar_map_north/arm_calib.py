@@ -20,6 +20,8 @@
     t             (车上转盘去圆环那几步 R1T2/R2T/R1T1/R2SPD)按 STM32 里已经保存的值真走一遍：去车上转盘 -> 去 2 号环 -> 回车上转盘
                   (码垛躲避那两步 STKA2/STKA1)按现在调的值走一遍码垛的路：去车上转盘 -> 绕电池盒到 STKA1 -> 往里缩到 STKA2
                   -> 缩着转到最远的环 -> 伸出去 -> 原路缩回来 -> 回车上转盘
+    take          (放地上 ZPLC、码垛 ZSTK 那两步)和比赛时一样从车上转盘 1 号格夹一个物料(格子里先放好)，回到 2 号环上方：
+                  物料在爪子里的位置和比赛时一模一样，量出来的高度才准(用手塞进爪子夹的偏高，量出的 ZPLC 偏低，比赛时就往地上顶)
     v             打开/关掉摄像头画面(vlive.py 的窗口：看物料、圆环认得怎么样)。原料盘上方姿态、ZGRAB、ZOBRAW、
                   圆环上方姿态、ZPLC、ZOBRNG 这几步会自动打开(要在树莓派桌面的终端里运行向导)
     g -16 -18     (看原料盘的那几步：A1G、ZGRAB、CLWOR、ZOBRAW)原料画面里的绿十字往左 16、往上 18 像素(往右、往下为正)，
@@ -206,11 +208,17 @@ STEPS = [
          text='直接输入数字(例如 400)，或者 +100 / -100：伸缩会按这个速度缩到 2 号环的长度再伸回来给你看。越大越快，\n'
               '0 = 和 A2SPD 一样(A2SPD 也是 0 就按伸缩舵机的速度 EXTSPD)。满意了回车保存，手臂缩到 2 号环的长度、转到 2 号环上方。\n'
               '物料还夹着，下一步用得上。输入 t 按保存的值真走一遍。'),
+    # (10-25 用户"降到最低设置 z=5 留出这么多冗余，还是会往下面压触发过载保护")以前这一步让人用手把物料塞进爪子夹住再量：
+    #   比赛时物料是从车上转盘格子里按 ZDROP 夹出来的，在爪子里的位置不一样(ZDROP 那一步让物料底离格子 2~5mm，
+    #   从格子里夹的就比那时往下多出这么多；手塞得深还要多)，量出来的 ZPLC 偏低几毫米，比赛时每次都往地上顶。改成 take 和比赛时一样夹
     dict(key='ZPLC', kind='lift', title='往地上放物料的高度 ZPLC', setup='ring_down',
-         text='先输入 c 夹住一个物料，用 -10 / -5 / -1 慢慢往下降，降到物料底部刚好碰到地面(圆环里)。'),
+         text='物料要和比赛时一样从车上转盘里夹：爪子里有物料先拿出来(o 张开)，在车上转盘 1 号格放一个物料，输入 take：\n'
+              '手臂按比赛时的路去车上转盘、降到 ZDROP 夹起来、回到 2 号环上方(物料在爪子里的位置和比赛时一模一样)。\n'
+              '再用 -10 / -5 / -1 慢慢往下降，降到物料底部刚好碰到地面(圆环里)，回车。\n'
+              '(用手塞进爪子夹的不准：量出来偏低几毫米，比赛时就会往地上顶、触发升降的堵转保护)'),
     dict(key='ZSTK', kind='lift', title='码垛高度 ZSTK', setup='ring_down',
          text='在已经放好的物料上面再放一个时的高度，一般 = ZPLC + 物料高度(60mm)。\n'
-              '可以在圆环里放一个物料，夹着第二个物料往下降到刚好叠上去。'),
+              '可以在圆环里放一个物料，车上转盘 1 号格再放一个，输入 take 和比赛时一样夹出来，往下降到刚好叠上去。'),
     # (10-24 用户"第二层码放躲避的时候……往里面缩去躲避然后到位置了再伸过去不要一会缩一会伸")码垛时夹着物料去圆环，路上要经过
     #   已经叠了两层的环：绕过电池盒在 STKA1 停下、往里缩到 STKA2，缩着转到要放的环，再只伸出去。路上没有两层的垛照旧走。
     #   这两个值树莓派自己用：存进配置的 mission_cfg(store 是名字)，不发给 STM32
@@ -772,6 +780,35 @@ class Wizard:
         except CalError as e:
             self.out(f'  !! 回 2 号环上方失败：{e}')
 
+    def _take_like_race(self):
+        """(10-25)take：量 ZPLC/ZSTK 用的物料和比赛时一样从车上转盘 1 号格夹出来(比赛时 TAKE 就是这样夹的)：
+        去车上转盘上方(TRAY，绕电池盒) -> 转盘转到 1 号格、张开(CLWOT) -> 降到 ZDROP -> 夹紧(CLWC) -> 升到 ZHI -> 回 2 号环上方(APZ)。
+        TRAY/APZ 是 STM32 按比赛时的路走，要 ARMOK=1；没打开就不动，说怎么办。"""
+        P = self.P
+        if float(P.get('ARMOK', 0.0) or 0.0) < 0.5:
+            self.out('  ★ take 要按比赛时的路去车上转盘、再回圆环(STM32 的 TRAY/APZ)，要先打开 ARMOK：q 退出，'
+                     'run_live 里 set ARMOK 1，再 python3 arm_calib.py --from ZPLC')
+            return
+        self.out('  和比赛时一样从车上转盘 1 号格夹物料(格子里要先放好一个)：去车上转盘 -> 降到 ZDROP 夹紧 -> 升起 -> 回 2 号环上方')
+        self.lift_to(P['ZHI'])
+        if not self._to_tray():
+            self.out('  ★ STM32 走不了去车上转盘的路(要新的 arm.c、ARMOK=1)：没夹')
+            return
+        self.tt_to(P['TT1'])
+        self.claw_to(self.claw_val('CLWOT'))
+        self.sleep(max(0.3, float(P.get('TTWAIT', 800.0) or 0.0) / 1000.0))   # 转盘转到位
+        self.lift_to(P['ZDROP'])
+        self.claw_to(P['CLWC'])
+        self.sleep(max(0.2, float(P.get('CLWAIT', 400.0) or 0.0) / 1000.0))
+        self.lift_to(P['ZHI'])
+        self.do(f'APZ {P["A1P"]:g} {P["A2P"]:g} {P["ZHI"]:g}')
+        self.z_cmd = None
+        self.z = self.lift_now()
+        if self.z is None:
+            self.z = float(P['ZHI'])
+        self._read_servos()
+        self.out('  夹好了(物料在爪子里的位置和比赛时一样)，手臂在 2 号环上方。用 -10 / -5 / -1 往下降，降到物料底部刚好碰到，回车')
+
     # ------------------------------------------------------------ (10-24)码垛躲避 STKA1/STKA2(树莓派用，存在 mission_cfg)
     def _load_store(self):
         """从配置的 mission_cfg 读码垛躲避那两个值放进 self.P；没调过放比赛时的默认(和 mission_hooks 一样)，记在 store_unset。"""
@@ -1063,6 +1100,9 @@ class Wizard:
             return None
         if line == 't' and st['key'] in ('STKA1', 'STKA2'):
             self._try_stack_path(st)
+            return None
+        if line == 'take' and st['key'] in ('ZPLC', 'ZSTK'):
+            self._take_like_race()
             return None
         if line == 'v':
             if self._viewer is not None and self._viewer.poll() is None:

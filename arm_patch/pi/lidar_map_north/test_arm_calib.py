@@ -831,5 +831,50 @@ class StackDodgeTests(unittest.TestCase):
         self.assertFalse([c for c in stm.sent if c.startswith('APZ')])
 
 
+class TakeLikeRaceTests(unittest.TestCase):
+    """(10-25 用户"降到最低的时候设置 z=5 留出这么多冗余，还是会往下面压触发过载保护")量 ZPLC / ZSTK 用的物料要和比赛时一样
+    从车上转盘夹(以前让人用手塞进爪子，夹的位置不一样，量出的 ZPLC 偏低)：take = 去车上转盘(TRAY) -> 转盘 1 号格、张开 CLWOT ->
+    降到 ZDROP -> 夹紧 -> 升到 ZHI -> 回 2 号环上方(APZ)，再往下降量。ARMOK=0 时 STM32 走不了比赛的路：不动，说怎么办。"""
+
+    def _run(self, items, armok=1.0, key='ZPLC'):
+        stm = FakeStm32()
+        stm.P.update(ARMOK=armok, ZDROP=65.0, ZHI=100.0, A1P=300.0, A2P=-760.0, CLWOT=1940.0)
+        cfg = make_cfg()
+        lines = []
+        Wizard(stm, cfg, inp=Script(stm, items), out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index(key))
+        return stm, cfg, lines
+
+    def test_take_grips_from_the_tray_like_the_race(self):
+        stm, cfg, lines = self._run(['take', '-90', '-3', '', 'q'])
+        s = stm.sent
+        i_tray, i_drop, i_close = s.index('TRAY'), s.index('LIFT 65'), s.index('CLAW 2910')
+        i_apz = s.index('APZ 300 -760 100')
+        self.assertTrue(i_tray < i_drop < i_close < i_apz, s)
+        self.assertIn('TT 2608', s[i_tray:i_drop])                      # 转盘 1 号格转到爪子下面
+        self.assertIn('CLAW 1940', s[i_tray:i_drop])                    # 车上转盘上方张开(CLWOT)
+        self.assertEqual(s[i_close + 1:i_apz], ['LIFT 100'])            # 夹紧以后先升到 ZHI 再回圆环
+        self.assertAlmostEqual(stm.P['ZPLC'], 7.0, places=3)            # 从 ZHI 100 往下 90、再 3
+        self.assertAlmostEqual(load(cfg)['stm32_params']['ZPLC'], 7.0, places=3)
+        text = '\n'.join(lines)
+        self.assertIn('输入 take', text)
+        self.assertIn('物料在爪子里的位置和比赛时一样', text)
+
+    def test_take_on_the_stack_step_too(self):
+        stm, cfg, lines = self._run(['take', '-35', 'q', 'q'], key='ZSTK')
+        i_apz = stm.sent.index('APZ 300 -760 100')
+        self.assertIn('TRAY', stm.sent[:i_apz])
+        self.assertIn('LIFT 65', stm.sent[i_apz:])                      # 夹好回到 2 号环上方以后从 ZHI 往下降
+
+    def test_take_needs_armok(self):
+        stm, cfg, lines = self._run(['take', 'q'], armok=0.0)
+        self.assertNotIn('TRAY', stm.sent)
+        self.assertFalse([c for c in stm.sent if c.startswith(('APZ', 'CLAW'))])
+        self.assertTrue(any('set ARMOK 1' in l for l in lines), lines)
+
+    def test_take_only_on_height_steps(self):
+        stm, cfg, lines = self._run(['take', 'q'], key='ZGRAB')
+        self.assertNotIn('TRAY', stm.sent)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

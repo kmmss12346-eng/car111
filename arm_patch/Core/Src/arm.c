@@ -85,7 +85,8 @@ static float g_lmrg   = 200.0f;    /* LFMRG  升降走完后多等多少毫秒(�
 static float g_lhmd   = 2.0f;      /* LFHMD  LIFT HOME 用的 Emm 回零模式(0~3，见张大头手册) */
 static float g_lhtm   = 8000.0f;   /* LFHTM  LIFT HOME 最多等多少毫秒 */
 static float g_lchk   = 1.5f;      /* LFCHK  (10-21 用户：下到最低了升降还往下动)每次走完用编码器核对实际高度，差这么多毫米以上(丢步：要去的高度
-                                    *        机构到不了、顶到东西)就按编码器改过来并报 LIFTSLIP；0 = 不核对(以前的做法) */
+                                    *        机构到不了、顶到东西)就按编码器改过来并报 LIFTSLIP；0 = 走完不核对(以前的做法)。
+                                    *        (10-25)走的时候顶住了(碰到地面/槽底/最高点)不管 LFCHK 是多少都马上叫停、按编码器记高度 */
 
 static float g_zhi    = 100.0f;    /* ZHI    搬运途中的高度(抬高，越大越高) */
 static float g_zgrab  = 20.0f;     /* ZGRAB  在原料盘上夹物料时的高度 */
@@ -372,6 +373,7 @@ static uint8_t     lift_guess    = 0;         /* (10-21)开机没读到编码器
 static void Pos_Save(float z);
 static int  Lift_EncPos(float near_mm, float *z, uint16_t *raw);
 static int Lift_Check(float mm);
+static int Lift_Wait_Watch(float from, float to, uint32_t ms);
 
 static uint32_t Lift_Time_Ms(uint32_t pulses)
 {
@@ -542,7 +544,7 @@ static const char *Lift_Goto(float mm)
     Lift_Span(lift_mm);
     Lift_Span(mm);
 
-    if (!Wait_Ms(Lift_Time_Ms(pulses)))
+    if (!Lift_Wait_Watch(lift_mm, mm, Lift_Time_Ms(pulses)))
     {
         float z;
         uint16_t e;
@@ -594,6 +596,8 @@ static float   lift_cpr    = 65536.0f;    /* 编码器一圈的读数(标定时�
 static uint8_t lift_cal_ok = 0;
 static uint8_t lift_src    = 0x31;        /* 读哪个值：0x31 编码器值；有的驱动器 0x31 总回 0，就用 0x36 实时位置(取一圈里的部分) */
 static uint8_t lift_nochk  = 0;           /* (10-21)LIFT CAL 上下走那两步不核对：旧的标定可能不准，按它改高度会把这次标定带歪 */
+static uint8_t lift_stall  = 0;           /* (10-25)Lift_Wait_Watch 刚才顶住停下了：Lift_Check 按 lift_stall_z 核对(LFCHK=0 也核对) */
+static float   lift_stall_z = 0.0f;       /*        停下的地方(一路盯着编码器数过来的) */
 
 static float   pos_last    = 0.0f;        /* 最后一次记进 Flash 的高度(一样就不重复写) */
 static uint8_t pos_last_ok = 0;
@@ -679,17 +683,20 @@ static int Lift_Check(float mm)
     float z, z2, d;
     uint16_t e;
     int k;
-    int bad;
+    int bad, far;
+    uint8_t stall = lift_stall, moving;
     char m[80];
     char s1[20];
     char s2[20];
 
-    if (g_lchk <= 0.0f || !lift_cal_ok || lift_nochk)  { Lift_Span_Reset(); return 0; }
-    if (!Lift_EncPos(mm, &z, &e))  { Lift_Span_Reset(); return 0; }
+    lift_stall = 0;
+    /* (10-25)走的时候顶住停下了(Lift_Wait_Watch)：LFCHK=0 也核对，按一路盯着数过来的高度找(差 20mm 以上也不会认错圈) */
+    if ((g_lchk <= 0.0f && !stall) || !lift_cal_ok || lift_nochk)  { Lift_Span_Reset(); return 0; }
+    if (!Lift_EncPos(stall ? lift_stall_z : mm, &z, &e))  { Lift_Span_Reset(); return 0; }
     for (k = 0; k < 12 && Absf(z - mm) >= 0.3f; k++)
     {
         Delay_Report(80);                          /* 还在走就等它停下(和 Wait_Ms 一样照常回报车头角度) */
-        if (car_abort || !Lift_EncPos(mm, &z2, &e))  { Lift_Span_Reset(); return 0; }
+        if (car_abort || !Lift_EncPos(z, &z2, &e))  { Lift_Span_Reset(); return 0; }
         if (Absf(z2 - z) < 0.15f)
         {
             z = z2;
@@ -697,6 +704,7 @@ static int Lift_Check(float mm)
         }
         z = z2;
     }
+    moving = (k >= 12 && Absf(z - mm) >= 0.3f);   /* 等了 1 秒左右还在走 */
     if (lift_guess && Absf(z - mm) <= 20.0f)
     {
         /* (10-21)开机没读到编码器、高度是猜的：第一次读到就按编码器认准 */
@@ -731,19 +739,101 @@ static int Lift_Check(float mm)
         Lift_Span_Reset();
         return 0;
     }
-    /* 编码器一圈 40mm：实际差 20mm 以上会认成差另一圈的某个数。只有落在这次走过的高度范围里(多 2mm)、差不到 15mm 才信 */
-    bad = (d > 15.0f || z < lift_span_lo - 2.0f || z > lift_span_hi + 2.0f);
-    snprintf(m, sizeof(m), "LIFTSLIP want=%s got=%s%s\r\n", s1, s2, bad ? " (too far, kept)" : "");
+    /* 编码器一圈 40mm：实际差 20mm 以上会认成差另一圈的某个数。只有落在这次走过的高度范围里(多 2mm)、差不到 15mm 才信。
+     * (10-25)顶住停下的(stall)高度是一路盯着数过来的，一定可信；差 15mm 以上(blocked)记下真高度，但这一步不往下做 */
+    bad = !stall && (d > 15.0f || z < lift_span_lo - 2.0f || z > lift_span_hi + 2.0f);
+    far = stall && d > 15.0f;
+    snprintf(m, sizeof(m), "LIFTSLIP want=%s got=%s%s\r\n", s1, s2, bad ? " (too far, kept)" : (far ? " (blocked)" : ""));
     Say(m);
     if (bad)
     {
+        if (!moving)
+        {
+            /* (10-25 用户"z=5 还是往下压触发过载保护")以前这里不叫停：差太多(比如碰地的地方比要去的高 15mm 以上)驱动器就一直顶着，
+             * 顶 1~2 秒触发堵转保护(松轴、不再响应)。不动了就叫它停住；还在走(加减速比估的慢)的不停，别停在半路 */
+            Emm_V5_Stop_Now(LIFT_ADDR, false);
+            HAL_Delay(5);
+        }
         return 1;                                  /* 不可信：调用的地方报 ERR LIFT，不夹/不松爪子 */
     }
     Emm_V5_Stop_Now(LIFT_ADDR, false);             /* 闭环驱动器顶着到不了的位置会一直使劲：叫它停住，它要去的位置也就成了现在的位置 */
     HAL_Delay(5);
     lift_mm = z;
     Lift_Span_Reset();
-    return 0;
+    return far ? 1 : 0;
+}
+
+/* (10-25 用户"降到最低的时候设置 z=5 留出这么多冗余，还是会往下面压触发过载保护")Lift_Goto 等升降走完时一直读编码器盯着
+ * (以前只按时间等，等完才核对一次)：
+ *   到了(差不到 0.3mm)：马上往下做，不再白等 LFMRG；
+ *   离要去的还差 1mm 以上，电机却连着两次(约 80ms)几乎没动(物料/爪子碰到地面、转盘槽底，或者顶到最高点)：马上叫驱动器停住。
+ *     以前要一直顶到等完(算好的时间 + LFMRG)再核对，碰得越早顶得越久；核对时差 15mm 以上还不叫停，一直顶到驱动器堵转保护；
+ *   到点了还在走(LFACC 加减速比估的慢)：接着等它走完(最多再等一倍时间)，不在半路就去核对。
+ * 出发时先读一次：编码器和程序记的高度对不上(差 5mm 以上，或者开机时高度是猜的)就不盯，只按时间等(和以前一样，交给 Lift_Check)。
+ * 之后每 40ms 读一次，在上一次读到的高度附近找(一次最多走几毫米，不会认错圈)。标定过编码器就盯(LFCHK=0 也盯：顶住了照样叫停)。
+ * 返回 0 = 被急停打断；1 = 到了 / 等完了；2 = 顶住停下了(lift_stall = 1，停在 lift_stall_z，Lift_Check 按它核对) */
+static int Lift_Wait_Watch(float from, float to, uint32_t ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    uint32_t el, per = 40u;
+    float mmps = g_lrpm / 60.0f * g_lspr / ((g_lppm > 1.0f) ? g_lppm : 1.0f);   /* 每秒走多少毫米 */
+    float still_mm, jump, z, z2;
+    uint8_t still = 0;
+    uint16_t e;
+
+    lift_stall = 0;
+    if (!lift_cal_ok || lift_nochk || lift_guess)  return Wait_Ms(ms);
+    HAL_Delay(5);                                  /* 刚发了走的指令：两条 Emm 指令之间要留空隙，连着发驱动器会当成一帧坏数据丢掉 */
+    if (!Lift_EncPos(from, &z, &e) || Absf(z - from) > 5.0f)
+    {
+        el = HAL_GetTick() - t0;
+        return Wait_Ms(ms > el ? ms - el : 0u);
+    }
+    if (mmps * 0.04f > 8.0f)  per = (uint32_t)(8000.0f / mmps);       /* 走得很快：读得勤一点，两次之间不超过 8mm */
+    if (per < 10u)  per = 10u;
+    still_mm = 0.3f * mmps * (float)per / 1000.0f;                    /* 一次间隔里走得不到正常的三成 = 没动 */
+    if (still_mm > 0.2f)  still_mm = 0.2f;
+    jump = 2.0f * mmps * (float)per / 1000.0f + 3.0f;                 /* 一次间隔里不可能走这么多：读数不对，不算 */
+    for (;;)
+    {
+        if (car_abort)  return 0;
+        el = HAL_GetTick() - t0;
+        if (el >= ms + ms)  break;
+        Delay_Report(per);
+        if (car_abort)  return 0;
+        el = HAL_GetTick() - t0;
+        if (!Lift_EncPos(z, &z2, &e) || Absf(z2 - z) > jump)
+        {
+            if (el >= ms)  break;                  /* 读不到：等够了就交给 Lift_Check */
+            still = 0;
+            continue;
+        }
+        if (Absf(z2 - to) < 0.3f)                  /* 到了：最后这一点走完就往下做，不再白等 LFMRG */
+        {
+            HAL_Delay((uint32_t)(Absf(z2 - to) / ((mmps > 1.0f) ? mmps : 1.0f) * 1000.0f) + 2u);
+            return car_abort ? 0 : 1;
+        }
+        if (el >= 200u && Absf(z2 - z) < still_mm)
+        {
+            z = z2;
+            if (Absf(z - to) >= 1.0f && ++still >= 2)
+            {
+                Emm_V5_Stop_Now(LIFT_ADDR, false); /* 顶住了：叫它停住，别再使劲(堵转保护要连着顶 1~2 秒才触发) */
+                HAL_Delay(5);
+                if (car_abort)  return 0;
+                lift_stall_z = z;
+                lift_stall = 1;
+                return 2;
+            }
+            if (el >= ms)  break;                  /* 到点了、差不到 1mm 也不动了：交给 Lift_Check */
+        }
+        else
+        {
+            z = z2;
+            still = 0;
+        }
+    }
+    return car_abort ? 0 : 1;
 }
 
 /* 待机姿态(10-15 用户：上电、PARK 都回到自己定的高度/手臂角度/夹爪)。STBY SAVE 把现在的样子记下来，

@@ -735,10 +735,17 @@ class ArmLinkTests(unittest.TestCase):
         self.assertIn('升降没到 120.0mm，实际在 115.0mm', lines[0])
         self.assertIn('ZHI / STBY / LFMAX', lines[0])
         self.assertIn('改到 113 以下', lines[0])
-        low = lift_slip_text('LIFTSLIP want=2.0000 got=3.0000')          # 往下顶在 3mm 不动了：2mm 比最低点还低
-        self.assertIn('比升降最低点还低', low)
+        low = lift_slip_text('LIFTSLIP want=2.0000 got=3.0000')          # 往下顶在 3mm 不动了：2mm 太低
+        self.assertIn('在 3.0mm 就碰到底了', low)
         self.assertIn('ZPLC', low)
         self.assertIn('改到 4 以上', low)
+        self.assertIn('take', low)                                       # (10-25)ZPLC 偏低多半是量的时候手塞的物料：说用 take 重新量
+        blk = lift_slip_text('LIFTSLIP want=5.0000 got=30.0000 (blocked)')   # (10-25)走的时候顶住了，离要去的差 25mm
+        self.assertIn('在 30.0mm 就被挡住了', blk)
+        self.assertIn('马上叫它停住', blk)
+        self.assertIn('ERR LIFT', blk)
+        self.assertNotIn('LIFT ZERO', blk)                               # 高度是一路盯着数的，不用重新认零
+        self.assertIn('上不去了', lift_slip_text('LIFTSLIP want=113.0000 got=90.0000 (blocked)'))
         self.assertNotIn('多半是', lift_slip_text('LIFTSLIP want=2.0000 got=0.0000'))   # 记高了往下顶到底：改过来就好，不是参数的事
         mid = lift_slip_text('LIFTSLIP want=20.0000 got=18.0000')
         self.assertIn('实际在 18.0mm', mid)

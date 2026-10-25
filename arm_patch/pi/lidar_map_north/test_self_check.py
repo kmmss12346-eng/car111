@@ -72,6 +72,21 @@ class SelfCheckTests(unittest.TestCase):
             self.assertIn('原料区最近那格没示教', text)
             self.assertIn('TEMP 的 1、3 号环没调', text)
 
+    def test_lfchk_zero_is_flagged(self):
+        """(10-25)LFCHK=0：升降走完不核对，旧固件碰到地面一直顶到过载保护：★ 让改回 1.5。"""
+        class Link0(FakeLink):
+            def request(self, text, timeout, collect=False):
+                out = super().request(text, timeout, collect=True)
+                if text == 'GET':
+                    out = (True, 'DONE', out[2] + ['P LFCHK=0.0000'])
+                return out if collect else out[:2]
+        with tempfile.TemporaryDirectory() as d:
+            self._files(d)
+            bad = self_check.run(Link0(), self._cfg(), os.path.join(d, 'no_lidar'), lambda s: None, root=d)
+            self.assertTrue(any('set LFCHK 1.5' in b for b in bad), bad)
+            bad = self_check.run(FakeLink(), self._cfg(), os.path.join(d, 'no_lidar'), lambda s: None, root=d)
+            self.assertFalse(any('LFCHK' in b for b in bad), bad)
+
     def test_no_link(self):
         lines = []
         bad = self_check.run(None, {}, '/nonexistent', lines.append, root=tempfile.gettempdir())

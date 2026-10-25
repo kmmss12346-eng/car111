@@ -848,3 +848,19 @@ git_log.txt                ← 分支最近 120 条提交记录
   2 号环直接对到 claw_px.RING；run_live 的 r2off 只说去掉了；vlive.r2off_px 删了。用户去掉前 r2off 已经是 0 0。
   先说明过：原料的 g 一直只改 RAW，圆环十字不准是因为从来没量过(没做 vclaw RING，用的是配置估计值)。测试 RingCrossTests、
   GreenCrossTests、sim test_ring_cross_sets_where_ring2_is_aligned。部署包 tasks_1024i(arm.c 和 1024h 一样)。
+- **10-25 放物料时升降还往下顶、触发过载(用户"降到最低的时候设置 z=5 留出这么多冗余还是会往下面压触发过载保护，好好检查一下到底是哪里的代码出问题了")：**
+  查到的代码问题：① 固件 Lift_Goto 只按时间等(距离/速度 + LFMRG)，等完才用编码器核对一次：物料一碰到地面驱动器就一直使劲往下顶，碰得越早顶得越久；
+  ② Lift_Check 差 15mm 以上(too far)只回 ERR LIFT、不叫停：碰地的地方比 ZPLC 高 15mm 以上(10-23 漂到过 25mm)驱动器一直顶到堵转保护；
+  ③ LFCHK=0 时整个不核对，顶住了也不叫停(10-23 让用户 set 过 LFCHK 0，第二次就过载)；
+  ④ arm_calib 的 ZPLC/ZSTK 让人用手把物料塞进爪子量，比赛时物料是从车上转盘格子里按 ZDROP 夹的，物料在爪子里的位置不一样
+  (ZDROP 那一步让物料底离格子 2~5mm，从格子里夹的就往下多出这么多，手塞得深更多)：量出的 ZPLC 偏低，比赛时每次都往地上顶。
+  改法：固件 `Lift_Wait_Watch`(Lift_Goto 等的时候每 40ms 读编码器，在上一次读到的附近找，不会认错圈)：到了(差 <0.3mm)马上往下做(不再白等 LFMRG)；
+  离目标 1mm 以上、连着两次几乎没动 → Stop_Now(碰到后约 0.1 秒就不顶了)，lift_stall/lift_stall_z 交给 Lift_Check：LFCHK=0 也核对、
+  在停下的高度附近找；差 15mm 以上回 `LIFTSLIP … (blocked)`、记真高度、ERR LIFT。到点了还在走(加减速比估的慢)接着等，最多 2 倍时间。
+  出发前读一次编码器(先等 5ms，Emm 两条指令要隔开)，和 lift_mm 差 5mm 以上或开机高度是猜的(lift_guess)就不盯、照旧按时间等。
+  Lift_Check 的 too far：不动了也 Stop_Now(还在走的不停，免得停在半路)。Lift_Finish(Move_Over 里边转边升降)没改，最后一段 Lift_Goto 是盯着的。
+  arm_calib ZPLC/ZSTK 加 `take`(要 ARMOK=1)：TRAY → TT1、CLWOT → ZDROP → CLWC → ZHI → APZ 回 2 号环上方，再往下降量。
+  arm_link.lift_slip_text：往下碰到底改成"在 xx mm 就碰到底了…改到 xx 以上；放地上的 ZPLC 用 arm_calib --from ZPLC 输入 take 重新量"，加 (blocked)。
+  测试桩：假升降按转速随时间走(mv_goal/mv_v，Stop_Now 停在原地，相对运动接着上一次的目标)；test_arm 353 项；TakeLikeRaceTests。部署包 tasks_1025a(要烧固件)。
+  **让用户做：** 烧固件；`get` 看 LFCHK 不是 0、LFRPM(10-22 车上配置是 150、LFACC 0)；arm_calib --from ZPLC 用 take 重新量 ZPLC、ZSTK。
+  碰地高度越来越高(5.8→25)的机械原因还是没查清(LFRPM 150 + LFACC 0 硬起硬停可能让带轮/皮带一点点滑)：新固件碰到就停，顶的力和时间都小很多。

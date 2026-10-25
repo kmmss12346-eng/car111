@@ -1,7 +1,7 @@
 """(10-24)比赛前自检：终端输入 check。只问、只看文件，车和手臂都不动。
 每一项打一行：✓ 没问题，★ 要处理(后面写怎么办)。最后说一共几项要处理。
 
-查的东西：STM32 连着没有、固件新不新(PRE、升降开机认高度)、机械臂参数、升降高度认没认准；
+查的东西：STM32 连着没有、固件新不新(PRE、升降开机认高度)、机械臂参数、升降核对开没开(LFCHK)、升降高度认没认准；
 配置里机械臂任务开没开、full on/off、开机自动比赛(bootrace)开没开、码垛躲避(STKA1/STKA2)调没调、四个停车点；
 示教文件(原料区最近那格、1、3 号环、摄像头和手臂的对应关系、爪子点)；摄像头、雷达的设备在不在；开机自启动装没装；SD 卡剩多少空间。"""
 import glob
@@ -57,6 +57,9 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
             no('机械臂参数还没标定(ARMOK=0)：标定好以后 set ARMOK 1')
         else:
             ok(f'机械臂参数在(ARMOK=1，ZHI={params.get("ZHI", 0):g}，ZOBRAW={params.get("ZOBRAW", 0):g})')
+        if 'LFCHK' in params and params['LFCHK'] <= 0.0:
+            # (10-25 用户"降到最低设置 z=5 还是往下压触发过载保护")LFCHK=0：升降走完不用编码器核对，旧固件顶住了也不叫停
+            no('LFCHK=0：升降走完不核对高度(旧固件碰到地面也不叫停，一直顶到过载保护)：set LFCHK 1.5')
         try:
             r = link.request('LIFT?', 3.0, collect=True)
             line = next((l for l in (r[2] if len(r) > 2 else []) if l.startswith('LIFT ')), '')

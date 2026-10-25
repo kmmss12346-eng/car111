@@ -51,20 +51,29 @@ def lift_slip_text(line):
     if not m:
         return None
     want, got = float(m.group(2)), float(m.group(3))
+    # (10-25)放地上的高度 ZPLC 偏低最常见的原因：量的时候物料是用手塞进爪子的，和比赛时从车上转盘夹的位置不一样
+    zplc = '；放地上的 ZPLC 用 python3 arm_calib.py --from ZPLC，输入 take 和比赛时一样从车上转盘夹物料再量' if want <= 30 else ''
     if m.group(1) == 'PUSH':                     # (10-21)差一点没到：爪子顶到下面(原料盘/地面/转盘槽底)，驱动器一直往下顶，爪子合不上
         if got > want:
             return (f'★ 升降要降到 {want:.1f}mm，到 {got:.1f}mm 就下不去了(爪子顶到下面了？顶着爪子合不上)：STM32 已叫它别再往下顶。'
-                    f'哪个高度设的 {want:.0f}(ZGRAB / ZPLC / ZDROP)调高一两毫米(set 名字 {got + 1:.0f})')
+                    f'哪个高度设的 {want:.0f}(ZGRAB / ZPLC / ZDROP)调高一两毫米(set 名字 {got + 1:.0f}){zplc}')
         return f'★ 升降要升到 {want:.1f}mm，到 {got:.1f}mm 就上不去了(顶到最高点？)：STM32 已叫它别再往上顶'
     if 'too far' in line:
         return (f'★ 升降核对：要到 {want:.1f}mm，编码器算出 {got:.1f}mm，差太多(升降没走/被卡住了？)：没改，这一步不往下做(ERR LIFT)。'
                 '车停好以后看一下升降，放到最低点，输入 arm LIFT ZERO')
+    if 'blocked' in line:                        # (10-25)走的时候一路盯着编码器，在离要去的 15mm 以外就顶住了：高度可信，只是差太多
+        if got > want:
+            return (f'★ 升降要降到 {want:.1f}mm，在 {got:.1f}mm 就被挡住了(差 {got - want:.0f}mm，太多)：STM32 已马上叫它停住、不再往下顶，'
+                    f'高度按编码器记成 {got:.1f}，这一步不往下做(ERR LIFT，不松/不夹爪子)。看看爪子、物料碰到了什么{zplc}')
+        return (f'★ 升降要升到 {want:.1f}mm，在 {got:.1f}mm 就上不去了(差 {want - got:.0f}mm)：STM32 已叫它停住、按编码器记了高度，'
+                '这一步不往下做(ERR LIFT)。看看是不是卡住了')
     hint = ''
     if got < want and want >= 60:
         hint = f'。多半是 {want:.0f}mm 比升降能到的最高还高：哪个参数设的 {want:.0f}(ZHI / STBY / LFMAX …)改到 {got - 2:.0f} 以下'
     elif got > want and want <= 30:
-        hint = f'。多半是 {want:.0f}mm 比升降最低点还低：哪个参数设的 {want:.0f}(ZPLC / ZGRAB / ZDROP …)改到 {got + 1:.0f} 以上'
-    return f'★ 升降没到 {want:.1f}mm，实际在 {got:.1f}mm(顶住丢步了，STM32 已按编码器改过来){hint}'
+        hint = (f'。多半是 {want:.0f}mm 太低了：在 {got:.1f}mm 就碰到底了(物料/爪子碰到地面、槽底，或者到了升降最低点)：'
+                f'哪个参数设的 {want:.0f}(ZPLC / ZGRAB / ZDROP …)改到 {got + 1:.0f} 以上{zplc}')
+    return f'★ 升降没到 {want:.1f}mm，实际在 {got:.1f}mm(顶住了：STM32 已叫它停住、不再使劲，高度按编码器改过来){hint}'
 
 
 _CLAW_WHY = {'O': '张开', 'OR': '原料盘上方张开', 'OT': '车上转盘上方张开', 'C': '夹紧', 'STBY': '待机姿态', 'US': '直接给的脉宽'}

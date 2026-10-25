@@ -113,7 +113,21 @@ static double pos36_off = -70000.0;                      /* 0x36 实时位置(�
 static double phys_top = 1e9, phys_bot = -1e9, late_mm = 0.0, late_left = 0.0;
 static int lift_dead = 0;                 /* 1 = 升降驱动器收到指令也不动(堵转保护、丢了帧)：编码器照旧读 */
 static int late_n = 3, late_steps = 0;
-static void lift_tick(uint32_t ms) { double q; if (late_steps > 0 && ms == 80) { q = late_left / late_steps; phys_mm += q; late_left -= q; late_steps--; } }
+/* (10-25)升降按发的速度慢慢走(转/分 × 40mm 一圈)，时间在 HAL_Delay 里走：Lift_Wait_Watch 一路读编码器，要能看到它在走、碰到底停住 */
+static double mv_goal = 60.0, mv_v = 0.0;                /* 正在去的高度、速度 mm/s(0 = 没在走) */
+static double mv_slow = 1.0;                             /* 实际速度是发的几倍(< 1 = 比估的慢) */
+static int mv_clamped = 0;                               /* 1 = 要去的地方超出机构能到的(会顶住) */
+static uint32_t late_acc = 0, t_block = 0, t_stop = 0;   /* 顶住(碰到底/顶)的时刻、清零以后第一次叫升降停住的时刻 */
+static void lift_tick(uint32_t ms) {
+    double q, st;
+    if (mv_v > 0.0) {
+        st = mv_v * (double)ms / 1000.0;
+        if (fabs(mv_goal - phys_mm) <= st) { phys_mm = mv_goal; mv_v = 0.0; if (mv_clamped) t_block = now; }
+        else phys_mm += (mv_goal > phys_mm) ? st : -st;
+    }
+    if (mv_v > 0.0 || late_steps <= 0) { late_acc = 0; return; }
+    for (late_acc += ms; late_acc >= 80 && late_steps > 0; late_acc -= 80) { q = late_left / late_steps; phys_mm += q; late_left -= q; late_steps--; }
+}
 uint32_t fake_flash[256];
 static int erases = 0;
 static void flash_blank(void) { int q; for (q = 0; q < 256; q++) fake_flash[q] = 0xFFFFFFFFu; }
@@ -138,17 +152,20 @@ int Car_Motor_Query(uint8_t addr, uint8_t func, uint8_t *out, uint8_t len) {
     out[0] = 5; out[1] = 0x31; out[2] = (uint8_t)(v >> 8); out[3] = (uint8_t)v; out[4] = 0x6B; return 1;
 }
 void Emm_V5_Pos_Control(uint8_t a, uint8_t d, uint16_t v, uint8_t acc, uint32_t clk, bool r, bool f) {
-    double t;
-    (void)v; (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
+    double t, from;
+    (void)acc; (void)r; (void)f; EV("L%s%u;", d ? "-" : "+", clk);
     if (!d && !t_up1) t_up1 = now ? now : 1;
     if (a != 5 || lift_dead) return;
-    t = phys_mm + (d ? -1.0 : 1.0) * (double)clk / 80.0;
+    from = (mv_v > 0.0) ? mv_goal : phys_mm;              /* 相对上一次要去的地方(Emm 的相对运动) */
+    t = from + (d ? -1.0 : 1.0) * (double)clk / 80.0;
+    mv_clamped = (t > phys_top || t < phys_bot);
     if (t > phys_top) t = phys_top;
     if (t < phys_bot) t = phys_bot;
-    if (late_mm > 0.0) { late_left = (t > phys_mm) ? late_mm : -late_mm; late_steps = late_n; t -= late_left; }
-    phys_mm = t;
+    if (late_mm > 0.0) { late_left = (t > phys_mm) ? late_mm : -late_mm; late_steps = late_n; late_acc = 0; t -= late_left; }
+    mv_goal = t; mv_v = (double)v / 60.0 * 40.0 * mv_slow;
+    if (mv_v <= 0.0) { phys_mm = t; mv_v = 0.0; }
 }
-void Emm_V5_Stop_Now(uint8_t a, bool f) { (void)f; EV("stop%u;", a); }
+void Emm_V5_Stop_Now(uint8_t a, bool f) { (void)f; EV("stop%u;", a); if (a == 5) { mv_v = 0.0; late_steps = 0; late_left = 0.0; if (!t_stop) t_stop = now; } }
 void Emm_V5_Origin_Trigger_Return(uint8_t a, uint8_t m, bool f) { (void)f; EV("home%u/%u;", a, m); }
 void Emm_V5_Origin_Interrupt(uint8_t a) { EV("homeint%u;", a); }
 
@@ -1055,9 +1072,10 @@ int main(void) {
     run("LIFT 5"); phys_mm = 32.0; clear(); Arm_Init();    /* 推了 27mm：按上次位置算出 -8mm，在行程外，挪一整圈到 32 */
     CHECK((pis("LIFTBOOT 32.0") || pis("LIFTBOOT 31.99")) && fabs(phys_mm - 60.0) < 0.05, "算到最低点以下时自动挪一圈");
     /* 急停打断升降：用编码器把高度找回来，不用重新回零 */
-    run("LIFT 60"); car_abort = 1; clear();
-    run("LIFT 80"); clear(); run("LIFT?");
-    CHECK(pis("LIFT 1 80.0"), "急停打断后用编码器找回高度");
+    run("LIFT 60"); abort_at = (int)now + 250; clear();
+    run("LIFT 80"); abort_at = -1; clear(); run("LIFT?");
+    CHECK(phys_mm > 62.0 && phys_mm < 78.0 && fabs(pinum("LIFT 1 ") - phys_mm) < 0.1, "急停打断：升降停在半路，用编码器找回真高度");
+    run("LIFT 80");
     /* 记录快满了：开机时擦掉重来，标定还在 */
     for (i = 0; i < 40; i++) { run("LIFT 50"); run("LIFT 70"); }
     erases = 0; clear(); Arm_Init();
@@ -1088,13 +1106,13 @@ int main(void) {
     CHECK(fabs(pinum("LIFT 1 ") - 115.0) < 0.05, "高度按编码器改成 115(以前还当作 120，差的 5mm 下次往下全顶到最低点下面)");
     clear();
     CHECK(run("LIFT 2") == 1 && fabs(phys_mm - 2.0) < 0.05 && !pis("LIFTSLIP"), "再降到 2mm(像 ZPLC)：正好到 2，不往最低点下面顶");
-    Arm_Param_Set("LFCHK", 0);                            /* 关掉核对 = 以前的样子 */
-    run("LIFT 120"); clear(); run("LIFT 2");
-    CHECK(fabs(phys_mm) < 0.05 && !pis("LIFTSLIP"), "LFCHK 0(以前)：顶住少走的 5mm 没人知道，下到 2mm 时往最低点下面顶(现场看到的'到底了还往下动')");
-    Arm_Param_Set("LFCHK", 1.5f); clear();
-    CHECK(run("LIFT 20") == 1 && fabs(pinum("LIFTSLIP want=") - 20.0) < 0.01 && fabs(pinum(" got=") - 18.0) < 0.05 && fabs(phys_mm - 18.0) < 0.05,
-          "LFCHK 打开：下一次走完就发现差了 2mm(在最低点顶住少走的)，改过来");
-    clear(); run("LIFT 20");
+    Arm_Param_Set("LFCHK", 0);                            /* 走完不核对(以前的样子) */
+    clear();
+    CHECK(run("LIFT 120") == 1 && fabs(pinum("LIFTSLIP want=") - 120.0) < 0.01 && fabs(pinum(" got=") - 115.0) < 0.05 && has("stop5;"),
+          "(10-25)LFCHK 0 也一样：走的时候顶到最高点马上叫停、按编码器记成 115(以前 LFCHK 0 一直顶着，顶到驱动器堵转保护)");
+    clear(); run("LIFT 2");
+    CHECK(fabs(phys_mm - 2.0) < 0.05 && !pis("LIFTSLIP"), "LFCHK 0：之后下到 2mm 就是 2mm(以前顶住少走的 5mm 没人知道，下到 2mm 时往最低点下面顶)");
+    Arm_Param_Set("LFCHK", 1.5f); clear(); run("LIFT 20");
     CHECK(fabs(phys_mm - 20.0) < 0.05 && !pis("LIFTSLIP"), "改过来以后再走就准了");
     run("LIFT 60"); phys_mm = 57.0; clear();              /* 被碰下去 3mm(程序还当在 60) */
     CHECK(run("LIFT 2") == 1 && fabs(pinum("LIFTSLIP want=") - 2.0) < 0.01 && fabs(pinum(" got=")) < 0.05 && has("stop5;") && fabs(phys_mm) < 0.05,
@@ -1102,8 +1120,9 @@ int main(void) {
     clear(); run("LIFT 2");
     CHECK(fabs(phys_mm - 2.0) < 0.05, "之后下到 2mm 就是 2mm");
     run("LIFT 60"); phys_mm = 78.0; clear();              /* 差了 18mm：编码器一圈 40mm，差太多可能认错圈 */
-    CHECK(run("LIFT 70") == -1 && pis("LIFTSLIP") && pis("(too far, kept)") && pis("ERR LIFT") && !has("stop5;"),
-          "差 15mm 以上：报(too far, kept)，不改，回 ERR LIFT(GRAB/DROP 就停在这里，不在半空夹/松爪子)");
+    CHECK(run("LIFT 70") == -1 && pis("LIFTSLIP") && pis("(too far, kept)") && pis("ERR LIFT") && has("stop5;"),
+          "差 15mm 以上：报(too far, kept)，不改，回 ERR LIFT(GRAB/DROP 就停在这里，不在半空夹/松爪子)；"
+          "(10-25)不动了也叫驱动器停住(以前不叫停，顶着的话一直顶到堵转保护)");
     clear(); run("LIFT?");
     CHECK(fabs(pinum("LIFT 1 ") - 70.0) < 0.05, "差太多时高度照旧(70)");
     phys_mm = 70.0;
@@ -1142,12 +1161,38 @@ int main(void) {
     clear(); run("LIFT?");
     CHECK(fabs(pinum("LIFT 1 ") - 21.0) < 0.05, "高度记成真的 21");
     phys_bot = -1e9;
+    /* ---- (10-25 用户"降到最低设置 z=5 留出这么多冗余，还是会往下面压触发过载保护")走的时候一直盯着编码器 ---- */
+    {
+        uint32_t t0;
+        run("LIFT 60"); t0 = now; clear();
+        CHECK(run("LIFT 80") == 1 && fabs(phys_mm - 80.0) < 0.05 && !has("stop5;") && now - t0 < 620u && now - t0 > 480u,
+              "正常走 20mm(0.5 秒)：一到就往下做，不再白等 LFMRG 200ms");
+        run("LIFT 100"); phys_bot = 12.0; t0 = now; t_block = t_stop = 0; clear();   /* 物料比 ZPLC 早 7mm 碰到地面 */
+        CHECK(run("LIFT 5") == 1 && fabs(pinum("LIFTSLIP want=") - 5.0) < 0.01 && fabs(pinum(" got=") - 12.0) < 0.05 && !pis("blocked")
+              && has("stop5;") && t_block > 0 && t_stop >= t_block && t_stop - t_block <= 150u && fabs(phys_mm - 12.0) < 0.05,
+              "放物料：降到 5，12mm 就碰到地面：碰到后 0.15 秒内叫驱动器停住(以前一直顶到算好的时间 + LFMRG + 核对完)，按编码器记成 12，照常往下做(松爪子)");
+        CHECK(now - t0 < 2200u + 400u, "碰到地面以后不再白等");
+        clear(); run("LIFT?");
+        CHECK(fabs(pinum("LIFT 1 ") - 12.0) < 0.05, "高度记成真的 12");
+        run("LIFT 100"); phys_bot = 30.0; t_block = t_stop = 0; clear();              /* 碰地的地方比要去的高 25mm(差太多) */
+        CHECK(run("LIFT 5") == -1 && pis("(blocked)") && pis("ERR LIFT") && has("stop5;") && t_stop - t_block <= 150u && fabs(phys_mm - 30.0) < 0.05,
+              "碰到底的地方比要去的高 15mm 以上：马上叫停(以前这种不叫停，一直顶到驱动器堵转保护)，回 ERR LIFT 不松爪子");
+        clear(); run("LIFT?");
+        CHECK(fabs(pinum("LIFT 1 ") - 30.0) < 0.05, "差 25mm 也记成真的 30(一路盯着数的，不会认错圈)");
+        phys_bot = -1e9; run("LIFT 60");
+        mv_slow = 0.6; t0 = now; clear();                                              /* 升降比算的慢(LFACC 加减速) */
+        CHECK(run("LIFT 20") == 1 && fabs(phys_mm - 20.0) < 0.05 && !pis("LIFTSLIP") && !pis("LIFTPUSH") && !has("stop5;") && now - t0 > 1500u,
+              "升降比算的慢：到点了还在走就接着等它走完，不在半路叫停、不当成顶住");
+        mv_slow = 1.0; run("LIFT 60");
+    }
     /* (10-21)升降根本没动(堵转保护/丢帧)：编码器一圈 40mm，以前会把 100 认成 76 当"丢了 7mm"，在半空夹下去 */
     Arm_Param_Set("ZGRAB", 69.0f);
     run("LIFT 100"); run("CLAW O"); away(); lift_dead = 1; clear();
-    CHECK(run("GRAB 2 H") == -1 && pis("ERR LIFT") && pis("(too far, kept)") && !has("C;") && fabs(phys_mm - 100.0) < 0.05,
-          "GRAB 时升降没下去：认出的高度不在走过的范围里，回 ERR LIFT，不在半空夹");
-    lift_dead = 0; phys_mm = 69.0;                        /* (实车上这时要重新 LIFT ZERO)模拟里把机构放回程序以为的地方 */
+    CHECK(run("GRAB 2 H") == -1 && pis("ERR LIFT") && pis("(blocked)") && has("stop5;") && !has("C;") && fabs(phys_mm - 100.0) < 0.05,
+          "GRAB 时升降没下去：(10-25)一路盯着编码器，一直不动就叫停，报 (blocked)，回 ERR LIFT，不在半空夹");
+    clear(); run("LIFT?");
+    CHECK(fabs(pinum("LIFT 1 ") - 100.0) < 0.05, "没下去：高度记成真的 100(一路盯着数的，不会认错圈)");
+    lift_dead = 0;
     run("LIFT 60");
 
     /* ---- (10-21 用户"放 1、2 号环的时候爪子莫名其妙松开""运输过程中一定要按第三步 CLWC 夹紧")
