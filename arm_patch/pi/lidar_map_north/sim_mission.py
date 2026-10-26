@@ -4047,6 +4047,30 @@ class ZoneCalTests(unittest.TestCase):
             Jt = w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0])
             self.assertLess(float(np.abs(J - Jt).max()) / w.scale['RING'], 0.15, J)
 
+    def test_stale_j_size_still_aligns_smoothly(self):
+        """(10-26 实车暂存区：存的车轮和画面的对应关系(vcal RING 量的)和现在的比例差了一倍多，以前当它"不合理"，2 号环退回
+        一步一步挪(横移只许 20mm)，车停偏了三次都没对上、整个区不放)：方向照用、大小按现在的比例算，车停着算好挪过去，按实际走的再修；
+        横着挪够 35mm，三个都放准，修好的对应关系存下来。看清三个环时：按环距重新测前进那一列，横移那一列方向照用(不当补出来的)。"""
+        for seed, k, survey in ((21, 0.42, False), (22, 2.3, False), (23, 0.42, True)):
+            w = self._world(seed, park={'TEMP': 12.0}, park_side={'TEMP': 35.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, extra=dict(ring_survey=survey), lines=lines)
+            h.store.put('RING', 'ch', k * w.scale['RING'] * w.Rcam @ np.diag([1.0, -1.0]))     # 存的大小差了一倍多
+            rec = self._spy(w, h)
+            run_mission(w, h, stops=('QR', 'RAW', 'TEMP'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('对不上，重新测' if survey else '大小不对', text, text[-3000:])
+            self.assertIn('车停着算好要', text)
+            for bad in ('一步一步挪着对准', '这个区这次不放', '不合理'):
+                self.assertNotIn(bad, text, text[-3000:])
+            self.assertGreater(rec['s_max'].get('TEMP', 0.0), 25.0, rec['s_max'])
+            self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+            self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+            far = [e for (z, _k, _c, e, _st) in w.placed if z == 'TEMP']
+            self.assertLess(max(far), 3.0, far)
+            J = np.asarray(h.store.get('RING', 'ch'), float)            # 存下来的大小对了(下次直接用)
+            self.assertLess(abs(float(np.linalg.norm(J, axis=0).mean()) / w.scale['RING'] - 1.0), 0.2, J)
+
     def test_calc_wheels_not_moving_retries_with_sf_not_the_arm(self):
         """(10-21 用户"对准的时候不要用机械臂修正，就用车轮修正")车停着算好慢慢走过去，可是 V 走车轮没走起来(打滑：STM32 说走了，
         画面里的圆环一点没动)：不交给手臂，改用 S/F 再挪一次；对准 2 号环时手臂一下都不动，照样放好。"""

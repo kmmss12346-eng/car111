@@ -3007,6 +3007,18 @@ class MissionHooks:
         return c, r
 
     @staticmethod
+    def _j_rescaled(J, sc):
+        """(10-26)车轮和画面的对应关系只是大小不对(横移、前进两列在画面里还是差不多垂直)：方向照用，每列大小改成 sc。
+        方向也不对(或者数据坏了)返回 None。"""
+        J = np.asarray(J, float)
+        if J.shape != (2, 2) or not np.all(np.isfinite(J)) or not float(sc) > 0:
+            return None
+        n = np.linalg.norm(J, axis=0)
+        if float(n.min()) < 1e-6 or abs(float(J[:, 0] @ J[:, 1])) / float(n[0] * n[1]) > 0.5:
+            return None
+        return J / n * float(sc)
+
+    @staticmethod
     def _raw_J_bad(J, sc, rms=None, moved=None, pmm=None):
         """(10-18)车轮和画面的对应关系 J(列：横移 1mm、前进 1mm，原料盘中心在画面里动多少像素)合不合理：合理返回 ''，不合理返回原因。
         摄像头装在手臂上、看原料盘的姿态固定：车走 1mm，画面里该动约 px_per_mm.RAW 像素，横移和前进在画面里差不多垂直。"""
@@ -6927,6 +6939,7 @@ class MissionHooks:
         cfg, v, act, store = self.cfg, self.vision, self.act, self.store
         if act is None or not hasattr(act, 'vel') or getattr(act, '_no_vel', False):
             return 'nofw'
+        self._ring_scale_seed()
         J = store.get('RING', 'ch') if store is not None else None
         sc = float(v.scale('RING'))
         if J is None or (hasattr(store, 'synth') and store.synth('RING')):
@@ -6935,9 +6948,17 @@ class MissionHooks:
             return 'noj'
         J0 = np.asarray(J, float)
         bad = self._raw_J_bad(J0, sc)
+        vc_ = getattr(v, 'cfg', None)
+        unsure = isinstance(vc_, dict) and vc_.get('_ring_scale_src') == 'J'   # 比例就是按它算的：大小没核对过，修的时候也放宽
         if bad:
-            self.log(f'    (存的车轮和画面的对应关系不合理：{bad}：2 号环一步一步挪着对准)')
-            return 'noj'
+            J1 = self._j_rescaled(J0, sc)
+            if J1 is None:
+                self.log(f'    (存的车轮和画面的对应关系不合理：{bad}：2 号环一步一步挪着对准)')
+                return 'noj'
+            # (10-26)只是大小不对(两列还是垂直的；多半是量的时候看圆环的高度不一样)：方向照用、大小按现在的比例，挪的时候按车实际走的再修。
+            #   以前退回一步一步挪，横移只许 ring_strafe_max_mm(20mm)，车停偏了就对不上
+            self.log(f'    (存的车轮和画面的对应关系大小不对：{bad}。方向照用、大小按每毫米 {sc:.2f} 像素算，挪的时候按车实际走的再修)')
+            J0, unsure = J1, True
         P = self.arm.params() or {}
         if cfg.get('zone_obs_fine', True) and 'A1P' in P and 'A2P' in P:
             try:
@@ -6984,7 +7005,8 @@ class MissionHooks:
             return 'nofw'
         Jc = [J0.copy()]                                      # 现在用的车轮和画面的对应关系(边走边修)
         static, seen, trk = [], [], []                        # 车上不动的假圆环；最近认到的 (像素, 拍时车走了多少)；认准的 2 号环
-        note = dict(size=0, static=0, jfix_at=None, jlog=False, slip=False)
+        note = dict(size=0, static=0, jfix_at=None, jlog=False, slip=False, jsave=unsure)
+        k_lo, k_hi = (0.3, 3.0) if unsure else (0.6, 1.6)   # 按车实际走的修对应关系时，大小能改多少(大小没核对过/不对改过的放宽)
         out = dict(ok=False, err_mm=None, why='', how='车轮')
         try:
             v.live_goal = (float(goalp[0]), float(goalp[1]))
@@ -7083,7 +7105,7 @@ class MissionHooks:
             R = np.array([[a, -b], [b, a]])
             rms = float(np.sqrt(((Y - (R @ X.T).T) ** 2).sum(axis=1).mean()))
             k, ang = math.hypot(a, b), math.degrees(math.atan2(b, a))
-            if not (0.7 <= k <= 1.4 and abs(ang) <= 35.0) or rms > 8.0:
+            if not ((0.35 if unsure else 0.7) <= k <= (2.8 if unsure else 1.4) and abs(ang) <= 35.0) or rms > 8.0:
                 return False
             Jc[0] = R @ J0
             note['jfix_at'] = (ang, k)
@@ -7261,7 +7283,7 @@ class MissionHooks:
                 if sv[-1] >= 3.0 and sv[-1] >= 0.25 * sv[0]:
                     Jf = np.linalg.lstsq(Da, Di, rcond=None)[0].T
                     s1 = np.linalg.svd(Jf, compute_uv=False)
-                    if 0.6 * sv0[-1] <= s1[-1] and s1[0] <= 1.6 * sv0[0]:
+                    if k_lo * sv0[-1] <= s1[-1] and s1[0] <= k_hi * sv0[0]:
                         return Jf, '按挪过的两个方向重新算'
             best = None
             for tag, Jb in (('', J0), ('横移方向是反的', J0 @ np.diag([-1.0, 1.0])), ('前进方向是反的', J0 @ np.diag([1.0, -1.0]))):
@@ -7272,7 +7294,7 @@ class MissionHooks:
                 a_ = float((X * Di).sum()) / sxx
                 b_ = float((X[:, 0] * Di[:, 1] - X[:, 1] * Di[:, 0]).sum()) / sxx
                 k_, ang = math.hypot(a_, b_), math.degrees(math.atan2(b_, a_))
-                if not 0.6 <= k_ <= 1.6:
+                if not k_lo <= k_ <= k_hi:
                     continue
                 R = np.array([[a_, -b_], [b_, a_]])
                 rms = float(np.sqrt(((Di - (R @ X.T).T) ** 2).sum(axis=1).mean()))
@@ -7946,6 +7968,9 @@ class MissionHooks:
             jf = np.asarray(J, float)[:, 1]
             if float(np.hypot(*jf)) >= 0.2:
                 return jf, False
+        old = None                                               # (10-26)重新测之前存的(vcal RING 量的、横移那一列是实测的)
+        if fresh and self.store is not None and not self.store.synth('RING'):
+            old = self.store.get('RING', 'ch')
         if not rings0:
             return None, True
         step = 40
@@ -7967,8 +7992,19 @@ class MissionHooks:
         if float(np.hypot(*jf)) < 0.2:
             return None, True
         if self.store is not None:
-            self.store.put('RING', 'ch', [[-jf[1], jf[0]], [jf[0], jf[1]]])     # S 那一列用不到(不横移)，补一个和 F 垂直的
-            self.store.set_synth('RING', True)                                # 记下"横移那一列是补的"：真要横移时重新测
+            keep = None
+            if old is not None:
+                o = np.asarray(old, float)
+                of, os_ = o[:, 1], o[:, 0]
+                if float(of @ jf) >= 0.9 * float(np.hypot(*of)) * float(np.hypot(*jf)) and float(np.hypot(*os_)) > 1e-6:
+                    # (10-26)前进的方向没变(摄像头没转)，只是大小不对(看圆环的高度变了)：横移那一列方向照用，大小跟着前进那一列改，
+                    #   不当"补出来的"(以前当补的，2 号环就只能一步一步挪、横移只许 20mm)
+                    keep = np.column_stack([os_ / float(np.hypot(*os_)) * float(np.hypot(*jf)), jf])
+            if keep is not None:
+                self.store.put('RING', 'ch', keep)
+            else:
+                self.store.put('RING', 'ch', [[-jf[1], jf[0]], [jf[0], jf[1]]])     # S 那一列用不到(不横移)，补一个和 F 垂直的
+                self.store.set_synth('RING', True)                                # 记下"横移那一列是补的"：真要横移时重新测
             self.store.save()
         return jf, True
 
@@ -7980,6 +8016,7 @@ class MissionHooks:
         顺便用圆环间距算出每毫米多少像素(没做 vclaw RING 时用它)。"""
         import numpy as np
         v, cfg = self.vision, self.cfg
+        self._ring_scale_seed()
         if obs:                                                  # (10-20)obs=False：手臂已经在看圆环的姿态(往前找环时停下重看)
             self.arm.obs('RING', open_claw=True)
         self._a2_hint = (self.arm.params() or {}).get('A2P')
@@ -7987,6 +8024,7 @@ class MissionHooks:
         self._ring_ready = self._at_obs = True
         rings = v.ring_list(n=cfg.get('survey_frames') or None)
         if not rings:
+            self._ring_odd_size()
             self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
             return
         self._ring_rmed = float(np.median([r[2] for r in rings]))   # (10-20)圆环在画面里多大(最外圈半径)：对准 2 号环时只认这么大的
@@ -8136,6 +8174,10 @@ class MissionHooks:
         vc = getattr(v, 'cfg', None)
         if isinstance(vc, dict) and not vc.get('ring_rmax_cal') and many:
             vc.setdefault('px_per_mm', {})['RING'] = scale       # 没做 vclaw RING：按圆环间距算的比例换算毫米
+            vc['_ring_scale_src'] = 'survey'
+            if self.store is not None and hasattr(self.store, 'set_extra'):
+                self.store.set_extra('RING', 'px_mm_seen', round(float(scale), 3))   # (10-26)记下来：下次开机只看到一个环也按它算
+                self.store.save()
         # 对准时只认这么近的圆环：沿这一排不到半个间距(旁边那个环至少隔一个间距)，再加上挪到每个环以后离这一排远近的偏差
         side_px = max(side for _k, _f, side in parts)
         self.ring_gate_px = math.hypot(0.45 * sp_px, side_px + 10.0)
@@ -8157,6 +8199,61 @@ class MissionHooks:
             if not 0.75 <= ratio <= 1.33:
                 self.log(f'    ★ 按底盘走的距离算是每毫米 {np.hypot(*jf):.2f} 像素，按圆环间距 {sp_mm:g}mm 算是 {scale:.2f}：'
                          '底盘前后走的距离不准(FPPM)，或者圆环间距不是这么多(mission_cfg.ring_spacing_mm)')
+
+    def _ring_scale_seed(self):
+        """(10-26 实车：开机后第一次到暂存区只认出一个"圆"，没量出圆环这里每毫米多少像素，还是配置里默认的 2.96：vcal RING 量的
+        车轮和画面的对应关系(横移 1mm 动 1.12 像素)被当成不合理，2 号环退回一步一步挪(横移只许 20mm)，三次都没对上；按 2.96 算圆环
+        该有多大，半径 259 像素的大圆也被当成了圆环(10-23 看清三个环时量的是 1.27，圆环半径约 55 像素))。
+        没做 vclaw RING(量圆环大小)、这次运行也还没看清过三个环时，按量过的来：以前看清三个环时按环距量的(servo_cal.json 的
+        RING.px_mm_seen)，没有就按 vcal RING 量的车轮和画面的对应关系；都没有才用配置里的 px_per_mm.RING。一次运行只定一次。"""
+        v, store = self.vision, self.store
+        vc = getattr(v, 'cfg', None)
+        if not isinstance(vc, dict) or vc.get('ring_rmax_cal') or vc.get('_ring_scale_src'):
+            return
+        val, src, key = None, '', 'cfg'
+        try:
+            seen = float(store.extra('RING', 'px_mm_seen') or 0.0) if (store is not None and hasattr(store, 'extra')) else 0.0
+        except (TypeError, ValueError):
+            seen = 0.0
+        if 0.2 <= seen <= 20.0:
+            val, src, key = seen, '按以前看清三个圆环时量的环距', 'seen'
+        elif store is not None:
+            J = store.get('RING', 'ch')
+            if J is not None:
+                n = np.linalg.norm(np.asarray(J, float), axis=0)
+                m = float(n[1]) if (hasattr(store, 'synth') and store.synth('RING')) else float(np.mean(n))   # 只测过前进那一列
+                if 0.2 <= m <= 20.0:
+                    val, src, key = m, '按 vcal RING 量的车轮和画面的对应关系', 'J'   # 'J'：大小没有别的量法核对过
+        vc['_ring_scale_src'] = key
+        if val is None:
+            return
+        pm = vc.setdefault('px_per_mm', {})
+        old = pm.get('RING')
+        pm['RING'] = val
+        if old is None or abs(float(old) - val) > 0.1 * val:
+            self.log(f'    (圆环这里每毫米多少像素：没做 vclaw RING，{src}算 {val:.2f}' +
+                     (f'，不用配置里的 {float(old):.2f}' if old is not None else '') + ')')
+
+    def _ring_odd_size(self):
+        """(10-26)按大小认不出圆环时：不限大小再看一帧，画面里有圆就说出它多大、圆环该多大(认成了别的圆？摄像头离地的高度变了？)。"""
+        v = self.vision
+        vc = getattr(v, 'cfg', None)
+        if not hasattr(v, 'ring_px') or not isinstance(vc, dict):
+            return
+        try:
+            p = v.ring_px(n=1, any_size=True)
+        except (VisionError, TypeError, ValueError):
+            return
+        r = getattr(v, 'last_ring_rmax', None)
+        if p is None or not r:
+            return
+        try:
+            exp = (float(vc.get('ring_outer_diam_mm') or 95.0) + float(vc.get('ring_line_mm') or 0.0)) / 2.0 * float(v.scale('RING'))
+        except (KeyError, TypeError, ValueError):
+            return
+        self.log(f'    (画面 ({p[0]:.0f},{p[1]:.0f}) 有个圆，最外圈半径 {float(r):.0f} 像素；圆环最外圈半径该约 {exp:.0f} 像素'
+                 f'(每毫米 {float(v.scale("RING")):.2f} 像素)：大小对不上，不当圆环。车没停在圆环前面？要是它真是圆环，'
+                 '就是摄像头离地的高度变了(看圆环的高度 ZOBRNG、升降高度 arm LIFT? 对不对)，重新 vclaw RING)')
 
     # ---- 车身和圆环那一排不平行(车停斜了)：量出来、提醒、提前补手臂伸缩
     def _jf_best(self, jf):
