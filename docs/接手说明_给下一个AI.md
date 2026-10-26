@@ -895,3 +895,27 @@ git_log.txt                ← 分支最近 120 条提交记录
   ⑤ 屏幕白底黑字(用户"屏幕最好是白底字是黑的现在字也太小了顺序也排的不对")：arm.c 加参数 SCRFG(默认 0 黑)/SCRBG(默认 65535 白)，
   画字模式 cls 和 xstr 都按它们(要烧固件；以前的黑底白字 set SCRBG 0、set SCRFG 65535)。字小：字大小是屏工程里字库定的
   (字库 0 字高 120、字库 1 字高 72，见 10-23 那条)，程序改不了；顺序不对：还不知道用户要什么顺序，等用户发屏的照片。test_arm 354 项。
+- **10-26 暂存区 2 号环对不准(用户发了三次 mtest TEMP 1 的日志，都是"2 号环对不准：这个区这次不放")：**
+  原因：开机后第一次到圆环那里只认出一个"圆"(半径 259 像素，圆心在画面外 (245,-26))，_survey 量不出圆环这里每毫米多少像素(要看到两个以上环)，
+  vision.scale('RING') 还是配置默认的 2.96；_ring2_smooth 拿它查 vcal RING 量的车轮和画面的对应关系(横移 1.12、前进 1.16 像素/mm)，判"不合理"，
+  退回一步一步挪(servo.run + _wheels_kw，横移只许 ring_strafe_max_mm 20mm)，对不上就整个区不放。10-23 对得准是因为那几次 _survey 看到三个环，
+  把 px_per_mm.RING 改成了 1.27(只在内存里)。按 2.96 算 _ring_rmax_range 是 49~281 像素，259 的大圆也被当成圆环(按 1.14 算是 19~108)。
+  改：① `_ring_scale_seed`：没做 vclaw RING、这次运行还没看清三个环时，px_per_mm.RING 按 servo_cal.json 的 RING.px_mm_seen(_survey 看清三个环时存的)，
+  没有就按 vcal RING 的 J(一次运行只定一次；vc['_ring_scale_src'] = seen/J/cfg/survey)。② `_ring2_smooth`：J 只是大小不对(两列还垂直)就 `_j_rescaled`
+  方向照用、大小按 sc，不再退回一步一步挪；大小没核对过(src=J)或改过时，fit_j/jfix 能修的比例放宽到 0.3~3。③ `_jac_f(fresh=True)`(看清三个环、
+  存的前进那一列和环距对不上时重测)：前进方向没变就保留实测的横移那一列方向，不再标 synth(标了以后 2 号环只能一步一步挪)。
+  ④ `_ring_odd_size`：按大小认不出圆环时不限大小看一帧，说出那个圆多大、圆环该多大。测试 test_ring_scale.py、
+  sim ZoneCalTests.test_stale_j_size_still_aligns_smoothly。用户那几次的真实情况还不清楚：认出的"圆环"半径 259 像素(10-23 是 55)，
+  要么车没停在圆环前面(认的是别的圆)，要么摄像头离地近了很多(ZOBRNG/升降高度不对；10-24 开机读不到升降编码器 BOOT=NOENC)。新包的日志会说清楚。
+- **10-26 原料区慢、物料在下面却不抓(用户"识别对准抓取何下爪子的时间都太长……有时候下一个已经在摄像头下面了但是还是一直不抓取错过了又要再等一轮")：**
+  ① 不抓的原因：夹完一个回到看的姿态时原料盘多半已经停着(夹一个再回来 ≈ 原料盘转一圈 9 秒)，要推算这一次停了多久才知道够不够下爪；
+  `_raw_ct_predict` 以前要亲眼看到两次以上停下才推，不够就不说话，一直等它转一下再停 → 错过这一次，要的颜色再转一圈才回来。
+  改：只看到过一次停下也推下一次(离那一次 0.9~1.6 个周期内，按最早可能停下的时刻算：周期打 `raw_ct_period_tol`=0.1 折)；推不出来说一句
+  "原料盘停着(这一格上是 X)，不知道这一次已经停了多久……"。② 等着的时候量出原料盘每次停多久、转多久(_raw_ct_watch 的 prev_stop：手臂、车、
+  升降都没动过才量；在配置值的 0.6~1.6 倍 / 0.5~2 倍以内才记)，存进 raw_stops/raw_moves，_raw_ct_stop_len、`_raw_ct_period` 按量到的算。
+  ③ 每夹一个日志多一行"(下爪到放进转盘 x 秒、回到看原料盘 y 秒；从它停下算 z 秒，原料盘转一圈约 w 秒)"：看时间花在哪
+  (GRAB 里升降、夹爪的等待是固件参数 LFRPM/CLWAIT/CLSPO/TTWAIT，等用户发这行再说)。
+  ④ 识别提速，认出来的结果完全一样：matdet.detect_many(一帧认几个颜色：HSV、自动找爪子、不能用的边缘只算一次)，Vision.material_errors/plate_scan 用它；
+  RANSAC 一次算完(`_ransac_best`)；三个点一次抽完(`_triples_fast`：照 numpy Generator.choice 的 Floyd + Lemire 抽法，第一次用时和 rng.choice 比对，
+  对不上就退回一组一组抽)；auto_claw_mask 的 31×31 闭运算只在爪子那一块做。这台机器三个颜色一帧 108ms → 39ms。
+  ⑤ _raw_ct_pose：AP 回报的角度直接用，不再另读(每次回到看的姿态省两次串口来回)。测试 test_raw_timing.py、test_matdet.SameButFasterTests。

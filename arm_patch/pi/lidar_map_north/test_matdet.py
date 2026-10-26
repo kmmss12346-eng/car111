@@ -369,5 +369,104 @@ class ColorCalibTests(unittest.TestCase):
             self.assertIn('claw_px', vision.load_vision_cal(p))
 
 
+@unittest.skipUnless(HAVE_CV, '没有 opencv')
+class SameButFasterTests(unittest.TestCase):
+    """(10-26 用户"识别……太慢了")提速以后认出来的和以前完全一样：一帧认几个颜色只算一次 HSV/爪子区域(detect_many)、
+    RANSAC 一次算完、三个点一次抽完(和 rng.choice 抽到的一样)、爪子闭运算只在爪子那一块做。"""
+
+    def setUp(self):
+        import matdet
+        self.matdet = matdet
+
+    @staticmethod
+    def _ransac_before(pts, rmin, rmax, thr, iters, rng):
+        """10-25 以前 fit_circle 里一组一组算的 RANSAC(对照用)。"""
+        n, best_k, best = len(pts), -1, None
+        for _ in range(iters):
+            i = rng.choice(n, 3, replace=False)
+            (ax, ay), (bx, by), (cx, cy) = pts[i]
+            d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+            if abs(d) < 1e-6:
+                continue
+            a2, b2, c2 = ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy
+            ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
+            uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
+            r = math.hypot(ax - ux, ay - uy)
+            if not rmin <= r <= rmax:
+                continue
+            k = int(np.count_nonzero(np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - r) < thr))
+            if k > best_k:
+                best_k, best = k, (float(ux), float(uy), float(r))
+        return best
+
+    def test_triples_same_as_choice(self):
+        for n in (6, 7, 50, 333, 1000, 4096, 12000):
+            for s in (7, 99):
+                a = self.matdet._triples_slow(n, 160, np.random.default_rng(s + n))
+                b = self.matdet._triples(n, 160, np.random.default_rng(s + n))
+                np.testing.assert_array_equal(a, b)
+
+    def test_ransac_same_as_before(self):
+        rng = np.random.default_rng(0)
+        for k in range(60):
+            n = int(rng.integers(6, 700))
+            cx, cy, r = rng.uniform(50, 600), rng.uniform(50, 400), rng.uniform(10, 200)
+            a = rng.uniform(0, 2 * np.pi * rng.uniform(0.2, 1.0), n)
+            pts = np.column_stack([cx + r * np.cos(a), cy + r * np.sin(a)]) + rng.normal(0, 1.5, (n, 2))
+            out = rng.random(n) < 0.3
+            pts[out] = rng.uniform(0, 640, (int(out.sum()), 2))
+            if k % 2:
+                pts = np.round(pts)
+            self.assertEqual(self.matdet._ransac_best(pts, 15, 170, 2.0, 160, np.random.default_rng(7 + n)),
+                             self._ransac_before(pts, 15, 170, 2.0, 160, np.random.default_rng(7 + n)))
+
+    def test_detect_many_same_as_one_by_one(self):
+        frames = [cv2.imread(str(HERE / 'testdata' / n)) for n in ('arm_cam_18.jpg', 'arm_cam_19.jpg')]
+        rng = np.random.default_rng(3)
+        for s in range(8):
+            mats = [(int(c), float(rng.uniform(80, 560)), float(rng.uniform(60, 330)), float(rng.uniform(30, 60)))
+                    for c in rng.choice([1, 2, 3, 4, 5, 6], size=3, replace=False)]
+            frames.append(scene(mats, claw_top=(float(rng.uniform(330, 420)) if s % 4 else None), seed=s))
+        a = self.matdet.MaterialDetector(NO_MASK)
+        b = self.matdet.MaterialDetector(NO_MASK)
+        for fr in frames:
+            for cols in ([1, 2, 3], [3, 1, 2], [3], [6, 3, 1, 2], [1, 1, 3]):
+                one = {}
+                for c in cols:
+                    one[int(c)] = a.detect(fr, c)
+                self.assertEqual(one, b.detect_many(fr, cols))
+                self.assertEqual(a.last, b.last)
+                self.assertTrue(np.array_equal(a.last_claw, b.last_claw))
+                self.assertTrue((a._auto_cache is None and b._auto_cache is None) or np.array_equal(a._auto_cache, b._auto_cache))
+                self.assertEqual(a.r_ref, b.r_ref)
+
+    def test_vision_uses_one_pass_per_frame(self):
+        """Vision.material_errors / plate_scan：matdet 时一帧只调一次 detect_many；别的识别办法照旧一个一个认。"""
+        import vision
+        im = cv2.imread(str(HERE / 'testdata' / 'arm_cam_18.jpg'))
+
+        class Cam:
+            def read(self):
+                return im
+        v = vision.Vision(cfg={'matdet': dict(NO_MASK), 'turntable_on': False}, camera=Cam(), log=lambda s: None)
+        md = v.material_detector_obj()
+        calls = []
+        orig = md.detect_many
+        md.detect_many = lambda fr, cols: calls.append(list(cols)) or orig(fr, cols)
+        errs = v.material_errors([1, 3])
+        self.assertEqual(calls, [[1, 3]])
+        ref = self.matdet.MaterialDetector(NO_MASK)
+        for c in (1, 3):
+            r = ref.detect(im, c)
+            cu, cv_ = v.claw('RAW')
+            self.assertEqual(errs[c], None if r is None else (r['center'][0] - cu, r['center'][1] - cv_))
+        _plate, errs2 = v.plate_scan([1, 3])
+        self.assertEqual(calls, [[1, 3], [1, 3]])
+        self.assertEqual(errs2, errs)
+        v2 = vision.Vision(cfg={}, camera=Cam(), material_detector=lambda fr, c: (float(c), 0.0), log=lambda s: None)
+        self.assertEqual(v2.material_errors([2, 5]), {2: (2.0 - v2.claw('RAW')[0], -v2.claw('RAW')[1]),
+                                                       5: (5.0 - v2.claw('RAW')[0], -v2.claw('RAW')[1])})
+
+
 if __name__ == '__main__':
     unittest.main()

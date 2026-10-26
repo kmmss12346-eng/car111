@@ -3284,7 +3284,10 @@ class RawNearSlotTests(unittest.TestCase):
             grabs = [i for i, q in enumerate(r) if q.startswith('GRAB')]
             self.assertTrue(grabs)
             for i in grabs:
-                self.assertFalse(r[i - 1].startswith('AP '), r[i - 3:i + 1])
+                if r[i - 1].startswith('AP '):
+                    # (10-26)夹完回到看的姿态(同一边转过去：先 AP a1-2°、再 AP a1，AP 回报的角度直接用)，原料盘已经停着就马上下爪：
+                    #   前面那条 AP 是回来的那一对，不是下爪前另发的
+                    self.assertTrue(r[i - 2].startswith('AP ') and float(r[i - 2].split()[1]) < float(r[i - 1].split()[1]), r[i - 3:i + 1])
             self.assertEqual(sum(1 for v_ in w.tray.values() if v_), 3, text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
         P = h.arm.params()

@@ -430,7 +430,13 @@ def circle_material_detector(cfg=None, seed_r=None):
             return None
         c = res['center']
         return (float(c[0]), float(c[1]))
+
+    def many(frame, color_ids):
+        """(10-26)同一帧认好几个颜色 {颜色: (u, v) 或 None}：HSV、爪子区域这一帧只算一次(结果和一个一个认一样)。"""
+        return {c: (None if r is None else (float(r['center'][0]), float(r['center'][1])))
+                for c, r in md.detect_many(frame, color_ids).items()}
     det.detector = md
+    det.many = many
     return det
 
 
@@ -730,14 +736,25 @@ class Vision:
             g_last = g
             yield t, p, moved
 
+    @staticmethod
+    def _det_many(det, fr, colors):
+        """同一帧认好几个颜色 {颜色: 像素 (u, v) 或 None}：matdet 这一帧只算一次 HSV、爪子区域(10-26)；别的识别办法一个一个认。"""
+        if fr is None:
+            return {}
+        many = getattr(det, 'many', None)
+        if many is not None:
+            return many(fr, [int(c) for c in colors])
+        return {int(c): det(fr, int(c)) for c in colors}
+
     def material_errors(self, colors):
         """同一帧里认这几个颜色：{颜色: 偏差像素 (物料 - 爪子) 或 None}。不按顺序抓时，原料盘停下以后看哪个在爪子附近。"""
         det = self._material_det()
         fr = self._frame()
-        out = {}
         cu, cv_ = self.claw('RAW')
+        got = self._det_many(det, fr, colors)
+        out = {}
         for c in colors:
-            p = det(fr, int(c)) if fr is not None else None
+            p = got.get(int(c))
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
         return out
 
@@ -760,8 +777,9 @@ class Vision:
         t1 = time.perf_counter()
         out = {}
         cu, cv_ = self.claw('RAW')
+        got = self._det_many(det, fr, colors)
         for c in colors:
-            p = det(fr, int(c)) if fr is not None else None
+            p = got.get(int(c))
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
         t2 = time.perf_counter()
         plate = None

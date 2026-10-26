@@ -108,22 +108,86 @@ def _coverage(pts, cx, cy, bins=36):
     return len(np.unique(idx)) / float(bins)
 
 
+_TRIPLES_OK = None          # 这台电脑的 numpy：一次抽完(_triples_fast)和一组一组 rng.choice 抽到的一样不一样(第一次用时查一次)
+
+
+def _triples_fast(n, iters, rng):
+    """(10-26)和 [rng.choice(n, 3, replace=False) for _ in range(iters)] 抽到的完全一样，一次抽完(快几十倍)：
+    numpy 从 n 个里不放回抽 3 个用的是 Floyd 抽法再打乱，每组用 5 个 32 位随机数(Lemire 有界整数)。
+    万一碰到 Lemire 要重抽的(概率约千万分之一)返回 None(调用的地方退回一组一组抽)。"""
+    u = rng.integers(0, 1 << 32, size=(iters, 5), dtype=np.uint32).astype(np.uint64)
+    js = np.array([n - 3, n - 2, n - 1, 2, 1], np.uint64)
+    ex = js + np.uint64(1)
+    m = u * ex
+    if np.any((m & np.uint64(0xFFFFFFFF)) < (np.uint64(0xFFFFFFFF) - js) % ex):
+        return None
+    v = (m >> np.uint64(32)).astype(np.int64)
+    a0 = v[:, 0]
+    a1 = np.where(v[:, 1] == a0, n - 2, v[:, 1])
+    a2 = np.where((v[:, 2] == a0) | (v[:, 2] == a1), n - 1, v[:, 2])
+    D = np.stack([a0, a1, a2], axis=1)
+    rows = np.arange(iters)
+    for col, j in ((2, v[:, 3]), (1, v[:, 4])):         # 打乱：第 2 个和 [0, 2] 里抽的那个换，第 1 个和 [0, 1] 里抽的那个换
+        t = D[rows, j].copy()
+        D[rows, j] = D[rows, col]
+        D[rows, col] = t
+    return D.astype(np.intp)
+
+
+def _triples(n, iters, rng):
+    """RANSAC 每次用的三个点(下标)：和以前一组一组 rng.choice 抽到的一样。"""
+    global _TRIPLES_OK
+    if _TRIPLES_OK is None:
+        try:
+            _TRIPLES_OK = all(np.array_equal(_triples_fast(k, 40, np.random.default_rng(s + k)),
+                                             _triples_slow(k, 40, np.random.default_rng(s + k)))
+                              for k in (6, 37, 500, 4096) for s in (7, 13))
+        except Exception:
+            _TRIPLES_OK = False
+    if _TRIPLES_OK:
+        st = rng.bit_generator.state
+        t = _triples_fast(n, iters, rng)
+        if t is not None:
+            return t
+        rng.bit_generator.state = st                   # 要重抽：退回一组一组抽(从同一个状态开始，抽到的还是一样)
+    return _triples_slow(n, iters, rng)
+
+
+def _triples_slow(n, iters, rng):
+    return np.array([rng.choice(n, 3, replace=False) for _ in range(iters)], np.intp)
+
+
+def _ransac_best(pts, rmin, rmax, thr, iters, rng):
+    """(10-26 用户"识别……太慢了")RANSAC 一次算完：三个点一组还是按原来的办法抽(同样的随机数，抽到的完全一样)，
+    圆心、半径、每个圆上有多少点一起算(以前一组一组算，Python 循环占了认一个颜色的一半时间)。
+    挑的规则也一样：内点最多的、一样多取先抽到的。返回 (cx, cy, r) 或 None。"""
+    n = len(pts)
+    tri = _triples(n, iters, rng)
+    P = pts[tri]
+    ax, ay, bx, by, cx, cy = P[:, 0, 0], P[:, 0, 1], P[:, 1, 0], P[:, 1, 1], P[:, 2, 0], P[:, 2, 1]
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    ok = np.abs(d) >= 1e-6
+    ds = np.where(ok, d, 1.0)
+    a2, b2, c2 = ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy
+    ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / ds
+    uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / ds
+    r = np.array([math.hypot(x, y) for x, y in zip((ax - ux).tolist(), (ay - uy).tolist())])   # 和 _circle3 一样用 math.hypot
+    ok &= (rmin <= r) & (r <= rmax)
+    if not ok.any():
+        return None
+    idx = np.nonzero(ok)[0]
+    D = np.abs(np.hypot(pts[None, :, 0] - ux[idx, None], pts[None, :, 1] - uy[idx, None]) - r[idx, None])
+    j = int(idx[int(np.argmax(np.count_nonzero(D < thr, axis=1)))])
+    return float(ux[j]), float(uy[j]), float(r[j])
+
+
 def fit_circle(pts, rmin, rmax, r_ref=None, thr=2.0, iters=160, seed=7):
     """RANSAC 找圆，再精修。返回 (cx, cy, r, 内点数, 覆盖比例, 内点) 或 None。"""
     n = len(pts)
     if n < 6:
         return None
     rng = np.random.default_rng(seed + n)
-    best_k, best = -1, None
-    for _ in range(iters):
-        i = rng.choice(n, 3, replace=False)
-        c = _circle3(pts[i])
-        if c is None or not (rmin <= c[2] <= rmax):
-            continue
-        d = np.abs(np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) - c[2])
-        k = int(np.count_nonzero(d < thr))
-        if k > best_k:
-            best_k, best = k, c
+    best = _ransac_best(pts, rmin, rmax, thr, iters, rng)
     if best is None:
         return None
     cx, cy, r = best
@@ -293,13 +357,19 @@ class MaterialDetector:
         n, lab, st, _ = cv2.connectedComponentsWithStats(blue, connectivity=8)
         m = np.zeros_like(blue)
         min_a = self.cfg['claw_min_area_frac'] * h * w
+        box = None
         for i in range(1, n):
             x, y, bw, bh, a = st[i]
             if y + bh >= h - 2 and a >= min_a:
                 m[lab == i] = 255
-        if not m.any():
+                box = (x, y, x + bw, y + bh) if box is None else (min(box[0], x), min(box[1], y), max(box[2], x + bw), max(box[3], y + bh))
+        if box is None:
             return m
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+        # (10-26)只在爪子那一块(往外多留两个核半径)做闭运算：和整幅画面做完全一样(外面全是 0，核碰不到)，省一半多时间
+        x0, y0, x1, y1 = max(0, box[0] - 32), max(0, box[1] - 32), min(w, box[2] + 32), min(h, box[3] + 32)
+        sub = cv2.morphologyEx(m[y0:y1, x0:x1], cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+        m = np.zeros_like(blue)
+        m[y0:y1, x0:x1] = sub
         cols = m.max(axis=0) > 0
         top = np.argmax(m > 0, axis=0)
         rows = np.arange(h)[:, None]
@@ -384,13 +454,46 @@ class MaterialDetector:
         light = s <= s_light                                  # 只看饱和度(亮度随光线变，饱和度不怎么变)
         return light if color_id == 6 else not light
 
+    def _claw_shared(self, hsv, color_id, shared):
+        """detect_many 用：和 claw_mask(hsv=, color_id=) 一样的结果，但同一帧自动找爪子只找一次(找一次要十几毫秒)。"""
+        m = self._load_static(hsv.shape)
+        if m is not None:
+            return m
+        cache = self._auto_cache
+        if color_id in (3, 6) and cache is not None and cache.shape[:2] == hsv.shape[:2]:
+            return cache
+        if 'auto' not in shared:
+            shared['auto'] = self.auto_claw_mask(hsv)
+        m = shared['auto']
+        if color_id not in (3, 6) and m.any() and not shared.get('cached'):
+            shared['cached'] = True                       # 同一帧同一份：记一次和每个颜色都记一次结果一样
+            if cache is None or cache.shape != m.shape or np.count_nonzero(m) <= 1.03 * np.count_nonzero(cache):
+                self._auto_cache = m
+        return m
+
     # ---------------------------------------------------------- 主函数
-    def detect(self, frame, color_id, claw=None):
-        color_id = int(color_id)
-        cfg = self.cfg
+    def detect_many(self, frame, color_ids, claw=None):
+        """(10-26 用户"识别……太慢了")同一帧认好几个颜色：{颜色号: 结果 或 None}。HSV、爪子区域、不能用的边缘这一帧只算一次
+        (一个一个 detect 时每个颜色都重算)；结果和按 color_ids 的顺序一个一个 detect 完全一样(last、last_claw 也是最后一个颜色的)。"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        shared = {}
+        out = {}
+        for c in color_ids:
+            out[int(c)] = self._detect_hsv(hsv, int(c), claw, shared)
+        return out
+
+    def detect(self, frame, color_id, claw=None):
+        return self._detect_hsv(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), int(color_id), claw, None)
+
+    def _detect_hsv(self, hsv, color_id, claw, shared):
+        cfg = self.cfg
         h, w = hsv.shape[:2]
-        cm = claw if claw is not None else self.claw_mask(hsv=hsv, color_id=color_id)
+        if claw is not None:
+            cm = claw
+        elif shared is not None:
+            cm = self._claw_shared(hsv, color_id, shared)
+        else:
+            cm = self.claw_mask(hsv=hsv, color_id=color_id)
         self.last_claw = cm
         mask = self.color_mask(hsv, color_id)
         if cm is not None and cm.any():
@@ -404,15 +507,21 @@ class MaterialDetector:
             return None
         contours.sort(key=cv2.contourArea, reverse=True)
 
-        # 不能用的边缘：挨着爪子、挨着画面边(那里不是物料真正的边)
-        bad = np.zeros((h, w), np.uint8)
-        if cm is not None and cm.any():
-            k = 2 * int(cfg['claw_margin_px']) + 1
-            bad = cv2.dilate(cm, np.ones((k, k), np.uint8))
-        bad[:3, :] = 255
-        bad[-3:, :] = 255
-        bad[:, :3] = 255
-        bad[:, -3:] = 255
+        # 不能用的边缘：挨着爪子、挨着画面边(那里不是物料真正的边)。detect_many：同一个爪子区域只算一次
+        got = next((b for m_, b in (shared or {}).get('bad', ()) if m_ is cm), None)
+        if got is not None:
+            bad = got
+        else:
+            bad = np.zeros((h, w), np.uint8)
+            if cm is not None and cm.any():
+                k = 2 * int(cfg['claw_margin_px']) + 1
+                bad = cv2.dilate(cm, np.ones((k, k), np.uint8))
+            bad[:3, :] = 255
+            bad[-3:, :] = 255
+            bad[:, :3] = 255
+            bad[:, -3:] = 255
+            if shared is not None:
+                shared.setdefault('bad', []).append((cm, bad))
 
         rmin, rmax = cfg['r_px']
         r_ref = self.r_ref.get(color_id)

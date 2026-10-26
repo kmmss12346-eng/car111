@@ -198,6 +198,8 @@ DEFAULTS = dict(
                                         #   再把物料直着抬起 OVCLR 离开原料盘(CLWAIT + 升 OVCLR 的时间)，不够就等下一次停，不在它要转的时候夹
     raw_ct_stop_s=6.0,                  # (10-18 用户量的)原料盘每次大约停多久、转多久(秒)：还没量到之前按这个估计(停的时间按九折算，留余量)；
     raw_ct_move_s=3.0,                  #   亲眼看到两次停下以后，按量到的周期推算回到看的姿态时这一次已经停了多久
+                                        #   (10-26)最近那格等着的时候看到它转起来、又停下：量出停多久、转多久，以后按量到的算
+    raw_ct_period_tol=0.1,              #   (10-26)只看到过一次停下就回来、它已经停着：按周期推下一次停下，周期按这么多打折(按最早停下算，保守)
     raw_backlash_deg=2.0,               # (10-18 实车 ID1 有齿轮间隙)转到看原料盘的姿态时 ID1 先到小这么多度再转过去：每次都从同一边转到，停的地方一样
     raw_teach_verify=True,              # 示教停靠位对上以后按比赛的走法(从看的姿态一下转过去)再试，差了修角度(一点一点对和一下转过去停的地方不一样)
     raw_teach_verify_n=3,
@@ -4592,7 +4594,10 @@ class MissionHooks:
             raise ArmError('读不到手臂角度')
         if math.hypot(a[0] - h0[0], (a[1] - h0[1]) / 10.0) <= 5.0:
             self._raw_ct_approach(h0[0], h0[1])                # 从同一边转过去(齿轮间隙)，AP 到位误差 0.3°
-            a = self.arm.read_angles()
+            got = getattr(self.arm, 'angle', None) or {}
+            a = (got.get(1), got.get(2))                       # (10-26)AP 转完回报了两个角度：直接用，不再另读一遍(省两次串口来回)
+            if a[0] is None or a[1] is None:
+                a = self.arm.read_angles()
             if a[0] is None or a[1] is None:
                 raise ArmError('读不到手臂角度')
         a = [float(a[0]), float(a[1])]
@@ -4671,12 +4676,31 @@ class MissionHooks:
             return self._raw_stop_len()
         return 0.9 * float(self.cfg.get('raw_ct_stop_s', 6.0))
 
+    def _raw_ct_period(self):
+        """原料盘转一圈(停一次 + 转一次)要多久(秒)：亲眼量到过停多久、转多久就按量到的(中值)，没量到按 raw_ct_stop_s + raw_ct_move_s。"""
+        st, mv = sorted(self.raw_stops[-5:]), sorted(self.raw_moves[-5:])
+        s = st[len(st) // 2] if st else float(self.cfg.get('raw_ct_stop_s', 6.0))
+        m = mv[len(mv) // 2] if mv else float(self.cfg.get('raw_ct_move_s', 3.0))
+        return s + m
+
     def _raw_ct_predict(self, t):
         """手臂刚回到看的姿态、原料盘正停着：按亲眼看到的几次停下的时刻和周期，推算这一次是什么时候停下的。
-        要看到过两次以上停下(才知道真实的周期)；推算出来这会儿应该在转、或者马上要转，返回 None。"""
+        看到过两次以上停下：按量到的周期推；推算出来这会儿应该在转、或者马上要转，返回 None。
+        (10-26 用户"有时候下一个已经在摄像头下面了但是还是一直不抓取，错过了又要再等一轮")只看到过一次停下(多半就是刚才下爪的那一次)：
+        以前推不了，一直等它转一下再停，错过这一次停。现在按周期(量到的，没量到按配置的)推下一次：只推离那一次不到 1.6 个周期的，
+        而且按最早可能停下的时刻算(周期按 raw_ct_period_tol 打折：多算一点已经停了多久，剩的时间算少一点)。"""
         ts = getattr(self, '_ct_stops', None) or []
-        if len(ts) < 2:
+        if not ts:
             return None
+        if len(ts) < 2:
+            per = self._raw_ct_period()
+            lo = (1.0 - float(self.cfg.get('raw_ct_period_tol', 0.1))) * per   # 下一次最早什么时候停下
+            dt = t - ts[-1]
+            if per < 1.0 or not lo <= dt < 1.6 * per:
+                return None
+            if dt - lo > self._raw_ct_stop_len() - 0.2:
+                return None                                    # 按最早停下的算，这会儿快停完了(要转了)
+            return ts[-1] + lo
         nominal = float(self.cfg.get('raw_ct_stop_s', 6.0)) + float(self.cfg.get('raw_ct_move_s', 3.0))
         pers = []
         for a, b in zip(ts, ts[1:]):
@@ -4691,7 +4715,7 @@ class MissionHooks:
         return t - el
 
     def _raw_ct_watch(self, watch, max_s, after_move, focus=None, centers=None, known_stop=None, known_why='在对准的时候',
-                      known_color=None):
+                      known_color=None, prev_stop=None, say_unknown=False):
         """手臂在看原料盘的姿态不动，等原料盘停稳(连着两帧看得到的物料都没动)：返回 (停稳时刻, 停下的时刻或 None, {颜色: 像素})；
         max_s 秒内等不到返回 None。after_move = 要先看到它转起来(手臂刚动过、上一次停下已经用过：等下一次停，这样知道它是什么时候停下的)。
         focus = (画面位置, 半径像素)：只按这一块里的物料判断转没转、停没停(10-18 最近那格的做法：只管抓取位；
@@ -4699,17 +4723,24 @@ class MissionHooks:
         centers = 列表：(10-20)同一帧顺便认原料盘外圈(Vision.plate_scan)，认出的圆心加进这个列表(看车有没有被带偏，不用另外停下来看)。
         known_stop = (10-21)对准原料盘中心的时候看着它停下的时刻(_rc_plate_stop)、刚才下爪的那一次停下：一看还停着就按它算，
         不用等它转一下再停(known_why = 日志里说是什么时候停下的，None 不说)；known_color：抓取位那一块里要还是这个颜色才算还是那一次
-        (别的颜色 = 走开的时候原料盘已经转过、又停下了)；按量到的停多久这一次早该停完了也不算。"""
+        (别的颜色 = 走开的时候原料盘已经转过、又停下了)；按量到的停多久这一次早该停完了也不算。
+        prev_stop = (10-26)上一次停下的时刻(亲眼看到的，之后手臂、车都没动过)：看到它转起来就量出那一次停了多久，再看到停下量出转了多久
+        (self.raw_stops / raw_moves，以后按量到的算)。self._ct_seen = 返回的停下时刻是不是亲眼看到的(不是推算/对准时记的)。
+        say_unknown = 刚夹完回来/刚对准完：原料盘停着、推不出这一次停了多久时说一句为什么在等(接着等同一次停下时不说)。"""
         cfg, v = self.cfg, self.vision
         scan = centers is not None and hasattr(v, 'plate_scan')
         claw = np.array(v.claw('RAW'), float)
         still_px = float(cfg.get('raw_still_px', 6.0))
         keep_s = float(cfg.get('raw_keepalive_s', 12.0) or 0.0)
         prev, t_move, gap_t = None, None, None
+        said = False
+        self._ct_seen = False
         t_lim = self.now() + float(max_s)
         while self.now() < t_lim:
             self._check_abort()
             if keep_s > 0 and self.now() - self._ct_t_arm > keep_s:
+                if t_move is None:
+                    prev_stop = None                           # 动升降的时候它可能转起来了(没看到)：这一次停了多久量不准
                 if t_move is not None and gap_t is None:
                     gap_t = self.now()                         # (10-21)原料盘在转的时候去动升降：这段时间里停下的，按动之前算(保守)
                 try:
@@ -4743,6 +4774,9 @@ class MissionHooks:
                 if moved:
                     if t_move is None:
                         t_move = prev[0]
+                        s_nom = float(cfg.get('raw_ct_stop_s', 6.0))
+                        if prev_stop is not None and gap_t is None and 0.6 * s_nom <= t_move - float(prev_stop) <= 1.6 * s_nom:
+                            self.raw_stops = self.raw_stops[-9:] + [t_move - float(prev_stop)]   # (10-26)量到这一次停了多久
                     gap_t = None                               # 动过升降以后又看着它在转：停下是在这以后，看得到
                 elif t_move is not None:
                     t_stop = prev[0] - 0.07                    # 看着它停下：停下大概在第一帧停着的帧之前一点点
@@ -4751,6 +4785,10 @@ class MissionHooks:
                     else:
                         self.raw_cycle['t_stop'] = t_stop
                         self._ct_stops = (getattr(self, '_ct_stops', None) or [])[-5:] + [t_stop]
+                        self._ct_seen = True
+                        m_nom = float(cfg.get('raw_ct_move_s', 3.0))
+                        if 0.5 * m_nom <= t_stop - t_move <= 2.0 * m_nom:
+                            self.raw_moves = self.raw_moves[-9:] + [t_stop - t_move]          # (10-26)量到转了多久
                     return t, t_stop, px
                 elif not after_move:
                     return t, None, px
@@ -4769,6 +4807,11 @@ class MissionHooks:
                     if tp is not None and (used is None or abs(tp - used) > 1.0):     # 这一次停下已经看过、没用上：等下一次
                         self.log(f'    原料盘停着：按量到的周期推算已经停了 {t - tp:.1f} 秒')
                         return t, tp, px
+                    if tp is None and say_unknown and not said:    # (10-26)以前这里不说话，看着像"物料在下面却不抓"
+                        said = True
+                        here = '、'.join(COLOR_NAMES.get(int(c_), str(c_)) for c_ in sorted(pf))
+                        self.log(f'    原料盘停着(这一格上是 {here})，不知道这一次已经停了多久(推算这会儿快停完了、或者推不出来)：'
+                                 '等它转一下再停，免得下爪时它转起来')
             prev = (t, pf)
         return None
 
@@ -5264,6 +5307,7 @@ class MissionHooks:
         misses, recheck, after, last_stop = 0, False, True, None
         checked = not cfg.get('raw_near_check_last', True)
         reuse = None                                           # 刚下过爪(夹的颜色)：原料盘还停在这一次、这一格上还是它(没夹上)就马上再夹
+        cont = None                                            # (10-26)亲眼看到的上一次停下、之后手臂和车都没动：接着等时量它停了多久、转了多久
 
         def missed(c_, where):
             """夹过的颜色 c_ 还在原料盘上(where)：刚才那次没夹上。还能再夹就放回 left(等它转到这一格)。"""
@@ -5291,6 +5335,7 @@ class MissionHooks:
                 checked = True                                 # 都夹了：再看几秒原料盘，夹过的还在上面就是没夹上
                 self.log('    这一批都夹过了：再看一眼原料盘(夹过的还在上面 = 刚才没夹上，再夹)')
                 Pn_ = {k_: P[k_] + shift() for k_ in keys}
+                cont = None
                 c_ = self._raw_near_leftover(sorted(got_at), float(cfg.get('raw_near_check_s', 3.0)),
                                              at_slot=lambda p_: any(float(np.linalg.norm(p_ - Pn_[k_])) <= match for k_ in keys))
                 if c_ is None:
@@ -5309,14 +5354,17 @@ class MissionHooks:
             cen = [] if recheck else None
             ob = self._raw_ct_watch(watch, min(20.0, max(1.0, t_end - self.now())), after_move=after,
                                     focus=(P[near_k] + sh, 0.5 * sp), centers=cen, known_stop=known,
-                                    known_why=None if reuse else '在对准的时候', known_color=reuse or None)
+                                    known_why=None if reuse else '在对准的时候', known_color=reuse or None, prev_stop=cont,
+                                    say_unknown=reuse is not None or last_stop is None)
             known, after = None, True
             same, reuse = reuse is not None, None
+            cont = ob[1] if (ob is not None and getattr(self, '_ct_seen', False)) else None
             if recheck and cen:
                 recheck = False
                 r_ = self._raw_near_redo(D, comp, np.median(np.asarray(cen[-3:]), axis=0), shift=sh)
                 if r_ is not None:                             # 车被带偏了、对回去了：停靠位跟着挪，重新等原料盘停
                     P = r_[1]
+                    cont = None
                     continue
             if ob is None:
                 continue
@@ -5393,6 +5441,8 @@ class MissionHooks:
             q_seen = None                                      # (10-24)刚看着停下的那一帧：按它查物料在不在这一格，不再另拍一帧
             if px.get(int(item.color)) is not None and self.now() - float(_t) <= float(cfg.get('raw_seen_fresh_s', 0.5)):
                 q_seen = np.asarray(px[int(item.color)], float) - np.asarray(v.claw('RAW'), float)
+            cont = None                                        # 手臂要动了：下一次停了多久量不了
+            t_g0 = self.now()
             try:
                 got = self._raw_ct_grab(item, near_k, reach[near_k], tag, t_end=t_stop + self._raw_ct_stop_len() - T - margin - clear_s,
                                         near=left_s >= need + fix_s, watch_px=px, at=home, seen=q_seen)
@@ -5415,6 +5465,7 @@ class MissionHooks:
                 #   以前等的时间不重新算，要的那个转一圈回来之前就到时间了，这一批后面的全记"没夹到"
                 regrab[int(item.color)] = regrab.get(int(item.color), 0) + 1
                 t_end = max(t_end, self.now() + track)
+            t_g1 = self.now()
             try:
                 home, comp = self._raw_ct_pose(D)              # 回到看原料盘的姿态(同一边转过去)，顺便算手臂角度还差的一点让画面挪了多少
                 self._ct_home = home
@@ -5425,6 +5476,9 @@ class MissionHooks:
                 self.log('    ★ 回不到看原料盘的姿态：这个原料区不再接着夹(收着的手臂直接转过去会刮到电池盒)')
                 break
             self._ct_t_arm = self.now()
+            if left:                                           # (10-26)看时间花在哪：原料盘转一圈(停 + 转)多久，夹一个回来又要多久
+                self.log(f'    ({tag} 下爪到放进转盘 {t_g1 - t_g0:.1f} 秒、回到看原料盘 {self.now() - t_g1:.1f} 秒；'
+                         f'从它停下算 {self.now() - t_stop:.1f} 秒，原料盘转一圈约 {self._raw_ct_period():.1f} 秒)')
             known, reuse = t_stop, int(item.color)             # 原料盘还停在这一次：这一格上还是它(没夹上)就马上再夹
             if cfg.get('raw_near_recheck', True) and not self.disabled and left:
                 recheck = True                                 # 车被带偏了就车轮慢慢对回去(还有要夹的才看；等原料盘时顺便看，不另外停)
