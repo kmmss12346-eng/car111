@@ -27,8 +27,10 @@
     g -16 -18     (看原料盘的那几步：A1G、ZGRAB、CLWOR、ZOBRAW)原料画面里的绿十字往左 16、往上 18 像素(往右、往下为正)，
                   存进 vision_cal.json，画面里马上跟着动。画面上 off 后面那两个数 = 物料离绿十字差多少：
                   先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。只输入 g = 看绿十字现在在哪
-                  (10-24 看圆环的那几步：A1P、R1、R3、ZPLC、ZOBRNG)挪的是圆环画面里的红十字(粗加工区、暂存区的爪子点)，
+                  (10-24 看圆环的那几步：A1P、ZPLC、ZOBRNG)挪的是圆环画面里的红十字(粗加工区、暂存区的爪子点)，
                   和原料的绿十字分开存、互不影响。爪子在 2 号环正上方时照抄画面上 off 后面那两个数，红十字就到 2 号环中心上了
+                  (10-26 R1、R3 两步)挪的是 1 号环的橙十字 / 3 号环的蓝十字：比赛时手臂转到这两个环以后，摄像头只动手臂
+                  把这个环的中心对到它自己的十字上再放(车不动，最多 2 秒)。三个十字互不影响
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
@@ -185,10 +187,14 @@ STEPS = [
               '或者 u 松开舵机用手摆，摆好回车。存的是比 2 号环多转了多少度，粗加工区、暂存区都用它。\n'
               '比赛时车只对准 2 号环一次，1、3 号环按这里的角度直接转过去放、取，车不动。高处看不准可以先 z -40 降低一点再看。\n'
               '以前存过的话手臂先转到存过的位置，对就直接回车。要重调：python3 arm_calib.py --from A1P，先看爪子正对 2 号环再做这两步。\n'
-              '(10-24)红十字挪准了(上一步)的话，也可以在原来的高度看：把 1 号环中心(黄十字)对到红十字上。'),
+              '(10-26)画面里的橙十字 = 1 号环自己的十字：比赛时手臂按这里的角度转过去以后，摄像头只动手臂(车不动，最多 2 秒)\n'
+              '把 1 号环中心(黄十字)对到橙十字上再放。爪子摆到 1 号环正上方以后(先 z -40 降低看准，再升回来)，画面上 off 后面\n'
+              '那两个数就是 1 号环离橙十字多少：输入 g 加这两个数，橙十字就挪到 1 号环中心上(只改 1 号环的，红十字、3 号环的不动)。\n'
+              '橙十字已经挪准了的话，也可以直接把 1 号环中心(黄十字)对到橙十字上再回车。'),
     dict(key='R3', kind='ringpose', ring=3, title='3 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动。手臂转到了 2 号环上方(以前存过 3 号环就是存过的位置)：把爪子移到 3 号环中心的正上方(和上一步一样调)，摆好回车。\n'
-              '(10-24)红十字挪准了的话，也可以在原来的高度看：把 3 号环中心(黄十字)对到红十字上。'),
+              '(10-26)画面里的蓝十字 = 3 号环自己的十字(比赛时摄像头只动手臂把 3 号环中心对到它上再放)：爪子摆到 3 号环正上方以后，\n'
+              '输入 g 加画面上 off 后面那两个数，蓝十字就挪到 3 号环中心上(只改 3 号环的)。蓝十字挪准了也可以直接把黄十字对到它上。'),
     # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)。
     # (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调"；"ID1 连续转动，不要伸缩一下就停一下")按从车上转盘出去的顺序调；
     #   比赛时 ID1 一直转不停：转过 R1T2 开始伸到 R2T，转过 R1T1 开始缩到圆环那边要的长度；回车上转盘反过来(R2STG=1 才分段停下来走)。
@@ -614,11 +620,13 @@ class Wizard:
         return None
 
     # ------------------------------------------------------------ 摄像头画面(另开一个 vlive.py 进程，向导只用串口，不冲突)
-    def _view_open(self, mode):
-        if self._viewer is not None and self._viewer.poll() is None and self._view_mode == mode:
+    def _view_open(self, mode, ring=None):
+        """ring = 1 / 3(R1、R3 两步)：画面按这个环自己的十字(橙 / 蓝)算偏差。"""
+        ring = ring if mode == 'ring' and ring in (1, 3) else None
+        if self._viewer is not None and self._viewer.poll() is None and self._view_mode == (mode, ring):
             return
         self._view_close()
-        args = [sys.executable, str(ROOT / 'vlive.py')] + (['--ring'] if mode == 'ring' else ['1'])
+        args = [sys.executable, str(ROOT / 'vlive.py')] + ((['--ring'] + (['--ringno', str(ring)] if ring else [])) if mode == 'ring' else ['1'])
         if self.cfg_path is not None:
             args += ['--config', str(self.cfg_path)]           # (10-23)和向导用同一份配置(g 挪的十字存在它说的 vision_cal.json)
         try:
@@ -628,10 +636,13 @@ class Wizard:
             self.out(f'  (打不开摄像头画面：{e})')
             self._viewer = None
             return
-        self._view_mode, self._view_told = mode, False
+        self._view_mode, self._view_told = (mode, ring), False
         self.out('  摄像头画面已打开(另一个窗口' + ('，看圆环' if mode == 'ring' else '，看物料，窗口里按 1~6 换颜色') +
                  ')；输入 v 关掉/再打开')
-        if mode == 'ring':
+        if mode == 'ring' and ring:
+            self.out(f'  画面里的{"橙" if ring == 1 else "蓝"}十字 = {ring} 号环自己的十字(比赛时摄像头只动手臂把 {ring} 号环中心对到它上再放)：'
+                     '输入 g 左右 上下 挪它，红十字和另一个环的不动')
+        elif mode == 'ring':
             self.out('  画面里的红十字 = 粗加工区、暂存区这边的爪子点(比赛时 2 号环中心对到它)：输入 g 左右 上下 挪它，原料的绿十字不动')
 
     def _claw_shift(self, line):
@@ -642,8 +653,14 @@ class Wizard:
         mode = getattr(self, '_step_mode', None)
         if mode not in ('raw', 'ring'):
             raise CalError('g 只在看摄像头画面的那几步用：看原料盘的(A1G、ZGRAB、CLWOR、ZOBRAW)挪原料的绿十字，'
-                           '看圆环的(A1P、R1、R3、ZPLC、ZOBRNG)挪圆环的红十字')
-        kind, name = ('RAW', '原料的绿十字') if mode == 'raw' else ('RING', '圆环的红十字(粗加工区、暂存区)')
+                           '看圆环的(A1P、ZPLC、ZOBRNG)挪圆环的红十字，R1、R3 挪 1、3 号环自己的十字')
+        ring = getattr(self, '_step_ring', None) if mode == 'ring' else None
+        if mode == 'raw':
+            kind, name = 'RAW', '原料的绿十字'
+        elif ring in (1, 3):
+            kind, name = f'RING{ring}', f'{ring} 号环的{"橙" if ring == 1 else "蓝"}十字'      # (10-26)
+        else:
+            kind, name = 'RING', '圆环的红十字(粗加工区、暂存区)'
         parts = line.split()
         if len(parts) == 1:
             try:
@@ -656,6 +673,8 @@ class Wizard:
             self.out('  输入 g 左右 上下 挪它(像素，往右、往下为正)，例如 g -16 -18 = 往左 16、往上 18。\n' +
                      ('  画面上 off 后面那两个数 = 物料离绿十字差多少：先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。'
                       if kind == 'RAW' else
+                      f'  画面上 off 后面那两个数 = {ring} 号环离{name}差多少：爪子摆到 {ring} 号环正上方以后照抄这两个数，'
+                      f'{name}就到 {ring} 号环中心上了。' if kind != 'RING' else
                       '  画面上 off 后面那两个数 = 圆环离红十字差多少：爪子摆到 2 号环正上方以后照抄这两个数，红十字就到 2 号环中心上了。'))
             return None
         du, dv = (_num(parts[1]), _num(parts[2])) if len(parts) == 3 else (None, None)
@@ -671,7 +690,8 @@ class Wizard:
         self.out(f'  {name}：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f}) 像素，已存进 {Path(path).name}'
                  '(画面里马上跟着动；想挪回去就输入相反的数)。' +
                  ('绿十字改了，原料区要重新 rteach RAW near' if kind == 'RAW' else
-                  '比赛时车轮把 2 号环中心对到这里(1、3 号环按调的角度跟着转过去，不用重调)'))
+                  f'比赛时手臂转到 {ring} 号环以后，摄像头只动手臂把 {ring} 号环中心对到这里再放' if kind != 'RING' else
+                  '比赛时车轮把 2 号环中心对到这里(1、3 号环有自己的十字，不跟着动)'))
         if self._viewer is None or self._viewer.poll() is not None:
             self.out('  (摄像头画面没开着：输入 v 打开看看)')
         return None
@@ -1019,8 +1039,9 @@ class Wizard:
         self.out(st['text'])
         self._setup(st)
         mode = CAM_STEPS.get(st['key'] if isinstance(st['key'], str) else st['key'][0])
+        self._step_ring = st.get('ring') if k == 'ringpose' else None     # (10-26)R1、R3：g 挪这个环自己的十字
         if self.view and mode:
-            self._view_open(mode)
+            self._view_open(mode, self._step_ring)
         elif self._viewer is not None:
             self._view_close()
         self._step_mode = mode
@@ -1109,7 +1130,7 @@ class Wizard:
                 self._view_close()
                 self.out('  摄像头画面已关')
             else:
-                self._view_open(getattr(self, '_step_mode', None) or 'raw')
+                self._view_open(getattr(self, '_step_mode', None) or 'raw', getattr(self, '_step_ring', None))
             return None
         if line == 'r':
             self._read_servos()

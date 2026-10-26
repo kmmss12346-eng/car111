@@ -12,6 +12,7 @@
   - 多帧取中值，再剔除离群点后取平均，比单帧准
   - 输出"偏差像素" = 目标像素 - 爪子像素，交给 visual_servo
 爪子像素 claw_px 是爪子的轴线在画面里的位置：RAW 用于夹原料盘上的物料，RING 用于对准地上圆环。
+(10-26)RING1 / RING3：1、3 号环自己的十字(手臂转到 arm_calib 调的 1、3 号环角度以后，摄像头把这个环的中心对到它上)，没调过就和 RING 一样。
 改 claw_px.RING 1 个像素，放置位置大约移动 0.34mm(按 2.96 像素/毫米算)；以后实际放偏了，就调这个数。
 claw_px.PICK：圆环上方观察时，物料正好在爪子下面，它顶面圆心在画面里的位置(物料顶面比圆环高，和 RING 不是同一个点)。
 粗加工区第一次放下物料以后自动量一次存起来；取回、码垛时圆环白心被物料盖住，就直接把物料顶面对到这个点。
@@ -25,6 +26,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CAL_FILE = 'vision_cal.json'        # vclaw 实测的爪子像素存在这里(优先于配置文件里的 claw_px)
+RING_CROSS = ('RING1', 'RING3')      # (10-26)1、3 号环自己的十字(claw_px 里的键)；没调过就用 RING(2 号环的红十字)
+
+
+def cross_color(kind):
+    """画面里十字的颜色(BGR)：原料绿、2 号环(圆环这边)红、1 号环橙、3 号环蓝。"""
+    return {'RAW': (0, 255, 0), 'RING1': (0, 165, 255), 'RING3': (255, 120, 0)}.get(kind, (0, 0, 255))
 
 
 class VisionError(Exception):
@@ -584,7 +591,9 @@ class Vision:
         """每毫米多少像素。RAW：配置了物料直径(material_diam_mm)并且已经认到过没被挡住的物料时，
         用认到的物料半径现算(观察高度变了也准)；RING：vclaw RING 量过圆环最外圈半径时用它和 ring_outer_diam_mm 算；
         PICK(圆环上放着的物料的顶面)：用量到的物料顶面半径和物料直径算；
-        否则用配置里的 px_per_mm。"""
+        否则用配置里的 px_per_mm。RING1 / RING3(1、3 号环的十字)和 RING 一样(同一个高度看地上的圆环)。"""
+        if kind in RING_CROSS:
+            kind = 'RING'
         if kind == 'PICK':
             r = self.cfg.get('pick_r_px') or self.last_pick_r
             if r and self.cfg.get('material_diam_mm'):
@@ -614,6 +623,8 @@ class Vision:
         v = cp.get(kind)
         if v is None and kind == 'PICK':
             v = cp['RING']              # PICK 还没量过：画图、算画面范围先用圆环的点(对准前要先 has_pick())
+        if v is None and kind in RING_CROSS:
+            v = cp['RING']              # (10-26)1、3 号环自己的十字还没调过：和 2 号环的红十字一样
         return (float(v[0]), float(v[1]))
 
     def has_pick(self):
@@ -1027,13 +1038,13 @@ class Vision:
             return None
         return x0, y0, x1, y1
 
-    def ring_px(self, n=None, expect=None, any_size=False, max_px=None):
-        """离 expect(默认=爪子像素)最近的那个圆环的中心像素，多帧稳健平均；看不到返回 None。
+    def ring_px(self, n=None, expect=None, any_size=False, max_px=None, kind='RING'):
+        """离 expect(默认=爪子像素 claw(kind)；kind = RING / RING1 / RING3)最近的那个圆环的中心像素，多帧稳健平均；看不到返回 None。
         max_px：最近的那个也离 expect 超过这么多像素，就当没看到(不去追旁边那个圆环)。给了它就只在 expect 附近那一块画面里找(快)；
         对准过程中上一次刚认到过(圆环正往爪子点靠)，找的那一块再缩小到"上次的位置到爪子点"附近，没找到再用整块找一次。
         self.last_ring_rmax = 这几帧里那个圆环最外圈半径(像素)的中值。"""
         n = int(n or self.cfg['frames'])
-        ex = expect or self.claw('RING')
+        ex = expect or self.claw(kind)
         pts = []
         rmax = []
         reach_full = float(max_px) if max_px else None
@@ -1052,7 +1063,7 @@ class Vision:
                     if best is not None:
                         break
                     reach = reach_full                      # 小的那块里没找到：这次测量剩下的帧都用整块
-                self._publish(fr, 'RING', None if best is None else (best[0], best[1]), rings=rings)
+                self._publish(fr, kind, None if best is None else (best[0], best[1]), rings=rings)
                 if best is not None:
                     pts.append((best[0], best[1]))
                     if len(best) >= 4:
@@ -1188,12 +1199,12 @@ class Vision:
         out.sort(key=lambda r: r[0])
         return out
 
-    def ring_error(self, n=None, max_px=None):
-        """圆环中心偏差像素 = 圆环中心 - 爪子(RING)。看不到返回 None。max_px 见 ring_px。"""
-        p = self.ring_px(n, max_px=max_px)
+    def ring_error(self, n=None, max_px=None, kind='RING'):
+        """圆环中心偏差像素 = 圆环中心 - 十字(kind：RING 红十字；RING1 / RING3 = 1、3 号环自己的十字)。看不到返回 None。max_px 见 ring_px。"""
+        p = self.ring_px(n, max_px=max_px, kind=kind)
         if p is None:
             return None
-        cu, cv_ = self.claw('RING')
+        cu, cv_ = self.claw(kind)
         return (p[0] - cu, p[1] - cv_)
 
     # ------------------------------------------------------------ 圆环上放着的物料(取回、码垛)
@@ -1278,7 +1289,7 @@ class Vision:
         import cv2
         out = fr.copy()
         md = None
-        if kind == 'RING':
+        if kind == 'RING' or kind in RING_CROSS:
             claw = self.last_claw
         else:
             try:
@@ -1290,7 +1301,7 @@ class Vision:
             out[claw > 0] = (out[claw > 0] * 0.5).astype(out.dtype)               # 爪子区域变暗(这块不用来识别)
         cu, cv_ = self.claw(kind)
         info = ''
-        if kind == 'RING':
+        if kind == 'RING' or kind in RING_CROSS:
             details = getattr(self._ring, 'last', None) or []
             kept = [(r[0], r[1]) for r in (rings or [])]
             for d in details:
@@ -1306,7 +1317,8 @@ class Vision:
             if not details:
                 for r in rings or []:
                     cv2.circle(out, (int(round(r[0])), int(round(r[1]))), int(round(r[2])), (0, 255, 255), 1)
-            what = f'RING ({len(kept)} found' + (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
+            what = (f'RING{kind[4:]} (' if kind in RING_CROSS else 'RING (') + f'{len(kept)} found' + \
+                (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
         else:
             res = getattr(md, 'last', None) if md is not None else None
             if color_id == 'plate':
@@ -1340,8 +1352,11 @@ class Vision:
             msg = f'{what}: ' + ('to goal' if goal is not None else 'off') + f' {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm'
         else:
             msg = f'{what}: NOT FOUND'
-        # (10-24 用户"粗加工区域和暂存区域的十字做成红色的")原料的爪子点绿十字，圆环那边(RING/PICK)红十字
-        cv2.drawMarker(out, (int(cu), int(cv_)), (0, 255, 0) if kind == 'RAW' else (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+        # (10-24 用户"粗加工区域和暂存区域的十字做成红色的")原料的爪子点绿十字，圆环那边(RING/PICK)红十字；
+        # (10-26)1 号环的十字橙色、3 号环的蓝色(旁边写 R1 / R3)
+        cv2.drawMarker(out, (int(cu), int(cv_)), cross_color(kind), cv2.MARKER_CROSS, 30, 2)
+        if kind in RING_CROSS:
+            cv2.putText(out, 'R' + kind[4:], (int(cu) + 8, int(cv_) + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cross_color(kind), 2)
         lines = [msg + time.strftime('   %H:%M:%S')]
         if info.strip():
             lines.append(info.strip())                 # 第二行：半径、遮挡、看到几个物料(一行写不下)

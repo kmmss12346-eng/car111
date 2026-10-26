@@ -311,7 +311,13 @@ DEFAULTS = dict(
     zone_a1_margin_deg=5.0,             #   转过去的角度离 ID1 限位至少这么多度(补偿摩擦多给的角度被限位截掉)，不然这个环照旧挪车对准
     zone_a2_margin_deg=15.0,            #   离 ID2 限位至少这么多度
     # (10-20 用户)arm_calib 里调过 1、3 号环(ring_teach.json 里 src=arm_calib)的粗加工区/暂存区：车只把 2 号环对准一次，之后车一下都不动；
-    #   1、3 号环按调的角度(比 2 号环多转多少)直接转过去放、取，不再用摄像头对、也不再挪车。没调过：大声提醒，照旧一个环一个环挪车对准
+    #   1、3 号环按调的角度(比 2 号环多转多少)直接转过去放、取，不再挪车。没调过：大声提醒，照旧一个环一个环挪车对准
+    zone_cal_fine=True,                 # (10-26 用户"到指定位置之后再通过摄像头微调机械臂的位置……车的位置不动，对准之间必须控制在两秒左右")
+                                        #   调过的 1、3 号环：空爪先转到调的角度上方(看圆环的高度)，摄像头只动手臂把这个环的中心对到它自己的十字
+                                        #   (claw_px.RING1 / RING3，没调过就是红十字)上，再去车上转盘夹物料、回到对准的角度放。记下来，
+                                        #   这个区第二轮(码垛也是)直接用，不再对。False = 以前的直接按调的角度放
+    zone_cal_fine_s=2.0,                #   对准最多这么多秒(不算转过去的时间)；到时间没对准：比调的角度更准就按现在的放，不然按调的角度放
+    zone_cal_fine_max_mm=30.0,          #   一开始就差这么多以上：多半认错了环(或者车停偏太多)，不信它，按调的角度放
     zone_smooth=True,                   # 对准 2 号环(align_by 是 wheels 时)：像原料区一样车轮连续慢慢走(只发 V 速度，不转车头)，边走边每帧认 2 号环，
                                         #   越近越慢，停着看几帧确认对准；跟丢了停下重新找。要 STM32 认 V、vcal RING 量过车轮和画面的对应关系
                                         #   (横移、前进两列都实测过)；不然照旧一步一步挪(servo.run)
@@ -6738,7 +6744,9 @@ class MissionHooks:
                 warned.add(zone)
                 if out['cal']:
                     self.log(f'    ({zone} 1、3 号环按 arm_calib 调的角度：车对准 2 号环以后不动，只转手臂过去放、取'
-                             f'(比 2 号环多转 1 号 ID1 {out[1][0]:+.1f}°/ID2 {out[1][1]:+.0f}°，3 号 ID1 {out[3][0]:+.1f}°/ID2 {out[3][1]:+.0f}°))')
+                             f'(比 2 号环多转 1 号 ID1 {out[1][0]:+.1f}°/ID2 {out[1][1]:+.0f}°，3 号 ID1 {out[3][0]:+.1f}°/ID2 {out[3][1]:+.0f}°)'
+                             + (f'；转过去以后空爪先用摄像头只动手臂微调(最多 {float(self.cfg.get("zone_cal_fine_s", 2.0)):g} 秒)再放'
+                                if self.cfg.get('zone_cal_fine', True) else '') + ')')
                 else:
                     self.log(f'    ({zone} 1、3 号环按以前 rteach 示教的角度，转过去以后还用摄像头再对一次。'
                              '建议在 arm_calib 里重新调：python3 arm_calib.py --from A1P)')
@@ -6885,6 +6893,49 @@ class MissionHooks:
         if cfg.get('zone_timeout_s'):
             kw['timeout_s'] = float(cfg['zone_timeout_s'])
         return kw
+
+    def _cal_fine(self, zone, ring, a1, a2):
+        """(10-26 用户"在 1、3 号环运动到指定位置之后再通过摄像头微调机械臂的位置，车的位置不动，对准之间必须控制在两秒左右")
+        arm_calib 调过的 1、3 号环：空爪转到调的角度 (a1, a2) 上方(看圆环的高度 ZOBRNG)，摄像头只动手臂(车不动)把这个环的中心
+        对到它自己的十字(claw_px.RING1 / RING3，没调过就是 2 号环的红十字)上，最多 zone_cal_fine_s 秒(不算转过去的时间)。
+        返回对准以后的 (ID1, ID2)；到时间没对准但比调的角度准就返回现在的；看不到、一开始就差太多(认错环)、没变准返回 None(按调的角度放)。"""
+        cfg = self.cfg
+        kind = f'RING{int(ring)}'
+        P = self.arm.params() or {}
+        self._ring_ready = self._at_obs = False
+        if P.get('ZOBRNG') is not None:
+            self.arm.apz(a1, a2, float(P['ZOBRNG']))          # 边转边升降到看圆环的高度(空爪)
+        else:
+            self.arm.ap(a1, a2)
+        self._ring_ready = True                               # 张着爪停在圆环上方的观察高度
+        t0 = self.now()
+        kw = self._arm_only_kw(a1, a2)
+        kw['timeout_s'] = max(0.3, float(cfg.get('zone_cal_fine_s', 2.0)))
+        kw['max_iter'] = int(cfg.get('zone_cal_fine_iter', 3))
+        res = self.servo.run('RING', self._ring_measure(kind), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+                             allow_chassis=False, label=f'{zone}环{ring}微调', bounds=self.vision.bounds(kind), confirm=False, **kw)
+        took = self.now() - t0
+        if res is None:
+            self.log(f'    ★ 环{ring} 微调：没结果({took:.1f} 秒)：按调的角度放')
+            return None
+        hist = list(getattr(res, 'history', None) or getattr(res, 'hist', None) or [])
+        e0 = float(hist[0]) if hist else None
+        cap = float(cfg.get('zone_cal_fine_max_mm', 30.0))
+        if e0 is not None and e0 > cap:
+            self.log(f'    ★ 环{ring} 微调：一开始就差 {e0:.1f}mm(超过 {cap:g}mm，多半认错了环)，用了 {took:.1f} 秒：不信它，按调的角度放')
+            return None
+        ok = bool(res.ok) or float(res.err_mm) <= float(cfg['accept_mm']['RING'])
+        better = e0 is not None and math.isfinite(float(res.err_mm)) and float(res.err_mm) < e0 - 0.3
+        if not (ok or better):
+            self.log(f'    ★ 环{ring} 微调没对上({res})，用了 {took:.1f} 秒：按调的角度放')
+            return None
+        b1, b2 = self.arm.read_angles()
+        if b1 is None or b2 is None:
+            return None
+        self.log(f'    环{ring} 微调' + ('好了' if ok else '到时间了(比调的角度准，按现在的放)') +
+                 f'：还差 {float(res.err_mm):.1f}mm' + (f'(一开始差 {e0:.1f}mm)' if e0 is not None else '') +
+                 f'，手臂比调的角度多转 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.1f}°，用了 {took:.1f} 秒')
+        return b1, b2
 
     def _zone_arm_fine(self, zone, ring, a1, a2, covered=None):
         """(10-19)空爪转到 ring 号环上方 (a1, a2)，只动手臂(车不动)用摄像头对准这个环；covered = 码垛：环上已经有这个颜色的物料，
@@ -7878,15 +7929,34 @@ class MissionHooks:
             a1, a2 = p2
             self.log('    环2：就在对准的这个环，不再对准')
         elif T.get('cal'):
-            # (10-20 用户)arm_calib 调过：直接按调的角度转过去(放置补偿默认不加，见 place_comp_on)，不再用摄像头对，也绝不挪车
-            d1, d2 = T[ring]
+            # (10-20 用户)arm_calib 调过：直接按调的角度转过去(放置补偿默认不加，见 place_comp_on)，绝不挪车
+            fine_on = bool(self.cfg.get('zone_cal_fine', True)) and not self.nogo
+            learned = (self._zone_learn.get(zone) or {}).get(ring) if fine_on else None
+            d1, d2 = learned if learned is not None else T[ring]
             tgt = self._cal_target(ring, p2[0] + d1, p2[1] + d2)
             if tgt is None:
                 self.stats.place(False)
                 self._show_stats()
                 return False
             a1, a2 = tgt
-            self.log(f'    环{ring}：按 arm_calib 调的角度只转手臂(比 2 号环多转 ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，车不动、不再用摄像头对')
+            if learned is not None:
+                self.log(f'    环{ring}：按这个区第一次用摄像头微调好的角度只转手臂(比 2 号环多转 ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，车不动、不再对')
+            elif fine_on and not stack:
+                # (10-26 用户)空爪先转过去，摄像头只动手臂对准这个环自己的十字(最多 zone_cal_fine_s 秒)，再去夹物料回来放
+                self.log(f'    环{ring}：按 arm_calib 调的角度只转手臂(比 2 号环多转 ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，车不动；'
+                         '空爪先用摄像头只动手臂微调')
+                try:
+                    fine = self._cal_fine(zone, ring, a1, a2)
+                except ArmAbort:
+                    raise
+                except (ArmError, VisionError) as ex:
+                    self.log(f'    ★ 环{ring} 微调出错：{ex}：按调的角度放')
+                    fine = None
+                if fine is not None:
+                    a1, a2 = fine
+                    self._zone_learn.setdefault(zone, {})[ring] = (a1 - p2[0], a2 - p2[1])   # 这个区第二轮(码垛也是)直接用
+            else:
+                self.log(f'    环{ring}：按 arm_calib 调的角度只转手臂(比 2 号环多转 ID1 {d1:+.1f}°、ID2 {d2:+.0f}°)，车不动、不再用摄像头对')
         else:
             try:
                 tgt = self._zone_target(zone, ring, p2, T)
@@ -8490,15 +8560,17 @@ class MissionHooks:
         cam = (getattr(self.vision, 'cfg', None) or {}).get('camera') or {}
         return float(cam.get('height', 480)), float(cam.get('width', 640))
 
-    def _ring_measure(self):
+    def _ring_measure(self, kind='RING'):
         """对准圆环用的测量：只认离爪子点 ring_gate_px 以内的圆环(看清过三个环以后才有)，不去追旁边那个。
-        place_shift_mm：放下的位置整体挪一点(爪子点没量准时的实测修正)——把"要对到的点"在画面里挪过去。"""
+        place_shift_mm：放下的位置整体挪一点(爪子点没量准时的实测修正)——把"要对到的点"在画面里挪过去。
+        kind = 'RING1' / 'RING3'：(10-26)按 1、3 号环自己的十字算。"""
         gate = self.ring_gate_px
         n = self.cfg.get('zone_frames') or None
+        kw = {} if kind == 'RING' else {'kind': kind}
         if gate:
-            base = lambda: self.vision.ring_error(n=n, max_px=gate)
+            base = lambda: self.vision.ring_error(n=n, max_px=gate, **kw)
         else:
-            base = lambda: self.vision.ring_error(n=n)
+            base = lambda: self.vision.ring_error(n=n, **kw)
         off = self._place_shift_px()
         if off is None:
             return base

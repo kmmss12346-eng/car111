@@ -996,14 +996,15 @@ class SimVision:
             return False, None
         return not w.plate_phase()[1], (0.0, 0.0)
 
-    def ring_error(self, n=None, max_px=None):
+    def ring_error(self, n=None, max_px=None, kind='RING'):
+        """kind = RING / RING1 / RING3：(10-26)偏差按哪个十字算(1、3 号环自己的十字没设就和 RING 一样)。"""
         w = self.w
         if w.zone not in ('ROUGH', 'TEMP'):
             return None
         c = w.claw()
         k = min((1, 2, 3), key=lambda k: np.linalg.norm(w.ring_center(k) - c))
-        e = self._off('RING', w.pixel_error(w.ring_center(k), 'RING', _frames_dt(n), n))
-        cl = self.claw('RING')
+        e = self._off(kind, w.pixel_error(w.ring_center(k), 'RING', _frames_dt(n), n))
+        cl = self.claw(kind)
         for fr in self.fake_rings:                            # 车上那个东西离爪子点更近：认成它(和实车一样)
             ef = (float(fr[0]) - cl[0], float(fr[1]) - cl[1])
             if e is None or math.hypot(*ef) < math.hypot(e[0] + cl[0] - self.TRUE_CLAW[0], e[1] + cl[1] - self.TRUE_CLAW[1]):
@@ -4023,7 +4024,9 @@ class ZoneCalTests(unittest.TestCase):
             self.assertIn('车停着算好要', text)
             self.assertNotIn('车轮边走边对准 2 号环', text)                # (10-21 用户)不再一开始就边走边对
             self.assertIn('按 arm_calib 调的角度只转手臂', text)
-            self.assertNotIn('只动手臂对准', text)                         # 1、3 号环不再用摄像头对
+            self.assertNotIn('只动手臂对准', text)                         # 1、3 号环不再用以前那种一步一步的摄像头对准
+            self.assertIn('空爪先用摄像头只动手臂微调', text)              # (10-26)第一轮：转过去以后空爪用摄像头只动手臂微调
+            self.assertIn('按这个区第一次用摄像头微调好的角度', text)      #   第二轮直接用第一轮微调好的
             for bad in ('照旧一个环一个环', '照旧挪车对准', '一步一步挪着对准'):
                 self.assertNotIn(bad, text)                                # 没有任何挪车对准的退路
             self.assertIn('车没动、只转手臂放的，不再对准', text)
@@ -4041,6 +4044,55 @@ class ZoneCalTests(unittest.TestCase):
         print(f'\n  [工位按 arm_calib 调的角度放 3 组] 放置真实误差 平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
         self.assertLess(errs.mean(), 2.0)
         self.assertLess(errs.max(), 3.5)
+
+    def test_ring13_camera_fine_tune_fixes_a_bad_calibration(self):
+        """(10-26 用户"在 1、3 号环运动到指定位置之后再通过摄像头微调机械臂的位置……车的位置不动，对准之间必须控制在两秒左右")
+        arm_calib 调的 1、3 号环角度差了 1.5°(爪子偏约 8mm)：空爪转过去以后摄像头只动手臂把环心对到十字上(每个环不超过 2 秒多一点)，
+        再夹物料放，放得准；车在对准 2 号环以后一下都不动。关掉(zone_cal_fine=false)就按调错的角度放，偏得多。"""
+        out = {}
+        for fine in (True, False):
+            errs, took = [], []
+            for seed in range(3):
+                w = self._world(seed)
+                lines = []
+                h = self._make(w, dict(zone_cal_fine=fine), lines=lines)
+                for z in h._teach_all.values():                      # 调的时候 ID1 差了 1.5°
+                    z['1'] = [z['1'][0] + 1.5, z['1'][1]]
+                    z['3'] = [z['3'][0] - 1.5, z['3'][1]]
+                rec = self._spy(w, h)
+                run_mission(w, h, log=lines.append)
+                text = '\n'.join(lines)
+                self._ok(w, h, text)
+                self.assertEqual(rec['vel_after'], [], text[-3000:])           # 对准 2 号环以后车轮不再走
+                zone_moves = [m for m in rec['moves'] if m[0] in ('ROUGH', 'TEMP')]
+                self.assertTrue(all((not m[1]) or m[4] for m in zone_moves), zone_moves)   # S/F 只在对准 2 号环时、和做完挪回停车点
+                errs += [e for (z, k, _c, e, _st) in w.placed if k in (1, 3)]
+                took += [float(l.split('用了 ')[1].split(' 秒')[0]) for l in lines if '微调好了' in l or '微调到时间了' in l]
+                if fine:
+                    self.assertEqual(text.count('车不动；空爪先用摄像头只动手臂微调'), 4, text[-3000:])   # 两个区第一轮的 1、3 号环
+                    self.assertIn('按这个区第一次用摄像头微调好的角度', text)                      # 第二轮(码垛)直接用
+            out[fine] = (max(errs), max(took) if took else None)
+        print(f'\n  [1、3 号环调差 1.5°] 摄像头微调：放置误差最大 {out[True][0]:.2f}mm，每个环微调最长 {out[True][1]:.1f} 秒；'
+              f'不微调：最大 {out[False][0]:.2f}mm')
+        self.assertLess(out[True][0], 3.0, out)
+        self.assertGreater(out[False][0], 5.0, out)
+        self.assertLessEqual(out[True][1], 2.6, out)
+
+    def test_ring1_cross_is_where_ring1_goes(self):
+        """(10-26)1 号环有自己的十字(claw_px.RING1)：往右挪了 15 像素，1 号环就照着这个十字对，放的位置跟着挪(3 号环、2 号环不受影响)。"""
+        res = {}
+        for shift in (0.0, 15.0):
+            w = self._world(1)
+            h = self._make(w)
+            c = w.vision.claw('RING')
+            if shift:
+                w.vision.cfg['claw_px']['RING1'] = [c[0] + shift, c[1]]
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+            res[shift] = {k: e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH'}
+        self.assertLess(res[0.0][1], 2.5, res)
+        self.assertGreater(res[15.0][1], res[0.0][1] + 5.0, res)                 # 15 像素 ≈ 10mm：1 号环放的地方跟着十字挪了
+        self.assertLess(abs(res[15.0][3] - res[0.0][3]), 1.5, res)              # 3 号环不受影响
+        self.assertLess(abs(res[15.0][2] - res[0.0][2]), 1.5, res)              # 2 号环不受影响
 
     def test_second_round_goes_back_to_where_the_first_round_stopped(self):
         """(10-26 用户"这个车在这四个停靠点停稳了但是后面第二轮运行夹取第二轮物料的时候还能在同样的地方吗")
@@ -4432,7 +4484,7 @@ class ZoneCalTests(unittest.TestCase):
         self.assertIn('2 号环上放着第一批的物料(白心盖住了)', text)
         self._ok(w, h, text)
         i = text.rfind('▶ TEMP 放')
-        self.assertIn('按 arm_calib 调的角度只转手臂', text[i - 3000:])
+        self.assertIn('只转手臂(比 2 号环多转', text[i - 3000:])            # 1、3 号环照旧只转手臂(第二轮按第一轮微调好的角度)
 
     def test_obs_error_is_removed_before_aligning(self):
         """OBS 大动作到位差 1°(ATOLC)：对准 2 号环前手臂先精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)，1、3 号环才放得准。"""
@@ -4442,7 +4494,7 @@ class ZoneCalTests(unittest.TestCase):
             for seed in range(3):
                 w = self._world(seed)
                 w.obs_err_deg = 1.0
-                h = self._make(w, dict(zone_obs_fine=fine))
+                h = self._make(w, dict(zone_obs_fine=fine, zone_cal_fine=False))   # (10-26)1、3 号环的摄像头微调关掉：只看回到 A1P/A2P 这一下
                 run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
                 e += [x for (z, k, _c, x, _st) in w.placed if z == 'ROUGH' and k in (1, 3)]
             errs[fine] = max(e)

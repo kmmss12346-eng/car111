@@ -16,7 +16,9 @@ vclaw RAW <颜色号>         实测"爪子夹物料时，物料在画面里的�
 vclaw RING [外径mm]        实测"放下的物料落在画面哪里"(claw_px.RING)：圆环纸摆好、物料拿走以后用(步骤见 README)；
                              后面写上用尺子量的黑环外径(毫米)，例如 vclaw RING 100，用来把像素换成毫米
 g 13 1                     (10-25)挪圆环的红十字(粗加工区、暂存区的爪子点)：往右 13、往下 1 像素(往左、往上用负数)，马上存进 vision_cal.json，
-                             不用退出主程序。g RAW 13 1 = 挪原料的绿十字；只输入 g = 看两个十字现在在哪。和 arm_calib 里的 g 存的是同一个地方
+                             不用退出主程序。g RAW 13 1 = 挪原料的绿十字；(10-26)g R1 13 1 / g R3 13 1 = 挪 1、3 号环自己的十字
+                             (橙 / 蓝：比赛时手臂转到 1、3 号环以后摄像头只动手臂把环心对到它上再放)；只输入 g = 看四个十字现在在哪。
+                             和 arm_calib 里的 g 存的是同一个地方
 vcal RING                  视觉校准(圆环)：手臂/底盘各动几个小动作，测出"动作量 ↔ 画面移动量"，存进 servo_cal.json
 vcal RAW <颜色号>          视觉校准(原料盘上的物料；颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝)
                              只校准手臂不动底盘：在后面加 arm，例如  vcal RING arm
@@ -624,6 +626,8 @@ def handle_cli(k, parts, link=None, raw_cfg=None, state=None, log=print):
                 if nofilt:
                     h.cfg['zone_filter'] = False
                     log('  nofilt：这次对准不用测量滤波(每次都按这一次测的修)')
+            if what in ('RAW', 'ROUGH', 'TEMP'):
+                h._anchor0, h._anchor_now = {}, None    # (10-26)车是手放的：做完不按"第一次停的地方"挪(只有比赛一圈圈跑才用)
             t_go = h.now()
             by_w = what in ('RAW', 'ROUGH', 'TEMP') and hasattr(h, '_by_wheels') and h._by_wheels(what)
             try:
@@ -661,6 +665,7 @@ def _clear_zone_records(h, zone, batch, log):
     old = sorted(((k, v) for k, v in h.on_ring.items() if k[0] == zone and v), key=lambda kv: kv[0][1])
     for key in [k for k in h.on_ring if k[0] == zone]:
         del h.on_ring[key]
+    getattr(h, '_zone_learn', {}).pop(zone, None)          # (10-26)1、3 号环这次重新用摄像头微调(g R1 / g R3 挪过十字也马上看得到)
     for key in [k for k in getattr(h, 'pose_at', {}) if k[0] == zone]:
         del h.pose_at[key]
     if old:
@@ -1127,23 +1132,28 @@ def _forget_pick(h, log, what):
         '：下次 mtest ROUGH(或比赛里)第一个物料放下以后自动重新量')
 
 
+CROSS_NAMES = {'RING': '红十字(圆环，2 号环，粗加工区、暂存区)', 'RAW': '绿十字(原料)',
+               'RING1': '1 号环的橙十字', 'RING3': '3 号环的蓝十字'}
+
+
 def _cross_shift(h, parts, state, log):
     """(10-25 用户"可不可以直接在主程序改")和 arm_calib 的 g 一样挪十字(爪子点 claw_px)，不用退出主程序：
     g 13 1 / g RING 13 1 = 圆环的红十字(粗加工区、暂存区)往右 13、往下 1 像素；g RAW 13 1 = 原料的绿十字。往右、往下为正。
-    马上存进 vision_cal.json，这个程序里也马上按新的对准(不用重开)。只输入 g = 看两个十字现在在哪。"""
+    (10-26 用户"这新加的两个也要是在主程序可调节的")g R1 13 1 / g R3 13 1 = 1、3 号环自己的十字(claw_px.RING1 / RING3)。
+    马上存进 vision_cal.json，这个程序里也马上按新的对准(不用重开)。只输入 g = 看四个十字现在在哪。"""
     args = list(parts[1:])
     kind = 'RING'
-    if args and args[0].upper() in ('RING', 'RAW'):
-        kind = args.pop(0).upper()
+    alias = {'RING': 'RING', 'RAW': 'RAW', 'R1': 'RING1', 'RING1': 'RING1', 'R3': 'RING3', 'RING3': 'RING3', 'R2': 'RING'}
+    if args and args[0].upper() in alias:
+        kind = alias[args.pop(0).upper()]
     h._ensure_vision()
     vis = h.vision
     if not args:
-        r, g = vis.claw('RING'), vis.claw('RAW')
-        log(f'红十字(圆环，粗加工区、暂存区) ({r[0]:.0f}, {r[1]:.0f})   绿十字(原料) ({g[0]:.0f}, {g[1]:.0f})。'
-            '挪红十字：g 13 1(往右 13、往下 1 像素，往左、往上用负数)；挪绿十字：g RAW 13 1')
+        log('   '.join(f'{CROSS_NAMES[k]} ({vis.claw(k)[0]:.0f}, {vis.claw(k)[1]:.0f})' for k in ('RING', 'RING1', 'RING3', 'RAW')) + '。\n'
+            '挪红十字：g 13 1(往右 13、往下 1 像素，往左、往上用负数)；挪 1、3 号环的：g R1 13 1 / g R3 13 1；挪绿十字：g RAW 13 1')
         return None
     if len(args) != 2:
-        raise ValueError('格式：g 13 1(红十字往右 13、往下 1 像素) / g RAW 13 1(绿十字) / g(看两个十字在哪)')
+        raise ValueError('格式：g 13 1(红十字往右 13、往下 1 像素) / g R1 13 1、g R3 13 1(1、3 号环的十字) / g RAW 13 1(绿十字) / g(看四个十字在哪)')
     try:
         du, dv = float(args[0]), float(args[1])
     except ValueError:
@@ -1161,7 +1171,7 @@ def _cross_shift(h, parts, state, log):
     from vision import save_vision_cal
     path = save_vision_cal(kind, new, h.cfg.get('vision_cal_file') or None)
     vis.cfg.setdefault('claw_px', {})[kind] = [new[0], new[1]]
-    name = '红十字(圆环，粗加工区、暂存区)' if kind == 'RING' else '绿十字(原料)'
+    name = CROSS_NAMES[kind]
     mm = ''
     try:
         mm = f'，约 {math.hypot(du, dv) / vis.scale(kind):.1f}mm'

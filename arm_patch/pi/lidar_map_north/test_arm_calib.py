@@ -390,7 +390,10 @@ class WizardTests(unittest.TestCase):
         self.wiz = arm_calib.Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, view=True, popen=FakeProc)
         self.wiz.run(STEP_KEYS.index('ZOBRAW'))
         modes = [('--ring' in p.args) for p in started]
-        self.assertEqual(modes, [False, True, True], [p.args for p in started])   # 物料 → 圆环 → (关了再开)圆环
+        # 物料 → 圆环 → (关了再开)圆环 → (10-26)进 R1 重新打开，按 1 号环自己的十字(--ringno 1)
+        self.assertEqual(modes, [False, True, True, True], [p.args for p in started])
+        self.assertEqual([p.args[p.args.index('--ringno') + 1] if '--ringno' in p.args else None for p in started],
+                         [None, None, None, '1'], [p.args for p in started])
         self.assertTrue(all(not p.alive for p in started))                 # 退出时都关了
         self.assertTrue(any('摄像头画面已打开' in l for l in self.lines))
         self.assertTrue(any('摄像头画面已关' in l for l in self.lines))
@@ -595,6 +598,22 @@ class RingCrossTests(unittest.TestCase):
         self.assertIn('+10,+10 px', msg)                                     # 圆环 (330,250) 离红十字 (320,240)
         self.assertNotIn('r2off', msg)
 
+    def test_ring1_and_ring3_have_their_own_crosses(self):
+        """(10-26)vlive --ringno 1 / 3：按 1、3 号环自己的十字(橙 / 蓝)画、算偏差；红十字(2 号环)不画。"""
+        import numpy as np
+        from vlive import annotate
+
+        class Vis3(self.Vis):
+            def claw(self, kind):
+                return {'RING': (320.0, 240.0), 'RING1': (300.0, 240.0), 'RING3': (340.0, 240.0)}.get(kind, (300.0, 260.0))
+        fr = np.zeros((480, 640, 3), np.uint8)
+        out, msg = annotate(Vis3(), fr, 'ring', 1, ring_no=1)
+        self.assertEqual(tuple(int(x) for x in out[240, 312]), (0, 165, 255))     # 橙十字在 (300,240)
+        self.assertIn('+30,+10 px', msg)                                         # 圆环 (330,250) 离橙十字 (300,240)
+        out, msg = annotate(Vis3(), fr, 'ring', 1, ring_no=3)
+        self.assertEqual(tuple(int(x) for x in out[240, 352]), (255, 120, 0))     # 蓝十字在 (340,240)
+        self.assertIn('-10,+10 px', msg)
+
     def test_wizard_says_what_the_red_cross_is(self):
         started = []
 
@@ -672,6 +691,51 @@ class GreenCrossTests(unittest.TestCase):
         lines = self._run(cfg, ['g -16 -18', 'q'], 'A1G')            # 原料那几步挪原料的，圆环的不动
         d = load(cal)
         self.assertEqual((d['claw_px']['RAW'], d['claw_px']['RING']), ([284.0, 242.0], [328.0, 237.0]))
+
+    def test_g_in_r1_r3_moves_that_rings_own_cross(self):
+        """(10-26 用户"这个准星也是类似于二号环可以调节的……加在 arm_calib.py 的对准一号环和三号环里面")R1 里 g 挪 1 号环的十字，
+        R3 里挪 3 号环的；没挪过时从红十字的位置开始；三个十字互不影响。"""
+        cfg, cal = self._cfg()
+        lines = self._run(cfg, ['g 10 -5', 'q'], 'R1')
+        d = load(cal)
+        self.assertEqual(d['claw_px']['RING1'], [330.0, 235.0])      # 从红十字 (320,240) 开始挪
+        self.assertEqual(d['claw_px']['RING'], [320.0, 240.0])       # 红十字不动
+        self.assertNotIn('RING3', d['claw_px'])
+        self.assertTrue(any('1 号环的橙十字' in l and '(320, 240) → (330, 235)' in l for l in lines), lines[-8:])
+        self._run(cfg, ['g -6 3', 'q'], 'R3')
+        d = load(cal)
+        self.assertEqual((d['claw_px']['RING3'], d['claw_px']['RING1'], d['claw_px']['RING']),
+                         ([314.0, 243.0], [330.0, 235.0], [320.0, 240.0]))
+        self._run(cfg, ['g 2 2', 'q'], 'A1P')                        # 2 号环那一步挪红十字，1、3 号环的不动
+        d = load(cal)
+        self.assertEqual((d['claw_px']['RING'], d['claw_px']['RING1'], d['claw_px']['RING3']),
+                         ([322.0, 242.0], [330.0, 235.0], [314.0, 243.0]))
+
+    def test_main_program_g_moves_ring1_ring3_crosses(self):
+        """(10-26 用户"这新加的两个也要是在主程序可调节的")主程序 g R1 / g R3 挪 1、3 号环的十字；只输入 g 看四个十字。"""
+        import mission_cli
+        from vision import Vision
+        from vlive import load_vision_cfg
+        cfg, cal = self._cfg()
+
+        class H:
+            def __init__(self):
+                self.vision = Vision(load_vision_cfg(cfg))
+                self.cfg = {'vision_cal_file': cal}
+
+            def _ensure_vision(self):
+                pass
+        h, lines = H(), []
+        mission_cli._cross_shift(h, ['g', 'R1', '10', '-5'], {}, lines.append)
+        mission_cli._cross_shift(h, ['g', 'r3', '-6', '3'], {}, lines.append)
+        mission_cli._cross_shift(h, ['g', '1', '1'], {}, lines.append)
+        d = load(cal)
+        self.assertEqual((d['claw_px']['RING1'], d['claw_px']['RING3'], d['claw_px']['RING']),
+                         ([330.0, 235.0], [314.0, 243.0], [321.0, 241.0]))
+        self.assertEqual(h.vision.claw('RING1'), (330.0, 235.0))     # 这个程序里马上按新的
+        lines.clear()
+        mission_cli._cross_shift(h, ['g'], {}, lines.append)
+        self.assertTrue(any('1 号环的橙十字 (330, 235)' in l and '3 号环的蓝十字 (314, 243)' in l for l in lines), lines)
 
     def test_g_only_in_camera_steps_and_checks_input(self):
         cfg, cal = self._cfg()

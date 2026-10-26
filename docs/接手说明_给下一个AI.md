@@ -946,5 +946,20 @@ git_log.txt                ← 分支最近 120 条提交记录
   路线下一段照样按停车点算，误差不再一轮轮累计。差 < zone_anchor_min_mm(8) 不挪，> zone_anchor_max_mm(60) 不信(多半认错)。
   一个环一个环挪车对准的旧做法(align_by wheels、zone_reach 不是 arm)不记，照旧挪回这一次停的地方。
   sim ZoneCalTests.test_second_round_goes_back_to_where_the_first_round_stopped、RawNearSlotTests.test_second_visit_goes_back_to_where_the_first_visit_stopped。
+- **10-26 1、3 号环转过去以后用摄像头只动手臂微调再放(用户选的方案 A："到指定位置之后再通过摄像头微调机械臂的位置……车的位置不动，
+  对准之间必须控制在两秒左右"；"这新加的两个也要是在主程序可调节的")：**
+  mission_hooks `zone_cal_fine`(默认 True)：arm_calib 调过 1、3 号环的区(T['cal'])，第一次放 1/3 号环前空爪先转到调的角度上方
+  (apz 到 ZOBRNG)，`_cal_fine` 用 servo.run('RING', _ring_measure('RING1'/'RING3'), fixed_j, allow_chassis=False, timeout_s=zone_cal_fine_s=2,
+  max_iter 3) 只动手臂把这个环的中心对到它自己的十字上，再 _take 夹物料、回到对准的角度放。对上了 / 到时间但比开始准(err 比 history[0] 小 0.3mm 以上)
+  就用现在的角度；一开始就差 > zone_cal_fine_max_mm(30) 不信。结果存 `_zone_learn[区][环]`(相对 p2)，这个区第二轮(含码垛)直接用、不再对。
+  十字：vision claw_px.RING1 / RING3(没有就用 RING；`RING_CROSS`、`cross_color`：1 号橙、3 号蓝)，ring_px/ring_error 加 kind；
+  vlive `--ringno 1/3`；arm_calib R1、R3 两步开 vlive --ringno、g 挪这个环自己的十字(_step_ring)；主程序 `g R1 dx dy` / `g R3 dx dy`(mission_cli._cross_shift)，
+  只输入 g 看四个十字。sim ZoneCalTests.test_ring13_camera_fine_tune_fixes_a_bad_calibration(调差 1.5°：微调后最大 2.8mm、每个环最长 1.7 秒；
+  不微调 10mm)、test_ring1_cross_is_where_ring1_goes；test_obs_error_is_removed_before_aligning 改成 zone_cal_fine=False 跑。
+  mtest(手放车、hooks 一直用同一个)：RAW/ROUGH/TEMP 开始前清 _anchor0/_anchor_now(不按"第一次停的地方"挪)；_clear_zone_records
+  清 _zone_learn[区](1、3 号环重新微调，g R1/g R3 挪过十字马上看得到)。比赛 go 每次新建 MissionHooks，本来就清。
+- 用户 10-26 发的分段调试截图：ROUGH 2 号环偏 84.5mm，要横移 +72(往黄色区那边)、前进 +48 才对得上，_body_clear(qr_zone_margin_mm 30)只让挪 +7/+5，
+  整个区不放。和 35mm 黄色区余量无关(那里用的是 30)。多半是 arm_calib 调 A1P 时车离粗加工区比停车点 (1200,340) 远了约 7cm(或停车点改过)，
+  要在比赛停车点上重调 A1P/R1/R3；等用户发前面"圆环在画面里/看到 3 个圆环/夹角"那几行确认。
 - 已知：test_ringdet.SchoolTargetTests.test_empty_target_near_and_under_claw 在这台电脑上早就不过(0d408cf 也不过)：R=90 (337,260) 误差 0.602 像素，
   R=130 (337,283) 最近的结果是个半径 25 的小圆(离真圆心 15 像素)。是校赛靶(粗黑环 + 白心 + 数字)的合成图，和今天的改动无关，没改。

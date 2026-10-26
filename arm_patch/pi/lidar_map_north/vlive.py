@@ -20,7 +20,10 @@
     绿十字   (找物料时)原料这边的爪子位置 claw_px.RAW(vision_cal.json 优先，没有就用配置里的 mission_cfg.claw_px)。
              arm_calib 看原料的那几步里输入 g 左右 上下 挪它
     红十字   (10-24 找圆环时)粗加工区、暂存区这边的爪子位置 claw_px.RING：比赛时 2 号环中心对到这里。和原料的绿十字分开存、互不影响，
-             arm_calib 看圆环的那几步(2 号环、1/3 号环、ZPLC、ZOBRNG)里输入 g 左右 上下 挪它。vision_cal.json 一变这里马上重新读
+             arm_calib 看圆环的那几步(2 号环、ZPLC、ZOBRNG)里输入 g 左右 上下 挪它。vision_cal.json 一变这里马上重新读
+    橙十字 / 蓝十字  (10-26)--ringno 1 / --ringno 3(arm_calib 的 R1、R3 两步)：1、3 号环自己的十字 claw_px.RING1 / RING3。
+             比赛时手臂转到调的 1、3 号环角度以后，摄像头只动手臂把这个环的中心对到它上再放；没调过就和红十字一样。
+             在那两步里输入 g 左右 上下 挪它(主程序里 g R1 左右 上下 / g R3 左右 上下)，三个十字互不影响
     红斜十字 + 青色圆  识别到的物料圆心和拟合出来的整个圆(被爪子挡住的部分也画出来)
     黄圈     识别到的圆环(每一圈都画出来，被爪子挡住的部分也画)；灰色细圈 = 认到了但大小不像圆环，被过滤掉了
              (vclaw RING 量过以后按量到的大小过滤；左上角 rmax 是最外圈半径像素)
@@ -150,12 +153,14 @@ def claw_shift(cfg_path, du, dv, kind='RAW'):
     return old, new, path
 
 
-def annotate(vis, fr, mode, color):
+def annotate(vis, fr, mode, color, ring_no=2):
     """在一帧上画出爪子、识别结果和偏差，返回 (画好的图, 一行文字说明)。
-    (10-24)找物料时爪子点(claw_px.RAW)画绿十字，找圆环时爪子点(claw_px.RING)画红十字；偏差都按离这个十字算。"""
+    (10-24)找物料时爪子点(claw_px.RAW)画绿十字，找圆环时爪子点(claw_px.RING)画红十字；偏差都按离这个十字算。
+    (10-26)ring_no = 1 / 3：按 1、3 号环自己的十字(claw_px.RING1 / RING3，橙色 / 蓝色)算偏差。"""
     import cv2
+    from vision import cross_color
     out = fr.copy()
-    kind = 'RAW' if mode == 'material' else 'RING'
+    kind = 'RAW' if mode == 'material' else ('RING' if ring_no not in (1, 3) else f'RING{ring_no}')
     cu, cv_ = vis.claw(kind)
     ru, rv = cu, cv_
     target = None
@@ -200,8 +205,10 @@ def annotate(vis, fr, mode, color):
                 extra = f'  rmax={info["r_max"]:.0f}px {info["n_circles"]} circles seen {info["coverage"] * 100:.0f}%'
         if best is not None:
             target = (best[0], best[1])
-        what = f'rings: {len(rings)}'
-    cv2.drawMarker(out, (int(round(cu)), int(round(cv_))), (0, 255, 0) if kind == 'RAW' else (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+        what = f'rings: {len(rings)}' + (f' (ring {ring_no} cross)' if kind != 'RING' else '')
+    cv2.drawMarker(out, (int(round(cu)), int(round(cv_))), cross_color(kind), cv2.MARKER_CROSS, 30, 2)
+    if kind not in ('RAW', 'RING'):
+        cv2.putText(out, f'R{ring_no}', (int(round(cu)) + 8, int(round(cv_)) + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cross_color(kind), 2)
     if target is None:
         msg = f'{what}: NOT FOUND'
     else:
@@ -216,6 +223,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='摄像头实时预览识别效果')
     ap.add_argument('color', nargs='?', type=int, default=1, help='颜色号 1红 2黄 3蓝 4绿 5黑 6浅蓝')
     ap.add_argument('--ring', action='store_true', help='一开始就找地上圆环')
+    ap.add_argument('--ringno', type=int, choices=(1, 2, 3), default=2,
+                    help='(10-26)找圆环时偏差按几号环的十字算：2 = 红十字；1、3 = 这两个环自己的十字(arm_calib 的 R1、R3 用)')
     ap.add_argument('--config', default=None, help='默认：run_live.sh 里的 --config，没有就用 map_config_start2_roi.json')
     args = ap.parse_args(argv)
     if args.color not in COLOR_NAMES:
@@ -236,7 +245,8 @@ def main(argv=None):
         print(f'{ex}。map_merge_live 里用过 vdbg / gtest / mtest 的话，先把 map_merge_live 关掉再运行这个。')
         return 1
     print(f'配置：{cfg_path}')
-    print(f'爪子位置：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}')
+    print(f'爪子位置：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}  '
+          f'1 号环(橙十字) {vis.claw("RING1")}  3 号环(蓝十字) {vis.claw("RING3")}')
     print('按键：1~6 换颜色，r 切换物料/圆环，k 现场标定这个颜色(物料放在绿十字下面)，0 这个颜色恢复默认，s 存图，q 退出(先用鼠标点一下画面窗口)')
 
     mode = 'ring' if args.ring else 'material'
@@ -258,13 +268,14 @@ def main(argv=None):
                     from vision import apply_vision_cal
                     apply_vision_cal(vis.cfg, str(cal_p))
                     _reload_ranges(vis)
-                    print(f'爪子位置更新了：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}', flush=True)
+                    print(f'爪子位置更新了：原料(绿十字) {vis.claw("RAW")}  圆环(红十字) {vis.claw("RING")}  '
+                          f'1 号环(橙十字) {vis.claw("RING1")}  3 号环(蓝十字) {vis.claw("RING3")}', flush=True)
             fr = vis.camera.read()
             if fr is None:
                 time.sleep(0.05)
                 continue
             try:
-                out, msg = annotate(vis, fr, mode, color)
+                out, msg = annotate(vis, fr, mode, color, ring_no=args.ringno)
             except VisionError as ex:
                 out, msg = fr, f'ERROR: {ex}'
             now = time.monotonic()
