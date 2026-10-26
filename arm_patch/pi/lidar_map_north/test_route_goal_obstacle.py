@@ -244,9 +244,9 @@ class StopInputTests(unittest.TestCase):
         r = rp.check_stop(CFG, [], 'ROUGH', (1200, 300, 0))           # 离粗加工区只有 20mm(要 30)
         self.assertFalse(r['ok'])
         self.assertEqual(r['near'][0][:2], (1200, 310))
-        r = rp.check_stop(CFG, [], 'ROUGH', (1300, 400, 0))           # 停得下，但离工位远了、沿那一排偏了
-        self.assertTrue(r['ok'])
-        self.assertTrue(any('远 60mm' in w for w in r['warn']), r['warn'])
+        r = rp.check_stop(CFG, [], 'ROUGH', (1300, 385, 0))           # 停得下(离黄色区 35)，但离工位远了、沿那一排偏了
+        self.assertTrue(r['ok'], r)
+        self.assertTrue(any('远 45mm' in w for w in r['warn']), r['warn'])
         self.assertTrue(any('2 号环可能不在摄像头里' in w for w in r['warn']), r['warn'])
         r = rp.check_stop(CFG, [], 'RAW', (1200, 2100, 0))            # 车头反了：原料盘在车的左边
         self.assertTrue(any('左边' in w for w in r['warn']), r['warn'])

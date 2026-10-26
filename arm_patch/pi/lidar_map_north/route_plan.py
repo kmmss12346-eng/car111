@@ -42,6 +42,16 @@ v17(10-10 整合)：
    plan_mission 的 cfg 里 goal_near_fallback=True 时(run_live 按最小的障碍物余量也规划不出来以后才用)：某个停车点怎么也开不过去，
    就在它附近(沿车头方向 goal_near_mm、横着 goal_near_lateral_mm 内)找开得到的位置停，不再整场规划失败。
    check_stop：run_live 里 stop 命令输入停车点时先检查能不能停，不能停就给出最近能停的几个位置。
+
+10-26(用户：路径规划肯定要选最近的路线；车走的时候老压到黄色区，尽量走在车道中间、多留余量，一定不要碰黄色区)：
+   1. 离黄色区、墙、障碍物近的代价改成按“这一处车道最多能离多远”算(route_center，默认开)：同一个横截面上(走向的垂直方向前后
+      center_window_mm 内)能停得下的位置里净空最大的那一条当“中间”，比它近多少罚多少。以前按绝对距离罚：中间那条 400 宽的车道
+      (车宽含雷达 300)走在正中间两边也只有 50mm，每走一格都按“贴着黄色区”多算时间(yellow_soft_cost_s 0.5 秒/格，加上
+      clearance_penalty)，穿过去要多算 20 多秒，规划宁可绕外圈一大圈 —— 这就是“不选最近的路”。现在窄车道走在正中间不罚，
+      只按用时选最近的；同一条车道里偏离中间才罚(宽车道里贴边走也罚)，所以车总走在车道中间。
+      窄车道只轻微多算一点(narrow_lane_penalty，默认最多多算 30% 的行驶时间)：用时差不多的两条路才选宽的那条。
+   2. 黄色区硬余量最低 yellow_floor_mm(默认 35；配置里 yellow_min_margin_mm 写得更小也按它)：400 宽的车道居中两边 50，
+      栅格 25 最多偏 12.5，所以 35 照样开得过去；希望余量 yellow_margin_mm 默认 50。
 """
 import heapq
 import itertools
@@ -62,8 +72,11 @@ ROUGH_ZONE = (910, 0, 1490, 150)
 START_ZONES = ((2100, 0, 2400, 300), (2100, 2100, 2400, 2400))   # 启停区2(东南)、启停区1(东北)
 
 # 车身离黄色区至少留多少 mm(配置 yellow_margin_mm 可改)。挤不过去的地方放宽，最低到 YELLOW_MIN_MARGIN_MM。
-YELLOW_MARGIN_MM = 30
-YELLOW_MIN_MARGIN_MM = 15
+# (10-26 用户"多留点冗余出来一定不要碰到黄色区域")希望 30 -> 50，最低 15 -> 35，而且配置里写得更小也按 YELLOW_FLOOR_MM
+YELLOW_MARGIN_MM = 50
+YELLOW_MIN_MARGIN_MM = 35
+YELLOW_FLOOR_MM = 35             # 400 宽的车道(车宽含雷达 300)居中两边各 50，栅格 25 最多偏 12.5：35 是还一定开得过去的最大值
+YELLOW_NOTE_MM = 40              # 一段路线离黄色区不到这么多(而且比希望的 yellow_margin_mm 近)才在 note 里提示“走这段要特别注意”
 ZONE_MARGIN_MM = 30              # 暂存区/粗加工区
 RAW_MARGIN_MM = 30               # 原料转盘
 EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
@@ -286,6 +299,7 @@ def _margins(cfg):
     ym = max(0.0, float(g('yellow_margin_mm', YELLOW_MARGIN_MM)))
     ymin = float(g('yellow_min_margin_mm', YELLOW_MIN_MARGIN_MM))
     ymin = max(1.0, min(ymin, ym))          # 最低档不会是 0(压到黄色区本轮就结束)
+    ymin = max(ymin, float(g('yellow_floor_mm', YELLOW_FLOOR_MM)))   # (10-26)车上配置写的 30 也按 35
     ym = max(ym, ymin)
     return dict(ym=ym, ymin=ymin,
                 zm=max(0.0, float(g('zone_margin_mm', ZONE_MARGIN_MM))),
@@ -662,6 +676,20 @@ def _merge_maps(a, b):
     return {k: np.minimum(a[k], b[k]) for k in a}
 
 
+def _slide(a, axis, w, fn):
+    """(10-26)沿 axis 前后各 w 格取 fn(np.maximum / np.minimum)：每个点 = 它所在那一条上前后 w 格里的最大/最小值(出了栅格不算)。"""
+    out = a.copy()
+    n = a.shape[axis]
+    for k in range(1, min(int(w), n - 1) + 1):
+        lo = [slice(None)] * a.ndim
+        hi = [slice(None)] * a.ndim
+        lo[axis], hi[axis] = slice(0, n - k), slice(k, n)
+        lo, hi = tuple(lo), tuple(hi)
+        fn(out[lo], a[hi], out=out[lo])
+        fn(out[hi], a[lo], out=out[hi])
+    return out
+
+
 _FIXED_CACHE = {}
 
 
@@ -705,8 +733,12 @@ class Planner:
         self.step_f = STEP / m.v_f
         self.step_s = STEP / m.v_s * self.sf
         # 每开始一段新的直行/横移：加减速损失 + 指令开销
+        # (10-26)横移每一段的这部分最多乘 strafe_seg_factor(默认 1.25)：车上配的 strafe_cost_factor=3 以前这里也乘 2，
+        #   一次 60~80mm 的短横移按 3 秒算，规划宁可绕外圈多走 5 秒也不横移一下(原料区→粗加工区)。横移不准是走得越长偏得越多，
+        #   长横移照样按每格乘 strafe_cost_factor
         self.seg_f = m.v_f / m.a_f + m.overhead
-        self.seg_s = (m.v_s / m.a_s + m.overhead) * (1 + (self.sf - 1)/2)
+        ssf = min(1 + (self.sf - 1)/2, max(1.0, float(cfg.get('strafe_seg_factor', 1.25))))
+        self.seg_s = (m.v_s / m.a_s + m.overhead) * ssf
         self.turn1 = m.time_of('R', 90)
         self.turn2 = m.time_of('R', 180)
         # 每一段路线里横移的总长度上限(mm)。None=不限制(默认)。限制了规划不出来会自动放开再规划一次
@@ -719,11 +751,25 @@ class Planner:
         # soft_cost_per_mm_s 秒。前一项让规划宁可绕一点也不挤；后一项很小，只让挤的时候走中间，不会为了几毫米来回横移(抖)
         self.soft_cost = float(cfg.get('yellow_soft_cost_s', 0.5))
         self.soft_mm = float(cfg.get('soft_cost_per_mm_s', 0.004))
+        # (10-26 用户"肯定要选择最近的路线"、"尽量让车走在中间一点")上面两种代价都按“这一处车道最多能离多远”算：
+        #   走向的垂直方向前后 center_window_mm 内停得下的位置里净空最大的那条当中间，比它近才罚(窄车道走在正中间不罚)；
+        #   窄车道另外每格最多多算 narrow_lane_penalty 倍的行驶时间(用时差不多才选宽的)。route_center=false = 以前按绝对距离罚
+        self.center = bool(cfg.get('route_center', True))
+        self.center_w = max(1, int(round(float(cfg.get('center_window_mm', 300)) / STEP)))
+        self.center_tol = max(0.0, float(cfg.get('center_tol_mm', 5)))
+        self.narrow_pen = max(0.0, float(cfg.get('narrow_lane_penalty', 0.3)))
         rc = cfg.get('raw_center_mm', [1200, 2480]); self.raw = (float(rc[0]), float(rc[1]), float(cfg.get('raw_radius_mm', 150)))
         self.obstacles = [(float(x), float(y), float(r)) for x, y, r in obstacles]
-        self.sealed = lane_block_rects(cfg, self.obstacles) if cfg.get('lane_block', True) else []
+        lb = cfg.get('lane_block', 'soft')
+        # (10-26 用户"路径规划的时候肯定要选择最近的路线啊不能随机选择啊")lane_block='soft'(默认)：有障碍物的那段车道不再整段封死，
+        #   只是穿过去多算 lane_avoid_s 秒——绕开只多这么点就绕开，绕得更远就走近的，从障碍物旁边过(照样离障碍物 margin_mm)。
+        #   True = 以前的整段封死(开不过去才不封)；False = 不管车道，只绕开障碍物本身
+        self.soft_seal = isinstance(lb, str) and lb.lower() == 'soft'
+        self.sealed = lane_block_rects(cfg, self.obstacles) if lb else []
+        self.seal_s = max(0.0, float(cfg.get('lane_avoid_s', 2.0) or 0.0))
+        self._seal_cache = {}
         self.fixed = fixed_items(cfg)
-        self.var = obstacle_items(cfg, self.obstacles) + sealed_items(cfg, self.sealed)
+        self.var = obstacle_items(cfg, self.obstacles) + ([] if self.soft_seal else sealed_items(cfg, self.sealed))
         self.items = self.fixed + self.var
         self.fallback = False
         self.lane_fallback = False
@@ -800,29 +846,79 @@ class Planner:
         gaps = self.pose_eval((c[0], c[1], yaw_of(h)))
         return _worst(self.items, gaps, False)[0] >= -EPS_MM
 
+    # ---------- (10-26)有障碍物的车道：穿过去多算时间(lane_block='soft') ----------
+    def _seal_grid(self, ox, oy):
+        """栅格(原点偏移 ox, oy)上转轴点落在有障碍物的那段车道里的点 -> True；不是 soft 或没有这样的车道返回 None。"""
+        if not self.soft_seal or not self.sealed or self.seal_s <= 0:
+            return None
+        key = (round(ox, 3), round(oy, 3))
+        g = self._seal_cache.get(key)
+        if g is None:
+            xs = ox + np.arange(N) * STEP
+            ys = oy + np.arange(N) * STEP
+            PX, PY = np.meshgrid(xs, ys, indexing='ij')
+            g = np.zeros((N, N), bool)
+            for r in self.sealed:
+                g |= (PX >= r[0]) & (PX <= r[2]) & (PY >= r[1]) & (PY <= r[3])
+            self._seal_cache[key] = g
+        return g
+
+    def lanes_passed(self, poses):
+        """(10-26)车中心依次经过 poses [(x, y, …)] 走直线：穿过了哪几段有障碍物的车道 [(x0, y0, x1, y1)]。"""
+        out = []
+        if not self.sealed or len(poses) < 2:
+            return out
+        for (x0, y0), (x1, y1) in zip([p[:2] for p in poses], [p[:2] for p in poses[1:]]):
+            n = max(1, int(math.hypot(x1 - x0, y1 - y0) // STEP))
+            for k in range(n + 1):
+                x, y = x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n
+                for r in self.sealed:
+                    if r[0] < x < r[2] and r[1] < y < r[3] and r not in out:
+                        out.append(r)
+        return out
+
     # ---------- 单段A*(栅格) ----------
-    def _leg_tables(self, M):
-        """把表变成 A* 用的数组/扁平列表：每个车头方向、每个走向一张“这一步要多少秒(走不了=inf)”。"""
+    def _leg_tables(self, M, seal=None):
+        """把表变成 A* 用的数组/扁平列表：每个车头方向、每个走向一张“这一步要多少秒(走不了=inf)”。
+        seal = _seal_grid 的结果：(10-26)这些点所在的车道有障碍物，走一格多算 lane_avoid_s / 18 秒(穿过一整段约多 lane_avoid_s 秒)。"""
         node_ok = M['node_h'] >= 0
         sw_ok = M['sw_h'] >= 0
         turn_ok = M['turn_h'] >= 0
         pref = max(self.clr_pref, 1.0)
-        mult = 1.0 + self.clr_pen * np.clip((pref - M['gap']) / pref, 0.0, 1.0)
         sc, smm = self.soft_cost, self.soft_mm
+        sealp = None if seal is None else np.where(seal, self.seal_s / 18.0, 0.0)
 
         def pen(slack_p):
             d = np.maximum(-slack_p, 0.0)
             return np.where(d > 0, sc + smm * d, 0.0)
+
+        def along(h, ax):
+            """车头 h、沿 ax 走一格：(每格行驶时间乘的倍数(两端取大的), 比希望余量近的代价)。"""
+            gap = M['gap'][h]
+            if not self.center:
+                mult = 1.0 + self.clr_pen * np.clip((pref - gap) / pref, 0.0, 1.0)
+                return np.maximum(mult, np.roll(mult, -1, axis=ax)), pen(M['sw_p'][h, ax])
+            # (10-26)横截面(垂直于走向的那一条)上停得下的位置里净空最大的 = 这一处车道的“中间”：比它近多少罚多少
+            best = _slide(np.where(node_ok[h], gap, -np.inf), 1 - ax, self.center_w, np.maximum)
+            off = np.clip(np.minimum(best, pref) - gap, 0.0, pref)
+            mult = 1.0 + self.clr_pen * off / pref + self.narrow_pen * np.clip((pref - best) / pref, 0.0, 1.0)
+            d = np.maximum(-M['sw_p'][h, ax], 0.0)                  # 比希望余量近多少(黄色区 50、启停区旁边贴边)
+            dbest = _slide(np.where(sw_ok[h, ax], d, np.inf), 1 - ax, self.center_w, np.minimum)
+            ex = d - np.where(np.isfinite(dbest), dbest, 0.0)        # 车道窄、怎么走都近的那一部分不罚
+            return np.maximum(mult, np.roll(mult, -1, axis=ax)), np.where(ex > self.center_tol, sc + smm * ex, 0.0)
         mec = self.mode == 'mecanum'
         cost = np.full((4, 4, N, N), np.inf)
         for h in range(4):
+            per_ax = [along(h, 0), along(h, 1)]
             for k, (di, dj) in enumerate(DIRS):
                 lateral = (k - h) % 2 == 1
                 if lateral and not mec:
                     continue
                 ax = 0 if di else 1
                 base = self.step_s if lateral else self.step_f
-                c = base * np.maximum(mult[h], np.roll(mult[h], -1, axis=ax)) + pen(M['sw_p'][h, ax])
+                c = base * per_ax[ax][0] + per_ax[ax][1]
+                if sealp is not None:
+                    c = c + np.maximum(sealp, np.roll(sealp, -1, axis=ax))
                 c = np.where(sw_ok[h, ax], c, np.inf)
                 # c[i,j] = 从 (i,j) 往 +ax 走一格；往 -ax 走一格 = 从 (i-1,j) 往 +ax 的那一格
                 if di > 0 or dj > 0:
@@ -1021,7 +1117,7 @@ class Planner:
         if M['node_h'][gh, gi, gj] < 0:
             c = self.center_of(goal[0], goal[1], yaw_of(gh))
             return None, '终点受阻：' + self.why_blocked(c[0], c[1], gh)
-        T = self._leg_tables(M)
+        T = self._leg_tables(M, self._seal_grid(ox, oy))
         hb = self._heur(T, gi*N + gj, gh)
         if hb[sh][4][si*N + sj] == math.inf:
             return None, NO_ROUTE
@@ -1144,11 +1240,18 @@ class Planner:
         cands.sort()
         if not cands:
             return None, 'no_cand'
+
+        def clean(c):
+            """终点栅格点离停车点的差值每个方向不是 0 就至少 MIN_MOVE_MM：补上去也不会是小移动"""
+            rx, ry = gp[0] - (ox + c[1]*STEP), gp[1] - (oy + c[2]*STEP)
+            return all(abs(r) < 0.5 or abs(r) >= MIN_MOVE_MM for r in (rx, ry))
+        # (10-26)最近的几个终点栅格点规划出来最后都要补一条 8~10mm 的小移动(窄车道里栅格线挪不动)：再试几个补起来不小的
+        extra = [c for c in cands[max_try:] if clean(c)][:4]
         best = None
         why = NO_ROUTE
         tried = 0
-        for dist_, gi, gj in cands:
-            if tried >= max_try:
+        for dist_, gi, gj in cands[:max_try] + extra:
+            if tried >= max_try and (best is None or best[0][0] != 0 or best[0][1] == 0):
                 break
             gn = gi*N + gj
             hb = self._heur(T, gn, gh)
@@ -1243,9 +1346,12 @@ class Planner:
         if rel2 and [(k, round(h, 2)) for k, _, h in rel2] != [(k, round(h, 2)) for k, _, h in rel1]:
             tiers.append((g2, g2, rel2))                 # 第二档：停车点附近的障碍物都放到最小余量
         best, why, used = None, NO_ROUTE, None
+        direct = self._direct(items, start_c, goal) if gh == sh else None
+        if direct is not None:
+            best, tiers = ((0, 0, direct['time']), direct, None), []
         for t, (gmap_items, chk, rel) in enumerate(tiers):
             M = self._goal_maps(items, relaxed, gmap_items, ox, oy, gp)
-            T = self._leg_tables(M)
+            T = self._leg_tables(M, self._seal_grid(ox, oy))
             if not T['node'][sh][sn]:
                 if t == 0:
                     return None, '起点受阻：' + (self.why_blocked(start_c[0], start_c[1], sh) or '车身放不下')
@@ -1264,7 +1370,7 @@ class Planner:
         if best is None or not best[1]['ok']:
             # 最后一招(和以前一样)：停到附近按完整余量放得下的栅格点
             M = self.maps(ox, oy, items if relaxed else None)
-            T = self._leg_tables(M)
+            T = self._leg_tables(M, self._seal_grid(ox, oy))
             r, w = self._search(T, items, start, sn, gp, gh, gyaw, 12, 3, exact=False)
             if r is not None and r[1]['ok']:
                 best, used = r, None
@@ -1310,20 +1416,43 @@ class Planner:
                 notes.append(f'⚠ {name} 停车点附近的{names_}按余量 {self.obs_margin:.0f}mm 开不进去：'
                              f'只在停车点附近对它们留 {self.goal_min:.0f}mm，照样停在 ({goal[0]:.0f},{goal[1]:.0f})')
         # 黄色区：比希望的余量近 → 提示(只有挤不过去的地方才会这样)
+        # (10-26)中间 400 宽的车道走在正中间也只有 45~55mm(希望 50)：这是正常的最近路线，不再每段都提示；不到 YELLOW_NOTE_MM 才提示
         chk_items = items if used is None or not used[1] else tiers[used[0]][1]
         ym = self.yellow_margin
         ymins = [res['mins'][k] for k, it in enumerate(chk_items) if it[1] == 'yellow']
         ygap = min(ymins) if ymins else math.inf
-        if ygap < ym - 0.5:
+        if ygap < min(ym, YELLOW_NOTE_MM) - 0.5:
             notes.insert(0, f'⚠ 去 {name} 这一段按离黄色区 {ym:.0f}mm 规划不出来(车道太窄或停车点离黄色区太近)，'
                             f'这一段只留了 {max(ygap, 0):.0f}mm，走这段要特别注意。')
         real = [(res['mins'][k], it) for k, it in enumerate(chk_items) if not (it[1] == 'edge' and it[8] <= 0)]
+        passed = self.lanes_passed([start_c] + list(poses)) if self.soft_seal else []
+        if passed:
+            og = [res['mins'][k] for k, it in enumerate(chk_items) if it[1] == 'obs']
+            notes.append(f'去 {name} 从有障碍物的车道过(' + '，'.join(f'x{r[0]:.0f}~{r[2]:.0f} y{r[1]:.0f}~{r[3]:.0f}' for r in passed) +
+                         f')：绕开要多走 {self.seal_s:g} 秒以上，走近的' + (f'；车身(含雷达)离障碍物最近 {min(og):.0f}mm' if og else ''))
         moved = math.hypot(goal[0]-gx, goal[1]-gy) >= 0.5
         leg = dict(stop=name, start=start_c, goal=goal, cmds=cmds, poses=poses, note='；'.join(notes),
                    min_gap_mm=round(min(g for g, _ in real), 1) if real else None,
                    yellow_mm=round(ygap, 1) if ygap < math.inf else None, time_s=round(res['time'], 2),
-                   stop_pose=(gx, gy, gyaw), goal_shift=(round(fwd, 1), round(left, 1)) if moved else None)
+                   stop_pose=(gx, gy, gyaw), goal_shift=(round(fwd, 1), round(left, 1)) if moved else None,
+                   lanes_passed=passed)
         return leg, 'OK'
+
+    def _direct(self, items, start_c, goal):
+        """(10-26)停车点就在车头正前方/正后方(车头一样、同一条直线上)，一条直行开过去按硬余量扫得过：就走这一条。
+        回启停区 PREHOME→START 就是这样；A* 会为了“别贴着场地边”横移出去再回来(4 条指令)，没有意义。返回 _finish 那样的 dict 或 None。"""
+        a = math.radians(start_c[2])
+        dx, dy = goal[0] - start_c[0], goal[1] - start_c[1]
+        fwd = dx*math.cos(a) + dy*math.sin(a)
+        left = -dx*math.sin(a) + dy*math.cos(a)
+        if abs(left) >= 0.5 or abs(fwd) < MIN_MOVE_MM or abs(wrap180(goal[2] - start_c[2])) > 1e-6:
+            return None
+        cm = [('F', int(round(fwd)))]
+        ok, g, idx, what, poses, mins = _moves_eval(self.body, items, start_c, cm)
+        if not ok:
+            return None
+        return dict(ok=True, cmds=cm, poses=[(p[0], p[1], wrap180(p[2])) for p in poses], mins=mins, tiny=0,
+                    time=self.motion.route_time(cm), what=what)
 
     def _finish(self, items, start_piv, acts, node_piv, target_piv, gyaw):
         """A* 动作 → 指令；终点不在栅格上的差值并进最后一条同方向的移动；再按真实车身扫一遍检查。"""
@@ -1536,13 +1665,42 @@ def plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None):
     1、2 先用车道格子查一遍还连不连得通，不通就直接跳过(省时间)。
     每一档都先按横移上限规划；最后一档规划不出来再放开横移上限。
     planner.fallback = 放开了横移上限；planner.lane_fallback = 没能封死车道。
-    v17：黄色区不再整段“先 30 再 15 再 0”重来，而是一次规划里只在挤不过去的地方放宽(最低 yellow_min_margin_mm)。"""
+    v17：黄色区不再整段“先 30 再 15 再 0”重来，而是一次规划里只在挤不过去的地方放宽(最低 yellow_min_margin_mm)。
+    (10-26 用户"路径规划的时候肯定要选择最近的路线")lane_block='soft'(默认)：车道不封死，有障碍物的那段多算 lane_avoid_s 秒，
+    一次规划就选出最近的(绕开只多一点就绕开)；上面 1)~3) 的档只在 lane_block=True 时用。"""
     cap = cfg.get('strafe_max_mm_per_leg', None)
-    lane = bool(cfg.get('lane_block', True))
+    lb = cfg.get('lane_block', 'soft')
+    soft = isinstance(lb, str) and lb.lower() == 'soft'
+    lane = bool(lb) and not soft
     tol = float(cfg.get('lane_block_tol_mm', 80))
     stops = cfg.get('stops') or {}
     obstacles = [(float(x), float(y), float(r)) for x, y, r in obstacles]
     pts = [tuple(start_pose[:2])] + [tuple(float(v) for v in stops[n][:2]) for n in stop_names if n in stops]
+    if soft:
+        tries = [dict(cfg, lane_block='soft')]
+        if cap is not None:
+            tries.append(dict(cfg, lane_block='soft', strafe_max_mm_per_leg=None))
+        first = None
+        for c2 in tries:
+            legs, why, planner = _plan_mission(c2, obstacles, start_pose, stop_names, start_pivot)
+            if first is None:
+                first = (legs, why, planner)
+            if why == 'OK':
+                planner.fallback = (cap is not None and c2.get('strafe_max_mm_per_leg', cap) is None)
+                planner.lane_fallback = False
+                return legs, why, planner
+        if cfg.get('goal_near_fallback'):
+            c2 = tries[-1]
+            legs, why, planner = _plan_mission(c2, obstacles, start_pose, stop_names, start_pivot, near=True)
+            if why == 'OK':
+                planner.fallback = (cap is not None and c2.get('strafe_max_mm_per_leg', cap) is None)
+                planner.lane_fallback = False
+                planner.near_fallback = True
+                return legs, why, planner
+        legs, why, planner = first
+        planner.fallback = False
+        planner.lane_fallback = False
+        return legs, why, planner
     tries = []
     if lane and obstacles:
         seen = []

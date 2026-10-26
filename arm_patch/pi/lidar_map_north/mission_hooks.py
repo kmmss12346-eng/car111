@@ -131,8 +131,15 @@ DEFAULTS = dict(
     raw_near_any_order=False,           # (10-22 用户"就是要全部按照这个任务码的顺序来放置和夹取")不再用：原料区一律按任务码顺序夹，
                                         #   配置里写着 true 也不用(见 _grab_any_order)。只想这一次不按顺序(测试用)：mtest RAW 1 any
     raw_near_regrab=1,                  #   (10-21 实车"一会儿夹取一会儿不夹取")夹过的颜色还在原料盘上(刚才没夹上)：等它转到这一格再夹几次(0 = 不再夹)
-    raw_near_check_last=True,           #   这一批都夹过以后再看 raw_near_check_s 秒原料盘：夹过的还在上面就再夹(最后一个没夹上也看得出来)
+    raw_near_check_last=False,          #   这一批都夹过以后再看 raw_near_check_s 秒原料盘：夹过的还在上面就再夹(最后一个没夹上也看得出来)。
+                                        #   (10-26 用户"最后一个夹取完了把爪子缩回来就完事了啊还把爪子转过去干嘛呢")默认不看：最后一个夹完
+                                        #   手臂不再转回原料盘上方，直接收臂。True = 以前的再看一眼
     raw_near_check_s=3.0,
+    zone_anchor=True,                   # (10-26 用户"后面第二轮运行……还能在同样的地方吗")工位/原料区对准了(2 号环/原料盘中心)，
+                                        #   和第一次来对准时车轮挪的差多少，这一次停的位置就和第一次差多少(一路车轮打滑累计的)；
+                                        #   做完挪回停车点时多挪这一点，回到第一次停的地方，路线接着按停车点算(误差不再一轮轮累计)
+    zone_anchor_min_mm=8.0,             #   差得比这少不多挪(对准本身就有几毫米的误差)
+    zone_anchor_max_mm=60.0,            #   差得比这多不信(多半认错了)：照旧挪回这一次停的地方，日志说一句
     raw_frames=2,                       # 原料区对准时每次测量用几帧(一帧最快，停下来的时间有限)
     raw_max_iter=1,                     # (10-11 用户：不要一直校准)原料区对准最多修正几次，以前 3
     raw_gain=1.0,                       # 原料区对准每次修正偏差的多少(用 vcal RAW 测好的 J，一下修到位，不留余量)
@@ -823,6 +830,8 @@ class MissionHooks:
         self._zone_learn = {}               # (10-19)区 -> {环号: (dID1, dID2)}：只动手臂对准 1、3 号环时量到的(相对 2 号环)，第二批直接用
         self._zone_geom_why = {}            # (10-19)区 -> 这一趟为什么不能按环距算(None = 能)：到工位时定下，中途量到对应关系也不换做法
         self._p2_at = {}                    # (10-19)区 -> 对准 2 号环时车在哪(底盘位移 S、F)：车挪过就要重新对准
+        self._anchor0 = {}                  # (10-26)区 -> 第一次来对准(2 号环/原料盘中心)时车在哪(相对规定的停车点：S、F)
+        self._anchor_now = None             #   这一趟对准时的 (区, (S, F))；task() 开头清掉
         self._p2_failed = set()             # (10-20)这一趟 2 号环没对准的区：后面的物料不再试(省时间)，直接照旧一个环一个环对准
         self._zone_v_only = False           # (10-20)这一趟工位里车只用 V 动过(没发 S/F)：做完挪回停车点也只用 V(不转车头)
         self.ring_uv = {}                   # (10-20)(区, 圆环号) -> (画面里 u, v, 那时底盘 S, F)：看三个环时记下的，对准 2 号环时按它找
@@ -876,6 +885,7 @@ class MissionHooks:
         self._ensure(link)
         self.act.reset_disp()                       # 路线把车开到了新的停车点，位移从 0 重新算
         self.learn = {'S': 0.0, 'F': 0.0}
+        self._anchor_now = None
         self.visits[role] = self.visits.get(role, 0) + 1
         t_start = self.now()
         self._items_t = 0.0
@@ -2107,13 +2117,14 @@ class MissionHooks:
         if self.act is None:
             return
         d = self.act.disp
-        if abs(d['S']) >= 1 or abs(d['F']) >= 1:
-            if math.hypot(float(d['S']), float(d['F'])) <= float(self.cfg.get('raw_vel_back_mm', 160.0)) \
-                    and self._vel_goto(0.0, 0.0, tol_mm=0.6):
+        ts, tf = self._zone_back_target('RAW')
+        if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+            if math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)) \
+                    and self._vel_goto(ts, tf, tol_mm=0.6):
                 self.log('    车轮挪回停车点(只用 V，不转车头)')
             d = self.act.disp
-            if abs(d['S']) >= 1 or abs(d['F']) >= 1:
-                self._return_to_stop('RAW')
+            if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+                self._return_to_stop('RAW', (ts, tf))
 
     def _raw_recenter(self):
         """挪回原料区的工作位置：停车点，或者挪着找到的够得着物料的地方(raw_seek)。"""
@@ -4009,6 +4020,7 @@ class MissionHooks:
             return False
         c, r = m
         self._raw_center_disp = (float(self.act.disp['S']), float(self.act.disp['F']))
+        self._anchor_mark('RAW')
         home = self._raw_home()
         J = np.asarray(self.store.get('RAW', 'arm'), float)
         Jinv = np.linalg.inv(J)
@@ -5081,6 +5093,7 @@ class MissionHooks:
                            + '：这次不抓(示教的角度是按对准以后的位置记的，没对准就下爪会砸到物料)')
         c = np.asarray(m[0], float)
         self._raw_center_disp = (float(self.act.disp['S']), float(self.act.disp['F']))
+        self._anchor_mark('RAW')
         self._ct_t_arm = self.now()
         off = c - np.asarray(D['c'], float)                   # 对准以后还剩的一点偏差：认停靠位时示教的画面位置跟着挪
         keys = sorted(D['slots'])
@@ -5232,6 +5245,9 @@ class MissionHooks:
                     self.stats.grab(True)
                     self.in_tray[item.slot] = item
                     self._show_stats()
+                    if i == len(todo):
+                        self.log(f'    ({tag} 是这一批最后一个：夹完直接收臂，不再转回原料盘上方)')   # (10-26 用户)
+                        break
                 try:
                     if near_k:
                         home, comp = self._raw_ct_pose(D)      # 回到看原料盘的姿态(同一边转过去)，顺便算手臂角度还差的一点让画面挪了多少
@@ -5305,7 +5321,7 @@ class MissionHooks:
         track = float(cfg.get('raw_track_s', 40.0))
         t_end = self.now() + track
         misses, recheck, after, last_stop = 0, False, True, None
-        checked = not cfg.get('raw_near_check_last', True)
+        checked = not cfg.get('raw_near_check_last', False)
         reuse = None                                           # 刚下过爪(夹的颜色)：原料盘还停在这一次、这一格上还是它(没夹上)就马上再夹
         cont = None                                            # (10-26)亲眼看到的上一次停下、之后手臂和车都没动：接着等时量它停了多久、转了多久
 
@@ -5465,6 +5481,11 @@ class MissionHooks:
                 #   以前等的时间不重新算，要的那个转一圈回来之前就到时间了，这一批后面的全记"没夹到"
                 regrab[int(item.color)] = regrab.get(int(item.color), 0) + 1
                 t_end = max(t_end, self.now() + track)
+            if got and not left and checked:
+                # (10-26 用户"最后一个夹取完了把爪子缩回来就完事了啊还把爪子转过去干嘛呢")这一批夹完了、不再看原料盘：
+                #   手臂不转回原料盘上方，从车上转盘这里直接收臂(_raw_ct_body 收)
+                self.log(f'    ({tag} 是这一批最后一个：夹完直接收臂，不再转回原料盘上方，用了 {self.now() - t_g0:.1f} 秒)')
+                break
             t_g1 = self.now()
             try:
                 home, comp = self._raw_ct_pose(D)              # 回到看原料盘的姿态(同一边转过去)，顺便算手臂角度还差的一点让画面挪了多少
@@ -6969,6 +6990,7 @@ class MissionHooks:
             return None
         self._p2[zone] = (a1, a2)
         self._p2_at[zone] = (float(self.act.disp['S']), float(self.act.disp['F']))
+        self._anchor_mark(zone)
         self._learn_from(zone, 2)
         self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环只转手臂过去(' +
                  ('按 arm_calib 调的角度' if cal else '示教的、或者按环距算的') + ')，车不再动')
@@ -9064,24 +9086,59 @@ class MissionHooks:
         d = self.act.disp if self.act is not None else None
         if d is None:
             return
+        ts, tf = self._zone_back_target(zone)
         tried = False
-        if (abs(d['S']) >= 1 or abs(d['F']) >= 1) and getattr(self, '_zone_v_only', False) \
-                and math.hypot(float(d['S']), float(d['F'])) <= float(self.cfg.get('raw_vel_back_mm', 160.0)):
+        if (abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1) and getattr(self, '_zone_v_only', False) \
+                and math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)):
             tried = True
             try:
-                if self._vel_goto(0.0, 0.0, tol_mm=0.6):
+                if self._vel_goto(ts, tf, tol_mm=0.6):
                     self.log('    车轮挪回停车点(只用 V，不转车头)')
             except ArmAbort as ex:
                 raise Abort(str(ex))
             except ArmError:
                 pass
         d = self.act.disp
-        if not tried or abs(d['S']) >= 1 or abs(d['F']) >= 1:
-            self._return_to_stop(zone)                       # 远了 / V 没挪到：S/F
+        if not tried or abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+            self._return_to_stop(zone, (ts, tf))             # 远了 / V 没挪到：S/F
 
-    def _return_to_stop(self, zone):
+    def _anchor_mark(self, zone):
+        """(10-26 用户"这个车在这四个停靠点停稳了但是后面第二轮运行夹取第二轮物料的时候还能在同样的地方吗")
+        这一趟对准了(2 号环/原料盘中心)：记下车这时相对规定的停车点在哪(车轮挪的 + 规划时停车点挪过的)。对准以后车和工位/原料盘的
+        相对位置每次都一样，所以第一次记的当基准：以后再来，和第一次差多少，这一次停的位置就和第一次差多少。"""
+        if self.act is None:
+            return
         d = self.act.disp
-        s, f = -int(round(d['S'])), -int(round(d['F']))
+        fwd, left = getattr(self, '_cur_shift', None) or (0.0, 0.0)
+        a = (float(d['S']) + float(left), float(d['F']) + float(fwd))
+        self._anchor_now = (zone, a)
+        self._anchor0.setdefault(zone, a)
+
+    def _zone_back_target(self, zone):
+        """做完挪回停车点挪到哪(底盘位移 S、F)。(0, 0) = 这一次停的地方。这一趟对准过、以前也对准过：挪到第一次停的地方
+        (这一次比第一次偏了多少就多挪多少)，路线下一段照样按停车点算，车轮打滑的误差不再一圈圈累计。
+        差得不到 zone_anchor_min_mm 不多挪；超过 zone_anchor_max_mm 多半认错了，不信，照旧挪回这一次停的地方。"""
+        cfg = self.cfg
+        now, a0 = self._anchor_now, self._anchor0.get(zone)
+        if not cfg.get('zone_anchor', True) or now is None or now[0] != zone or a0 is None or now[1] is a0:
+            return 0.0, 0.0
+        es, ef = a0[0] - now[1][0], a0[1] - now[1][1]          # 这一次停的位置比第一次 往左 es、往前 ef
+        e = math.hypot(es, ef)
+        if e < float(cfg.get('zone_anchor_min_mm', 8.0)):
+            return 0.0, 0.0
+        name = {'RAW': '原料区', 'ROUGH': '粗加工区', 'TEMP': '暂存区'}.get(zone, zone)
+        off = '、'.join(t for t in ((f'往{"前" if ef > 0 else "后"} {abs(ef):.0f}mm' if abs(ef) >= 0.5 else ''),
+                                    (f'往{"左" if es > 0 else "右"} {abs(es):.0f}mm' if abs(es) >= 0.5 else '')) if t)
+        if e > float(cfg.get('zone_anchor_max_mm', 60.0)):
+            self.log(f'    ★ 这次停的位置比第一次来{name}时{off}，差 {e:.0f}mm：差太多，多半对准时认错了，不按它挪，照旧挪回这一次停的地方')
+            return 0.0, 0.0
+        self.log(f'    这次停的位置比第一次来{name}时{off}(一路车轮打滑累计的)：做完挪回第一次停的地方，'
+                 '下一段路线照样按停车点算(误差不再一轮轮累计)')
+        return -es, -ef
+
+    def _return_to_stop(self, zone, target=(0.0, 0.0)):
+        d = self.act.disp
+        s, f = int(round(float(target[0]) - d['S'])), int(round(float(target[1]) - d['F']))
         if s or f:
             self.log(f'    底盘挪回停车点：前进 {f:+d}mm、横移 {s:+d}mm')
             try:

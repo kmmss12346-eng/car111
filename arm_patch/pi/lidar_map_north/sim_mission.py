@@ -3191,10 +3191,43 @@ class RawNearSlotTests(unittest.TestCase):
                             w.off_s -= 20.0
                     return orig(slot)
                 h.arm.grab_here = grab
-            w, h, text = self._near_run(seed, hook=hook, cfg=dict(raw_ct_stop_s=25.0), plate_stop_s=25.0)
+            w, h, text = self._near_run(seed, hook=hook, cfg=dict(raw_ct_stop_s=25.0, raw_near_check_last=True),
+                                        plate_stop_s=25.0)
             self.assertIn('这一批都夹过了：再看一眼', text)
             self.assertIn('还在原料盘上', text)
             self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.air, w.collisions), (3, 3, 1, 0), text[-3000:])
+
+    def test_second_visit_goes_back_to_where_the_first_visit_stopped(self):
+        """(10-26 用户"第二轮运行夹取第二轮物料的时候还能在同样的地方吗")原料区也一样：第二次来停得和第一次差了一截，
+        对准原料盘中心时车轮多挪的就是这一截；做完挪回第一次停的地方(zone_anchor=false 照旧挪回这一次停的地方)。"""
+        import tempfile
+        for anchor in (True, False):
+            w = self._world(2, stop_err_mm=0.5)
+            path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
+            lines = []
+            h = self._make(w, path, lines, cfg=dict(zone_anchor=anchor))
+            seed_raw_wheels_j(w, h)
+            self._teach(w, h, path)
+            run_mission(w, h, stops=('QR',), log=lines.append)
+            ends = []
+            for k, err in enumerate(((0.0, 0.0), (8.0, -12.0)), 1):
+                if k == 2:
+                    for s in list(w.tray):                         # 第一批放出去了(这里不跑粗加工区、暂存区)
+                        w.tray[s] = None
+                    h.in_tray.clear()
+                w.arrive('RAW', k)
+                w.stop_err[:] = err
+                h.task('RAW', w.link, lines.append)
+                ends.append(w.stop_err + w._rot() @ np.array([-w.off_s, w.off_f]))   # 车真的停在哪(相对规定的停车点)
+            text = '\n'.join(lines)
+            self.assertEqual((h.stats.grab_ok, w.air, w.collisions), (6, 0, 0), text[-3000:])
+            self.assertLess(np.linalg.norm(ends[0]), 1.0, ends)
+            if anchor:
+                self.assertLess(np.linalg.norm(ends[1] - ends[0]), 3.0, (ends, text[-3000:]))
+                self.assertIn('第一次来原料区时', text)
+            else:
+                self.assertLess(np.linalg.norm(ends[1] - np.array([8.0, -12.0])), 1.0, ends)
+                self.assertNotIn('第一次来原料区时', text)
 
     def test_near_teach_then_grab_only_there_in_code_order(self):
         """示教一次；再来原料区(车停的位置不一样)：车轮对准(手臂不动、只用 V)，三个都在最近那一格夹到、放对槽，
@@ -4008,6 +4041,44 @@ class ZoneCalTests(unittest.TestCase):
         print(f'\n  [工位按 arm_calib 调的角度放 3 组] 放置真实误差 平均 {errs.mean():.2f}mm / 最大 {errs.max():.2f}mm')
         self.assertLess(errs.mean(), 2.0)
         self.assertLess(errs.max(), 3.5)
+
+    def test_second_round_goes_back_to_where_the_first_round_stopped(self):
+        """(10-26 用户"这个车在这四个停靠点停稳了但是后面第二轮运行夹取第二轮物料的时候还能在同样的地方吗")
+        第二轮车停得和第一轮差了一截(一路车轮打滑累计的)：对准 2 号环时车轮多挪的就是差的那一截；做完挪回停车点时多挪这一点，
+        车回到第一轮停的地方(路线下一段照样按停车点算，误差不再一轮轮累计)。差得太多(超过 zone_anchor_max_mm)不信，照旧挪回
+        这一次停的地方；zone_anchor=false 和以前一样。"""
+        errs = {'ROUGH': [(0.0, 0.0), (14.0, -22.0)], 'TEMP': [(0.0, 0.0), (-12.0, 18.0)]}
+        for extra, expect in ((None, 'first'), (dict(zone_anchor=False), 'this'), (dict(zone_anchor_max_mm=15.0), 'this')):
+            w = self._world(3, stop_err_mm=0.5)
+            n_in, orig = {}, w.arrive
+
+            def arrive(role, batch=1, w=w, n_in=n_in, orig=orig):
+                orig(role, batch)
+                if role in errs:
+                    w.stop_err[:] = errs[role][min(n_in.get(role, 0), 1)]
+                    n_in[role] = n_in.get(role, 0) + 1
+            w.arrive = arrive
+            lines = []
+            h = self._make(w, extra, lines=lines)
+            ends, ob = {}, h._zone_back
+
+            def back(zone, w=w, ends=ends, ob=ob):
+                r = ob(zone)
+                ends.setdefault(zone, []).append(w.stop_err + w._rot() @ np.array([-w.off_s, w.off_f]))   # 车真的停在哪(相对规定的停车点)
+                return r
+            h._zone_back = back
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._ok(w, h, text)
+            for z in ('ROUGH', 'TEMP'):
+                first, second = ends[z]
+                self.assertLess(np.linalg.norm(first - np.array(errs[z][0])), 1.0, (z, first))
+                if expect == 'first':
+                    self.assertLess(np.linalg.norm(second - first), 3.0, (z, first, second, text[-3000:]))
+                else:
+                    self.assertLess(np.linalg.norm(second - np.array(errs[z][1])), 1.0, (z, second))
+            self.assertEqual('做完挪回第一次停的地方' in text, expect == 'first', extra)
+            self.assertEqual('差太多' in text, bool(extra and 'zone_anchor_max_mm' in extra), extra)
 
     def test_parked_off_along_and_too_far_from_the_row(self):
         """车停得沿那一排偏了 45mm、离圆环那一排远了 30mm：车轮横着挪到 arm_calib 调 2 号环时的远近(30mm，以前只许 20mm)，

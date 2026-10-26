@@ -919,3 +919,32 @@ git_log.txt                ← 分支最近 120 条提交记录
   RANSAC 一次算完(`_ransac_best`)；三个点一次抽完(`_triples_fast`：照 numpy Generator.choice 的 Floyd + Lemire 抽法，第一次用时和 rng.choice 比对，
   对不上就退回一组一组抽)；auto_claw_mask 的 31×31 闭运算只在爪子那一块做。这台机器三个颜色一帧 108ms → 39ms。
   ⑤ _raw_ct_pose：AP 回报的角度直接用，不再另读(每次回到看的姿态省两次串口来回)。测试 test_raw_timing.py、test_matdet.SameButFasterTests。
+- **10-26 路线选最近的 + 走在车道中间、离黄色区多留余量(用户"路径规划的时候肯定要选择最近的路线啊不能随机选择啊"、
+  "车在移动的老是容易压到这个黄色的区域……尽量让车走在中间一点，多留点冗余出来一定不要碰到黄色区域")：**
+  原因：车上配置 yellow_margin_mm=50、clearance_penalty=5、clearance_pref_mm=150、strafe_cost_factor=3。中间 400 宽的车道(车宽含雷达 300)
+  走在正中间两边也只有 45~55，每走一格都按"比希望的 50 近"加 yellow_soft_cost_s(0.5 秒/格)、净空倍数 4.5 倍，穿过去要多算 20 多秒，
+  A* 宁可绕外圈(原料区→粗加工区 14.9 秒，直着往下 11.4 秒)；strafe_cost_factor=3 连每段横移的起停也乘 2，60~80mm 的短横移按 3 秒算。
+  route_plan 改：① `route_center`(默认 True)：净空倍数和"比希望余量近"的代价都按横截面(走向的垂直方向前后 center_window_mm=300)里
+  停得下的位置净空最大的那条算(`_slide`)，窄车道走在正中间不罚，偏了才罚(宽车道贴边也罚)；窄车道另外最多多算 narrow_lane_penalty=0.3 倍
+  行驶时间(用时差不多才选宽的)。② 黄色区硬余量 `yellow_floor_mm`=35(配置 yellow_min_margin_mm 写 30 也按 35；35 是 400 宽车道按 25 栅格
+  一定还有一条线开得过去的最大值)，默认 yellow_margin_mm 50、yellow_min_margin_mm 35。③ `strafe_seg_factor`(默认 1.25)：横移每段起停
+  最多乘这么多(长横移照样每格乘 strafe_cost_factor)。④ `_direct`：停车点在车头正前/正后、一条直行按硬余量扫得过就只走这一条
+  (PREHOME→START；不然 A* 为了躲启停区旁边贴边的软代价横移出去再回来)。⑤ `_search`：最近 4 个终点栅格点都要补 8~10mm 小移动时，
+  再试 4 个"补的差值每个方向是 0 或 ≥20mm"的；还不行就留着最后一条小移动(auto_run flatten 到停车点慢速补)。test_route_safety 只禁中间的小移动。
+  ⑥ note 里"只留了 xx mm"只在离黄色区不到 YELLOW_NOTE_MM=40 时写(居中走窄车道是正常的)。⑦ (前面就改的)lane_block='soft' 默认：
+  有障碍物的车道不整段封死，穿过去多算 lane_avoid_s=2 秒。车上配置 12 个随机障碍物布局：平均行驶 110.6→103.2 秒，最差 134→104 秒，
+  路线上离黄色区不到 40mm 的比例 8%→1%，规划 1.4→1.8 秒(这台电脑)。离黄色区最近的 30mm 是用户的 QR 停车点 (2010,1250) 本身
+  (车角对黄色区角)，建议 stop QR 2015 1250。比较脚本见 scratchpad rp_cmp/cmp_center.py(旧版 rp_head.py)。
+- **10-26 原料区最后一个夹完直接收臂(用户"最后一个夹取完了把爪子缩回来就完事了啊还把爪子转过去干嘛呢")：**
+  `raw_near_check_last` 默认 False(True = 以前的这一批都夹过以后再转回原料盘上方看 3 秒，夹过的还在上面就再夹)；
+  _raw_near_any 和 _raw_ct_body(非最近那格)最后一个夹到就 break，不再 _raw_ct_pose 转回看的姿态，_stow_quiet 收臂。
+- **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
+  10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
+  摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准
+  2 号环、_raw_ct_body / _raw_center_setup 对准原料盘中心以后)记下车轮挪的 + 规划挪过的停车点(_cur_shift)；第一次的当基准(_anchor0)。
+  以后再来，差多少这一次就停偏了多少；`_zone_back_target` 让 _zone_back / _raw_seek_end 挪回第一次停的地方(V 或 S/F)，
+  路线下一段照样按停车点算，误差不再一轮轮累计。差 < zone_anchor_min_mm(8) 不挪，> zone_anchor_max_mm(60) 不信(多半认错)。
+  一个环一个环挪车对准的旧做法(align_by wheels、zone_reach 不是 arm)不记，照旧挪回这一次停的地方。
+  sim ZoneCalTests.test_second_round_goes_back_to_where_the_first_round_stopped、RawNearSlotTests.test_second_visit_goes_back_to_where_the_first_visit_stopped。
+- 已知：test_ringdet.SchoolTargetTests.test_empty_target_near_and_under_claw 在这台电脑上早就不过(0d408cf 也不过)：R=90 (337,260) 误差 0.602 像素，
+  R=130 (337,283) 最近的结果是个半径 25 的小圆(离真圆心 15 像素)。是校赛靶(粗黑环 + 白心 + 数字)的合成图，和今天的改动无关，没改。

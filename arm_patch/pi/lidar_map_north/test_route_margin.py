@@ -36,26 +36,31 @@ class YellowMarginTests(unittest.TestCase):
         self.assertGreaterEqual(yellow_gap(CFG, legs), yellow_gap(CFG, legs0))
         self.assertFalse(any(L.get('note') for L in legs), '没有障碍物时每段都应该按 30mm 规划出来')
 
-    def test_default_is_30(self):
+    def test_default_is_50_and_floor_35(self):
+        # (10-26 用户"多留点冗余出来一定不要碰到黄色区域")希望 50、最低 35；配置里写的 30(车上以前配的)也按 35
         legs, why, pl = rp.plan_mission(dict(CFG), [], START, MISSION)
         self.assertEqual(why, 'OK')
-        self.assertEqual(pl.yellow_margin, 30)
-        self.assertEqual(pl.yellow_min, 15)
-        self.assertGreaterEqual(yellow_gap(CFG, legs), 30 - 0.1)
+        self.assertEqual(pl.yellow_margin, 50)
+        self.assertEqual(pl.yellow_min, 35)
+        self.assertGreaterEqual(yellow_gap(CFG, legs), 35 - 0.1)
+        pl = rp.Planner(dict(CFG, yellow_margin_mm=50, yellow_min_margin_mm=30), [])
+        self.assertEqual(pl.yellow_min, 35)
+        pl = rp.Planner(dict(CFG, yellow_margin_mm=50, yellow_min_margin_mm=30, yellow_floor_mm=30), [])
+        self.assertEqual(pl.yellow_min, 30)
 
     def test_narrow_lane_only_squeezes_where_needed_with_note(self):
-        # 中间车道 400 宽，车身+雷达 300：两边各最多 50mm。按 60mm 走不过去的那几段放宽并提示，其余段照样 60
+        # 中间车道 400 宽，车身+雷达 300：两边各最多 50mm。按 60mm 走不过去的那几段放宽，其余段照样 60。
+        # (10-26)窄车道走在正中间(两边 45~55)是正常的最近路线，不再提示；离黄色区不到 40mm 才提示“只留了”
         cfg = dict(CFG, yellow_margin_mm=60)
         legs, why, _ = rp.plan_mission(cfg, OUTER_BLOCKED, START, MISSION)
         self.assertEqual(why, 'OK')
-        notes = [L['note'] for L in legs if L.get('note')]
-        self.assertTrue(notes and all('只留了' in n for n in notes))
-        self.assertLess(len(notes), len(legs), '只有挤不过去的那几段才放宽')
+        narrow = [L for L in legs if L['yellow_mm'] < 60 - 0.1]
+        self.assertTrue(narrow, '外圈被堵，有几段只能走中间的窄车道')
+        self.assertLess(len(narrow), len(legs), '只有挤不过去的那几段才放宽')
         for L in legs:
-            self.assertGreaterEqual(L['yellow_mm'], 15 - 0.1)
-            if not L.get('note'):
-                self.assertGreaterEqual(L['yellow_mm'], 60 - 0.1)
-        self.assertGreaterEqual(yellow_gap(cfg, legs), 15 - 0.1)
+            self.assertGreaterEqual(L['yellow_mm'], 35 - 0.1)
+            self.assertEqual('只留了' in (L.get('note') or ''), L['yellow_mm'] < 40 - 0.5, L)
+        self.assertGreaterEqual(yellow_gap(cfg, legs), 35 - 0.1)
 
     def test_never_below_min_tier(self):
         # 最低也要 55mm：中间车道(最多 50)过不去，外圈又被堵 → 规划失败并说明原因，不会悄悄贴着黄色区走
@@ -73,9 +78,9 @@ class YellowMarginTests(unittest.TestCase):
 
     def test_why_blocked_mentions_yellow(self):
         p = rp.Planner(dict(CFG, yellow_margin_mm=30), [])
-        # 车头朝北，车身后边离黄色区只有 10mm(最低要 15)
-        self.assertIn('离黄色区不到 15mm', p.why_blocked(1600, 1850 + 145 + 10, 1))
-        self.assertEqual(p.why_blocked(1600, 1850 + 145 + 20, 1), '')
+        # 车头朝北，车身后边离黄色区只有 10mm(最低要 35)
+        self.assertIn('离黄色区不到 35mm', p.why_blocked(1600, 1850 + 145 + 10, 1))
+        self.assertEqual(p.why_blocked(1600, 1850 + 145 + 35, 1), '')
 
 
 if __name__ == '__main__':

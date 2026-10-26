@@ -50,11 +50,11 @@ class FootprintTests(unittest.TestCase):
         self.assertAlmostEqual(b.disk[2], 35.2, delta=0.1)
 
     def test_lidar_side_counts(self):
-        # 中间竖车道里，车身离西边黄色区 20mm(≥15)；车头朝北时雷达在西边、伸进黄色区，朝南时雷达在东边
-        ok, g, what = rp.pose_clear(CFG, [], (1150, 775, 90))
+        # 中间竖车道里，车身离西边黄色区 40mm(≥35)；车头朝北时雷达在西边、贴到黄色区，朝南时雷达在东边
+        ok, g, what = rp.pose_clear(CFG, [], (1170, 775, 90))
         self.assertFalse(ok)
         self.assertIn('黄色区', what)
-        ok, g, what = rp.pose_clear(CFG, [], (1150, 775, -90))
+        ok, g, what = rp.pose_clear(CFG, [], (1170, 775, -90))
         self.assertTrue(ok, what)
 
     def test_all_stops_are_clear(self):
@@ -109,10 +109,10 @@ class MovesClearTests(unittest.TestCase):
         self.assertIn('黄色区', what)
 
     def test_turn_sweep(self):
-        # 竖车道中间：停着、转完都放得下，但转的过程中车角扫到黄色区
-        self.assertTrue(rp.pose_clear(CFG, [], (1200, 775, 90))[0])
-        self.assertTrue(rp.pose_clear(CFG, [], (1200, 775, 180))[0])
-        ok, g, idx, what = rp.moves_clear(CFG, [], (1200, 675, 90), [('F', 100), ('R', 90)])
+        # 竖车道中间：停着、转完都放得下，但转的过程中车角扫到黄色区(离黄色区要 35：车头朝北和朝东都放得下的只有 x 1205~1220)
+        self.assertTrue(rp.pose_clear(CFG, [], (1210, 775, 90))[0])
+        self.assertTrue(rp.pose_clear(CFG, [], (1210, 775, 0))[0])
+        ok, g, idx, what = rp.moves_clear(CFG, [], (1210, 675, 90), [('F', 100), ('R', -90)])
         self.assertFalse(ok)
         self.assertEqual(idx, 1)
         self.assertIn('黄色区', what)
@@ -125,7 +125,7 @@ class MovesClearTests(unittest.TestCase):
 
     def test_check_moves_compat(self):
         pl = rp.Planner(CFG, [])
-        ok, msg, end = rp.check_moves(pl, (1200, 1200, 0), [('R', 90), ('F', 200)])
+        ok, msg, end = rp.check_moves(pl, (1225, 1200, 0), [('R', 90), ('F', 200)])
         self.assertTrue(ok, msg)
         self.assertAlmostEqual(end[1], 1400)
         ok, msg, end = rp.check_moves(pl, (2100, 700, 180), [('F', 1800)])
@@ -156,11 +156,12 @@ class MissionTests(unittest.TestCase):
             self.assertLess(math.hypot(end[0] - g[0], end[1] - g[1]), 0.6, f'{tag} {L["stop"]} {end}')
             self.assertAlmostEqual(rp.wrap180(end[2] - g[2]), 0, delta=1e-6)
             self.assertEqual(tuple(L['goal']), tuple(float(v) for v in g))
-            for c, v in L['cmds']:
+            for k, (c, v) in enumerate(L['cmds']):
                 self.assertIsInstance(v, int)
-                if c in ('F', 'S'):
+                if c in ('F', 'S') and k < len(L['cmds']) - 1:
+                    # (10-26)窄车道里走居中的栅格线，个别停车点最后要补一条 10mm 左右的小移动(auto_run 到停车点时慢速补上)；中间不许有
                     self.assertGreaterEqual(abs(v), rp.MIN_MOVE_MM, f'{tag} {L["stop"]} 有小移动 {c} {v}')
-            self.assertGreaterEqual(L['yellow_mm'], 15 - 0.1)
+            self.assertGreaterEqual(L['yellow_mm'], 35 - 0.1)
         # 整条指令(按顺序接起来)按真实车身、硬余量扫一遍
         allc = [c for L in legs for c in L['cmds']]
         ok, g, idx, what = rp.moves_clear(cfg, obs, z['start'], allc)

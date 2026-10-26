@@ -306,7 +306,8 @@ def main():
                 legs,why,pl_,mg,obs=attempt([s for s in mission if s!='PREHOME'])
             state['strafe_fallback']=bool(getattr(pl_,'fallback',False))
             state['lane_fallback']=bool(getattr(pl_,'lane_fallback',False))
-            state['sealed']=[] if state['lane_fallback'] else list(getattr(pl_,'sealed',[]))   # v11：整段封死的车道
+            state['sealed']=[] if state['lane_fallback'] else list(getattr(pl_,'sealed',[]))   # v11：整段封死的车道((10-26)soft：有障碍物、尽量不走的车道)
+            state['seal_soft']=bool(getattr(pl_,'soft_seal',False));state['seal_s']=float(getattr(pl_,'seal_s',0.0) or 0.0)
             state['box']=getattr(pl_,'box',None)                                                 # v13：车身外框(含雷达)
             state['plan_margin']=mg;state['plan_obs']=obs
         except ValueError as e:
@@ -349,7 +350,8 @@ def main():
         if state.get('box'):
             b_=state['box'];print(f'  规划用的车身外框(含雷达)：前后各{b_[1]:.0f}mm，右边{-b_[2]:.0f}mm，左边(雷达那边){b_[3]:.0f}mm（从车中心算）',flush=True)
         if state.get('sealed'):
-            print('  有障碍物、整段封死不走的车道：'+'，'.join(f'x{r[0]}~{r[2]} y{r[1]}~{r[3]}' for r in state['sealed']),flush=True)
+            print(('  有障碍物的车道(绕开只多走 %g 秒以内就绕开，再远就走近的、从障碍物旁边过)：'%state.get('seal_s',0.0) if state.get('seal_soft')
+                   else '  有障碍物、整段封死不走的车道：')+'，'.join(f'x{r[0]}~{r[2]} y{r[1]}~{r[3]}' for r in state['sealed']),flush=True)
         if state.get('lane_fallback'):
             print('  ⚠ 把有障碍物的车道整段封死以后到不了，已改成只绕开障碍物本身：路线会从障碍物旁边过！',flush=True)
         if abs(tb)>=0.5 and ps:print(f"  先原地{'逆时针' if tb>0 else '顺时针'}转{abs(tb):.0f}°，车头回到{ps[2]:.0f}°，车中心到 ({ps[0]:.0f},{ps[1]:.0f})",flush=True)
@@ -394,8 +396,9 @@ def main():
                 plan_route()
         path=list(state['path'])
         route.set_data(*zip(*path)) if path else route.set_data([],[])
-        for r in (state.get('sealed') or []):      # v11：整段封死的车道
-            box=Rectangle((r[0],r[1]),r[2]-r[0],r[3]-r[1],fc='red',alpha=.18,ec='red',hatch='xx',lw=1,zorder=3)
+        for r in (state.get('sealed') or []):      # v11：整段封死的车道((10-26)soft：尽量不走、浅一点不画叉)
+            box=Rectangle((r[0],r[1]),r[2]-r[0],r[3]-r[1],fc='red',alpha=.10 if state.get('seal_soft') else .18,ec='red',
+                          hatch=None if state.get('seal_soft') else 'xx',lw=1,zorder=3)
             world.add_patch(box);markers.append(box)
         world.set_title(f"ZONE {raw_cfg.get('start_zone',2)} | {state['reason']}",fontsize=10,color='red' if state['reason']!='ROUTE OK' else 'black')
         info.set_text(f"STOPPED views={len(history.views)} | candidates={len(history.objects)} | pose=({c['car_x_mm']:.0f}, {c['car_y_mm']:.0f}, {c['car_yaw_deg']:.1f} deg)\nOriginal v4 exclusion regions retained. Unobserved space is UNKNOWN.")
