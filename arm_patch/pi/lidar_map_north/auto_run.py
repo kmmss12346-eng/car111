@@ -1116,6 +1116,19 @@ class _Drive:
         moves = [(c, v) for c, v in (('S', s), ('F', f)) if abs(v) >= float(g('reloc_turn_tol_mm', 8))]
         model = body_model(self.cfg)
         q = self.nav.real()
+        fold = self._fold_axis(val)
+        if fold and any(c == fold for c, _ in moves):
+            # (10-26 用户"整个车运动和转向都太慢")转 90° 以后，转弯前横移(前后)差的那一份正好在下一条前进(横移)的方向上，
+            # 下一条会把它补上(每条都按"规划的位置"算长短)：只修另一份、按那里转也够安全时，这一份不单独挪(省一条慢速小动作)
+            rest = [(c, v) for c, v in moves if c != fold]
+            qf = q
+            for c, v in rest:
+                qf = apply_move(qf, c, v)
+            _, want2 = self.nav.turn_cmd(val)
+            if moves_clearance(self.cfg, obs, qf, [('R', want2)], step_deg=3.0)[0] >= need:
+                moves = rest
+                self.log(f'    ({"横移" if fold == "S" else "前后"}还差 {(s if fold == "S" else f):+.0f}mm：转完弯就是下一条'
+                         f'{"前进" if fold == "S" else "横移"}的方向，由它补上，不单独挪)')
         moves.sort(key=lambda cv: -pose_clearance(self.cfg, obs, apply_move(q, cv[0], cv[1]), model)[0])
         for c, v in moves:
             v2 = clamp_move(self.cfg, obs, self.nav.real(), c, int(round(v)), need)
@@ -1123,6 +1136,14 @@ class _Drive:
                 self._send(c, v2, self.fine, '(转弯前定位修正)')
                 self.n_fix[2] += 1
                 self.nav.moved(c, v2)
+
+    def _fold_axis(self, val):
+        """(10-26)这次转弯是 ±90°、转完紧接着一条前进/横移：转弯前哪一份偏差转完以后在这条的方向上(它会顺带补上)。
+        下一条是 F → 'S'(转弯前的横移)，是 S → 'F'；别的(转 180°、接着又转、到站)→ None。
+        配置 reloc_fold=false 关掉(以前的做法：转弯前两份都单独挪)。"""
+        if not self.cfg.get('reloc_fold', True) or abs(abs(float(val)) - 90.0) > 5.0 or self.k + 1 >= len(self.seq):
+            return None
+        return {'F': 'S', 'S': 'F'}.get(self.seq[self.k + 1][1])
 
     def _after_turn(self):
         """路线中间转完弯、接下来是一条长直行(>= reloc_split_mm)、上次定位以后又走了 >= reloc_min_travel_mm：先用雷达定位一次。

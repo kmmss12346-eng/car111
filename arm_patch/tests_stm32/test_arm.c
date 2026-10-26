@@ -1279,22 +1279,86 @@ int main(void) {
         run("CLAW O"); run("LIFT 100");
         slow = 1; ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
         clear(); t0 = now;
+        /* (10-26 用户"提前开这个机械臂的时候要丝滑运动，车动车的不要停")PREBG=1(默认)：只发 ID1 的转动就回 DONE，车马上能开；
+         * 绕电池盒的伸缩由底盘控制循环里的 Arm_Bg_Poll 发(这里每 20ms 叫一次，相当于车在开) */
         CHECK(run("PRE RAW") == 1, "PRE RAW：回 DONE");
-        CHECK(at("S1:100.0") >= 0 && at("S2:-950.0@400") > at("S1:100.0") && !has("S2:-700.0"),
-              "PRE RAW 在车上转盘上方：和 OBS 一样 ID1 一直转，转过 A1T2 伸缩直接到 A2E");
-        CHECK(ang[1] > 200.0f && now - t0 < 1500u && !has("H1:"), "PRE RAW：伸缩指令发了就回，不等 ID1 转完(还在半路，没停住)");
+        CHECK(has("S1:100.0") && !has("S2:") && now - t0 < 100u && ang[1] > 315.0f,
+              "PRE RAW(PREBG=1)：只发 ID1 的转动就马上回(伸缩还没发、ID1 刚开始转)，车不用停下等");
         CHECK(has("O;") && !has("L+") && !has("L-"), "PRE RAW：张开夹爪；本来在 ZHI，升降不动、不降到观察高度");
-        HAL_Delay(3000);                                  /* 车开过去的这段时间舵机自己转完 */
-        CHECK(ang[1] == 100.0f && ang[2] == -950.0f, "车开过去的路上手臂转到了观察姿态");
+        {
+            int k;
+            for (k = 0; k < 150; k++) { HAL_Delay(20); Arm_Bg_Poll(); }      /* 车开过去的 3 秒：底盘控制循环每个周期叫一次 */
+        }
+        CHECK(at("S2:-950.0@400") > at("S1:100.0") && !has("S2:-700.0"),
+              "PRE RAW 在车上转盘上方：车开着的时候后台照 OBS 的走法，ID1 转过 A1T2 伸缩直接到 A2E");
+        CHECK(fabsf(ang[1] - 100.0f) <= 1.0f && fabsf(ang[2] + 950.0f) <= 1.0f && has("H1:") && has("H2:"),
+              "车开过去的路上手臂转到了观察姿态，到了就停住(和不在后台走时一样：离目标 ATOLC 以内就停)");
         clear();
         CHECK(run("OBS RAW O") == 1 && !has("S1:") && !has("S2:") && has("H1:") && has("H2:") && has("L-800;"),
               "到了再 OBS RAW：已经在姿态上，舵机只原地保持，只降到观察高度");
-        /* 圆环那组：转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P，这一条发了就回 */
+        /* 圆环那组：转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P(车开着的时候后台发) */
+        run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear(); t0 = now;
+        CHECK(run("PRE RING") == 1 && has("S1:200.0") && !has("S2:") && now - t0 < 100u, "PRE RING：只发 ID1 的转动就回");
+        {
+            int k;
+            for (k = 0; k < 40 && !has("S2:-650.0"); k++) { HAL_Delay(20); Arm_Bg_Poll(); }
+            CHECK(has("S2:-650.0@500") && ang[1] <= 300.0f && ang[1] > 297.0f && !has("S2:-800.0"),
+                  "后台：ID1 刚转过 R1T2 就伸到 R2T(晚不过 2°，和在前台等着一样；还没转过 R1T1)");
+            for (k = 0; k < 150; k++) { HAL_Delay(20); Arm_Bg_Poll(); }
+        }
+        CHECK(at("S1:200.0") >= 0 && at("S2:-650.0@500") > at("S1:200.0") && at("S2:-800.0@500") > at("S2:-650.0@500"),
+              "PRE RING 在车上转盘上方：ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P");
+        CHECK(fabsf(ang[1] - 200.0f) <= 1.0f && fabsf(ang[2] + 800.0f) <= 1.0f && has("H1:") && has("H2:"), "PRE RING：车开过去的路上转到 A1P/A2P 停住");
+        /* PRE 以后车还没开、下一条手臂指令就来了：先把后台的走完再做 */
+        run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear();
+        CHECK(run("PRE RING") == 1 && !has("S2:"), "PRE RING：马上回");
+        CHECK(run("OBS RING O") == 1 && at("S2:-650.0@500") > at("S1:200.0") && at("S2:-800.0@500") > at("S2:-650.0@500")
+              && at("L-") > at("S2:-800.0@500") && fabsf(ang[1] - 200.0f) <= 1.0f && fabsf(ang[2] + 800.0f) <= 1.0f,
+              "PRE 后马上 OBS：先把后台的绕电池盒走完、到了，再降到观察高度");
+        /* 车停着(树莓派在看摄像头、算路线，没发底盘指令)：主循环的 Arm_Poll 接着走，绕电池盒的伸缩照样按时发 */
+        run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear();
+        run("PRE RING");
+        {
+            int k;
+            for (k = 0; k < 200 && !has("S2:-650.0"); k++) { HAL_Delay(5); Arm_Poll(); }
+            CHECK(has("S2:-650.0@500") && ang[1] <= 300.0f && ang[1] > 297.0f && !has("S2:-800.0"),
+                  "车停着：主循环里接着走，ID1 一转过 R1T2 就伸到 R2T(不会因为车没在开就晚发)");
+            for (k = 0; k < 600; k++) { HAL_Delay(5); Arm_Poll(); }
+            CHECK(at("S2:-800.0@500") > at("S2:-650.0@500") && fabsf(ang[1] - 200.0f) <= 1.0f && fabsf(ang[2] + 800.0f) <= 1.0f && has("H1:"),
+                  "车停着：一样转过 R1T1 缩到 A2P、转到 A1P 停住");
+        }
+        /* 车开着来了急停：后台的停在现在的位置 */
+        run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
+        clear();
+        run("PRE RING");
+        {
+            int k;
+            float a1;
+            for (k = 0; k < 10; k++) { HAL_Delay(20); Arm_Bg_Poll(); }
+            clear();
+            car_abort = 1;
+            HAL_Delay(5); Arm_Bg_Poll();                                      /* 刚看过 5ms：急停也马上处理 */
+            a1 = ang[1];
+            CHECK(has("H1:") && has("H2:") && !has("S1:") && !has("S2:"), "急停：后台的两个舵机马上停在现在的位置");
+            car_abort = 0;
+            clear();
+            for (k = 0; k < 100; k++) { HAL_Delay(20); Arm_Bg_Poll(); Arm_Poll(); }
+            CHECK(!has("S1:") && !has("S2:") && fabsf(ang[1] - a1) < 0.01f, "急停以后后台不再发转动(下一条指令来了也不接着转)");
+            clear();
+            CHECK(run("OBS RING O") == 1 && has("L-"), "急停以后照常能发 OBS");
+        }
+        run("STOW");
+        /* PREBG=0：以前的做法(等 ID1 转过绕电池盒的那几个角度、伸缩都发了才回) */
+        Arm_Param_Set("PREBG", 0);
         run("LIFT 100"); ang[1] = sgoal[1] = 323.0f; ang[2] = sgoal[2] = -862.0f;
         clear(); t0 = now;
         CHECK(run("PRE RING") == 1 && at("S1:200.0") >= 0 && at("S2:-650.0@500") > at("S1:200.0") && at("S2:-800.0@500") > at("S2:-650.0@500"),
-              "PRE RING 在车上转盘上方：ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P");
-        CHECK(ang[1] > 205.0f && ang[1] <= 231.0f && !has("H1:"), "PRE RING：转过 R1T1 发完最后一条伸缩就回(ID1 还没到 A1P)");
+              "PREBG=0：ID1 一直转，转过 R1T2 伸到 R2T、转过 R1T1 缩到 A2P");
+        CHECK(ang[1] > 205.0f && ang[1] <= 231.0f && !has("H1:"), "PREBG=0：转过 R1T1 发完最后一条伸缩就回(ID1 还没到 A1P)");
+        Arm_Param_Set("PREBG", 1);
         /* 不在车上转盘上方：两个一起发，马上回 */
         HAL_Delay(3000); ang[1] = sgoal[1] = 120.0f; ang[2] = sgoal[2] = -862.0f;
         clear(); t0 = now;

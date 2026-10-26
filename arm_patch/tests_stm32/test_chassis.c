@@ -638,6 +638,26 @@ static void test_strafe(float mm)
     CHECK(fabs(px) < 10.0, "S %.0f 前后漂了 %.1f mm", mm, px);
 }
 
+/* (10-26)arm.c 的 Arm_Bg_Poll：PRE(提前摆臂)在后台走，底盘控制循环每个周期叫一次(车开着手臂同时转)。这里只数叫了几次 */
+static int bg_polls = 0;
+void Arm_Bg_Poll(void) { bg_polls++; }
+
+static void test_bg_poll(void)
+{
+    printf("== (10-26)PRE 在后台走：直行/横移/转弯的控制循环每个周期都叫 Arm_Bg_Poll(车不用停下等手臂)\n");
+    reset_car(); user_params();
+    bg_polls = 0;
+    Car_Straight_Closed(150, 1000.0f);
+    CHECK(bg_polls > 20, "F 1000：Arm_Bg_Poll 只叫了 %d 次", bg_polls);
+    printf("   F 1000：叫了 %d 次\n", bg_polls);
+    bg_polls = 0;
+    Car_Strafe_Closed(140, 300.0f);
+    CHECK(bg_polls > 10, "S 300：Arm_Bg_Poll 只叫了 %d 次", bg_polls);
+    bg_polls = 0;
+    Car_TurnBy_Center(90.0f);
+    CHECK(bg_polls > 10, "R 90：Arm_Bg_Poll 只叫了 %d 次", bg_polls);
+}
+
 /* (10-17 用户)后面两个驱动器地址对调(右后=ID4、左后=ID3)：横移变成原地转；WMAP=1 以后横移、直走都正常 */
 static void test_wmap(void)
 {
@@ -1144,6 +1164,7 @@ int main(void)
 #ifndef CHASSIS_V12A
     test_drift();
     test_wmap();
+    test_bg_poll();
     test_wt();
     test_rol();
     test_vel();

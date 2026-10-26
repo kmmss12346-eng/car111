@@ -30,6 +30,7 @@
 #include <math.h>
 extern UART_HandleTypeDef huart3;
 extern float yaw_target;
+void Arm_Bg_Poll(void);              /* (10-26)arm.c：PRE 在后台走，底盘控制循环每个周期叫一次(车开着手臂同时转) */
 
 volatile uint8_t car_abort = 0;     /* 串口收到 '!' 时置 1：正在跑的闭环动作马上停车 */
 volatile float   car_last_err = 0;  /* 上一个闭环动作结束时的车头误差(度) */
@@ -815,6 +816,7 @@ static void Car_Turn_Closed(float target)
         int dir;
 
         HAL_Delay(SC_PERIOD_MS);
+        Arm_Bg_Poll();                                  /* (10-26)PRE 在后台走：车转着手臂同时转 */
         now  = HAL_GetTick();
         dt   = (float)(now - last) / 1000.0f;
         last = now;
@@ -1277,6 +1279,7 @@ void Car_Straight_Closed(uint16_t speed, float distance_mm)
         float dt, rem, vbrake, pi_out, corr, lim, yaw_now, lat;
 
         HAL_Delay(SC_PERIOD_MS);
+        Arm_Bg_Poll();                                  /* (10-26)PRE 在后台走：车开着手臂同时转 */
         now  = HAL_GetTick();
         dt   = (float)(now - last) / 1000.0f;
         last = now;
@@ -1514,6 +1517,7 @@ static void Strafe_Run(uint16_t speed, float distance_mm, uint8_t calib)
         float pi_out = 0.0f;
 
         HAL_Delay(SC_PERIOD_MS);
+        Arm_Bg_Poll();                                  /* (10-26)PRE 在后台走：车横移着手臂同时转 */
         now  = HAL_GetTick();
         dt   = (float)(now - last) / 1000.0f;
         last = now;

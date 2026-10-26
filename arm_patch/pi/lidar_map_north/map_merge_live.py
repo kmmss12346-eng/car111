@@ -985,6 +985,38 @@ def main():
             # (10-24)比赛前自检：只问、只看文件，车和手臂都不动(self_check.py)
             if state['busy'] or state['auto']:raise ValueError('正在跑：跑完再 check')
             import self_check;self_check.run(link,raw_cfg,args.port,lambda m:print(m,flush=True),root=str(ROOT));return
+        if k=='speed':
+            # (10-26 用户"整个车运动和转向都太慢了帮我加速")speed fast / max / normal(还原) / speed(看现在)，见 speed_profile.py
+            import speed_profile as spf
+            out_=lambda m:print(m,flush=True)
+            if len(parts)==1:spf.show(raw_cfg,link,out_);return
+            if len(parts)!=2 or parts[1].lower() not in ('fast','max','normal'):raise ValueError('格式：speed fast(提速) / speed max(再快一档) / speed normal(还原) / speed(看现在)')
+            if state['auto'] or state['busy']:raise ValueError('正在运行或扫描，等结束再用')
+            if link is not None:sync_now()
+            ch_,bad_=spf.switch(raw_cfg,parts[1].lower(),link,out_)
+            if ch_:
+                p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+                if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+                write_json_safe(p_,file_cfg())
+            spf.report(ch_,bad_,parts[1].lower(),out_);return
+        if k=='turntune':
+            # (10-26 用户"尤其是转向的时候")实车原地转几次 ±90°，自动选转弯最快、停得准的 TCLAG，存进配置
+            if link is None:raise ValueError('没有连接 STM32（--stm-port）')
+            if state['auto'] or state['busy']:raise ValueError('正在运行或扫描，等结束再用')
+            import speed_profile as spf
+            sync_now()
+            print('turntune：车会原地转 +90°、-90° 共 16 次(约 40 秒)，最后转回现在的车头。车周围留出 40cm 空地；要停输入 abort',flush=True)
+            state['busy']=True;state['abort']=False
+            def tworker():
+                try:
+                    best,old,rows=spf.turn_tune(link,lambda m:print(m,flush=True),aborted=lambda:state['abort'])
+                    save_params({'TCLAG':best})
+                    est=spf.turn_estimates(rows,best)
+                    if est:save_cfg_keys({'turn90_s':est[0],'turn180_s':est[1]})
+                    print(f'turntune 完成：TCLAG {old:g} → {best:g}(存进配置)'+(f'，转 90° 约 {est[0]:.1f} 秒' if est else '')+'。不满意：set TCLAG 原来的值',flush=True)
+                except Exception as e:print('turntune 出错：',repr(e),flush=True)
+                finally:state['busy']=False
+            threading.Thread(target=tworker,daemon=True).start();return
         if k=='full':
             # (10-24)比赛前选：full on = 一直跑完全程(用户 10-18 的要求，时间到了也接着做)；
             #   full off = 3 分钟内回到启停区(拿"按时返回 2 分 + 显示统计 4 分"；做不完的不做了)
@@ -1032,7 +1064,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_jog(c,val):
         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')

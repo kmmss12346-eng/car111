@@ -77,8 +77,10 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
             no(f'问升降高度出错：{ex!r}')
         try:
             r = link.request('PRE X', 2.0)                     # 参数不对：新固件回 ERR ARG(不动)，旧固件回 ERR CMD
-            if 'ERR ARG' in str(r[1]):
-                ok('固件是新的(认识 PRE：开往工位时提前摆臂)')
+            if 'ERR ARG' in str(r[1]) and 'PREBG' in params:
+                ok(f'固件是新的(10-26：开往工位时手臂在后台转、车不停；PREBG={params["PREBG"]:g})')
+            elif 'ERR ARG' in str(r[1]):
+                no('固件是 10-26 以前的：开往工位提前摆臂时车要停一下等手臂转过电池盒。烧 tasks_1026d 里的 arm.c、chassis.c、arm.h')
             else:
                 no(f'固件可能是旧的(PRE 回 {r[1]})：开往工位时不会提前摆臂。重新烧最新的 arm.c')
         except Exception as ex:
@@ -92,6 +94,9 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
     full = bool(mc.get('full_course', True))
     log('  · 跑法：' + ('full on(一直跑完全程)' if full else f'full off(3 分钟内回家，{float(mc.get("time_limit_s", 150)):g} 秒以后不再开始新的夹放)')
         + '。要改：full on / full off')
+    lv = str(((raw_cfg or {}).get('speed_saved') or {}).get('level') or 'normal')
+    log(f'  · 底盘速度：speed {lv}(直行 {(raw_cfg or {}).get("route_speed_rpm", 220)}、横移 {(raw_cfg or {}).get("strafe_speed_rpm", 170)} 转/分)'
+        + ('。提速：speed fast，再 turntune' if lv == 'normal' else '。车头偏、停不准就 speed normal 还原'))
     if (raw_cfg or {}).get('boot_race'):
         log(f'  · 开机自动比赛开着：下次开电闸按启停区 {raw_cfg.get("start_zone")} 直接开跑(只用一次)')
     else:

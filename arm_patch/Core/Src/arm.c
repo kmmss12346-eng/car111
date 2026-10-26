@@ -134,6 +134,9 @@ static float g_atolc  = 1.0f;      /* ATOLC  大动作离目标多少度以内�
 static float g_atol   = 0.3f;      /* ATOL   微调离目标多少度以内算到位 */
 static float g_amaxd  = 60.0f;     /* AMAXD  AD 指令一次最多转多少度(防止发错数) */
 static float g_para   = 1.0f;      /* PARA   1 = ID1、ID2 一起转(快)；0 = 一个一个转 */
+static float g_prebg  = 1.0f;      /* PREBG  (10-26 用户"提前开这个机械臂的时候要丝滑运动，车动车的不要停")1 = PRE 只发第一条转动就回 DONE，
+                                    *        绕电池盒那几条伸缩交给底盘控制循环和主循环顺便发(车同时开，不停)；
+                                    *        0 = 以前的：等 ID1 转过绕电池盒的那几个角度、伸缩指令都发了才回(这一会儿车停着) */
 
 static float g_clwait = 400.0f;    /* CLWAIT 夹爪动作后等多久(毫秒) */
 static float g_clspd  = 0.0f;      /* CLSPD  夹爪合上(夹取)的速度(微秒/秒，脉宽每秒变多少)；0 = 一下子转过去(以前的做法)。张开到夹紧约差 500 微秒：1000 = 约 0.5 秒 */
@@ -218,6 +221,7 @@ static const ArmTun tun[] =
     { "ATOL",   &g_atol,    0.05f,   2.0f },
     { "AMAXD",  &g_amaxd,   1.0f,    300.0f },
     { "PARA",   &g_para,    0.0f,    1.0f },
+    { "PREBG",  &g_prebg,   0.0f,    1.0f },
     { "CLWAIT", &g_clwait,  0.0f,    3000.0f },
     { "CLSPD",  &g_clspd,   0.0f,    20000.0f },
     { "CLSPO",  &g_clspo,   0.0f,    20000.0f },
@@ -1552,6 +1556,27 @@ static int Detour_Get(Detour *d)
 /* (10-23)PRE(提前摆臂)：1 = Sweep / Stages 里要看着角度发的那几条指令都发出去了就返回，不等舵机转完(车同时开过去) */
 static uint8_t pre_nowait = 0;
 
+/* (10-26 用户"提前开这个机械臂的时候要丝滑运动，车动车的不要停")PRE 在后台走：Sweep 只把 ID1 的转动发出去就回(pre_bg = 1)，
+ * 后面"转过 T1 伸缩、转过 T2 再伸缩、到了停住"交给 Arm_Bg_Poll：底盘直行/横移/转弯的控制循环每个周期叫它一次，车照常开。
+ * 车停着(树莓派在看摄像头、算路线)的时候主循环的 Arm_Poll 也叫它：绕电池盒的伸缩不会因为车没在开就晚发。
+ * 下一条手臂指令来了先 Arm_Bg_Finish 走完。和 Sweep 循环里做的一模一样，只是分成一小步一小步做 */
+#define ARM_BG_POLL_MS  15u                /* 后台最多多久看一次舵机角度(和 Sweep 循环一样；底盘控制周期 20ms：每个周期都看) */
+static uint8_t pre_bg = 0;
+static struct
+{
+    uint8_t  on;                           /* 1 = 有一个 Sweep 在后台走 */
+    uint8_t  ph, ok1, ok2;
+    float    a1_end, at1, b1, at2, b2, spd2, dir, a;
+    uint32_t t0, tmax, t_poll;
+} bg;
+
+static void Bg_Begin(float a1_end, float at1, float b1, float at2, float b2, float spd2, float dir, float a, uint32_t t0, uint32_t tmax)
+{
+    bg.on = 1;  bg.ph = 0;  bg.ok1 = 0;  bg.ok2 = 1;
+    bg.a1_end = a1_end;  bg.at1 = at1;  bg.b1 = b1;  bg.at2 = at2;  bg.b2 = b2;
+    bg.spd2 = spd2;  bg.dir = dir;  bg.a = a;  bg.t0 = t0;  bg.tmax = tmax;  bg.t_poll = t0;
+}
+
 /* (10-23)PRE 用：只发转动指令不等。已经在目标上(ATOLC 以内)就只在原地保持(和 Servos_To 一样，不白白往前多给补偿) */
 static void Servo_Go(uint8_t id, float target, float spd)
 {
@@ -1573,6 +1598,11 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2,
     dir = (a1_end >= a) ? 1.0f : -1.0f;
     tmax = Servo_Start(1, &tgt, Big_Spd(1)) + SERVO_EXTRA_MS;
     t0 = HAL_GetTick();
+    if (pre_bg)
+    {
+        Bg_Begin(tgt, at1, b1, at2, b2, spd2, dir, a, t0, tmax);   /* (10-26)PRE：ID1 已经开始转，剩下的车开着的时候后台做 */
+        return NULL;
+    }
     while (!car_abort)
     {
         HAL_Delay(15);
@@ -1599,6 +1629,72 @@ static const char *Sweep(float a1_end, float at1, float b1, float at2, float b2,
     if (!ok1)  Servo_StopIfStuck(1, a1_end);
     if (!ok2)  Servo_StopIfStuck(2, b2);
     return NULL;
+}
+
+/* (10-26)后台 Sweep 走一步(和 Sweep 循环里每一圈做的一样)。走完了(或者没有在走)返回 1 */
+static uint8_t Bg_Step(void)
+{
+    float c, b;
+
+    if (!bg.on)
+    {
+        return 1;
+    }
+    if (car_abort)
+    {                                              /* 急停：停在现在的位置 */
+        if (Servo_ReadAngle(1, &c))  Servo_Hold(1, c);
+        if (Servo_ReadAngle(2, &c))  Servo_Hold(2, c);
+        bg.on = 0;
+        return 1;
+    }
+    if (!bg.ok1 && Servo_ReadAngle(1, &bg.a) && Servo_Arrived(1, bg.a, g_atolc))  { bg.ok1 = 1; Servo_Hold(1, bg.a); }
+    if (bg.ph == 0 && (bg.ok1 || (bg.a - bg.at1) * bg.dir >= 0.0f))
+    {
+        b = bg.b1;  bg.tmax += Servo_Start(2, &b, bg.spd2);  bg.ph = 1;  bg.ok2 = 0;   /* 转过 T1：开始伸缩 */
+    }
+    if (bg.ph == 1 && (bg.ok1 ? bg.ok2 : (bg.a - bg.at2) * bg.dir >= 0.0f))
+    {
+        b = bg.b2;  bg.tmax += Servo_Start(2, &b, bg.spd2);  bg.ph = 2;  bg.ok2 = 0;   /* 转过 T2：伸缩到要的长度 */
+    }
+    if (!bg.ok2 && Servo_ReadAngle(2, &c) && Servo_Arrived(2, c, g_atolc))  { bg.ok2 = 1; Servo_Hold(2, c); }
+    if (bg.ok1 && bg.ok2 && bg.ph == 2)
+    {
+        bg.on = 0;
+        return 1;
+    }
+    if ((HAL_GetTick() - bg.t0) > bg.tmax + 3000u)
+    {                                              /* 到时间还没到位：停住了(被挡住)就让它停在原地 */
+        if (!bg.ok1)  Servo_StopIfStuck(1, bg.a1_end);
+        if (!bg.ok2)  Servo_StopIfStuck(2, bg.b2);
+        bg.on = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* (10-26)底盘直行/横移/转弯的控制循环每个周期叫一次、主循环也叫：PRE 还在后台走就推进一步(最多 ARM_BG_POLL_MS 看一次舵机)。
+ * 急停马上处理(不等 ARM_BG_POLL_MS)：底盘控制循环收到急停就退出，下一条指令一来急停标志就清掉了 */
+void Arm_Bg_Poll(void)
+{
+    if (!bg.on)
+    {
+        return;
+    }
+    if (!car_abort && (HAL_GetTick() - bg.t_poll) < ARM_BG_POLL_MS)
+    {
+        return;
+    }
+    bg.t_poll = HAL_GetTick();
+    (void)Bg_Step();
+}
+
+/* (10-26)PRE 还在后台走：一直走完再返回(手臂指令开始前调，不和它抢舵机) */
+void Arm_Bg_Finish(void)
+{
+    while (!Bg_Step())
+    {
+        HAL_Delay(15);
+    }
 }
 
 /* (10-21 用户"先转动一个角度再伸长再转动一个角度再缩回，让我自由调")分段走：ID1 只转到 p1 -> ID2 只走到 l1 -> ID1 只转到 p2
@@ -1701,7 +1797,8 @@ static const char *Seq_Obs(uint8_t ring, uint8_t open_claw)
  * 转向观察姿态，但不等转完：要看着 ID1 角度发的那几条(绕电池盒的伸缩)发完就回 DONE，剩下的舵机自己转完，车同时开过去。
  * 不降到观察高度：开车时爪子留在最高处 ZHI(OBS 也是在 ZHI 转过去的，比原料盘上的物料、障碍物都高)。
  * 到了树莓派照常发 OBS：已经在姿态上就只核对一下、补最后一点，再降到观察高度。爪子里夹着物料不做(ERR HOLD)。
- * 车走的时候来了急停：已经发出去的转动不会停下(最多再转一秒左右，转到观察姿态) */
+ * (10-26)PREBG=1(默认)：在车上转盘上方时只发 ID1 的转动就回，绕电池盒的伸缩在后台发(见 Arm_Bg_Poll)；
+ * 车走的时候来了急停：后台的两个舵机停在现在的位置。PREBG=0：已经发出去的转动不会停下(最多再转一秒左右，转到观察姿态) */
 static const char *Seq_Pre(uint8_t ring)
 {
     float a1 = ring ? g_a1p : g_a1g;
@@ -1719,8 +1816,10 @@ static const char *Seq_Pre(uint8_t ring)
     if (Servo_ReadAngle(1, &a) && Absf(a - g_a1d) <= 15.0f && Detour_Get(&d))
     {
         pre_nowait = 1;                            /* 在车上转盘上方：和 OBS 一样绕电池盒，最后一条指令发了就返回 */
+        pre_bg = (g_prebg > 0.5f);                 /* (10-26)PREBG=1：只发 ID1 的转动就回，绕电池盒的伸缩车开着的时候后台发 */
         e = Leave_Tray(a1, a2);
         pre_nowait = 0;
+        pre_bg = 0;
         return e;
     }
     if (g_para > 0.5f)
@@ -2517,6 +2616,7 @@ void Arm_Poll(void)
     int n;
     uint8_t b;
 
+    Arm_Bg_Poll();                                 /* (10-26)PRE 在后台走：车停着的时候也接着走(绕电池盒的伸缩按时发) */
     /* 屏刚重新上电(忘了 sendxy、画面也没了)：选区页还在用就整页重画；
      * 比赛布局时把任务码重新写上(赛规要一直显示；树莓派写过的同样内容不会再发) */
     if (scr_boot)
@@ -2705,6 +2805,7 @@ int Arm_Command(const char *cmd, char *err, int errlen)
         return 0;
     }
     v = t[0];
+    Arm_Bg_Finish();                               /* (10-26)PRE 还在后台走：先走完(F/S/R 在 main.c 里先处理，不到这里) */
 
     /* ---- 夹爪：CLAW O / CLAW OR(原料盘上方张开) / CLAW OT(车上转盘上方张开) / CLAW C / CLAW <微秒> ---- */
     if (strcmp(v, "CLAW") == 0 && n == 2)

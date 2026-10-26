@@ -518,6 +518,35 @@ class MiscDriveTests(unittest.TestCase):
         self.assertTrue(-35 <= car.sent[1][1] <= -20, car.sent)        # 车头朝南：后退(往北)退回多走的那一截
         self.assertGreater(worst, 20.0)
 
+    def test_reloc_before_turn_folds_side_error_into_next_leg(self):
+        # (10-26 用户"整个车运动和转向都太慢")转弯前定位：车还往右偏了 20mm(横移)。转 90° 以后横移方向就是下一条前进的方向，
+        # 下一条前进按规划的位置算长短会把它补上：不再单独发一条慢速 S 20，最后停的地方一样
+        def run(fold):
+            car = SimCar((1180.0, 1100.0, -90.0), scale=0.04)
+            car.T = -90.0
+            ctx = SimCtx(car)
+            legs = [dict(stop='A', goal=(1600.0, 375.0, 0.0), cmds=[('F', 725), ('R', 90), ('F', 400)])]
+            logs = []
+            auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                           motion=None, cfg=dict(CFG, reloc_before_turn=True, approach_guard_travel_frac=0.05, reloc_stops=[],
+                                                 reloc_fold=fold),
+                           start=dict(est=(1200.0, 1100.0, -90.0), ref=(1200.0, 1100.0, -90.0)), caps={'rdec': False})
+            m = auto_run.body_model(CFG)
+            regs = auto_run.regions(CFG, [])
+            turn = [q for q in car.trace if abs(q[0] - 1180.0) < 30 and q[1] < 600]
+            return car, logs, min(auto_run.pose_clearance(CFG, [], q, m, regs)[0] for q in turn)
+        car0, logs0, w0 = run(False)
+        car1, logs1, w1 = run(True)
+        self.assertIn(('S', 20, 60), car0.sent)                             # 以前：单独横移 20
+        self.assertFalse([c for c in car1.sent if c[0] == 'S'], car1.sent)
+        self.assertEqual(len(car1.sent), len(car0.sent) - 1)
+        self.assertTrue(any('由它补上' in l for l in logs1))
+        i = [c[0] for c in car1.sent].index('R')
+        self.assertEqual(car1.sent[i + 1][0], 'F')
+        self.assertGreater(car1.sent[i + 1][1], car0.sent[i + 2][1] + 15)   # 下一条前进多走那 20mm
+        self.assertLess(max(abs(a - b) for a, b in zip(car1.pose(), car0.pose())), 1.0)
+        self.assertGreater(w1, 20.0)                                        # 转弯时车角离粗加工区还是很远
+
     def test_reloc_skipped_after_short_travel(self):
         car = SimCar((1200.0, 1000.0, 90.0))
         ctx = SimCtx(car)

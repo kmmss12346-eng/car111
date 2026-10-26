@@ -958,6 +958,29 @@ git_log.txt                ← 分支最近 120 条提交记录
   不微调 10mm)、test_ring1_cross_is_where_ring1_goes；test_obs_error_is_removed_before_aligning 改成 zone_cal_fine=False 跑。
   mtest(手放车、hooks 一直用同一个)：RAW/ROUGH/TEMP 开始前清 _anchor0/_anchor_now(不按"第一次停的地方"挪)；_clear_zone_records
   清 _zone_learn[区](1、3 号环重新微调，g R1/g R3 挪过十字马上看得到)。比赛 go 每次新建 MissionHooks，本来就清。
+- **10-26 整车提速 + 车开着摆臂(用户"这整个车运动和转向都太慢了帮我加速，还有就是每一个动作的衔接也要运动丝滑一点……在三分钟内尽量多抓取"、
+  "尤其是转向的时候还有就是提前开这个机械臂的时候要丝滑运动车动车的不要停")：**
+  - 固件 arm.c：PRE 在后台走(`PREBG`，默认 1)。Sweep 在 pre_bg 时 Bg_Begin 记下状态、只发 ID1 的转动就回 DONE；Bg_Step 做 Sweep 循环里
+    每一圈的事(转过 T1/T2 发伸缩、到了 Hold、超时 StopIfStuck、急停两个都 Hold)；`Arm_Bg_Poll`(最多 15ms 看一次，急停马上处理)在 chassis.c
+    Car_Turn_Closed / Car_Straight_Closed / Strafe_Run 每个周期 HAL_Delay 之后叫、Arm_Poll(主循环，车停着时)也叫；Arm_Command 开头
+    `Arm_Bg_Finish` 走完再做。PREBG=0 回到以前(等伸缩都发了才回)。只在车上转盘上方绕电池盒那种 PRE 用后台(别的 PRE 本来就不等)。
+    tests_stm32 全过(test_arm 365、test_chassis 225、test_servo 42)：后台伸缩晚不过 2°、车停着主循环接着走、急停马上停且之后不再转。
+    急停的已知小缝：底盘最后一个周期(走完那一下)里来的 '!'，Link_Done 先清了标志，后台会接着转完(和以前 pre_nowait 一样)。
+  - 转弯慢的原因：Car_Turn_Closed 最后几度按 TCKP×差的度数(转/分)靠上去，TCKP=3 是按 PPD 25.4 调的；车上 PPD=47，同样的转/分车身只转一半快。
+    底盘仿真(test_chassis 的假车，K_ROT 换成 PPD 47；脚本 scratchpad turnsweep/tc_sweep.c)R 90 用 2.6~3.1 秒(最后 20° 爬 1.5 秒)，
+    和实车日志 R +90 2.5 秒、R +60 3.2 秒一样。TCLAG(控制器认为的车身延迟，0.16)比真车大：提前刹车、慢慢爬；比真车小：冲过头再回。
+  - `speed_profile.py` + 主程序 `speed fast / speed max / speed normal / speed`：fast = 直行 190、横移 160 转/分，SCACC 150、SCDEC 110、
+    SSACC 180，TCV 120、TCA 600、TCD 300、TCMIN 2、TCKP = 0.128×PPD(47 → 6，限 3~8)，turn90_s 2.0 / turn180_s 2.8；max = 220/170、SCACC 200、
+    SCDEC 150、SSACC 200、TCV 150、TCA 800。第一次换档把原来的配置值(没有的记 None)和 STM32 当时的值(GET)存进配置 `speed_saved`，
+    normal 原样还原(test_speed_profile)。仿真：R 90 平均 2.6 → 2.0 秒，小角度修车头 1.0 → 0.7 秒，停下误差 ≤ 0.5°。
+  - `turntune`：HOME 后 TCLAG 0.16/0.13/0.10/0.08 各转 +90/-90 两遍(共 16 次，车转回原来的车头)，选每次误差都 ≤ 0.6° 里平均最快的
+    (差 0.05 秒以内选大的)，存 TCLAG，按实测平均用时 +0.1 更新 turn90_s(turn180_s = 1.4 倍)。出错/卡住/abort 保持原来的。
+  - route_plan.Motion：直行刹车按 SCDEC 算(`_seg(d, v, a, b)`)：F +1117(150 转/分、SCACC 100、SCDEC 70)估 3.6 秒，实车 3.8 秒(以前估 3.5)。
+  - auto_run._before_turn：定位以后转弯前要修的两份偏差里，转 90° 以后正好在下一条 F/S 方向上的那一份由下一条补上(Nav 每条按 ref 算长短)；
+    只修另一份、按那里转也够安全(moves_clearance ≥ reloc_check_margin_mm)就不单独挪(`reloc_fold`，默认 True；`_fold_axis`)。
+    test_nav_route 两个区：转弯前修正小动作 8 → 5 条，离禁区最近 9.5 / 14.3mm(要求 ≥ 5)。test_nav_drive.test_reloc_before_turn_folds_side_error_into_next_leg。
+  - 整轮用时大头是手臂：sim_mission 用用户的手臂参数估操作 316 秒(两批全做)+ 行驶约 90 秒。底盘这几样估计每轮省 30~40 秒；
+    再快要调手臂速度(LFRPM、ASPD、ROTSPD)。
 - 用户 10-26 发的分段调试截图：ROUGH 2 号环偏 84.5mm，要横移 +72(往黄色区那边)、前进 +48 才对得上，_body_clear(qr_zone_margin_mm 30)只让挪 +7/+5，
   整个区不放。和 35mm 黄色区余量无关(那里用的是 30)。多半是 arm_calib 调 A1P 时车离粗加工区比停车点 (1200,340) 远了约 7cm(或停车点改过)，
   要在比赛停车点上重调 A1P/R1/R3；等用户发前面"圆环在画面里/看到 3 个圆环/夹角"那几行确认。

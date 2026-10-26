@@ -180,8 +180,10 @@ class Motion:
             sp = {}
         acc_f = sp.get('SCACC', g('route_acc_rpm_s', 300))
         acc_s = sp.get('SSACC', g('strafe_acc_rpm_s', 200))
+        dec_f = sp.get('SCDEC') or acc_f                 # (10-26)直行刹车 STM32 用 SCDEC(0 = 和 SCACC 一样)
         self.v_f = float(g('route_speed_rpm', 220)) / 60.0 * float(g('fwd_mm_per_rev', 249.0))        # 直行最高速 mm/s
-        self.a_f = float(acc_f) / 60.0 * float(g('fwd_mm_per_rev', 249.0))                            # 直行加减速 mm/s²
+        self.a_f = float(acc_f) / 60.0 * float(g('fwd_mm_per_rev', 249.0))                            # 直行加速 mm/s²
+        self.d_f = float(dec_f) / 60.0 * float(g('fwd_mm_per_rev', 249.0))                            # 直行刹车 mm/s²
         self.v_s = float(g('strafe_speed_rpm', 170)) / 60.0 * float(g('strafe_mm_per_rev', 235.0))    # 横移最高速
         self.a_s = float(acc_s) / 60.0 * float(g('strafe_mm_per_rev', 235.0))                         # 横移加减速
         self.turn90 = float(g('turn90_s', 1.8))          # 一次 90° 转弯(含起步、对准、等待回复)
@@ -189,17 +191,20 @@ class Motion:
         self.overhead = float(g('cmd_overhead_s', 0.25))  # 每条指令：串口往返 + 停稳 + 读陀螺仪
 
     @staticmethod
-    def _seg(d, v, a):
+    def _seg(d, v, a, b=None):
+        """走 d：按 a 加速到 v、按 b 刹车(b 不给 = a)。"""
         d = abs(d)
         if d <= 0:
             return 0.0
-        if d >= v*v/a:
-            return d/v + v/a
-        return 2*math.sqrt(d/a)
+        k = 0.5*(1.0/a + 1.0/(b or a))                   # 加速 + 刹车一共走 k×v²
+        if d >= k*v*v:
+            return d/v + k*v
+        vp = math.sqrt(d/k)
+        return vp/a + vp/(b or a)
 
     def time_of(self, cmd, val):
         if cmd == 'F':
-            return self._seg(val, self.v_f, self.a_f) + self.overhead
+            return self._seg(val, self.v_f, self.a_f, self.d_f) + self.overhead
         if cmd == 'S':
             return self._seg(val, self.v_s, self.a_s) + self.overhead
         if cmd == 'R':

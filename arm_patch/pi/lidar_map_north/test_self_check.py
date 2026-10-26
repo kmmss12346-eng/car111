@@ -8,8 +8,8 @@ import self_check
 
 
 class FakeLink:
-    def __init__(self, new_fw=True, armok=1.0, lift='LIFT 1 60.0 BOOT=POS'):
-        self.new_fw, self.armok, self.lift = new_fw, armok, lift
+    def __init__(self, new_fw=True, armok=1.0, lift='LIFT 1 60.0 BOOT=POS', prebg=True):
+        self.new_fw, self.armok, self.lift, self.prebg = new_fw, armok, lift, prebg
         self.sent = []
 
     def request(self, text, timeout, collect=False):
@@ -17,7 +17,8 @@ class FakeLink:
         if text == 'PING':
             out = (True, 'PONG', [])
         elif text == 'GET':
-            out = (True, 'DONE', [f'P ARMOK={self.armok:.4f}', 'P ZHI=115.0000', 'P ZOBRAW=116.0000'])
+            out = (True, 'DONE', [f'P ARMOK={self.armok:.4f}', 'P ZHI=115.0000', 'P ZOBRAW=116.0000']
+                   + (['P PREBG=1.0000'] if self.new_fw and self.prebg else []))
         elif text == 'LIFT?':
             out = (True, 'DONE', [self.lift])
         elif text.startswith('PRE'):
@@ -48,7 +49,8 @@ class SelfCheckTests(unittest.TestCase):
             bad = self_check.run(link, self._cfg(), os.path.join(d, 'no_lidar'), lines.append, root=d)
             text = '\n'.join(lines)
             self.assertTrue(set(link.sent) <= {'PING', 'GET', 'LIFT?', 'PRE X'}, link.sent)     # 只问，不发会动的指令
-            self.assertIn('固件是新的', text)
+            self.assertIn('固件是新的(10-26：开往工位时手臂在后台转、车不停；PREBG=1)', text)
+            self.assertIn('底盘速度：speed normal(直行 220、横移 170 转/分)。提速：speed fast，再 turntune', text)
             self.assertIn('升降高度认准了：60.0mm', text)
             self.assertIn('原料区最近那格示教过', text)
             self.assertIn('ROUGH 的 1、3 号环调过手臂角度', text)
@@ -71,6 +73,16 @@ class SelfCheckTests(unittest.TestCase):
             self.assertIn('升降高度是猜的', text)
             self.assertIn('原料区最近那格没示教', text)
             self.assertIn('TEMP 的 1、3 号环没调', text)
+
+    def test_firmware_before_background_pre_and_speed_level(self):
+        """(10-26)认识 PRE 但没有 PREBG：提前摆臂时车要停一下，★ 让烧 tasks_1026d；speed fast 以后自检写现在的档。"""
+        with tempfile.TemporaryDirectory() as d:
+            self._files(d)
+            cfg = dict(self._cfg(), route_speed_rpm=190, strafe_speed_rpm=160, speed_saved={'level': 'fast'})
+            lines = []
+            bad = self_check.run(FakeLink(prebg=False), cfg, os.path.join(d, 'no_lidar'), lines.append, root=d)
+            self.assertTrue(any('固件是 10-26 以前的' in b and 'tasks_1026d' in b for b in bad), bad)
+            self.assertIn('底盘速度：speed fast(直行 190、横移 160 转/分)。车头偏、停不准就 speed normal 还原', '\n'.join(lines))
 
     def test_lfchk_zero_is_flagged(self):
         """(10-25)LFCHK=0：升降走完不核对，旧固件碰到地面一直顶到过载保护：★ 让改回 1.5。"""
