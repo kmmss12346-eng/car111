@@ -4119,7 +4119,7 @@ class ZoneCalTests(unittest.TestCase):
                 zone_moves = [m for m in rec['moves'] if m[0] in ('ROUGH', 'TEMP')]
                 self.assertTrue(all((not m[1]) or m[4] for m in zone_moves), zone_moves)   # S/F 只在对准 2 号环时、和做完挪回停车点
                 errs += [e for (z, k, _c, e, _st) in w.placed if k in (1, 3)]
-                took += [float(l.split('用了 ')[1].split(' 秒')[0]) for l in lines if '微调好了' in l or '微调到时间了' in l]
+                took += [float(l.split('用了 ')[1].split(' 秒')[0]) for l in lines if '微调好了' in l or '微调到上限了' in l]
                 if fine:
                     self.assertEqual(text.count('车不动；空爪先用摄像头只动手臂微调'), 4, text[-3000:])   # 两个区第一轮的 1、3 号环
                     self.assertIn('按这个区第一次用摄像头微调好的角度', text)                      # 第二轮(码垛)直接用
@@ -4129,6 +4129,30 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(out[True][0], 3.0, out)
         self.assertGreater(out[False][0], 5.0, out)
         self.assertLessEqual(out[True][1], 2.6, out)
+
+    def test_ring13_fine_tune_keeps_going_until_aligned(self):
+        """(10-27 用户"把微调时间放长直到调好为止")1、3 号环的摄像头微调一直调到对准为止：手臂和画面的对应关系存得偏大一倍
+        (每次只修一半，要修好几次)，手臂每修一下还要多等 0.8 秒才停稳(实车串口、舵机比模拟慢)：以前最多 2 秒、3 次就停下、
+        按半路的角度放；现在接着调，偏差到 tol_mm.RING 以内才停。"""
+        out = {}
+        for old in (True, False):
+            w = self._world(1, ap_fine_extra_s=0.8)
+            lines = []
+            h = self._make(w, dict(zone_cal_fine_s=2.0, zone_cal_fine_iter=3) if old else None, lines=lines)
+            for z in h._teach_all.values():                      # 调的时候 ID1 差了 1.5°
+                z['1'] = [z['1'][0] + 1.5, z['1'][1]]
+                z['3'] = [z['3'][0] - 1.5, z['3'][1]]
+            h.store.put('RING', 'arm', 2.0 * np.asarray(h.store.get('RING', 'arm'), float))
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+            done = [l for l in lines if '微调好了' in l]
+            cut = [l for l in lines if '微调到上限了' in l or '微调没对上' in l]
+            out[old] = (len(done), len(cut), {k: e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH' and k in (1, 3)})
+        print(f'\n  [对应关系偏大一倍] 以前(2 秒、3 次)：对准 {out[True][0]} 个、半路停 {out[True][1]} 个，放置误差 {out[True][2]}；'
+              f'现在：对准 {out[False][0]} 个、半路停 {out[False][1]} 个，放置误差 {out[False][2]}')
+        self.assertGreater(out[True][1], 0, out)                  # 以前：有的环到 3 次 / 2 秒就停了
+        self.assertEqual((out[False][0], out[False][1]), (2, 0), out)   # 现在：1、3 号环都调到对准
+        self.assertLess(max(out[False][2].values()), max(out[True][2].values()), out)
+        self.assertLess(max(out[False][2].values()), 2.0, out)
 
     def test_ring1_cross_is_where_ring1_goes(self):
         """(10-26)1 号环有自己的十字(claw_px.RING1)：往右挪了 15 像素，1 号环就照着这个十字对，放的位置跟着挪(3 号环、2 号环不受影响)。"""
