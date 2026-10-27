@@ -1035,6 +1035,20 @@ def main():
             write_json_safe(p_,file_cfg())
             print('已设置 full on：一直跑完全程(下一次 go / race 起作用，存进配置)' if parts[1]=='on' else
                   '已设置 full off：3 分钟内回家，150 秒以后不再开始新的夹放、来不及就直接回家(下一次 go / race 起作用，存进配置)',flush=True);return
+        if k=='zmargin':
+            # (10-27 用户"轮子不是可以自由移动吗")车轮对准 2 号环时车身离这个工位(粗加工区/暂存区)最少留多少毫米：mission_cfg.zone_align_margin_mm
+            mc_=dict(raw_cfg.get('mission_cfg') or {})
+            if len(parts)==1:
+                print(f"现在：车轮对准 2 号环时车身离工位最少留 {float(mc_.get('zone_align_margin_mm',5.0)):g}mm(黄色区、场地边照旧 30mm)。"
+                      '改：zmargin 毫米(0~30；规则：车身压进工位这一轮就结束)',flush=True);return
+            try:v_=float(parts[1]) if len(parts)==2 else None
+            except ValueError:v_=None
+            if v_ is None or not 0.0<=v_<=30.0:raise ValueError('格式：zmargin 毫米(0~30)，例如 zmargin 5')
+            mc_['zone_align_margin_mm']=v_;raw_cfg['mission_cfg']=mc_
+            p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+            if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+            write_json_safe(p_,file_cfg())
+            print(f'已设置 zmargin {v_:g}：车轮对准 2 号环时车身离工位最少留 {v_:g}mm(下一次 go / race 起作用，存进配置)',flush=True);return
         if k=='r2off':
             # (10-24 用户"故意对偏的那个红色十字去掉")r2off 去掉了：圆环这边的爪子点(红十字)直接挪，效果一样
             print('r2off(故意对偏)已经去掉了：粗加工区、暂存区的爪子点(圆环画面里的红十字)在 arm_calib 看圆环的那几步里输入 g 左右 上下 直接挪'
@@ -1234,6 +1248,7 @@ def main():
     print('调试：zone 1 / zone 2 切换启停区；go = 一键全流程(不再问 y)；park = 收臂、升降停 60mm；abort = 急停(急停后不自动收臂)。',flush=True)
     print('比赛前选：full on = 一直跑完全程 / full off = 3 分钟内回家(拿按时返回、显示统计的分)；full = 看现在是哪个。check = 比赛前自检(车不动)。',flush=True)
     print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
+    print('工位对 2 号环只用车轮(手臂不补)：zmargin 5 = 车轮挪的时候车身离粗加工区/暂存区最少留 5mm(只输入 zmargin 看现在多少)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)

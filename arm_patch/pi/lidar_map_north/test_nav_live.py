@@ -569,6 +569,15 @@ class LiveTests(unittest.TestCase):
                       inputs=[(lambda: True, 'full on')], screen_zone=None, end_on='已设置 full on')
         self.assertIs((self.cfg_after.get('mission_cfg') or {}).get('full_course'), True)
 
+    def test_zmargin_command_saves(self):
+        """(10-27)zmargin 10：存进配置 mission_cfg.zone_align_margin_mm(车轮对准 2 号环时车身离工位最少留多少)；超出 0~30 不改。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'zmargin 10')], screen_zone=None, end_on='已设置 zmargin 10')
+        self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_align_margin_mm'), 10.0)
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(zone_align_margin_mm=5.0)),
+                      inputs=[(lambda: True, 'zmargin 50')], screen_zone=None, end_on='zmargin 毫米(0~30)')
+        self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_align_margin_mm'), 5.0)
+
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)
         car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01), cfg_extra=dict(race_auto=False),
