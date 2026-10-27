@@ -153,6 +153,35 @@ class RingTests(unittest.TestCase):
             out2 = v.overlay(img, 'RAW', None, color_id=1)
             self.assertEqual(out2.shape, img.shape)
 
+    def test_watching_plate_writes_live_view(self):
+        """(10-27 用户"这个画面不是实时的已经卡住了")原料区等原料盘停、下爪前看(material_errors)也写实时画面：
+        每个认出的物料画圈、写颜色和离爪子点多少毫米；live_view='' 时不写。"""
+        import tempfile
+        from pathlib import Path
+        img = np.full((480, 640, 3), 200, np.uint8)
+        cv2.circle(img, (380, 250), 60, (40, 200, 230), -1, cv2.LINE_AA)        # 黄色物料
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / 'live.jpg')
+            v = quiet_vision(camera=FakeCam(img), cfg=dict(live_view=path, matdet={'claw_mask': '/nonexistent'}))
+            cu, cv_ = v.claw('RAW')
+            errs = v.material_errors([2, 1])
+            self.assertIsNone(errs[1])
+            self.assertAlmostEqual(errs[2][0], 380 - cu, delta=2.0)
+            self.assertAlmostEqual(errs[2][1], 250 - cv_, delta=2.0)
+            out = cv2.imread(path)
+            self.assertEqual(out.shape, img.shape)
+            diff = np.abs(out.astype(int) - img.astype(int)).sum(axis=2)
+            self.assertGreater(int(diff[230:270, 360:400].sum()), 0)            # 圆心画了红叉
+            self.assertGreater(int(diff[200:240, 392:520].sum()), 0)            # 旁边写了 YELLOW ..mm
+            mm = math.hypot(380 - cu, 250 - cv_) / v.scale('RAW')
+            lab = v.overlay(img, 'RAW', None, color_id='watch', pts=[(380.0, 250.0, 2, 60.0)])
+            self.assertEqual(lab.shape, img.shape)
+            self.assertGreater(mm, 0.0)
+            v2 = quiet_vision(camera=FakeCam(img), cfg=dict(live_view='', matdet={'claw_mask': '/nonexistent'}))
+            p2 = str(Path(td) / 'none.jpg')
+            v2.material_errors([2])
+            self.assertFalse(Path(p2).exists())
+
     def test_vview_reads_the_same_file(self):
         import vview
         self.assertEqual(vview.DEFAULT_PATH, Vision.DEFAULT['live_view'])

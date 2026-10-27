@@ -24,6 +24,8 @@ import os
 import time
 from pathlib import Path
 
+COLOR_EN = {1: 'RED', 2: 'YELLOW', 3: 'BLUE', 4: 'GREEN', 5: 'BLACK', 6: 'LIGHT_BLUE'}   # (10-27)实时画面上写的颜色名(和日志里一样)
+
 ROOT = Path(__file__).resolve().parent
 CAL_FILE = 'vision_cal.json'        # vclaw 实测的爪子像素存在这里(优先于配置文件里的 claw_px)
 RING_CROSS = ('RING1', 'RING3')      # (10-26)1、3 号环自己的十字(claw_px 里的键)；没调过就用 RING(2 号环的红十字)
@@ -439,9 +441,11 @@ def circle_material_detector(cfg=None, seed_r=None):
         return (float(c[0]), float(c[1]))
 
     def many(frame, color_ids):
-        """(10-26)同一帧认好几个颜色 {颜色: (u, v) 或 None}：HSV、爪子区域这一帧只算一次(结果和一个一个认一样)。"""
-        return {c: (None if r is None else (float(r['center'][0]), float(r['center'][1])))
-                for c, r in md.detect_many(frame, color_ids).items()}
+        """(10-26)同一帧认好几个颜色 {颜色: (u, v) 或 None}：HSV、爪子区域这一帧只算一次(结果和一个一个认一样)。
+        完整结果(半径等)留在 det.last_many，画实时画面用。"""
+        res = md.detect_many(frame, color_ids)
+        det.last_many = res
+        return {c: (None if r is None else (float(r['center'][0]), float(r['center'][1]))) for c, r in res.items()}
     det.detector = md
     det.many = many
     return det
@@ -767,6 +771,16 @@ class Vision:
         for c in colors:
             p = got.get(int(c))
             out[int(c)] = None if p is None else (p[0] - cu, p[1] - cv_)
+        if fr is not None:
+            # (10-27 用户"这个画面不是实时的已经卡住了")原料区等原料盘停、下爪前看的都是这里：以前不写实时画面，vview 一直停在对准那一帧。
+            #   现在每个认出的物料画圈、写颜色和离爪子点多少毫米(看哪个颜色认偏了)
+            full = getattr(det, 'last_many', None) or {}
+            pts = []
+            for c, p in got.items():
+                if p is not None:
+                    r = full.get(int(c)) if isinstance(full, dict) else None
+                    pts.append((p[0], p[1], int(c), r.get('radius') if isinstance(r, dict) else None))
+            self._publish(fr, 'RAW', None, color_id='watch', pts=pts)
         return out
 
     def plate_scan(self, colors, hints=None):
@@ -1321,7 +1335,25 @@ class Vision:
                 (f', {len(details) - len(kept)} wrong size' if len(details) > len(kept) else '') + ')'
         else:
             res = getattr(md, 'last', None) if md is not None else None
-            if color_id == 'plate':
+            if color_id == 'watch':
+                # (10-27)等原料盘：这一帧认出的每个物料——拟合的圆(青)、圆心(红叉)、颜色和离爪子点多少毫米
+                try:
+                    sc = float(self.scale('RAW'))
+                except Exception:
+                    sc = 0.0
+                labs = []
+                for q in pts or []:
+                    u, w_ = float(q[0]), float(q[1])
+                    name = COLOR_EN.get(int(q[2]), str(q[2])) if len(q) > 2 else ''
+                    if len(q) > 3 and q[3]:
+                        cv2.circle(out, (int(round(u)), int(round(w_))), int(round(float(q[3]))), (255, 255, 0), 2)
+                    cv2.drawMarker(out, (int(round(u)), int(round(w_))), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
+                    lab = name + (f' {math.hypot(u - cu, w_ - cv_) / sc:.0f}mm' if sc > 0 else '')
+                    cv2.putText(out, lab, (int(u) + 12, int(w_) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+                    cv2.putText(out, lab, (int(u) + 12, int(w_) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                    labs.append(lab)
+                info = '  '.join(labs) if labs else 'no material seen'
+            elif color_id == 'plate':
                 if plate is not None:
                     pc = plate.get('c_now', plate['c'])
                     pr = float(plate.get('r_now', plate['r']))
@@ -1334,7 +1366,7 @@ class Vision:
             elif target is not None and res is not None:
                 cv2.circle(out, (int(round(target[0])), int(round(target[1]))), int(round(res['radius'])), (255, 255, 0), 2)
                 info = f' r={res["radius"]:.0f}px hidden {res["occluded"] * 100:.0f}%'
-            what = 'PLATE CENTER' if color_id == 'plate' else ('WATCHING PLATE' if color_id == 'any' else f'MATERIAL {color_id}')
+            what = 'PLATE CENTER' if color_id == 'plate' else ('WATCHING PLATE' if color_id in ('any', 'watch') else f'MATERIAL {color_id}')
             if kind == 'PICK':
                 what += ' on ring' + ('' if self.has_pick() else ' (PICK point not learned)')
         goal = getattr(self, 'live_goal', None) if color_id == 'plate' else None
@@ -1350,6 +1382,8 @@ class Vision:
             except Exception:
                 mm = float('nan')
             msg = f'{what}: ' + ('to goal' if goal is not None else 'off') + f' {du:+.0f},{dv:+.0f}px ~{mm:.1f}mm'
+        elif color_id == 'watch':
+            msg = what                                 # (10-27)等原料盘：认到的写在第二行
         else:
             msg = f'{what}: NOT FOUND'
         # (10-24 用户"粗加工区域和暂存区域的十字做成红色的")原料的爪子点绿十字，圆环那边(RING/PICK)红十字；
