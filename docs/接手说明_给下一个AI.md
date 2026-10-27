@@ -1040,6 +1040,14 @@ git_log.txt                ← 分支最近 120 条提交记录
   ZoneFlowTests.test_return_from_the_tray_learns_its_bias(同一个动作时不学偏差、也不用再转一次，学偏差只在关掉时有用)、
   ZoneFlowTests.test_drives_straight_to_each_ring_in_code_order(一个环一个环挪车的旧做法，车上不用：同一个动作时 60 个种子底盘平均多修 0.3 下
   (0.87 -> 1.20)、种子 0 修了 5 下超过 ≤4，放置一样准；多半是模拟随机数用得不一样，没细查)。
+- **10-27 晚 粗加工区取回不再花时间"对准"(用户"车在粗加工区域……放置完了还要夹取回车上，夹取回车上的时候不要再花时间对准了直接夹取就行了")：**
+  车没动、只转手臂放的取回(direct)本来就不用摄像头，但 _goto_recorded → _return_to_pose(from_tray) 走的是 f97944d 的"同一个动作到位"
+  (先往转盘那边多转约 5°、再分两下慢慢转回来)，回读差 0.15° 以上再转、最多两次——看着就是在对准，每个多 1~2 秒。
+  改：`pickback_quick`(默认 True)：direct 的取回 `_quick_to_pose` 一条 APZ 转到放下时的角度(边转边降到 ZOBRNG)，回读一次，
+  ID1 差 `pickback_tol_deg`(1°)以上才 _ap_from_tray_side 补一下，接着 PICK。挪过车放的(direct=False，老做法)照旧回到记录位置 + 摄像头对准
+  (sim 里那条老路一律直接夹会夹空 4 个、碰倒 5 个，没改)。sim ZoneCalTests.test_pickback_goes_straight_to_the_placed_angles
+  (6 个取回 86.2 秒，以前 90.4 秒，没有"再转一次")。同一天用户选了"两处都是"，我把原料区也改成第二次来不对准，
+  用户纠正"我的意思是粗加工区……夹取回车上"，原料区那个撤回了、没提交，别再加。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准
