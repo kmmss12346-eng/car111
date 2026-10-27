@@ -507,7 +507,7 @@ class VisualServo:
     def run(self, kind, measure, scale_px_per_mm, tol_mm, allow_chassis=True, max_iter=None, timeout_s=None, label='',
             bounds=None, confirm=None, chassis_axes=None, chassis_fix_max_mm=None, chassis_s_range=None, fixed_j=False,
             gain_arm=None, near_avg=None, wheels_first=None, filt=None, arm_range=None,
-            wheels_only=None, chassis_f_range=None, gain_ch=None, probe_s=True):
+            wheels_only=None, chassis_f_range=None, gain_ch=None, probe_s=True, min_step=None):
         """对准(见 _run)。
         wheels_only = True：只动车轮(见 _run_wheels)，手臂一下都不动；None = 用配置里的 wheels_only。
         这时 chassis_s_range / chassis_f_range = 横移 / 前后累计允许的范围(毫米，相对开始时)，chassis_fix_max_mm = 前后累计最多走多少，
@@ -519,7 +519,8 @@ class VisualServo:
         gain_arm / near_avg：只这一次用的手臂修正比例 / "差一点点超出容差先再测一次"(0 = 不再测，直接修)。
         wheels_first / filt：只这一次 先动车轮(只在 'F'/'Fs' 时有用) / 测量滤波；None = 用配置里的。
         arm_range = {'id2': (下限, 上限)}：这次手臂能偏的范围(相对开始对准时的角度)；开始前手臂已经提前伸缩过时，
-        按机构的行程算还能往哪边偏多少(不然会按 ±arm_limit_deg 以为还能伸，顶到头)。没给的轴按 ±arm_limit_deg。"""
+        按机构的行程算还能往哪边偏多少(不然会按 ±arm_limit_deg 以为还能伸，顶到头)。没给的轴按 ±arm_limit_deg。
+        min_step = {'id1': 度, 'id2': 度}：只这一次的最小一步(10-27：1、3 号环微调时每一下 ID1 多给了补偿、小一步也转得动)。"""
         if self.cfg.get('wheels_only') if wheels_only is None else wheels_only:
             self._fixed = bool(fixed_j)
             saved = {'near_avg': self.cfg.get('near_avg')} if near_avg is not None else {}
@@ -538,7 +539,9 @@ class VisualServo:
         self._rpm = (self.cfg.get('wheels_rpm') or None) if self._wheels else None
         self._flt = bool(self.cfg.get('filter') if filt is None else filt)
         saved = {}
-        for k, val in (('gain_arm', gain_arm), ('near_avg', near_avg)):
+        if min_step is not None:
+            min_step = dict(self.cfg.get('min_step_deg') or {}, **min_step)
+        for k, val in (('gain_arm', gain_arm), ('near_avg', near_avg), ('min_step_deg', min_step)):
             if val is not None:
                 saved[k] = self.cfg.get(k)
                 self.cfg[k] = val

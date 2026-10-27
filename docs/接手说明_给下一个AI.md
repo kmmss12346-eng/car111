@@ -993,6 +993,29 @@ git_log.txt                ← 分支最近 120 条提交记录
   sim：SimWorld(id1_backlash_deg) 舵机角度 a1 / 手臂实际 a1_act；ZoneCalTests.test_ring13_fine_tune_with_id1_backlash(以前 11.6mm，现在 1.1mm)。
   ZoneArmGeomTests.test_ring_out_of_reach_moves_the_car_and_realigns_ring2 种子 3 → 0：那条老退路(够不着就挪车)本来就约 1/6 种子会在
   "回到 2 号环重新对准"时认错环(zone_backlash_deg=0 也是种子 4、6)，用户的车不走这条路；以后有空可以查。
+- **10-27 晚 1、3 号环的修正真的转得动(用户"红1蓝2红3还是这样有偏差尤其是1号环偏差最大"；我提了"夹着物料放之前再对一次"和
+  "把修正改好"两条，用户"再对一次没有必要吧把修正改好就行了"——只做了后一条，别加"夹着物料再对一次")：**
+  实车日志 1 号环微调 7.4 → 7.6 → 3.4 → 3.35 → 3.30mm(后面修了 3 次手臂一下不动，到 10 秒上限按差 3.3mm 放)。两个原因：
+  ① STM32 的 AP(arm.c Servos_To，tol = ATOL 0.3°)：本来就离目标 ATOL 以内的只 Hold 不转；要转的(小动作 15°/s、8ms 查一次)
+  离目标还差 ATOL 以内就 Hold，停在差 0.15~0.3° 的地方。零点几度的小修正等于没转(visual_servo 的 min_step 0.35° 也被它放大/归零)。
+  ② 06b6022 的"先多转 zone_backlash_deg(2°)再转回来"不够：实测间隙 2.3°，多转的那一下本身也提前 0.3° 停，舵机走不完间隙、手臂不动，
+  转回来那一下也碰不到手臂——往转盘那边的小修正全被吃掉；手臂还停在间隙的另一边，微调好的位置和夹着物料从转盘转回来放的位置
+  差零点几度(1 号环离转轴最远，加上 return_tol_deg 0.4° ≈ 1.7mm，一共偏 3~6mm)。改：
+  `zone_backlash_extra_deg`(默认 1)：`_id1_backlash` 返回的"先多转"= 间隙 + 它(一共 3°)；`zone_atol_comp`(None = 0.7×ATOL = 0.21°，
+  `_id1_comp`)：ID1 最后一下往转的方向多给这么多(`_cal_fine` 开始那下、ArmActuators.id1_comp = arm_move 的每一下、`_ap_from_tray_side`)；
+  `_cal_fine` 给 servo.run 传 min_step={'id1': ATOL − comp + 0.05}(visual_servo.run 新参数，只这一次)；`return_tol_fine_deg`(0.15)：
+  `_return_to_pose(from_tray)` ID1 差 0.15° 以上就再转(以前 0.4°)，再转两次还差、但在 return_tol_deg 以内不打 ★。
+  sim：SimWorld(ap_atol=True，默认开)：AP 照 Servos_To 停(`_ap_atol_stop`：差 ATOL 以内不转；4.5° 以内的小动作停在差 ATOL − U(0, 0.15) 的地方；
+  大动作照旧)，ap_atol=False = 以前一下转到目标(补偿以后会转过头，别再用它测补偿)。ZoneCalTests.test_ring13_small_corrections_really_move
+  (间隙 2.3°、和实车一样 1 号环离转盘角度最远(ring_tan 1 号 -150)：以前 1/2/3 号环最大 6.1/2.7/1.3mm，现在 1.4/0.5/1.5mm)、
+  test_sim_ap_stops_within_atol_like_stm32；test_ring13_camera_fine_tune_fixes_a_bad_calibration 的"每个环 ≤ 2.6 秒"改成平均 ≤ 2 秒、
+  最长 ≤ 4 秒(ap_atol 以后个别环在 tol 附近被画面噪声多拖一两次，不补偿也一样，最长 3.7 秒)。
+  ap_atol 默认开以后有 5 个**旧做法**(车上现在不用)的测试超阈值，改前的代码(zone_atol_comp=0、zone_backlash_extra_deg=0)也一模一样超，
+  不是这次改坏的：MissionSimTests.test_live_defaults_whatever_stops_under_the_claw_and_wheels_first(10-10 的每环对准，放置 2.98mm > 2.5)、
+  ZoneFlowTests.test_next_ring_starts_at_the_reach_of_the_last_one / test_wheels_move_closer_when_the_arm_cannot_reach(一个环一个环对准)、
+  RawFollowTests.test_taught_slots_predict_and_grab_on_the_stop(跟随 + 三个停靠位，只夹到 1 个)、
+  RawCenterTeachTests.test_slot_far_beyond_the_range_does_not_move_the_arm(多发了一条 AP)。这 5 个照旧用理想舵机(ap_atol=False，有注释)；
+  以后要用这些做法，先在 ap_atol=True 下查手臂小修正(它们的 id1_comp 是 0、min_step 0.35)。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

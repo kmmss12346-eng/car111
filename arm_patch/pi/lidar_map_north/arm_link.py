@@ -423,6 +423,9 @@ class ArmActuators:
         #   要往那一边转就先多转 id1_backlash 度再转回来。mission_hooks 的 1、3 号环微调时设，平时 0
         self.id1_backlash = 0.0
         self.id1_from = 1.0
+        # (10-27 实车"调了这么久机械臂位置基本没有变")id1_comp > 0：每一下 ID1 往转的方向多给这么多度。STM32 的 AP 离目标还差 ATOL(0.3°)
+        #   以内就算到了、停下(还差不到 ATOL 的干脆不转)，零点几度的小修正等于没转；多给一点，停下的地方才是要的地方
+        self.id1_comp = 0.0
 
     def reset_disp(self):
         self.disp = {'S': 0.0, 'F': 0.0}
@@ -436,10 +439,13 @@ class ArmActuators:
             raise ArmError('读不到 ID1/ID2 的角度(A? 没有回 ANG)，检查总线舵机')
         bl = float(getattr(self, 'id1_backlash', 0.0) or 0.0)
         side = 1.0 if float(getattr(self, 'id1_from', 1.0)) >= 0.0 else -1.0
+        comp = float(getattr(self, 'id1_comp', 0.0) or 0.0)
+        last = (1.0 if d_id1 > 0 else -1.0) if abs(float(d_id1)) > 1e-6 else 0.0   # 最后一下 ID1 往哪边转
         if bl > 0.0 and float(d_id1) * side > 1e-6:
             # 这一下要往 id1_from 那一边转：只转过去，舵机先走完齿轮间隙手臂才动、最后还停在间隙另一边。先多转 bl 再转回来
             self.arm.ap(a1_0 + d_id1 + side * bl, a2_0 + d_id2)
-        self.arm.ap(a1_0 + d_id1, a2_0 + d_id2)
+            last = -side
+        self.arm.ap(a1_0 + d_id1 + last * comp, a2_0 + d_id2)
         a1_1, a2_1 = self.arm.angle[1], self.arm.angle[2]
         if a1_1 is None or a2_1 is None:
             return None                                   # 没读回来，按指令的量算

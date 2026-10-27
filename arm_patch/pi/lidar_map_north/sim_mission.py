@@ -70,7 +70,7 @@ class SimWorld:
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
                  qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0, plate_jitter_deg=0.0,
-                 arm_r_mm=None, id1_backlash_deg=0.0):
+                 arm_r_mm=None, id1_backlash_deg=0.0, ap_atol=True):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -85,6 +85,9 @@ class SimWorld:
         self.lift_mm = 60.0
         # (10-27 实车 ID1 有齿轮间隙)舵机转到 a1，手臂(爪子、摄像头)只在舵机顶到间隙一边的时候才跟着动(见 a1 的 setter)；0 = 没有间隙
         self.id1_backlash_deg = float(id1_backlash_deg)
+        # (10-27 实车"调了这么久但是机械臂位置基本没有变")AP 照着 arm.c 的 Servos_To 停：离目标 ATOL 以内的不转，小动作离目标还差 ATOL 以内
+        #   就停(见 _ap_atol_stop)；False = 小动作一下转到目标(以前的模拟)
+        self.ap_atol = bool(ap_atol)
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
         self.claw_open = True
@@ -265,18 +268,30 @@ class SimWorld:
             self.a1, self.a2 = s1, s2
             self._a1_act = s_act
 
-    def _servos_to(self, a1, a2, speed, fine=False):
+    def _servos_to(self, a1, a2, speed, fine=False, exact=()):
         P = self.params
         self._sweep_check(a1, a2)
         t1, t2 = self._servo_t(a1 - self.a1, speed), self._servo_t(a2 - self.a2, speed)
         self.advance(max(t1, t2) if P['PARA'] > 0.5 else t1 + t2)
         if fine:                                           # AP：到位误差 0.3°，实际重复精度更好
-            self.a1 = a1 + self.rng.normal(0, 0.03)
-            self.a2 = a2 + self.rng.normal(0, 0.08)
+            self.a1 = a1 + (0.0 if 1 in exact else self.rng.normal(0, 0.03))   # exact：停的地方已经算好了(_ap_atol_stop)
+            self.a2 = a2 + (0.0 if 2 in exact else self.rng.normal(0, 0.08))
         else:                                              # 大动作：到位误差 ATOLC
             tol = P['ATOLC']
             self.a1 = a1 + self.rng.uniform(-0.8 * tol, 0.8 * tol)
             self.a2 = a2 + self.rng.uniform(-0.8 * tol, 0.8 * tol)
+
+    def _ap_atol_stop(self, cur, tg):
+        """(10-27)arm.c Servos_To(AP 用 ATOL)：本来就离目标 ATOL 以内的只原地保持、不转；小动作(离目标 4.5° 以内，Servo_Start
+        按 15°/s 转、8ms 查一次角度)离目标还差 ATOL 以内就算到了、停下：停在差 ATOL 减去最后一次查角度时多走的 0~0.15° 的地方。
+        大一点的动作转得快、查一次走得多，照旧当作转到了(返回 None)。"""
+        atol = float(self.params.get('ATOL', 0.3))
+        d = float(tg) - float(cur)
+        if abs(d) <= atol:
+            return float(cur)
+        if abs(d) >= 4.5:
+            return None
+        return float(tg) - math.copysign(max(0.0, atol - float(self.rng.uniform(0.0, 0.15))), d)
 
     def _open_claw(self):
         """张开爪子。夹着物料时：在转盘上方(ZDROP、转盘姿态)张开 = 放回转盘；在工位里降到 ZPLC / ZSTK 张开 = 放在地上(圆环里)；
@@ -652,7 +667,17 @@ class SimWorld:
             if big:
                 spd = max(spd, P['ASPD'])                       # 角度变化大：用大动作速度(和 arm.c 一致)
             b1, b2 = self.ap_bias if (big and self.ap_bias) else (0.0, 0.0)
-            self._servos_to(a1_ + b1, a2_ + b2, spd, fine=True)
+            t1, t2, ex = a1_ + b1, a2_ + b2, []
+            if self.ap_atol:
+                for i, cur in ((1, self.a1), (2, self.a2)):
+                    st = self._ap_atol_stop(cur, t1 if i == 1 else t2)
+                    if st is not None:
+                        ex.append(i)
+                        if i == 1:
+                            t1 = st
+                        else:
+                            t2 = st
+            self._servos_to(t1, t2, spd, fine=True, exact=ex)
             if not big:
                 self.advance(self.ap_fine_extra_s)
             ang(1)
@@ -1291,7 +1316,8 @@ class MissionSimTests(unittest.TestCase):
     def test_live_defaults_whatever_stops_under_the_claw_and_wheels_first(self):
         """比赛默认(10-10 用户要的)：原料区爪子下面停的是哪个就夹哪个(只动爪子)、工位对准先慢慢动车轮：全抓到、全放对、不空夹。"""
         for seed in range(3):
-            w = SimWorld(seed=300 + seed, code=self.CODE)
+            # (10-27)ap_atol=False：这条旧做法(车上现在不用)是按理想舵机调的阈值；按 STM32 的 ATOL 停(ap_atol)改前改后一样超(手臂小修正不准)，以后要用再查
+            w = SimWorld(seed=300 + seed, code=self.CODE, ap_atol=False)
             h = make(w, dict(LIVE_DEFAULTS))
             run_mission(w, h)
             self.assertEqual(h.stats.grab_ok, 6)
@@ -1551,7 +1577,8 @@ class ZoneFlowTests(unittest.TestCase):
     def test_wheels_move_closer_when_the_arm_cannot_reach(self):
         """车停得离圆环太远/太近，手臂伸缩到头也够不着：车轮横着挪(只挪够不着的那一段)，照样放对；离停车点不超过 ring_strafe_max_mm(20)。"""
         for side in (55.0, -55.0):                               # 手臂伸缩 ±44mm + 横移 20mm 够得着(停车误差 ±8mm)
-            for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park_side={'ROUGH': side, 'TEMP': side})):
+            # (10-27)ap_atol=False：这条旧做法(车上现在不用)是按理想舵机调的阈值；按 STM32 的 ATOL 停(ap_atol)改前改后一样超(手臂小修正不准)，以后要用再查
+            for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park_side={'ROUGH': side, 'TEMP': side}, ap_atol=False)):
                 self._assert_all_good(w, h, text, seed)
                 self.assertIn('手臂伸缩够不着：车轮横着挪', text)
                 ext = self._zone_s_extent(w)
@@ -1799,7 +1826,8 @@ class ZoneFlowTests(unittest.TestCase):
         for pre in (True, False):
             obs, first = [], []
             for seed in range(3):
-                w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0, park_side={'ROUGH': 30.0, 'TEMP': 30.0})
+                # (10-27)ap_atol=False：这条旧做法(车上现在不用)是按理想舵机调的阈值；按 STM32 的 ATOL 停(ap_atol)改前改后一样超(手臂小修正不准)，以后要用再查
+                w = SimWorld(seed=seed, code=self.CODE, cam_deg=90.0, park_side={'ROUGH': 30.0, 'TEMP': 30.0}, ap_atol=False)
                 lines = []
                 h = make(w, dict(ring_precorrect=pre), log=lines.append)
                 run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1'), log=lines.append)
@@ -2280,8 +2308,9 @@ class RawFollowTests(unittest.TestCase):
         手臂提前过去等，一停就下爪；三个都夹到、不夹空。"""
         import tempfile
         for seed in (0, 1, 6):
+            # (10-27)ap_atol=False：这条旧做法(车上现在不用)是按理想舵机调的阈值；按 STM32 的 ATOL 停(ap_atol)改前改后一样超(手臂小修正不准)，以后要用再查
             w = SimWorld(seed=seed, code=MissionSimTests.CODE, plate_stop_s=6.0, plate_move_s=3.0, raw_scale=0.6,
-                         params=dict(ZOBRAW=100.0, ZGRAB=80.0, LFRPM=150.0, LFMRG=100.0))
+                         params=dict(ZOBRAW=100.0, ZGRAB=80.0, LFRPM=150.0, LFMRG=100.0), ap_atol=False)
             d = tempfile.mkdtemp()
             path = os.path.join(d, 'ring_teach.json')
             lines = []
@@ -2645,7 +2674,8 @@ class RawCenterTeachTests(unittest.TestCase):
     def test_slot_far_beyond_the_range_does_not_move_the_arm(self):
         """按画面算要转的角度超出范围太多：手臂不动(只记位置)，说清楚现在的角度和范围。"""
         import tempfile
-        w = self._world(1)
+        # (10-27)ap_atol=False：这条旧做法(车上现在不用)是按理想舵机调的阈值；按 STM32 的 ATOL 停(ap_atol)改前改后一样超(手臂小修正不准)，以后要用再查
+        w = self._world(1, ap_atol=False)
         path = os.path.join(tempfile.mkdtemp(), 'ring_teach.json')
         lines = []
         h = self._make(w, path, lines, cfg=dict(raw_center_reach_deg=dict(id1=60.0, id2=100.0)))
@@ -4151,12 +4181,15 @@ class ZoneCalTests(unittest.TestCase):
                 if fine:
                     self.assertEqual(text.count('车不动；空爪先用摄像头只动手臂微调'), 4, text[-3000:])   # 两个区第一轮的 1、3 号环
                     self.assertIn('按这个区第一次用摄像头微调好的角度', text)                      # 第二轮(码垛)直接用
-            out[fine] = (max(errs), max(took) if took else None)
-        print(f'\n  [1、3 号环调差 1.5°] 摄像头微调：放置误差最大 {out[True][0]:.2f}mm，每个环微调最长 {out[True][1]:.1f} 秒；'
-              f'不微调：最大 {out[False][0]:.2f}mm')
+            out[fine] = (max(errs), max(took) if took else None, float(np.mean(took)) if took else None)
+        print(f'\n  [1、3 号环调差 1.5°] 摄像头微调：放置误差最大 {out[True][0]:.2f}mm，每个环微调平均 {out[True][2]:.1f} 秒、'
+              f'最长 {out[True][1]:.1f} 秒；不微调：最大 {out[False][0]:.2f}mm')
         self.assertLess(out[True][0], 3.0, out)
         self.assertGreater(out[False][0], 5.0, out)
-        self.assertLessEqual(out[True][1], 2.6, out)
+        # (10-27)模拟的 AP 按 STM32 的 ATOL 停(ap_atol)以后，个别环在 tol_mm 附近被画面噪声多拖一两次(以前不补偿也一样)；
+        #   10-27 用户要"一直调到对准为止"(最多 10 秒)：平均两秒以内、最长 4 秒
+        self.assertLessEqual(out[True][2], 2.0, out)
+        self.assertLessEqual(out[True][1], 4.0, out)
 
     def test_ring13_fine_tune_keeps_going_until_aligned(self):
         """(10-27 用户"把微调时间放长直到调好为止")1、3 号环的摄像头微调一直调到对准为止：手臂和画面的对应关系存得偏大一倍
@@ -4204,6 +4237,57 @@ class ZoneCalTests(unittest.TestCase):
         self.assertGreater(out[True][0], 5.0, out)
         self.assertLess(out[False][0], 2.0, out)
         self.assertEqual(out[False][1], 0, out)                     # 现在每个环都调到对准
+
+    def test_ring13_small_corrections_really_move(self):
+        """(10-27 晚，实车"红1蓝2红3还是这样有偏差尤其是1号环偏差最大"：1 号环微调卡在差 3.3mm、修了 3 次手臂不动)真车 ID1 齿轮间隙 2.3°，
+        STM32 的 AP 离目标还差 ATOL(0.3°)以内就停、本来就差不到 ATOL 的不转(SimWorld ap_atol)：以前"先多转 2° 再转回来"走不完间隙，
+        往转盘那边的小修正被间隙吃掉，微调好的位置和夹着物料转回来放的位置不在间隙的同一边(1 号环最多偏 6mm，2 号环也偏 2.7mm)。
+        现在先多转 间隙 + 1°(zone_backlash_extra_deg)、每一下往转的方向多给 0.7×ATOL(zone_atol_comp)、转回来差 0.15° 以上就再转：
+        三个环都放准、都"微调好了"。几何和实车一样：1 号环离车上转盘的角度最远、3 号环最近。"""
+        out = {}
+        for old in (True, False):
+            errs, done, cut = {1: [], 2: [], 3: []}, 0, 0
+            for seed in range(4):
+                w = self._world(seed, id1_backlash_deg=2.3)
+                self.assertTrue(w.ap_atol)
+                w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}        # 和实车一样 1 号环的角度离车上转盘 A1D 最远、3 号环最近
+                                                                             #   (实车 A1D 比三个环都大，模拟里比三个环都小，反过来一样)
+                w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
+                lines = []
+                h = self._make(w, dict(zone_backlash_extra_deg=0.0, zone_atol_comp=0.0) if old else None, lines=lines)
+                for z in h._teach_all.values():                      # 调的角度差 1.6°(实车一开始差 6.6~7.4mm)
+                    z['1'] = [z['1'][0] + 1.6, z['1'][1]]
+                    z['3'] = [z['3'][0] - 1.6, z['3'][1]]
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+                for (z, k, _c, e, _st) in w.placed:
+                    if z == 'ROUGH':
+                        errs[k].append(e)
+                done += sum(1 for l in lines if '微调好了' in l)
+                cut += sum(1 for l in lines if '微调到上限了' in l or '微调没对上' in l)
+            out[old] = ({k: round(max(v), 2) for k, v in errs.items()}, done, cut)
+        print(f'\n  [间隙 2.3° + STM32 差 ATOL 就停] 三个环放置误差最大：以前 {out[True][0]}，现在 {out[False][0]}')
+        self.assertGreater(out[True][0][1], 3.0, out)                 # 以前：1 号环偏得最多(和实车一样)
+        self.assertGreater(max(out[True][0].values()), 4.0, out)
+        self.assertLess(max(out[False][0].values()), 2.0, out)        # 现在：三个环都在 2mm 以内
+        self.assertEqual((out[False][1], out[False][2]), (8, 0), out)  # 4 次 × 1、3 号环：都调到对准
+
+    def test_sim_ap_stops_within_atol_like_stm32(self):
+        """(10-27)模拟里的 AP 和 arm.c 的 Servos_To 一样：离目标 ATOL 以内不转；小动作停在离目标还差 0.15~0.3° 的地方；大动作照旧到目标。"""
+        w = SimWorld(seed=0)
+        a1 = w.a1
+        w.handle(f'AP {a1 + 0.25:.3f} {w.a2:.3f}')
+        self.assertEqual(w.a1, a1)                                   # 差 0.25°：不转
+        w.handle(f'AP {a1 + 1.0:.3f} {w.a2:.3f}')
+        self.assertTrue(a1 + 0.7 - 1e-9 <= w.a1 <= a1 + 0.85 + 1e-9, w.a1 - a1)    # 往大转 1°：少转 0.15~0.3°
+        b = w.a1
+        w.handle(f'AP {b - 2.0:.3f} {w.a2:.3f}')
+        self.assertTrue(b - 1.85 - 1e-9 <= w.a1 <= b - 1.7 + 1e-9, w.a1 - b)
+        w.handle(f'AP {w.a1 + 30.0:.3f} {w.a2:.3f}')                   # 大动作：照旧(重复精度 0.03°)
+        self.assertAlmostEqual(w.a1, b - 2.0 + 30.0, delta=0.5)
+        w0 = SimWorld(seed=0, ap_atol=False)                           # 关掉：一下转到
+        c = w0.a1
+        w0.handle(f'AP {c + 0.25:.3f} {w0.a2:.3f}')
+        self.assertAlmostEqual(w0.a1, c + 0.25, delta=0.15)
 
     def test_ring1_cross_is_where_ring1_goes(self):
         """(10-26)1 号环有自己的十字(claw_px.RING1)：往右挪了 15 像素，1 号环就照着这个十字对，放的位置跟着挪(3 号环、2 号环不受影响)。"""
