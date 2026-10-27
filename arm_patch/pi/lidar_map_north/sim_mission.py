@@ -933,6 +933,12 @@ class SimVision:
             w.advance(w.frame_extra_s)
         return pc, out
 
+    color_bias_px = {}                  # (10-27)测试用：这些颜色的物料总是认偏这么多像素(实车 YELLOW 在爪子正下方，每次都认在离爪子点 40mm)
+
+    def _bias(self, col, q):
+        b = self.color_bias_px.get(int(col))
+        return q if (q is None or b is None) else (float(q[0]) + float(b[0]), float(q[1]) + float(b[1]))
+
     def material_error(self, color_id, n=None):
         w = self.w
         items = [it for it in w.raw_items if it['color'] == int(color_id)]
@@ -942,7 +948,7 @@ class SimVision:
         c = w.claw()
         it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
         dt = MEASURE_S if not n else 0.05 + 0.07 * int(n)          # 一帧大约 0.07 秒(n 帧取平均)
-        return self._off('RAW', w.pixel_error(w.raw_pos(it), 'RAW', dt))
+        return self._bias(color_id, self._off('RAW', w.pixel_error(w.raw_pos(it), 'RAW', dt)))
 
     def material_stream(self, color_id):
         """和真的 Vision.material_stream 一样：每认完一帧 yield (这帧拍下的时间, 像素位置或 None, 画面变了的比例或 None)；认一帧要 FRAME_S。"""
@@ -977,7 +983,7 @@ class SimVision:
                 it = min(items, key=lambda i: np.linalg.norm(w.raw_pos(i) - c))
                 e = w.scale['RAW'] * (w._cam() @ (w.raw_pos(it) - c)) + w.rng.normal(0, w.noise_px, 2)
                 if abs(e[0]) <= 300 and abs(e[1]) <= 220:
-                    q = self._off('RAW', (float(e[0]), float(e[1])))
+                    q = self._bias(col, self._off('RAW', (float(e[0]), float(e[1]))))
             out[int(col)] = q
         w.advance(0.05 + 0.07 * len(colors))
         return out
@@ -3228,6 +3234,21 @@ class RawNearSlotTests(unittest.TestCase):
             self.assertEqual((self._in_tray(w), h.stats.grab_ok), (3, 3), text[-3000:])
             self.assertIn('是这一批最后一个：夹完直接收臂', text)
             self.assertEqual(after_last_grab(w.requests), 'STOW', w.requests[-12:])
+
+    def test_mis_seen_color_in_the_near_slot_is_still_grabbed(self):
+        """(10-27 用户"黄色的认偏了，明明就是在正下方，只要第一个在爪子的正下方，后面的就不要想了，识别出来直接下抓")
+        最近那格：某个颜色每次都认在离爪子点 40mm 的地方(认偏了，其实就停在爪子正下方)。原料盘中心对准过，这一格上认出是它
+        就直接下爪：三个都夹到。raw_near_trust_slot=False 是以前的做法：离得远不下爪、一直等，它和后面的都没夹到。"""
+        def hook(w, h):
+            w.vision.color_bias_px = {5: (40.0 * w.scale['RAW'], 0.0)}      # 第一批第二个 BLACK 总是认偏 40mm
+            h._raw_plate_still = lambda px, c: False                        # 画面里看不到别的物料没动(实车那次的情况)
+        w, h, text = self._near_run(1, hook=hook)
+        self.assertIn('认出是它就直接下爪', text)
+        self.assertNotIn('不下爪', text)
+        self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.air, w.collisions), (3, 3, 0, 0), text[-3000:])
+        w0, h0, t0 = self._near_run(1, hook=hook, cfg=dict(raw_near_trust_slot=False))
+        self.assertIn('不下爪', t0)
+        self.assertLess(h0.stats.grab_ok, 3, t0[-3000:])
 
     def test_second_visit_goes_back_to_where_the_first_visit_stopped(self):
         """(10-26 用户"第二轮运行夹取第二轮物料的时候还能在同样的地方吗")原料区也一样：第二次来停得和第一次差了一截，

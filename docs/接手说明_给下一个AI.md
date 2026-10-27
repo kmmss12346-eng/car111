@@ -943,6 +943,15 @@ git_log.txt                ← 分支最近 120 条提交记录
   _raw_any / _grab_item 本来就是每个开始前才 OBS，最后一个以后不转。sim：after_last_grab(最后一条 GRAB 以后第一条转手臂的指令)
   RawNearSlotTests.test_last_grab_stows_without_swinging_back、RawFollowTests.test_fixed_grab_spot_last_grab_stows 都是 STOW。
   收臂 STOW：存了待机姿态(STBY SAVE)就回到它，没存回 A1H/A2R。用户车上用的是最近那格(rteach RAW near)，1026b 起就是这样。
+- **10-27 原料区最近那格认出就直接下爪(用户"黄色的认偏了，明明就是在正下方，只要第一个在爪子的正下方，后面的就不要想了，识别出来直接下抓")：**
+  实车 YELLOW 每次停在最近那一格都认在离爪子点 37~42mm(GREEN 同一格 3.8mm)，raw_ct_check 超过 raw_slot_accept_mm(25)不下爪，
+  一直等到时间到，后面的 RED 也没夹。`raw_near_trust_slot`(默认 True)：_raw_near_any 调 _raw_ct_grab(trust=True)，原料盘中心对准过、
+  这一格(occupancy，raw_slot_match 以内)认出是要的颜色就直接下爪，离得远只记一行日志、也不按它挪车轮(raw_grab_fix)。
+  用户明确说"不能放弃夹取任何一个物料"：不要加"夹不了就跳过"的做法(10-27 加过又撤了)。
+  sim RawNearSlotTests.test_mis_seen_color_in_the_near_slot_is_still_grabbed(SimVision.color_bias_px 让 BLACK 认偏 40mm)。
+  同一天 vview 在原料区等物料时也实时更新(vision.material_errors 写画面，标出每个颜色、离爪子点多少 mm)。
+  暂存区离黄色区近：到站对准 2 号环时车轮把车挪到"A1P/A2P 下 2 号环在十字上"的远近，手臂调长了车就往黄色区退(_body_clear 只要 30mm，
+  两块黄色区中间那条缝有 55mm 就挪进去了)；建议用户 stop TEMP 320 1200、stop ROUGH 1200 320，车摆在停车点重调 arm_calib --from A1P，程序没改。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

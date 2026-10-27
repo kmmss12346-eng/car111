@@ -201,6 +201,10 @@ DEFAULTS = dict(
                                         #   (10-24 用户"识别到了之后下达抓取命令能不能快速一点")最近那格：刚看着原料盘停下的那一帧不到 raw_seen_fresh_s 秒，
                                         #   就按那一帧里物料的位置查，不再另拍一帧；手臂已经在抓取的角度上就不再发 AP
     raw_seen_fresh_s=0.5,
+    raw_near_trust_slot=True,           # (10-27 用户"只要第一个在爪子的正下方，后面的就不要想了，识别出来直接下抓，一定是在正下方")最近那格：
+                                        #   车轮已经把原料盘中心对准了(爪子就在这一格正上方)，这一格上认出是要的颜色就直接下爪，
+                                        #   不再按"物料离爪子点超过 raw_slot_accept_mm"拦(实车 YELLOW 每次都认在离爪子点 37~42mm，其实就在正下方)。
+                                        #   False = 以前的：离得远就不下爪、等下一次停
     raw_need_clear=True,                # (10-24 用户"上升过程中停顿一下，原料盘一转就把物料甩飞")原料盘这次停下剩的时间，要够下爪、夹紧、
                                         #   再把物料直着抬起 OVCLR 离开原料盘(CLWAIT + 升 OVCLR 的时间)，不够就等下一次停，不在它要转的时候夹
     raw_ct_stop_s=6.0,                  # (10-18 用户量的)原料盘每次大约停多久、转多久(秒)：还没量到之前按这个估计(停的时间按九折算，留余量)；
@@ -4853,12 +4857,13 @@ class MissionHooks:
         return q is not None and float(np.linalg.norm(np.asarray(q, float))) / float(v.scale('RAW')) \
             <= float(self.cfg.get('raw_slot_accept_mm', 25.0))
 
-    def _raw_ct_grab(self, item, k, a, tag, t_end=None, near=False, watch_px=None, at=None, seen=None):
+    def _raw_ct_grab(self, item, k, a, tag, t_end=None, near=False, watch_px=None, at=None, seen=None, trust=False):
         """按 k 号停靠位示教的角度 a 转过去(在看原料盘的高度)，直接下爪夹进 item 自己的转盘槽。返回 True 夹了 / False 没夹。
         (10-21)near(最近那格)：下爪前车轮按物料实际停的位置补一下(_raw_grab_fix，t_end 之前要下爪)；夹完不挪回去
         (raw_grab_fix_back=False；等原料盘时按车轮挪了多少算停靠位在画面里的位置)。
         (10-24 用户"识别到了之后下达抓取命令能不能快速一点")at = 手臂现在的 [ID1, ID2]：已经在 a 上(最近那格就是看的姿态)不再发 AP；
-        seen = 刚看着原料盘停下的那一帧里这个物料离爪子点多少像素：按它查，不再另拍一帧。"""
+        seen = 刚看着原料盘停下的那一帧里这个物料离爪子点多少像素：按它查，不再另拍一帧。
+        (10-27)trust = 最近那格、原料盘中心已经对准：这一格上认出是它就直接下爪，认出的位置离爪子点远也不拦(认偏了)、也不按它挪车。"""
         cfg, v = self.cfg, self.vision
         if at is None or max(abs(float(at[0]) - float(a[0])), abs(float(at[1]) - float(a[1]))) > 0.5:
             self.arm.ap(float(a[0]), float(a[1]))
@@ -4867,7 +4872,13 @@ class MissionHooks:
             q = seen if seen is not None else v.material_errors([item.color]).get(item.color)
             if q is not None:
                 d = float(np.linalg.norm(np.asarray(q, float))) / float(v.scale('RAW'))
-                if d > float(cfg.get('raw_slot_accept_mm', 25.0)):
+                if d > float(cfg.get('raw_slot_accept_mm', 25.0)) and trust:
+                    # (10-27 用户"黄色的认偏了，明明就是在正下方……识别出来直接下抓")
+                    self.log(f'  {tag} ({item.color_name} 认在离爪子点 {d:.0f}mm 的地方，但原料盘中心已经对准、它就停在爪子下面这一格：'
+                             '认出是它就直接下爪)')
+                    q = None
+                    near = False                               # 认的位置不准：不按它挪车轮(raw_grab_fix)
+                elif d > float(cfg.get('raw_slot_accept_mm', 25.0)):
                     if watch_px is not None and self._raw_plate_still(watch_px, item.color):
                         # (10-21 实车 BLUE 一次认成离爪子点 122mm、一次 60mm，每次停下都不夹)：手臂没动，别的物料都还在原地 = 原料盘没转
                         self.log(f'  {tag} 下爪前一看 {item.color_name} 离爪子点 {d:.0f}mm，但原料盘上别的物料都还在原地(没转)：'
@@ -5471,7 +5482,8 @@ class MissionHooks:
             t_g0 = self.now()
             try:
                 got = self._raw_ct_grab(item, near_k, reach[near_k], tag, t_end=t_stop + self._raw_ct_stop_len() - T - margin - clear_s,
-                                        near=left_s >= need + fix_s, watch_px=px, at=home, seen=q_seen)
+                                        near=left_s >= need + fix_s, watch_px=px, at=home, seen=q_seen,
+                                        trust=bool(cfg.get('raw_near_trust_slot', True)))
             except (ArmError, VisionError) as ex:
                 if isinstance(ex, ArmAbort):
                     raise
