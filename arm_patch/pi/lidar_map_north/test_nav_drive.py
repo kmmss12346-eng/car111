@@ -518,6 +518,42 @@ class MiscDriveTests(unittest.TestCase):
         self.assertTrue(-35 <= car.sent[1][1] <= -20, car.sent)        # 车头朝南：后退(往北)退回多走的那一截
         self.assertGreater(worst, 20.0)
 
+    def test_no_keepalive_twitch_right_after_driving(self):
+        # (10-27 实车：每次转弯前雷达定位都先"车不动：太久没动，升降往下 4mm 再回来"，车其实刚开完 3~5 秒的直线)
+        # ctx.tick 从车最后一次动算多久没动：开完一段马上定位不摆；真停着(扫描、规划)5.5 秒以上才摆
+        t = [100.0]
+        bobs = []
+
+        class KH(Hooks):
+            def keepalive(self):
+                bobs.append(t[0])
+        car = SimCar((1200.0, 1100.0, -90.0), scale=0.04)
+        car.T = -90.0
+        om = car.move
+
+        def move(cmd, val, speed=None):
+            t[0] += 6.0                                     # 一条走 6 秒(比 keepalive_s 长)
+            return om(cmd, val, speed)
+        car.move = move
+
+        class TCtx(SimCtx):
+            def relocalize(self, plan_pose, frames=8, use_init=True, **kw):
+                if self.tick is not None:
+                    self.tick()                             # 真的 Ctx.relocalize 一开始就调 tick
+                return super().relocalize(plan_pose, frames, use_init, **kw)
+        ctx = TCtx(car)
+        hooks = KH(car)
+        ctx.tick = auto_run.make_tick(hooks, {'keepalive_s': 5.5}, now=lambda: t[0])
+        legs = [dict(stop='A', goal=(1200.0, 375.0, 0.0), cmds=[('F', 725), ('R', 90)])]
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=hooks, speeds={},
+                       motion=None, cfg=dict(CFG, reloc_before_turn=True, approach_guard_travel_frac=0.05, reloc_stops=[]),
+                       start=dict(est=(1200.0, 1100.0, -90.0), ref=(1200.0, 1100.0, -90.0)), caps={'rdec': False})
+        self.assertEqual(ctx.calls, 1)                      # 转弯前定位了
+        self.assertEqual(bobs, [])                          # 刚开完一段：不摆
+        t[0] += 6.0
+        ctx.tick()
+        self.assertEqual(len(bobs), 1)                      # 真停着 6 秒：摆
+
     def test_reloc_before_turn_folds_side_error_into_next_leg(self):
         # (10-26 用户"整个车运动和转向都太慢")转弯前定位：车还往右偏了 20mm(横移)。转 90° 以后横移方向就是下一条前进的方向，
         # 下一条前进按规划的位置算长短会把它补上：不再单独发一条慢速 S 20，最后停的地方一样

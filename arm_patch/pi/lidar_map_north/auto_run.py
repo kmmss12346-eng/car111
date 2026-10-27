@@ -623,6 +623,12 @@ def make_tick(hooks, cfg, now=time.monotonic):
                 raise
             except Exception:
                 pass
+
+    def moved():
+        """(10-27 实车：每次转弯前雷达定位都先"车不动：太久没动，升降往下 4mm 再回来"，车其实刚开完 3~5 秒的直线)
+        车刚动过(一条 F/S/R 走完、一个停车点做完)：从这时起算多久没动。以前从上次摆算，开一段路以后第一次 tick 就摆。"""
+        last[0] = now()
+    tick.moved = moved
     return tick
 
 
@@ -945,6 +951,15 @@ class _Drive:
         except Exception:
             return []
 
+    def _moved(self):
+        """(10-27)告诉 ctx.tick 车刚动过(手臂轻摆按"多久没动"算，刚开完一段马上定位不摆)。"""
+        f = getattr(getattr(self.ctx, 'tick', None), 'moved', None)
+        if f is not None:
+            try:
+                f()
+            except Exception:
+                pass
+
     def _next_marker(self, k):
         for j in range(k + 1, len(self.seq)):
             if self.seq[j][1] is None:
@@ -971,6 +986,7 @@ class _Drive:
         extra = f'，车头误差 {info["err"]:+.2f}°' if 'err' in info else ''
         self.e_last = info.get('err') or 0.0
         self.log(f'  [{self.i}/{self.total}] {cmd} {_fmt(v)}{label} -> {"完成" if ok else reply}  用时{dt:.1f}秒{est}{extra}')
+        self._moved()
         bad = check_move(cmd, v, ok, reply)
         if bad:
             raise Abort(f'第{self.i}条指令 {bad}')
@@ -980,6 +996,8 @@ class _Drive:
         """发一条转弯(route 或修正)。target_yaw = 转完以后 est 的车头。"""
         t0 = time.monotonic()
         sent, ok, reply = send_turn(self.link, deg, self.caps, self.log, toward_zero)
+        if sent:
+            self._moved()
         if not sent and ok:
             self.nav.turned(target_yaw, 0.0)
             return
@@ -1276,6 +1294,7 @@ class _Drive:
             _call(self.hooks, 'pre_cancel', stop)          # (10-23)提前摆了臂：收好再开走
         elif self.hooks is not None and hasattr(self.hooks, 'task'):
             self.hooks.task(stop, self.link, self.log)
+            self._moved()                                       # 停车点做完：车、手臂刚动过
         elif self.stop_wait > 0:
             self.log(f'    执行任务：先停 {self.stop_wait:.1f} 秒代替')
             t_end = time.monotonic() + self.stop_wait

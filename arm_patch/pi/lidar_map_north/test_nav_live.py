@@ -578,6 +578,16 @@ class LiveTests(unittest.TestCase):
                       inputs=[(lambda: True, 'zmargin 50')], screen_zone=None, end_on='zmargin 毫米(0~30)')
         self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_align_margin_mm'), 5.0)
 
+    def test_turnloc_command_saves(self):
+        """(10-27)turnloc off：存进配置 reloc_before_turn=false(每个弯直接转)，并提醒风险；turnloc on 改回来。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'turnloc off')], screen_zone=None, end_on='已设置 turnloc off')
+        self.assertIs(self.cfg_after.get('reloc_before_turn'), False)
+        self.assertIn('扫进黄色区', self.log)
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, reloc_before_turn=False),
+                      inputs=[(lambda: True, 'turnloc on')], screen_zone=None, end_on='已设置 turnloc on')
+        self.assertIs(self.cfg_after.get('reloc_before_turn'), True)
+
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)
         car = self.run_live(1, dict(scale=-0.01, drift_deg=-0.08, resid_deg=0.3, slip=0.01), cfg_extra=dict(race_auto=False),

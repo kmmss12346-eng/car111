@@ -1035,6 +1035,17 @@ def main():
             write_json_safe(p_,file_cfg())
             print('已设置 full on：一直跑完全程(下一次 go / race 起作用，存进配置)' if parts[1]=='on' else
                   '已设置 full off：3 分钟内回家，150 秒以后不再开始新的夹放、来不及就直接回家(下一次 go / race 起作用，存进配置)',flush=True);return
+        if k=='turnloc':
+            # (10-27 用户"到了转弯的地方不应该是立马转过去吗")离黄色区/工位/场地边近的转弯，转之前先停下用雷达确认位置(reloc_before_turn)
+            on_=bool(raw_cfg.get('reloc_before_turn',True))
+            if len(parts)==1:
+                print(('现在：turnloc on，离黄色区/工位/场地边近的转弯先停下用雷达确认位置再转(没对上就照推算的转)' if on_ else
+                       '现在：turnloc off，每个弯都直接转，不停下来用雷达确认位置')+'。改：turnloc on / turnloc off',flush=True);return
+            if len(parts)!=2 or parts[1] not in ('on','off'):raise ValueError('格式：turnloc on(转弯前确认位置) / turnloc off(直接转)')
+            save_cfg_keys({'reloc_before_turn':parts[1]=='on'})
+            print('已设置 turnloc on：离黄色区/工位/场地边近的转弯先停下用雷达确认位置(下一次 go / race 起作用，存进配置)' if parts[1]=='on' else
+                  '已设置 turnloc off：每个弯都直接转(下一次 go / race 起作用，存进配置)。★ 推算的位置一路有误差(走 3~4 米差 3~7cm)，'
+                  '模拟里关掉以后转弯时车角会扫进黄色区 5~9cm(规则：这一轮结束)；恢复：turnloc on',flush=True);return
         if k=='zmargin':
             # (10-27 用户"轮子不是可以自由移动吗")车轮对准 2 号环时车身离这个工位(粗加工区/暂存区)最少留多少毫米：mission_cfg.zone_align_margin_mm
             mc_=dict(raw_cfg.get('mission_cfg') or {})
@@ -1249,6 +1260,7 @@ def main():
     print('比赛前选：full on = 一直跑完全程 / full off = 3 分钟内回家(拿按时返回、显示统计的分)；full = 看现在是哪个。check = 比赛前自检(车不动)。',flush=True)
     print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
     print('工位对 2 号环只用车轮(手臂不补)：zmargin 5 = 车轮挪的时候车身离粗加工区/暂存区最少留 5mm(只输入 zmargin 看现在多少)。',flush=True)
+    print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)

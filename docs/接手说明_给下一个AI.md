@@ -962,6 +962,13 @@ git_log.txt                ← 分支最近 120 条提交记录
   (以前两个方向一起按 10% 一档少挪)。日志写清楚被什么拦住；车轮到头还差超过 accept_mm 时提示 2 号环的手臂姿态是车贴着工位调的，
   车停在停车点 arm_calib --from A1P 重调(根本解决：2 号环正下方离工位 30~60mm)。这次的情况改完能横移 15mm、还差约 8mm(10 以内照样放)。
   主程序 `zmargin 毫米`(0~30，存进 mission_cfg.zone_align_margin_mm；只输入 zmargin 看现在多少)，test_nav_live.test_zmargin_command_saves。
+- **10-27 转弯停留(用户"为什么每一次转弯的时候停留这么久……到了转弯的地方不应该是立马转过去吗")：**
+  实车日志里转弯前雷达定位(_before_turn，离黄色区/工位/场地边近、推算误差可能比余量大时)每次都先"车不动：太久没动，升降往下 4mm
+  再回来"：make_tick 按"离上次摆多久"算，车开完 3~5 秒的直线以后第一次 tick 就摆。改：tick.moved()(_Drive._send / _turn / 停车点做完调 `_moved`)，
+  按"车多久没动"算，刚开完一段定位不摆(test_nav_drive.test_no_keepalive_twitch_right_after_driving)。
+  转弯前定位本身不能去掉：test_nav_route 那两条路线、误差 1.2~2% 时关掉它车角扫进黄色区 47~90mm，开着最近 9.5~13mm；实车一次定位到
+  横 35mm、前后约 67mm 的偏差。但实车 5 次里 4 次没对上(28%、28%、0%、点太少 61 个；要 45%)，没对上照推算转。主程序 `turnloc on/off`
+  存 reloc_before_turn(默认 on，off 时提醒风险；test_nav_live.test_turnloc_command_saves)。转弯本身 R 90 实车 2.0 秒(speed fast 以后；以前 3.2~3.7)。
   sim ZoneCalTests.test_stop_close_to_zone_wheels_reach_ring2_without_arm(停车点 [1270,345,180] 雷达那边朝区，余量 30 就是实车那一次)。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
