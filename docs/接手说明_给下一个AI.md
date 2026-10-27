@@ -775,7 +775,6 @@ git_log.txt                ← 分支最近 120 条提交记录
     program.s 里 baud 改成 9600(新版软件默认 115200)。固件 scr_box：t0/t7 整宽两行大字，t2/t3 最下一行左右两半中字，
     Screen_Text 取文字里最后一个数，前面加 GB2312 "抓取"(D7A5C8A1)/"放置"(B7C5D6C3)；t1/t4/t5/t6 不再画。
     树莓派 _show_stats 跑的时候不写(screen_stats_live=false)，_start 回到启停区才写 GRAB n / PLACE n。竖屏没做(放不下 8 个 120 像素的大字)。
-    (10-27 晚改成读到码以后一直显示抓取数、放置数：screen_counts_live，见后面"10-27 晚 屏上抓取/放置数")
   - race：race_start 默认 'now' = ZONE LOCK 清屏、不出 START，切区直接开跑(和 zone n + go 一样，开跑后扫描、规划)；'screen' = 以前屏上按 START。
   - 一键启动 = 整车电闸(用户"一键启动是一个物理的上电开关""这个电就是整车的电闸")：固件 Boot_Keepalive(上电后、第一条机械臂指令之前每 6 秒升降上下 4mm，
     最多 90 秒)；树莓派 `bootrace 1|2|off` 存配置 boot_race/start_zone(start_zone 改 zone_snap 才写得进文件)，install_boot_race.sh 装
@@ -1041,24 +1040,13 @@ git_log.txt                ← 分支最近 120 条提交记录
   ZoneFlowTests.test_return_from_the_tray_learns_its_bias(同一个动作时不学偏差、也不用再转一次，学偏差只在关掉时有用)、
   ZoneFlowTests.test_drives_straight_to_each_ring_in_code_order(一个环一个环挪车的旧做法，车上不用：同一个动作时 60 个种子底盘平均多修 0.3 下
   (0.87 -> 1.20)、种子 0 修了 5 下超过 ≤4，放置一样准；多半是模拟随机数用得不一样，没细查)。
-- **10-27 晚 粗加工区取回不再花时间"对准"(用户"车在粗加工区域……放置完了还要夹取回车上，夹取回车上的时候不要再花时间对准了直接夹取就行了")：**
-  车没动、只转手臂放的取回(direct)本来就不用摄像头，但 _goto_recorded → _return_to_pose(from_tray) 走的是 f97944d 的"同一个动作到位"
-  (先往转盘那边多转约 5°、再分两下慢慢转回来)，回读差 0.15° 以上再转、最多两次——看着就是在对准，每个多 1~2 秒。
-  改：`pickback_quick`(默认 True)：direct 的取回 `_quick_to_pose` 一条 APZ 转到放下时的角度(边转边降到 ZOBRNG)，回读一次，
-  ID1 差 `pickback_tol_deg`(1°)以上才 _ap_from_tray_side 补一下，接着 PICK。挪过车放的(direct=False，老做法)照旧回到记录位置 + 摄像头对准
-  (sim 里那条老路一律直接夹会夹空 4 个、碰倒 5 个，没改)。sim ZoneCalTests.test_pickback_goes_straight_to_the_placed_angles
-  (6 个取回 86.2 秒，以前 90.4 秒，没有"再转一次")。同一天用户选了"两处都是"，我把原料区也改成第二次来不对准，
-  用户纠正"我的意思是粗加工区……夹取回车上"，原料区那个撤回了、没提交，别再加。
-- **10-27 晚 屏上抓取/放置数(用户"这个屏幕只显示数字抓取和放置的个数没有显示了")：**
-  10-23 起抓取数、放置数只在回到启停区(_start)才写：没回到启停区(停掉、分段调试、出错)屏上就只有任务码。回家以后也可能只剩任务码：
-  ①回家收臂(PARK，升降停 60)时屏要是掉电重启，固件只重画 STM32 自己读到的任务码；②树莓派同样的字不重发(arm_link._screen_last)。
-  改：树莓派 `screen_counts_live`(默认 True，新键；旧键 screen_stats_live 不再读，apply_mission_config 写进车上配置的旧默认值 false 会挡住它)：
-  读到任务码以后 _show_stats 写 GRAB 0 / PLACE 0，做成一个改一次(读到码以前不写，开跑前屏上照旧什么都没有)；
-  _start 收臂以后 screen_reset，任务码、抓取数、放置数再写一遍，没写成(arm_link.screen 现在返回 True/False)歇 0.2 秒再写一次。
-  固件 arm.c(要烧录)：画模式下每个框最后画的字记在 scr_last(Screen_Box 画、Screen_Text 记、Screen_Clear 清)，屏重新上电(88 FF FF FF)时
-  Screen_Redraw 全部重画(任务码、抓取数、放置数，不管是谁写的)；t0 没画过、STM32 又读到了码才 QR_Draw。
-  测试：test_arm 370 项(新加 5 项，旧固件有 3 项不过)；sim MissionSimTests.test_screen_counts_shown_while_running、
-  test_screen_rewritten_after_screen_reboot_at_home(旧代码两项都不过)。每写一次屏约 50ms(9600 波特率)，一轮最多多写 18 次(约 1 秒)。
+- **10-27 晚 用户要求恢复成 ring_1027d 的状态(用户"调试了半天……没有你一开始给我的那一版……怎么恢复之前的状态"，发了另一个窗口
+  发 ring_1027d.zip 那条消息的截图："就是恢复成这个状态")：** ring_1027d.zip 的 mission_hooks.py、arm_link.py、map_merge_live.py
+  和 f97944d 一模一样。之后树莓派上的两处改动撤回了(这次提交)：a3f8e57 粗加工区取回直接夹(pickback_quick)、4413e14 的树莓派部分
+  (读到码以后一直显示抓取/放置数 screen_counts_live、回家收臂后强制重写)。现在 arm_patch/pi 和 f97944d 完全一样。
+  4413e14 的固件部分留着：屏重新上电时把画过的字(任务码、抓取数、放置数)全部重画(scr_last/Screen_Redraw)，和树莓派的改动无关、不影响对准。
+  这两样别再加回去，除非用户再要。用户同时说"现在这个二号也对不齐了"：撤回的两处都不碰 2 号环对准；恢复以后还对不齐，
+  先看标定(A1P/A2P、红十字、停车点)和机械(10-27 早上 ID2 齿条滑过齿)，要日志里 2 号环那几行。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

@@ -423,9 +423,6 @@ DEFAULTS = dict(
     #   (有 vcal RING 量过的车轮和画面的对应关系时不用这个，按 ring_order 推)
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': 150.0, '2': 0.0, '3': -150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
-    pickback_quick=True,                # (10-27 用户"夹取回车上的时候不要再花时间对准了直接夹取就行了")车没动、只转手臂放的取回：一条指令转到放下时的
-                                        #   角度(边转边降)，不再先多转再分两下慢慢转回来、不再一遍遍回读再转；只回读一次，差 pickback_tol_deg 以上才补一下
-    pickback_tol_deg=1.0,
     # (10-22 用户"这个也要按顺序来")粗加工区/暂存区(含码垛)一律按任务码的顺序放(规则：必须按照任务码的顺序和位置放置)。
     #   以前的 place_order='sweep'(顺路 3→2→1)去掉了：车上配置里还写着也不再用
     zone_timeout_s=None,                # 工位里一次对准最多用几秒(到了还差一点点也按 accept_mm 放，不一直磨)
@@ -441,9 +438,7 @@ DEFAULTS = dict(
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),
     screen_show=('code', 'code2', 'grab', 'place'),   # (10-23 用户"按要求显示必要的字")屏上只写这几样：任务码两行、抓取数、放置数
-    screen_counts_live=True,            # (10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码以后最下面一行一直显示
-                                        #   "抓取n 放置n"(新固件画成中文；从 0 开始，做成一个改一次，回到启停区再写一次)；
-                                        #   false = 10-23 的做法(回到启停区才写)。以前的键 screen_stats_live 不再读(车上配置里可能存着它的旧默认值 false)
+    screen_stats_live=False,            # (10-23 晚)抓取数、放置数只在回到启停区以后写(新固件画成中文"抓取3  放置5")；true = 跑的时候也写
                                         #   (赛规：一直显示任务码，回家后显示正确抓取数、正确放置数)；阶段、提示、B1/B2 只在终端日志里   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
 
@@ -1048,7 +1043,7 @@ class MissionHooks:
                 if ok is False:
                     raise ArmError('QR CLR 没有回 DONE')
                 self._screen_clear()                # (10-23)清屏：上一次的任务码擦掉，读到码再写
-                self._show_stats()                  # 已经有任务码才写抓取0、放置0(一般这时还没读到码：屏上什么都没有)
+                self._show_stats()                  # screen_stats_live=true 才写 GRAB 0、PLACE 0(默认回家才写)
                 self._prep['qr'] = True
                 self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上的字也清了(读到任务码再显示)')
             except Exception as ex:
@@ -1473,15 +1468,13 @@ class MissionHooks:
 
     # ------------------------------------------------------------------ 小工具
     def _ui(self, key, text):
-        """写屏。返回 False = 写了但没写成(串口没回话之类)；别的情况(写成了、不用写)返回 True/None。"""
         if self.arm is None:
-            return None
+            return
         if key not in (self.cfg.get('screen_show') or ()):   # (10-23)屏上只写赛规要的：任务码、抓取数、放置数
-            return None
+            return
         obj = self.cfg['screen'].get(key)
         if obj:
-            return self.arm.screen(obj, text)
-        return None
+            self.arm.screen(obj, text)
 
     def _screen_clear(self):
         """(10-23)清屏回到比赛布局(STM32 的 ZONE LOCK)：上一次跑留下的任务码、旧的字都擦掉。旧固件不认 ZONE 就算了。"""
@@ -1515,10 +1508,9 @@ class MissionHooks:
 
     def _show_stats(self):
         # (10-23)屏上只写做成的个数(GRAB 3、PLACE 5)，和回家以后一样：赛规要显示"正确抓取数量和正确放置数量"，3/6 这种裁判看不懂。
-        #   新固件把 GRAB 3 画成"抓取3"。
-        # (10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码以后就写(抓取0 放置0)，做成一个改一次(同样的字不重发)；
-        #   读到码以前不写(开跑前屏上什么都没有)。screen_counts_live=false：跑的时候不写，回到启停区(_start)才写
-        if not self.cfg.get('screen_counts_live', True) or self.plan is None:
+        # (10-23 晚用户"回启停区后显示中文抓取 n 放置 n")跑的时候不写(屏上只有任务码)，回到启停区(_start)才写；
+        #   新固件把 GRAB 3 画成"抓取3"。screen_stats_live=true 跑的时候也写
+        if not self.cfg.get('screen_stats_live', False):
             return
         self._ui('grab', self.stats.final_grab_text())
         self._ui('place', self.stats.final_place_text())
@@ -6350,9 +6342,9 @@ class MissionHooks:
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在圆环上方)，再挪底盘
         self._zone_back('ROUGH')
 
-    def _goto_recorded(self, zone, item, quick=False):
+    def _goto_recorded(self, zone, item):
         """取回时直接回到放下那一刻的底盘位置和手臂角度(物料就在那儿)。成功回到返回 True；没有记录或不允许返回 False。
-        回去以后下一步的 servo.run 会先测一次：偏差在容差内就不动，直接夹。quick(10-27)：接着直接夹、不用摄像头，见 _quick_to_pose。"""
+        回去以后下一步的 servo.run 会先测一次：偏差在容差内就不动，直接夹。"""
         rec = self.pose_at.get((zone, item.slot))
         if not rec or not self.cfg.get('pickback_fast', True):
             return False
@@ -6364,9 +6356,6 @@ class MissionHooks:
             self.log(f'    底盘回到放下时的位置：前进 {dF:+d}mm、横移 {dS:+d}mm')
             self._zone_v_only = False
             self.act.chassis_move(dS, dF)
-        if quick:
-            self._quick_to_pose(rec['a1'], rec['a2'])
-            return True
         self._return_to_pose(rec['a1'], rec['a2'], from_tray=not self._ring_ready)   # 刚把上一个夹回转盘：从转盘那边转回来
         zobr = float(self.arm.params().get('ZOBRNG', 0.0))
         if zobr > 0.05:
@@ -6404,7 +6393,7 @@ class MissionHooks:
             rec0, d0 = self.pose_at.get((zone, item.slot)), self.act.disp
             direct = bool(rec0 and rec0.get('arm') and self._p2.get(zone) is not None
                           and abs(float(rec0['S']) - float(d0['S'])) < 2.0 and abs(float(rec0['F']) - float(d0['F'])) < 2.0)
-            recorded = self._goto_recorded(zone, item, quick=direct and bool(cfg.get('pickback_quick', True)))
+            recorded = self._goto_recorded(zone, item)
             if recorded and direct:
                 self.log('    按放下时的角度直接取(车没动、只转手臂放的，不再对准)')
                 if self.nogo:
@@ -9118,33 +9107,6 @@ class MissionHooks:
         except Exception:
             return None
 
-    def _quick_to_pose(self, a1, a2):
-        """(10-27 用户"夹取回车上的时候不要再花时间对准了直接夹取就行了")取回(车没动、只转手臂放的)：一条指令转到放下时的角度，
-        边转边降到看圆环的高度(ZOBRNG，接着 PICK 从这里往下)；不再先往车上转盘那边多转、再分两下慢慢转回来，也不一遍遍回读再转。
-        物料就在那儿，爪子张开有余量，差零点几度夹得住。只回读一次：大动作偶尔停偏 pickback_tol_deg 以上才补一下。"""
-        try:
-            zr = float((self.arm.params() or {}).get('ZOBRNG', 0.0))
-        except (TypeError, ValueError):
-            zr = 0.0
-        if zr > 0.05:
-            self.arm.apz(a1, a2, zr)
-        else:
-            self.arm.ap(a1, a2)
-        try:
-            b1, b2 = self.arm.read_angles()
-        except ArmAbort:
-            raise
-        except ArmError:
-            return
-        tol = float(self.cfg.get('pickback_tol_deg', 1.0))
-        if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= 10.0 * tol):
-            return
-        self.log(f'    转到放下时的角度差了 ID1 {b1 - a1:+.1f}°、ID2 {b2 - a2:+.0f}°：补一下')
-        if self._same_approach():
-            self._ap_from_tray_side(a1, a2, cur1=b1)
-        else:
-            self.arm.ap(a1, a2)
-
     def _return_to_pose(self, a1, a2, from_tray=False):
         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。
         from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。
@@ -9481,19 +9443,10 @@ class MissionHooks:
     def _start(self, visit):
         if self.arm is not None:
             self.park()                                          # 收臂、升降停到开机高度 60(下次上电编码器能认出来)；夹着东西时不做
-            reset = getattr(self.arm, 'screen_reset', None)
-            if reset is not None:
-                reset()                                          # (10-27)收臂、升降停 60 时屏可能掉电重启过(画面全没了)：写过的字也再写一次
-            if self.plan is not None:
-                l0, l1 = self.plan.screen_code(self._code_plus())
-                self._ui('code', l0)
-                self._ui('code2', l1)
         s = self.stats
         self._ui('stage', 'DONE')
-        for key, text in (('grab', s.final_grab_text()), ('place', s.final_place_text())):   # 回家以后只显示做成的个数(赛规要"正确的数量")
-            if self._ui(key, text) is False:
-                self.sleep(0.2)
-                self._ui(key, text)                              # (10-27)没写成(串口偶尔一次没回话)：再写一次
+        self._ui('grab', s.final_grab_text())                    # 回家以后只显示做成的个数(赛规要"正确的数量")
+        self._ui('place', s.final_place_text())
         self._ui('msg', f'T={self.elapsed():.0f}s')
         self.log(f'  ■ 回到启停区。用时 {self.elapsed():.0f}s；屏上显示 {s.final_grab_text()}、{s.final_place_text()}'
                  f'(抓了 {s.grab_total} 次、放了 {s.place_total} 次)')
