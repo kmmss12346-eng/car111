@@ -715,6 +715,24 @@ int main(void) {
         scr_in(boot, 4); Arm_Poll();
         CHECK(scrs("\"321+654+\"") && scrs("\"987+123\"") && !scrs("START") && pi[0] == 0,
               "比赛布局时屏重新上电：把任务码重新写上(赛规要一直显示)，不再发给树莓派");
+        /* (10-27 用户"屏幕只显示数字，抓取和放置的个数没有显示了")抓取数、放置数也要重画 */
+        run("SCR t2 GRAB 6"); run("SCR t3 PLACE 12"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("xstr 0,240,240,80,1,0,65535,1,1,1,\"\xD7\xA5\xC8\xA1" "6\"") && scrs("xstr 240,240,240,80,1,0,65535,1,1,1,\"\xB7\xC5\xD6\xC3" "12\"")
+              && scrs("\"321+654+\"") && scrs("\"987+123\"") && pi[0] == 0,
+              "(10-27)屏重新上电：抓取数、放置数和任务码一起重画(以前只重画任务码：回家收臂时屏掉电重启，屏上就只剩任务码)");
+        CHECK(scrs("321+654+") && strstr(strstr(scr, "321+654+") + 1, "321+654+") == 0, "(10-27)屏重新上电：任务码只画一遍");
+        run("SCR t2 GRAB 7"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("\"\xD7\xA5\xC8\xA1" "7\"") && !scrs("\"\xD7\xA5\xC8\xA1" "6\""), "(10-27)重画的是最后一次写的字(抓取7，不是以前的 6)");
+        run("ZONE LOCK"); run("QR CLR"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scr[0] == 0, "(10-27)清过屏(ZONE LOCK)以后屏重新上电：以前的字不再画");
+        run("SCR t0 156+123+"); run("SCR t7 516+231"); run("SCR t2 GRAB 0"); clear();
+        scr_in(boot, 4); Arm_Poll();
+        CHECK(scrs("\"156+123+\"") && scrs("\"516+231\"") && scrs("\"\xD7\xA5\xC8\xA1" "0\"") && !scrs("\xB7\xC5\xD6\xC3"),
+              "(10-27)树莓派写的任务码(扫码器插在树莓派上，STM32 没读到码)：屏重新上电也重画；没写过的放置数不画");
+        run("ZONE LOCK");
         run("QR CLR");
     }
     /* 旧的树莓派程序不发 ZONE LOCK：写 SCR 时自动回到比赛布局 */

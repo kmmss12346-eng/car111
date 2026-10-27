@@ -227,21 +227,23 @@ class ArmLink:
         return bool(ok)
 
     def screen(self, obj, text):
-        """往串口屏的文本控件写字(只能 ASCII，且不超过 STM32 一行 47 字符的限制)。同样的内容不重复发。失败只记日志不抛错。"""
+        """往串口屏的文本控件写字(只能 ASCII，且不超过 STM32 一行 47 字符的限制)。同样的内容不重复发。失败只记日志不抛错。
+        返回 True = 写成了(或者已经是这些字)，False = 没写成。"""
         text = str(text).encode('ascii', 'replace').decode('ascii').replace('"', "'").replace('!', '.')   # '!' = STM32 的急停
         cmd = f'SCR {obj} {text}'[:47]
         if self._screen_last.get(obj) == cmd:
-            return
+            return True
         try:
             ok, reply, _ = self.request(cmd, 2.0)
             if ok:
                 self._screen_last[obj] = cmd
-            else:
-                self.log(f'    (串口屏 {obj} 写入失败：{reply})')
+                return True
+            self.log(f'    (串口屏 {obj} 写入失败：{reply})')
         except ArmAbort:
             raise
         except Exception as ex:
             self.log(f'    (串口屏 {obj} 写入出错：{ex!r})')
+        return False
 
     def screen_reset(self):
         """屏被清过(ZONE LOCK、STM32 重启)：忘掉"已经写过什么"，下次每个控件都重新写。"""

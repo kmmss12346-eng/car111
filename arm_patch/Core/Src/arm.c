@@ -1987,9 +1987,10 @@ static const char *Seq_Park(void)
  *   ├────────────────────────────┤
  *   │          516+231           │  t7 任务码后两组：7 个大字 = 420 宽                 y=120~239
  *   ├──────────────┬─────────────┤
- *   │    抓取6     │   放置12    │  t2 / t3：树莓派回到启停区以后写，程序在数字前面    y=240~319
- *   └──────────────┴─────────────┘     加上"抓取"/"放置"(树莓派发 GRAB 6 / 6 都行，只取数字)
- * 开机、开跑前屏上什么都没有(白底)；读到任务码画 t0、t7。以前的 t1/t4/t5/t6 小字不再画(表里没有的名字画模式下不发) */
+ *   │    抓取6     │   放置12    │  t2 / t3：树莓派写，程序在数字前面加上"抓取"/"放置"   y=240~319
+ *   └──────────────┴─────────────┘     (树莓派发 GRAB 6 / 6 都行，只取数字)
+ * 开机、开跑前屏上什么都没有(白底)；读到任务码画 t0、t7。(10-27)树莓派读到码以后就写 t2/t3(抓取0 放置0，做成一个改一次)，
+ * 回到启停区再写一次。屏重新上电(画面没了)时画过的字全部重画。以前的 t1/t4/t5/t6 小字不再画(表里没有的名字画模式下不发) */
 #define SCR_FONT_BIG   0
 #define SCR_FONT_MID   1
 #define SCR_FONT_SMALL SCR_FONT_MID        /* 以前的选区页(ZONE ASK，旧流程)用的小字：现在只有中字 */
@@ -2002,6 +2003,7 @@ static const ScrBox scr_box[] =
     { "t3", 240, 240, 240,  80, SCR_FONT_MID, 0u, "\xB7\xC5\xD6\xC3" },       /* GB2312 "放置" */
 };
 #define SCR_BOX_N  ((int)(sizeof(scr_box) / sizeof(scr_box[0])))
+static char scr_last[SCR_BOX_N][24];       /* (10-27)每个框最后画的字(抓取/放置已经加上中文)：屏重新上电时全部重画，清屏时清掉 */
 
 static void Screen_Send(const char *buf, int n)
 {
@@ -2017,6 +2019,16 @@ static void Screen_Send(const char *buf, int n)
     }
     HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 100);
     HAL_UART_Transmit(&huart2, (uint8_t *)endb, 3, 100);
+}
+
+/* 画模式：在框 b 里画一行字 */
+static void Screen_Box(const ScrBox *b, const char *text)
+{
+    char buf[96];
+
+    /* xstr x,y,w,h,字库,字色,背景色,水平居中(1中),垂直居中(1中),背景方式(1=纯色，顺便擦掉旧字),"文字" */
+    Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,%u,1,1,1,\"%s\"",
+                              b->x, b->y, b->w, b->h, b->font, (unsigned)g_scrfg, (unsigned)g_scrbg, text));
 }
 
 void Screen_Text(const char *obj, const char *text)
@@ -2045,15 +2057,29 @@ void Screen_Text(const char *obj, const char *text)
                     snprintf(t, sizeof(t), "%s%.*s", b->label, (int)(e - d), d);
                     text = t;
                 }
-                /* xstr x,y,w,h,字库,字色,背景色,水平居中(1中),垂直居中(1中),背景方式(1=纯色，顺便擦掉旧字),"文字" */
-                Screen_Send(buf, snprintf(buf, sizeof(buf), "xstr %d,%d,%d,%d,%d,%u,%u,1,1,1,\"%s\"",
-                                          b->x, b->y, b->w, b->h, b->font, (unsigned)g_scrfg, (unsigned)g_scrbg, text));
+                Screen_Box(b, text);
+                snprintf(scr_last[i], sizeof(scr_last[i]), "%s", text);   /* (10-27)记下来：屏重新上电时重画 */
                 return;
             }
         }
         return;                                    /* 表里没有的名字：画模式下忽略 */
     }
     Screen_Send(buf, snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, text));
+}
+
+/* (10-27 用户"屏幕只显示数字，抓取和放置的个数没有显示了")屏重新上电(电压掉一下屏自己重启，画面全没了)：
+ * 画模式下每个框最后画的字原样重画(任务码、抓取数、放置数，不管是扫码器读到的还是树莓派写的)。以前只重画扫码器读到的任务码 */
+static void Screen_Redraw(void)
+{
+    int i;
+
+    for (i = 0; i < SCR_BOX_N; i++)
+    {
+        if (scr_last[i][0] != 0)
+        {
+            Screen_Box(&scr_box[i], scr_last[i]);
+        }
+    }
 }
 
 /* 直接发一条原始的淘晶驰指令，例如 "page 1"、"t0.pco=63488" */
@@ -2070,6 +2096,7 @@ static void Screen_Clear(void)
 {
     char buf[16];
 
+    memset(scr_last, 0, sizeof(scr_last));         /* (10-27)清了屏：屏重新上电时不再重画以前的字 */
     if (g_scrmode > 0.5f)
     {
         Screen_Send(buf, snprintf(buf, sizeof(buf), "cls %u", (unsigned)g_scrbg));
@@ -2618,7 +2645,8 @@ void Arm_Poll(void)
 
     Arm_Bg_Poll();                                 /* (10-26)PRE 在后台走：车停着的时候也接着走(绕电池盒的伸缩按时发) */
     /* 屏刚重新上电(忘了 sendxy、画面也没了)：选区页还在用就整页重画；
-     * 比赛布局时把任务码重新写上(赛规要一直显示；树莓派写过的同样内容不会再发) */
+     * 比赛布局时把画过的字全部重新写上(任务码、抓取数、放置数：赛规要一直显示；树莓派写过的同样内容不会再发)。
+     * 扫码器读到码的时候选区页还在(任务码还没画过)：现在画 */
     if (scr_boot)
     {
         scr_boot = 0;
@@ -2626,9 +2654,13 @@ void Arm_Poll(void)
         {
             Zone_Show(1);
         }
-        else if (qr_valid)
+        else
         {
-            QR_Draw();
+            Screen_Redraw();
+            if (qr_valid && scr_last[0][0] == 0)    /* scr_box[0] 是 t0 */
+            {
+                QR_Draw();
+            }
         }
     }
     /* 触摸：中断里已经认好了按钮 */

@@ -101,6 +101,9 @@ class SimWorld:
         self.tt_slot = 1
         self.tt_ready = 0.0
         self.screen = {}
+        self.scr_log = []                     # (10-27)每次写成的屏 (控件, 字)，按先后
+        self.screen_wipe_at = None            # (10-27)例如 ('PARK', 1) = 第 1 次 PARK 时屏掉电重启、画面全没了(这里当作 STM32 什么都没重画)
+        self.scr_fail = []                    # (10-27)这些 SCR 指令(原样)第一次发时回 ERR TIMEOUT(串口偶尔一次没回话)
         self.requests = []
         self.abort_flag = False
         self.abort_at = abort_at              # 例如 ('GRAB', 2) = 第 2 次 GRAB 时被急停
@@ -540,6 +543,8 @@ class SimWorld:
             self.trk = None                                    # 别的转动指令接管舵机：APN 的目标作废
         self.advance(DUR.get(verb.rstrip('?'), 0.0) if verb != 'A?' else DUR['A'])
         n = self.count[verb] = self.count.get(verb, 0) + 1
+        if self.screen_wipe_at and verb == self.screen_wipe_at[0] and n == self.screen_wipe_at[1]:
+            self.screen = {}                                   # (10-27)这条指令做的时候屏掉电重启：画面全没了
         if self.abort_at and verb == self.abort_at[0] and n == self.abort_at[1]:
             return False, 'ERR ABORT', info
         fail_at = None
@@ -620,8 +625,12 @@ class SimWorld:
                 self.qr_code = None
             return True, 'DONE', info
         if verb in ('SCR', 'SCMD'):
+            if verb == 'SCR' and text in self.scr_fail:
+                self.scr_fail.remove(text)
+                return False, 'ERR TIMEOUT', info
             if verb == 'SCR' and len(parts) >= 3:
                 self.screen[parts[1]] = text.split(' ', 2)[2]
+                self.scr_log.append((parts[1], self.screen[parts[1]]))
             return True, 'DONE', info
         if verb == 'CLAW':
             if parts[1] in ('OR', 'OT') and not self.claw3_fw:
@@ -1246,6 +1255,40 @@ class MissionSimTests(unittest.TestCase):
         self.assertTrue(scr)
         self.assertEqual({r.split()[1] for r in scr}, {'t0', 't7', 't2', 't3'}, scr)
         self.assertFalse([r for r in scr if '/' in r], '跑的过程中也只写做成的个数(GRAB 3，不写 GRAB 3/6)')
+
+    def test_screen_counts_shown_while_running(self):
+        """(10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码就显示抓取0 放置0，做成一个改一次；
+        回到启停区收臂以后任务码、抓取数、放置数都再写一次(收臂时屏可能掉电重启过)。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        h = make(w)
+        run_mission(w, h)
+        self.assertEqual([o for o, _t in w.scr_log][:2], ['t0', 't7'])       # 读到码以前屏上什么都没有：最先写的是任务码
+        self.assertEqual([t for o, t in w.scr_log if o == 't2'], [f'GRAB {i}' for i in range(7)] + ['GRAB 6'])
+        self.assertEqual([t for o, t in w.scr_log if o == 't3'], [f'PLACE {i}' for i in range(13)] + ['PLACE 12'])
+        g1 = next(i for i, r in enumerate(w.requests) if r.startswith('GRAB'))
+        self.assertIn('SCR t2 GRAB 0', w.requests[:g1])                     # 第一个物料夹起来以前就有抓取0、放置0
+        self.assertIn('SCR t3 PLACE 0', w.requests[:g1])
+        k = max(i for i, r in enumerate(w.requests) if r == 'PARK')
+        self.assertEqual([r for r in w.requests[k + 1:] if r.startswith('SCR')],
+                         ['SCR t0 156+123+', 'SCR t7 516+231', 'SCR t2 GRAB 6', 'SCR t3 PLACE 12'])
+        w2 = SimWorld(seed=1, code=self.CODE)
+        run_mission(w2, make(w2, dict(screen_counts_live=False, screen_stats_live=True)))
+        self.assertEqual([t for o, t in w2.scr_log if o in ('t2', 't3')], ['GRAB 6', 'PLACE 12'])   # false：回到启停区才写(旧键不再读)
+
+    def test_screen_rewritten_after_screen_reboot_at_home(self):
+        """(10-27)回到启停区收臂、升降停 60 的时候屏掉电重启(画面全没了)：树莓派收完臂再把任务码、抓取数、放置数写一遍
+        (以前同样的字不重发，屏上就什么都没有了)；写失败(串口一次没回话)再写一次。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        w.screen_wipe_at = ('PARK', 1)
+        run_mission(w, make(w))
+        self.assertEqual(w.screen, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 6', 't3': 'PLACE 12'})
+        w = SimWorld(seed=1, code=self.CODE)
+        w.screen_wipe_at = ('PARK', 1)
+        w.scr_fail = ['SCR t3 PLACE 12', 'SCR t3 PLACE 12']                # 跑的时候、回家以后第一次都没写成
+        lines = []
+        run_mission(w, make(w, log=lines.append), log=lines.append)
+        self.assertEqual(w.screen['t3'], 'PLACE 12')
+        self.assertIn('串口屏 t3 写入失败', '\n'.join(lines))
 
     def test_chassis_returns_to_stop_point(self):
         w = SimWorld(seed=2, code=self.CODE)
