@@ -4313,6 +4313,36 @@ class ZoneCalTests(unittest.TestCase):
                     self.assertIn('能挪的范围限成', text)
                     self.assertEqual(h.stats.place_ok, 0, text[-3000:])
 
+    def test_stop_close_to_zone_wheels_reach_ring2_without_arm(self):
+        """(10-27 实车粗加工区"这是为什么没有对准就停了"：存的停车点车身离粗加工区只剩 20mm，2 号环还要往区那边横移 23mm，按导航的
+        余量 30mm 只许挪 9mm、还差 12.6mm，整个区不放。用户"不能拿机械臂补……轮子不是可以自由移动吗")车轮对准 2 号环时离这个工位
+        只留 zone_align_margin_mm(5mm)：车轮横移 15mm(车身离粗加工区还剩 5mm，不压进去)，还差 8mm 照样放，三个都放了，手臂一下都不补。
+        zone_align_margin_mm=30 就是以前：限住、这个区不放，并且说清楚是 2 号环的手臂姿态调的时候车贴着工位。"""
+        import re
+        pose = [1270.0, 345.0, 180.0]          # 车头朝西：左边(雷达那边)朝南 = 粗加工区；车身南边 345-130-45=170，离区 20mm
+        for margin in (5.0, 30.0):
+            w = self._world(3, park={'ROUGH': 0.0}, park_side={'ROUGH': 23.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, dict(zone_align_margin_mm=margin), lines=lines, raw={'stops': {'ROUGH': pose}})
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            w.arrive('ROUGH', 1)
+            h.task('ROUGH', w.link, lines.append)
+            text = '\n'.join(lines)
+            self.assertIn('能挪的范围限成', text, text[-3000:])
+            self.assertIn('车身离粗加工区不到', text, text[-3000:])
+            self.assertNotIn('手臂补', text)
+            s_end = [int(m) for m in re.findall(r'车轮停在 横移 ([+-]\d+)mm', text)]
+            self.assertTrue(s_end, text[-3000:])
+            if margin < 10.0:
+                self.assertTrue(13 <= s_end[0] <= 15, (s_end, text[-3000:]))
+                self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+                self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+                self.assertNotIn('这个区这次不放', text)
+            else:
+                self.assertLessEqual(s_end[0], 10, s_end)
+                self.assertEqual(h.stats.place_ok, 0, text[-3000:])
+                self.assertIn('2 号环正下方离工位太近', text)
+
     def test_calc_wheels_only_never_moves_the_arm_and_reaches_far(self):
         """(10-21 用户"修正距离可以放开")车离圆环那一排远了 100mm(以前车轮横移最多 70mm、剩下的手臂补)：知道停车点在地图上哪儿
         (能查车身碰不碰工位/场地边)时只用车轮横着挪过去对准，手臂停在看圆环的姿态一下都不动，三个都放准。"""

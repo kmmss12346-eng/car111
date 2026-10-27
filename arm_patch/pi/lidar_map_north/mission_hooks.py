@@ -359,6 +359,9 @@ DEFAULTS = dict(
     zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)沿圆环那一排离停车点这么近以内不按地图查：
                                         #   地图查是按"车正好停在规划的停车点"算的，车本来就停偏了才要挪；对准的地方就是 arm_calib 调 2 号环时车停的地方
     zone_map_free_s_mm=10.0,            #   横着(往工位那边/往外)只有这么近以内不查：横着挪压进工位、别的颜色区域这一轮就结束了，照样按地图查
+    zone_align_margin_mm=5.0,           #   (10-27 用户"轮子不是可以自由移动吗"：车身离粗加工区 20mm，按导航的余量 30mm 只许横移 9mm，还差 12.6mm 整个区不放)
+                                        #   车轮对准 2 号环时车身离这个工位最少留多少毫米(车慢慢挪、摄像头看着，不用导航那么大的余量)；只管这个工位，
+                                        #   离黄色区、场地边、别的区照旧按 qr_zone_margin_mm。规则：车身(机械臂除外)压进工位这一轮就结束，不能小于 0
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
     zone_cal_over_deg=dict(id1=2.0, id2=40.0),   # 1、3 号环按调的角度(加上 2 号环对准时手臂补的)超出限位不到这么多度：按限位放；再多就这个环不放(车不挪)
     zone_cal_min_deg=5.0,               # 1、3 号环存的 ID1 比 2 号环转得不到这么多度：多半是没调就回车了(存成 0)，当没调
@@ -3930,9 +3933,10 @@ class MissionHooks:
             self.log(f'    (读地图障碍物出错：{ex!r})')
             return []
 
-    def _body_clear(self, pose, d, obstacles):
+    def _body_clear(self, pose, d, obstacles, work=None):
         """车从停车点 pose 挪 d = [横移(左+), 前进] 毫米以后，车身(含雷达)离场地边、黄色区/工位、障碍物够不够远(原料转盘不查：
-        往原料盘那边能挪多少另外限着)。返回 (行不行, 原因)。"""
+        往原料盘那边能挪多少另外限着)。work = (工位 'ROUGH'/'TEMP', 余量 mm)：离这个工位只按这个余量查(10-27：车轮对准 2 号环时用，
+        比导航的 qr_zone_margin_mm 小)，别的照旧。返回 (行不行, 原因)。"""
         cfg, rc = self.cfg, self.raw_cfg
         x0, y0, h = pose
         a = math.radians(h)
@@ -3949,26 +3953,32 @@ class MissionHooks:
         try:
             import route_plan as rp
             field = float(getattr(rp, 'FIELD', 2400))
-            rects = list(getattr(rp, 'YELLOW', [])) + [getattr(rp, 'TEMP_ZONE', (0, 910, 150, 1490)),
-                                                        getattr(rp, 'ROUGH_ZONE', (910, 0, 1490, 150))]
+            zones = {'TEMP': tuple(getattr(rp, 'TEMP_ZONE', (0, 910, 150, 1490))),
+                     'ROUGH': tuple(getattr(rp, 'ROUGH_ZONE', (910, 0, 1490, 150)))}
+            rects = list(getattr(rp, 'YELLOW', [])) + [zones['TEMP'], zones['ROUGH']]
         except Exception:
             field = 2400.0
+            zones = {'TEMP': (0, 910, 150, 1490), 'ROUGH': (910, 0, 1490, 150)}
             rects = [(550, 1400, 1000, 1850), (1400, 1400, 1850, 1850), (550, 550, 1000, 1000), (1400, 550, 1850, 1000),
-                     (0, 910, 150, 1490), (910, 0, 1490, 150)]
+                     zones['TEMP'], zones['ROUGH']]
         rects += [tuple(r) for r in (rc.get('extra_blocked_rects') or [])]
+        wz = zones.get(work[0]) if work else None
         if any(cx < zm or cx > field - zm or cy < zm or cy > field - zm for cx, cy in corners):
             return False, '会出场地'
         for r in rects:
             x0_, y0_, x1_, y1_ = (float(t) for t in r[:4])
+            w_ = wz is not None and tuple(float(t) for t in r[:4]) == tuple(float(t) for t in wz[:4])
+            m_ = max(0.0, float(work[1])) if w_ else zm
             sep = False
             for ax in ((1.0, 0.0), (0.0, 1.0), (fx, fy), (lx, ly)):
                 pa = [cx * ax[0] + cy * ax[1] for cx, cy in corners]
                 pb = [px * ax[0] + py * ax[1] for px in (x0_, x1_) for py in (y0_, y1_)]
-                if min(pa) >= max(pb) + zm or min(pb) >= max(pa) + zm:
+                if min(pa) >= max(pb) + m_ or min(pb) >= max(pa) + m_:
                     sep = True
                     break
             if not sep:
-                return False, '离黄色区/工位太近'
+                return False, (f'车身离{dict(ROUGH="粗加工区", TEMP="暂存区").get(work[0], work[0])}不到 {m_:g}mm(再挪就压进去了)'
+                               if w_ else '离黄色区/工位太近')
         for ox, oy, orr in obstacles or []:
             dx, dy = ox - x, oy - y
             uu, vv = dx * fx + dy * fy, dx * lx + dy * ly
@@ -7127,6 +7137,7 @@ class MissionHooks:
         wonly = bool(cfg.get('zone_wheels_only', True))     # (10-21 用户)只用车轮修，手臂不补
         pose0 = self._stop_pose(zone)
         obs = self._map_obstacles()
+        wk = (zone, max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))))   # (10-27)离这个工位只留这么多(车轮对准 2 号环)
         if wonly and pose0 is not None:                      # 能按地图查车身碰不碰工位/场地边：修正距离放开
             scap = max(scap, float(cfg.get('zone_wheels_s_mm', 150.0)) + abs(float(sh_l)))
             fmax = max(fmax, float(cfg.get('zone_wheels_f_mm', 150.0)))
@@ -7268,7 +7279,7 @@ class MissionHooks:
             if pose0 is not None:
                 s_ok = max(-scap, min(scap, s_t))
                 for _k in range(60):
-                    if self._body_clear(pose0, (s_ok, float(need[1])), obs)[0]:
+                    if self._body_clear(pose0, (s_ok, float(need[1])), obs, work=wk)[0]:
                         break
                     s_ok = s_ok - math.copysign(min(5.0, abs(s_ok)), s_ok)
                     if abs(s_ok) < 1e-6:
@@ -7332,7 +7343,7 @@ class MissionHooks:
                 fpos = float(drv.pos()[1])
                 if fpos >= f_end - 0.5:
                     break
-                if pose0 is not None and not self._body_clear(pose0, (float(drv.pos()[0]), fpos + 20.0), obs)[0]:
+                if pose0 is not None and not self._body_clear(pose0, (float(drv.pos()[0]), fpos + 20.0), obs, work=wk)[0]:
                     why = f'往前 {fpos - f0:.0f}mm 再走车身会碰到东西(按地图)，没看清圆环'
                     break
                 drv.send(0.0, seek_v, run_s=min(1.0, (f_end - fpos) / seek_v))
@@ -7453,23 +7464,39 @@ class MissionHooks:
             按地图查过车身不碰工位/场地边/障碍物(碰就少挪)。返回 (位置, 被限了没有)。"""
             t2 = np.array([max(-scap, min(scap, float(t[0]))), max(float(drv.lo[1]), min(float(drv.hi[1]), float(t[1])))])
             cl = float(np.linalg.norm(t2 - t)) > 0.5
+            note.pop('clamp_why', None)
             free_f = float(cfg.get('zone_map_free_mm', 60.0))
             free_s = float(cfg.get('zone_map_free_s_mm', 10.0))
 
             def ok_(q):
                 """离停车点这么近(沿那一排 free_f 以内、横着 free_s 以内)不按地图查；再远按地图查过车身不碰东西才行。
-                横着往工位那边挪照样按地图查(压进工位/别的颜色区域这一轮就结束了)。"""
+                横着往工位那边挪照样按地图查(压进工位/别的颜色区域这一轮就结束了；离这个工位只留 zone_align_margin_mm)。"""
                 if abs(float(q[0])) <= free_s and abs(float(q[1])) <= free_f:
                     return True
-                return self._body_clear(pose0, (float(q[0]), float(q[1])), obs)[0]
+                ok, why = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk)
+                if not ok:
+                    note['clamp_why'] = why
+                return ok
+
+            def most(q0, q1):
+                """从 q0(行)往 q1(不行)最远能挪到哪(二分，0.1mm 以内)。"""
+                lo_, hi_ = 0.0, 1.0
+                for _ in range(14):
+                    mid = 0.5 * (lo_ + hi_)
+                    if ok_(q0 + (q1 - q0) * mid):
+                        lo_ = mid
+                    else:
+                        hi_ = mid
+                return q0 + (q1 - q0) * lo_
             if pose0 is not None and not ok_(t2):
-                for fr_ in np.linspace(0.9, 0.0, 10):
-                    q = a + (t2 - a) * fr_
-                    if ok_(q):
-                        t2, cl = q, True
-                        break
+                cl = True
+                qf = np.array([float(a[0]), float(t2[1])])        # (10-27)前后照走，只少横移(以前横移、前后一起按比例少挪)
+                if ok_(qf):
+                    t2 = most(qf, t2)
+                elif ok_(a):
+                    t2 = most(np.asarray(a, float), t2)
                 else:
-                    t2, cl = a.copy(), True
+                    t2 = a.copy()
             return t2, cl
 
         def calc(c_f):
@@ -7512,7 +7539,8 @@ class MissionHooks:
                         return False, True, False, False, em_, False
                     return False, False, False, False, em_, not wonly  # 剩下不到 1mm 车轮挪不准：手臂补(只用车轮时就到这里)
                 self.log(f'    {"" if it == 0 else "再"}算一次：2 号环偏 {em_:.1f}mm，车停着算好要 横移 {d[0]:+.0f}mm、前进 {d[1]:+.0f}mm'
-                         + (f'(能挪的范围限成 横移 {da[0]:+.0f}、前进 {da[1]:+.0f})' if cl else '') +
+                         + ((f'(能挪的范围限成 横移 {da[0]:+.0f}、前进 {da[1]:+.0f}'
+                             + (f'：{note["clamp_why"]}' if note.get('clamp_why') else '') + ')') if cl else '') +
                          ('，慢慢走过去' if calc_smooth and not note.get('no_v') else '，一次挪过去'))
                 went = False
                 if calc_smooth and not note.get('no_v'):
@@ -7601,8 +7629,18 @@ class MissionHooks:
                 return out
             if wonly:                                         # (10-21 用户)只用车轮：手臂一下都不动，还差不到 accept_mm 照样放
                 out['ok'] = em <= acc
+                cw_ = str(note.get('clamp_why') or '') if edge else ''
+                at_zone = '压进去' in cw_                       # (10-27)车轮是被"再挪车身就压进这个工位"拦住的
+                if out['ok'] and at_zone and em > tol:
+                    self.log(f'    (车轮被工位边拦住，2 号环还差 {em:.1f}mm，在 {acc:g}mm 以内照样放；想放得更准：车停在停车点，'
+                             'python3 arm_calib.py --from A1P 重调 2 号环的手臂姿态，手臂多伸一点)')
                 if not out['ok']:
                     out['why'] = f'只用车轮对准还差 {em:.1f}mm(超过 {acc:g}mm，手臂不补)'
+                    if cw_:
+                        out['why'] = f'车轮挪到头了还差 {em:.1f}mm({cw_}' + ('；规则：车身压进工位这一轮就结束)' if at_zone else ')')
+                    if at_zone:
+                        self.log('    ★ 2 号环正下方离工位太近：2 号环的手臂姿态(arm_calib 的 A1P/A2P)是车贴着工位时调的。'
+                                 '车停在停车点(车身离工位 30~60mm)，python3 arm_calib.py --from A1P 重调，手臂多伸一点够到 2 号环')
                 return out
             # 车轮到头了/到时间了/没进展：只动手臂补剩下的(车不动)
             if store.get('RING', 'arm') is None:
