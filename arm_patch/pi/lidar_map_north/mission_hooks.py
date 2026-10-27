@@ -40,7 +40,7 @@ import time
 
 import numpy as np
 
-from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort, unknown_cmd
+from arm_link import ArmLink, ArmActuators, ArmError, ArmAbort, unknown_cmd, approach_id1
 from task_plan import parse_code, TaskError, role_of, Stats, COLOR_NAMES
 from visual_servo import VisualServo, JacStore
 from vision import Vision, VisionError, apply_vision_cal, load_vision_cal
@@ -326,14 +326,22 @@ DEFAULTS = dict(
     zone_backlash_deg=2.0,              # (10-27 实车 ID1 齿轮间隙约 2°：微调时手臂一下都不动，调好了放下去 3 号环还偏)手臂转到圆环上方的角度时，
                                         #   ID1 最后一下总是从车上转盘那一边转到位(和夹着物料从转盘转回来放的方向一样)：要往转盘那边转就先多转这么多度
                                         #   再转回来。1、3 号环微调、对准 2 号环前回到 A1P、放之前回到对准角度"再转一次"都这样。0 = 不管间隙(以前)
-    zone_backlash_extra_deg=1.0,        # (10-27 晚，实车 1 号环卡在差 3.3mm 不动)上面"先多转"的是 间隙 + 这么多度(默认一共 3°)。实测间隙 2.3°，
-                                        #   多转的那一下 STM32 还会提前 0.3° 停：只多转 2°，舵机走不完间隙、手臂不动，转回来那一下也碰不到手臂，
-                                        #   往转盘那边的小修正全被间隙吃掉。0 = 只多转一个间隙(10-27 上午那版)
+    zone_backlash_extra_deg=3.0,        # (10-27 晚，实车 1 号环卡在差 3.3mm 不动)上面"先多转"的是 间隙 + 这么多度(默认一共 5°)。实测间隙 2.3°，
+                                        #   多转的那一下 STM32 还会提前 0.3° 停，ID1 还有摩擦(零点几度的一小下舵机转了、手臂被卡着不动，下一下才一起跳过去)：
+                                        #   多转的要比 间隙 + 摩擦 大，不然舵机走不完、手臂不动，转回来也带不动手臂。转回来那一段分几下、每下不到 3.5°
+                                        #   (arm_link.approach_id1：STM32 一下转 4.5° 以上是快速转的，停的地方差 1° 多)。
+                                        #   10-27 晚第一版是 1(共 3°)：实车往回修的一小下还是常常先不动、再一下跳过头。0 = 只多转一个间隙(10-27 上午那版)
+    zone_same_approach=True,            # (10-27 晚，用户"最后每一个环还是有一点点偏差")ID1 每次都用同一个动作到位：先转到要的角度往车上转盘那边多转
+                                        #   (间隙 + zone_backlash_extra_deg)的地方，再转回来——不管这一下往哪边修。1、3 号环微调的每一下、夹着物料从转盘
+                                        #   转回来放之前、对准 2 号环前回到 A1P、码垛缩着转到要放的环都这样：手臂每次被一样地带过去(摩擦卡住的量也一样)，
+                                        #   微调好的位置就是放下的位置。False = 只在要往转盘那边转时这样(10-27 那版)
     zone_atol_comp=None,                # (10-27 实车"调了这么久但是机械臂位置基本没有变")STM32 的 AP 离目标还差 ATOL(0.3°)以内就算到了、停下，
                                         #   还差不到 ATOL 的干脆不转：1 号环那里零点几度的小修正等于没转。1、3 号环微调的每一下、回到 A1P、放之前
                                         #   "再转一次"，ID1 往转的方向多给这么多度，停下的地方才是要的地方。None = ATOL 的 0.7 倍；0 = 不补(以前)
     return_tol_fine_deg=0.15,           # (10-27)从车上转盘转回对准的角度(放 1、2、3 号环之前)：差这么多以上就再转一次(以前 0.4°，
                                         #   1 号环离转轴最远，0.4° 在那里约 1.7mm)；zone_atol_comp 是 0 时照旧按 return_tol_deg
+    zone_cal_fine_tol_mm=1.0,           # (10-27 晚)1、3 号环摄像头微调对到多少毫米以内才算"微调好了"(和 tol_mm.RING 取小的)。以前按 tol_mm.RING，
+                                        #   车上是 3mm：差 2.9mm 也算好了、按这个放。主程序 rtol 看/改
     zone_cal_fine_max_mm=30.0,          #   一开始就差这么多以上：多半认错了环(或者车停偏太多)，不信它，按调的角度放
     zone_smooth=True,                   # 对准 2 号环(align_by 是 wheels 时)：像原料区一样车轮连续慢慢走(只发 V 速度，不转车头)，边走边每帧认 2 号环，
                                         #   越近越慢，停着看几帧确认对准；跟丢了停下重新找。要 STM32 认 V、vcal RING 量过车轮和画面的对应关系
@@ -345,7 +353,8 @@ DEFAULTS = dict(
     zone_seek_speed=10.0,               #   往前找的速度(毫米/秒)
     zone_vel_speed=15.0,                #   车轮最快多少毫米/秒(偏多少毫米就每秒走多少，越近越慢)
     zone_vel_min_speed=5.0,             #   最慢多少毫米/秒(太慢电机按 0 转/分算会不动)
-    zone_vel_tol_mm=None,               #   车轮对到多少毫米以内算对准(停着拍 3 帧取平均)；None = tol_mm.RING
+    zone_vel_tol_mm=1.5,                #   车轮对 2 号环到多少毫米以内算对准(停着拍 3 帧取平均；和 tol_mm.RING 取小的；None = tol_mm.RING)。
+                                        #   (10-27 晚，以前 None：车上 tol_mm.RING 是 3mm，差 2.9mm 也算对准了不再挪)主程序 rtol 看/改
     zone_find_s=60.0,                   #   找 + 对准一共最多多少秒((10-25 用户"识别时间改长，每一个地方都要做完")40 -> 60)
     zone_lost_s=3.0,                    #   对准时连着几秒认不出 2 号环算跟丢了：停下重新找(停着找 2 倍这么久)
     zone_look_s=15.0,                   #   一开始停着找 2 号环最多多少秒(车没动，找不到多半是认不出：暂存区第二批 2 号环被物料盖住时改认物料)。(10-25)10 -> 15
@@ -6951,7 +6960,8 @@ class MissionHooks:
             self.arm.ap(a1 + side * bl, a2)
         comp = self._id1_comp()
         if bl > 0.0:
-            self.arm.ap(a1 - side * comp, a2)                 # 往 a1 转(从转盘那边过来)：多给 comp，STM32 提前停下的地方才是 a1
+            # 往 a1 转(从转盘那边过来)：多给 comp，STM32 提前停下的地方才是 a1；(10-27 晚)转回来每一下不到 4.5°(approach_id1)
+            approach_id1(self.arm, a1 + side * bl, a1 - side * comp, a2)
         self._ring_ready = True                               # 张着爪停在圆环上方的观察高度
         t0 = self.now()
         kw = self._arm_only_kw(a1, a2)
@@ -6966,16 +6976,19 @@ class MissionHooks:
                 atol = 0.3
             kw['min_step'] = {'id1': max(0.05, atol - comp + 0.05)}
         act = getattr(self.servo, 'act', None)
-        was = (getattr(act, 'id1_backlash', 0.0), getattr(act, 'id1_from', 1.0), getattr(act, 'id1_comp', 0.0))
+        was = (getattr(act, 'id1_backlash', 0.0), getattr(act, 'id1_from', 1.0), getattr(act, 'id1_comp', 0.0),
+               getattr(act, 'id1_always', False))
         if act is not None:
             act.id1_backlash, act.id1_from = bl, side         # 微调的每一下也从转盘那一边到位(不然往回的小修正全被间隙吃掉，手臂不动)
             act.id1_comp = comp                               # 每一下多给 comp(STM32 离目标差 ATOL 以内就停)
+            act.id1_always = self._same_approach()            # (10-27 晚)不管往哪边修，每一下都先多转再转回来(摩擦卡住的量每次一样)
+        tol = self._ring_tol('zone_cal_fine_tol_mm')          # (10-27 晚)对到 1mm 以内(以前按 tol_mm.RING，车上 3mm)
         try:
-            res = self.servo.run('RING', self._ring_measure(kind), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+            res = self.servo.run('RING', self._ring_measure(kind), self.vision.scale('RING'), tol,
                                  allow_chassis=False, label=f'{zone}环{ring}微调', bounds=self.vision.bounds(kind), confirm=False, **kw)
         finally:
             if act is not None:
-                act.id1_backlash, act.id1_from, act.id1_comp = was
+                act.id1_backlash, act.id1_from, act.id1_comp, act.id1_always = was
         took = self.now() - t0
         if res is None:
             self.log(f'    ★ 环{ring} 微调：没结果({took:.1f} 秒)：按调的角度放')
@@ -7008,7 +7021,8 @@ class MissionHooks:
         再加 zone_backlash_extra_deg(要比真的间隙大：STM32 提前停，多转的不够，舵机走不完间隙、手臂不动)；zone_backlash_deg 是 0 就是 0。"""
         bl = max(0.0, float(self.cfg.get('zone_backlash_deg', 2.0) or 0.0))
         if bl > 0.0:
-            bl += max(0.0, float(self.cfg.get('zone_backlash_extra_deg', 1.0) or 0.0))
+            bl += max(0.0, float(self.cfg.get('zone_backlash_extra_deg', 3.0) or 0.0))
+            bl = min(bl, 8.0)          # 转回来那一段分几下转(approach_id1)，再多也没用
         try:
             a1d = float((self.arm.params() or {}).get('A1D'))
         except ArmAbort:
@@ -7016,6 +7030,20 @@ class MissionHooks:
         except Exception:
             a1d = None
         return bl, (1.0 if a1d is None or a1d >= float(a1) else -1.0)
+
+    def _same_approach(self):
+        """(10-27 晚)zone_same_approach：ID1 每次都先多转再转回来到位(不管往哪边)；zone_backlash_deg 是 0(不管间隙)时不用。"""
+        return bool(self.cfg.get('zone_same_approach', True)) and float(self.cfg.get('zone_backlash_deg', 2.0) or 0.0) > 0.0
+
+    def _ring_tol(self, key):
+        """(10-27 晚)对准圆环的容差(毫米)：key = 'zone_cal_fine_tol_mm'(1、3 号环微调) / 'zone_vel_tol_mm'(2 号环车轮)，
+        和 tol_mm.RING 取小的；没设(None、0)就是 tol_mm.RING。"""
+        base = float(self.cfg['tol_mm']['RING'])
+        try:
+            v = float(self.cfg.get(key) or 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        return min(base, v) if v > 0.0 else base
 
     def _id1_comp(self):
         """(10-27)ID1 每一下往转的方向多给多少度(zone_atol_comp；None = STM32 的 ATOL × 0.7)：STM32 离目标还差 ATOL 以内就停。"""
@@ -7030,16 +7058,20 @@ class MissionHooks:
             return max(0.0, 0.7 * atol)
         return max(0.0, float(v))
 
-    def _ap_from_tray_side(self, a1, a2, cur1=None):
+    def _ap_from_tray_side(self, a1, a2, cur1=None, always=None):
         """手臂转到 (a1, a2)，ID1 最后一下从车上转盘那一边到位(_id1_backlash)：现在在 a1 的另一边(要往转盘那边转)、
-        或者不知道现在在哪(cur1=None)，就先多转(比间隙多一点)再转回来。最后一下往转的方向多给 _id1_comp 度(STM32 提前停)。"""
+        或者不知道现在在哪(cur1=None)，就先多转(比间隙多一点)再转回来。最后一下往转的方向多给 _id1_comp 度(STM32 提前停)。
+        always(None = zone_same_approach)：(10-27 晚)不管现在在哪边，都先转到往转盘那边多转的地方再转回来(每次同一个动作到位)。"""
         bl, side = self._id1_backlash(a1)
         comp = self._id1_comp()
+        if always is None:
+            always = self._same_approach()
         last = -side if cur1 is None else (1.0 if float(a1) > float(cur1) else -1.0)
-        if bl > 0.0 and (cur1 is None or (float(a1) - float(cur1)) * side > 0.0):
-            self.arm.ap(float(a1) + side * bl, float(a2))
-            last = -side
-        self.arm.ap(float(a1) + last * comp, float(a2))
+        if bl > 0.0 and (always or cur1 is None or (float(a1) - float(cur1)) * side > 0.0):
+            # 先多转 bl，再转回来(每一下不到 4.5°，慢慢转、停得准；见 arm_link.approach_id1)
+            approach_id1(self.arm, float(a1) + side * bl, float(a1) - side * comp, float(a2))
+        else:
+            self.arm.ap(float(a1) + last * comp, float(a2))
 
     def _zone_arm_fine(self, zone, ring, a1, a2, covered=None):
         """(10-19)空爪转到 ring 号环上方 (a1, a2)，只动手臂(车不动)用摄像头对准这个环；covered = 码垛：环上已经有这个颜色的物料，
@@ -7194,8 +7226,10 @@ class MissionHooks:
         if cfg.get('zone_obs_fine', True) and 'A1P' in P and 'A2P' in P:
             try:
                 a1, a2 = self.arm.read_angles()
-                if a1 is not None and a2 is not None and (abs(a1 - float(P['A1P'])) > 0.15 or abs(a2 - float(P['A2P'])) > 1.5):
-                    # 精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)；(10-27)ID1 从车上转盘那一边到位(齿轮间隙)
+                if a1 is not None and a2 is not None and (self._same_approach() or abs(a1 - float(P['A1P'])) > 0.15
+                                                          or abs(a2 - float(P['A2P'])) > 1.5):
+                    # 精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)；(10-27)ID1 从车上转盘那一边到位(齿轮间隙)；
+                    #   (10-27 晚)zone_same_approach：读数已经对上也照样多转再转回来——夹着物料回来放 2 号环也是这个动作，手臂停的地方一样
                     self._ap_from_tray_side(float(P['A1P']), float(P['A2P']), cur1=a1)
             except ArmAbort:
                 raise
@@ -7205,7 +7239,7 @@ class MissionHooks:
         off = self._place_shift_px()
         goal0 = claw + (np.asarray(off, float) if off is not None else 0.0)
         goalp = goal0
-        tol = float(cfg.get('zone_vel_tol_mm') or cfg['tol_mm']['RING'])
+        tol = self._ring_tol('zone_vel_tol_mm')              # (10-27 晚)默认 1.5mm(以前按 tol_mm.RING，车上 3mm)
         acc = self._wheels_accept('RING')
         vmax = float(cfg.get('zone_vel_speed', 15.0))
         vmin = float(cfg.get('zone_vel_min_speed', 5.0))
@@ -7984,10 +8018,25 @@ class MissionHooks:
             self.arm.apz(wps[0][0], wps[0][1], z)            # 第一段从车上转盘出发：STM32 照旧按圆环那边的参数绕电池盒
         else:
             self.arm.ap(wps[0][0], wps[0][1])
-        for w1, w2 in wps[1:]:
-            self.arm.ap(w1, w2)
-        self._return_to_pose(a1t, a2t, from_tray=False)
+        a1c = self._carry_rest(wps, a1t)
+        self._return_to_pose(a1c, a2t, from_tray=False)
         return True
+
+    def _carry_rest(self, wps, a1t):
+        """码垛路线第一个点以后的几个点(第一个点调用的人自己转过去)。(10-27 晚)zone_same_approach：最后转到要放的环的角度 a1t 那一下
+        用同一个动作到位(先往车上转盘那边多转再转回来，伸缩停在最后一个点的长度)，和第一轮微调、平放时转回来一样，放的地方才一样。
+        返回接着伸出去时 ID1 用的角度：same 时是最后一下发的角度(多给了补偿；STM32 差 ATOL 以内不转，ID1 原地不动，只伸缩)。"""
+        same = self._same_approach()
+        rest = list(wps[1:])
+        if same and rest and abs(float(rest[-1][0]) - float(a1t)) <= 0.5:
+            rest = rest[:-1]                                    # 最后一个点就是转到 a1t：改成下面同一个动作
+        for w1, w2 in rest:
+            self.arm.ap(w1, w2)
+        if not same:
+            return float(a1t)
+        self._ap_from_tray_side(float(a1t), float(wps[-1][1]), always=True)
+        _bl, side = self._id1_backlash(a1t)
+        return float(a1t) - side * self._id1_comp()
 
     def _stack_in(self, ring, poses, tall, P, num, start, a2_in, a2_lim, clear, a1t, a2t, always=False):
         """_stack_carry 的 'in' 走法(10-24)：绕过电池盒 -> 停下往里缩 -> 缩着转到 ring 号环的角度 -> 只伸出去。
@@ -8030,9 +8079,8 @@ class MissionHooks:
             self.arm.apz(wps[0][0], wps[0][1], z)               # 从车上转盘出发：STM32 照旧按圆环那组绕电池盒，停在 a1_in(还伸在 R2T)
         else:
             self.arm.ap(wps[0][0], wps[0][1])
-        for w1, w2 in wps[1:]:
-            self.arm.ap(w1, w2)                                 # 只往里缩；缩着只转
-        self._return_to_pose(a1t, a2t, from_tray=False)          # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
+        a1c = self._carry_rest(wps, a1t)                        # 只往里缩；缩着只转(最后转到目标环那一下同一个动作到位)
+        self._return_to_pose(a1c, a2t, from_tray=False)          # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
         return True
 
     def _place_item_arm(self, item, zone, ring, stack, label, T):
@@ -9061,13 +9109,17 @@ class MissionHooks:
 
     def _return_to_pose(self, a1, a2, from_tray=False):
         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。
-        from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。"""
+        from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。
+        (10-27 晚)from_tray 且 zone_same_approach：大幅转回来先停在往车上转盘那边多转(间隙 + zone_backlash_extra_deg)的地方，再转回来到位
+        ——和 1、3 号环微调的每一下、对准 2 号环前回 A1P 是同一个动作，手臂停的地方就是对准时停的地方(这时不学多转/少转、不用 return_preload_deg)。"""
         if a1 is None or a2 is None:
             raise ArmError('读不到对准时的手臂角度(A? 没回复)，不知道回哪里')
-        pre = self.cfg.get('return_preload_deg') or [0.0, 0.0]
-        learn = bool(self.cfg.get('return_bias', True)) and from_tray
+        same = bool(from_tray) and self._same_approach()
+        bl, side = self._id1_backlash(a1) if same else (0.0, 1.0)
+        pre = [0.0, 0.0] if same else (self.cfg.get('return_preload_deg') or [0.0, 0.0])
+        learn = bool(self.cfg.get('return_bias', True)) and from_tray and not same
         bias = self._ret_bias if learn else [0.0, 0.0]
-        c1, c2 = a1 - bias[0], a2 - bias[1]                      # 前几次转回来总是多转/少转多少，这次提前补上
+        c1, c2 = a1 - bias[0] + side * bl, a2 - bias[1]         # 前几次转回来总是多转/少转多少，这次提前补上；same：先停在往转盘那边多转 bl 的地方
         zr = None
         if from_tray and self.cfg.get('return_lower', True):
             try:
@@ -9088,6 +9140,8 @@ class MissionHooks:
             self.arm.apz(c1, c2, zr)
         else:
             self.arm.ap(c1, c2)
+        if same:
+            self._ap_from_tray_side(a1, a2, always=True)        # 再转回来到位(大动作停偏了也先回到多转的地方，最后一下每次一样)
         tol = float(self.cfg.get('return_tol_deg') or 0.4)
         try:
             tol = max(tol, float((self.arm.params() or {}).get('ATOL', 0.0)) + 0.05)   # 比 ATOL 还小的差舵机不会再动

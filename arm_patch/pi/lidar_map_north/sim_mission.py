@@ -70,7 +70,7 @@ class SimWorld:
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
                  qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0, plate_jitter_deg=0.0,
-                 arm_r_mm=None, id1_backlash_deg=0.0, ap_atol=True):
+                 arm_r_mm=None, id1_backlash_deg=0.0, ap_atol=True, id1_stick_deg=0.0, ap_fast_err=False):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -85,9 +85,15 @@ class SimWorld:
         self.lift_mm = 60.0
         # (10-27 实车 ID1 有齿轮间隙)舵机转到 a1，手臂(爪子、摄像头)只在舵机顶到间隙一边的时候才跟着动(见 a1 的 setter)；0 = 没有间隙
         self.id1_backlash_deg = float(id1_backlash_deg)
+        # (10-27 晚 实车"小修正先不动、再一下跳过头")ID1 还有摩擦：舵机顶到间隙一边以后还要再多转这么多度手臂才被带动(带动以后跟到
+        #   间隙那一边)，零点几度的一小下手臂被卡着不动，下一下才一起跳过去。0 = 没有摩擦(只有间隙)
+        self.id1_stick_deg = float(id1_stick_deg)
         # (10-27 实车"调了这么久但是机械臂位置基本没有变")AP 照着 arm.c 的 Servos_To 停：离目标 ATOL 以内的不转，小动作离目标还差 ATOL 以内
         #   就停(见 _ap_atol_stop)；False = 小动作一下转到目标(以前的模拟)
         self.ap_atol = bool(ap_atol)
+        # (10-27 晚)ap_fast_err：ID1 一下转 4.5° 以上(STM32 不限速，快速转、8ms 查一次)停的地方差 -0.3~+1.2°(多半转过头，实车日志
+        #   "回到对准姿态差了 ID1 -1.00°")；False = 大动作也停在目标上(以前的模拟)
+        self.ap_fast_err = bool(ap_fast_err)
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
         self.claw_open = True
@@ -199,11 +205,14 @@ class SimWorld:
         (往大转：手臂 = 舵机 - 间隙/2；往小转：手臂 = 舵机 + 间隙/2；换方向的头一个间隙舵机转了手臂不动)。"""
         self._a1 = float(v)
         b = float(self.__dict__.get('id1_backlash_deg', 0.0) or 0.0)
+        st = float(self.__dict__.get('id1_stick_deg', 0.0) or 0.0)
         act = self.__dict__.get('_a1_act')
-        if b <= 0.0 or act is None:
+        if (b <= 0.0 and st <= 0.0) or act is None:
             self._a1_act = self._a1
-        else:
-            self._a1_act = min(max(act, self._a1 - 0.5 * b), self._a1 + 0.5 * b)
+        elif act < self._a1 - 0.5 * b - st:               # (10-27 晚)id1_stick_deg：顶过间隙还要再多转这么多才带得动(摩擦)，带动了跟到间隙那一边
+            self._a1_act = self._a1 - 0.5 * b
+        elif act > self._a1 + 0.5 * b + st:
+            self._a1_act = self._a1 + 0.5 * b
 
     @property
     def a1_act(self):
@@ -292,6 +301,11 @@ class SimWorld:
         if abs(d) >= 4.5:
             return None
         return float(tg) - math.copysign(max(0.0, atol - float(self.rng.uniform(0.0, 0.15))), d)
+
+    def _ap_fast_stop(self, cur, tg):
+        """(10-27 晚)ap_fast_err：ID1 一下转 4.5° 以上，停在目标往转的方向 -0.3~+1.2° 的地方(快速转，查一次角度就走了 1° 多)。"""
+        d = float(tg) - float(cur)
+        return float(tg) + math.copysign(float(self.rng.uniform(-0.3, 1.2)), d)
 
     def _open_claw(self):
         """张开爪子。夹着物料时：在转盘上方(ZDROP、转盘姿态)张开 = 放回转盘；在工位里降到 ZPLC / ZSTK 张开 = 放在地上(圆环里)；
@@ -671,6 +685,8 @@ class SimWorld:
             if self.ap_atol:
                 for i, cur in ((1, self.a1), (2, self.a2)):
                     st = self._ap_atol_stop(cur, t1 if i == 1 else t2)
+                    if st is None and i == 1 and self.ap_fast_err:
+                        st = self._ap_fast_stop(cur, t1)
                     if st is not None:
                         ex.append(i)
                         if i == 1:
@@ -1603,7 +1619,9 @@ class ZoneFlowTests(unittest.TestCase):
         for seed in range(4):
             w = SimWorld(seed=seed, code=code, cam_deg=90.0)
             lines = []
-            h = make(w, log=lines.append)                                  # 按任务码顺序放(10-22 起一律这样)
+            # (10-27 晚)zone_same_approach=False：这条旧做法(一个环一个环挪车对准，车上不用)按以前的阈值测底盘修几下；同一个动作到位时
+            #   60 个种子平均多修 0.3 下(0.87 -> 1.20)，放置一样准，没细查
+            h = make(w, dict(zone_same_approach=False), log=lines.append)  # 按任务码顺序放(10-22 起一律这样)
             run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
             text = '\n'.join(lines)
             self.assertIn('看到 3 个圆环(认出 1、2、3 号)', text, text)
@@ -1858,7 +1876,8 @@ class ZoneFlowTests(unittest.TestCase):
         for learn in (True, False):
             w = SimWorld(seed=5, code=self.CODE, cam_deg=90.0, ap_bias=(0.9, 1.6))
             lines = []
-            h = make(w, dict(return_bias=learn), log=lines.append)
+            # (10-27 晚)zone_same_approach 开着时转回来先停在多转的地方再转回来，不学多转/少转，也不用"再转一次"：这里关掉测学偏差
+            h = make(w, dict(return_bias=learn, zone_same_approach=False), log=lines.append)
             run_mission(w, h, log=lines.append)
             text = '\n'.join(lines)
             self._assert_all_good(w, h, text, 5)
@@ -2496,8 +2515,9 @@ class RawFrameThreadTests(unittest.TestCase):
         car = self.Car()
         cam = self.RingCam(car, J, (320.0 + 14.0, 240.0 + 9.0), frame_s=0.5)
         lines = []
-        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, place_adj_file='', zone_lost_s=4.0, zone_calc=False)}, log=lines.append, vision=cam,
-                         now=time.monotonic, sleep=time.sleep)
+        # (10-27 晚)zone_same_approach=False：这里的假手臂不让转(只测车轮 V 一直续着)；回 A1P 的同一个动作在 ZoneCalTests 里测
+        h = MissionHooks({'mission_cfg': dict(raw_frame_thread=True, place_adj_file='', zone_lost_s=4.0, zone_calc=False, zone_same_approach=False)},
+                         log=lines.append, vision=cam, now=time.monotonic, sleep=time.sleep)
         h.act, h.store, h.arm = car, self.Store(), self.Arm()
         h.store.put('RING', 'ch', J)
         out = h._ring2_smooth('ROUGH')
@@ -4187,9 +4207,10 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(out[True][0], 3.0, out)
         self.assertGreater(out[False][0], 5.0, out)
         # (10-27)模拟的 AP 按 STM32 的 ATOL 停(ap_atol)以后，个别环在 tol_mm 附近被画面噪声多拖一两次(以前不补偿也一样)；
-        #   10-27 用户要"一直调到对准为止"(最多 10 秒)：平均两秒以内、最长 4 秒
-        self.assertLessEqual(out[True][2], 2.0, out)
-        self.assertLessEqual(out[True][1], 4.0, out)
+        #   10-27 用户要"一直调到对准为止"(最多 10 秒)。(10-27 晚)每一下都先多转 5° 再分两下慢慢转回来、对到 1mm(zone_cal_fine_tol_mm)：
+        #   平均 3 秒以内、最长 5 秒
+        self.assertLessEqual(out[True][2], 3.0, out)
+        self.assertLessEqual(out[True][1], 5.0, out)
 
     def test_ring13_fine_tune_keeps_going_until_aligned(self):
         """(10-27 用户"把微调时间放长直到调好为止")1、3 号环的摄像头微调一直调到对准为止：手臂和画面的对应关系存得偏大一倍
@@ -4254,7 +4275,8 @@ class ZoneCalTests(unittest.TestCase):
                                                                              #   (实车 A1D 比三个环都大，模拟里比三个环都小，反过来一样)
                 w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
                 lines = []
-                h = self._make(w, dict(zone_backlash_extra_deg=0.0, zone_atol_comp=0.0) if old else None, lines=lines)
+                h = self._make(w, dict(zone_backlash_extra_deg=0.0, zone_atol_comp=0.0, zone_same_approach=False,
+                                       zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None) if old else None, lines=lines)
                 for z in h._teach_all.values():                      # 调的角度差 1.6°(实车一开始差 6.6~7.4mm)
                     z['1'] = [z['1'][0] + 1.6, z['1'][1]]
                     z['3'] = [z['3'][0] - 1.6, z['3'][1]]
@@ -4270,6 +4292,80 @@ class ZoneCalTests(unittest.TestCase):
         self.assertGreater(max(out[True][0].values()), 4.0, out)
         self.assertLess(max(out[False][0].values()), 2.0, out)        # 现在：三个环都在 2mm 以内
         self.assertEqual((out[False][1], out[False][2]), (8, 0), out)  # 4 次 × 1、3 号环：都调到对准
+
+    CAR_TOL = dict(tol_mm=dict(RAW=2.0, RING=3.0, PICK=3.0, STACK=3.0), accept_mm=dict(RAW=4.0, RING=8.0, PICK=5.0, STACK=4.0),
+                   return_tol_deg=1.5, return_bias=False)           # 车上配置(10-22 备份)里的容差
+
+    def test_rings_left_with_small_errors_same_approach_and_tighter_tol(self):
+        """(10-27 晚 用户"最后每一个环还是有一点点偏差有什么办法给他消除吗")实车：对准容差 tol_mm.RING 是 3mm(差 2.9mm 也"微调好了"、
+        2 号环也算对准)；ID1 除了 2.3° 间隙还有摩擦(零点几度的一小下舵机转了、手臂被卡着不动，下一下才一起跳过去)；一下转 4.5° 以上
+        STM32 是快速转的、停的地方差 1° 多。以前(10-27 晚第一版：只在往转盘那边修时多转 3°)三个环都偏 2~6mm。
+        现在：每一下都先多转 5°、再分两下慢慢转回来到位(微调、夹着物料转回来、回 A1P 一个样)，1、3 号环对到 1mm、2 号环对到 1.5mm。"""
+        out = {}
+        for old in (True, False):
+            errs, took, cut = [], [], 0
+            for seed in range(4):
+                w = self._world(seed, id1_backlash_deg=2.3, id1_stick_deg=0.8, ap_fast_err=True)
+                w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}        # 和实车一样 1 号环的角度离车上转盘最远
+                w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
+                lines = []
+                cfg = dict(self.CAR_TOL)
+                if old:
+                    cfg.update(zone_backlash_extra_deg=1.0, zone_same_approach=False, zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None)
+                h = self._make(w, cfg, lines=lines)
+                for z in h._teach_all.values():                      # 调的角度差 1.6°(实车一开始差 5~7mm)
+                    z['1'] = [z['1'][0] + 1.6, z['1'][1]]
+                    z['3'] = [z['3'][0] - 1.6, z['3'][1]]
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+                text = '\n'.join(lines)
+                self.assertEqual((w.air, w.loose, w.collisions, w.sweep_hits), (0, 0, 0, 0), text[-3000:])
+                errs += [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH']
+                took += [float(l.split('用了 ')[1].split(' 秒')[0]) for l in lines if '微调好了' in l and '用了 ' in l]
+                cut += sum(1 for l in lines if '微调到上限了' in l or '微调没对上' in l)
+            out[old] = (round(max(errs), 2), round(float(np.mean(errs)), 2), cut, round(float(np.mean(took)), 1) if took else None)
+        print(f'\n  [实车容差 3mm + 间隙 2.3° + 摩擦] 三个环放置误差：以前 最大 {out[True][0]}mm 平均 {out[True][1]}mm；'
+              f'现在 最大 {out[False][0]}mm 平均 {out[False][1]}mm(微调平均 {out[False][3]} 秒)')
+        self.assertGreater(out[True][0], 3.0, out)                    # 以前：有的环偏 3mm 以上(和实车一样"一点点偏差")
+        self.assertLess(out[False][0], 2.0, out)                      # 现在：三个环都在 2mm 以内
+        self.assertLess(out[False][1], 1.2, out)
+        self.assertEqual(out[False][2], 0, out)                       # 都"微调好了"
+        self.assertLessEqual(out[False][3], 3.5, out)
+
+    def test_ring_tol_is_the_smaller_one(self):
+        """(10-27 晚)zone_cal_fine_tol_mm / zone_vel_tol_mm 和 tol_mm.RING 取小的；None 就是 tol_mm.RING。"""
+        w = self._world(0)
+        h = self._make(w, dict(self.CAR_TOL))
+        self.assertEqual((h._ring_tol('zone_cal_fine_tol_mm'), h._ring_tol('zone_vel_tol_mm')), (1.0, 1.5))
+        h = self._make(self._world(0), dict(self.CAR_TOL, zone_cal_fine_tol_mm=None, zone_vel_tol_mm=4.0))
+        self.assertEqual((h._ring_tol('zone_cal_fine_tol_mm'), h._ring_tol('zone_vel_tol_mm')), (3.0, 3.0))
+        h = self._make(self._world(0))                                  # 模拟默认 tol_mm.RING 1.2
+        self.assertEqual((h._ring_tol('zone_cal_fine_tol_mm'), h._ring_tol('zone_vel_tol_mm')), (1.0, 1.2))
+
+    def test_approach_id1_slow_steps_from_the_tray_side(self):
+        """(10-27 晚)arm_link.approach_id1：先转到多转的地方(快慢不管)，转回来每一下不到 3.5°(STM32 一下 4.5° 以内才慢慢转、停得准)；
+        多转的那一下没转过去就再转一次。"""
+        from arm_link import approach_id1
+
+        class Arm:
+            def __init__(self, a1, short=0.0):
+                self.angle = {1: a1, 2: -800.0}
+                self.cmds, self.short = [], short
+
+            def ap(self, a1, a2):
+                self.cmds.append((round(a1, 3), round(a2, 3)))
+                d = a1 - self.angle[1]
+                self.angle = {1: a1 - (self.short if abs(d) > 4.5 else 0.0) * (1 if d > 0 else -1), 2: a2}
+        arm = Arm(100.0)
+        approach_id1(arm, 105.0, 99.79, -800.0)                          # 往大多转 5°，再分两下转回 99.79
+        self.assertEqual(arm.cmds[0], (105.0, -800.0))
+        steps = [abs(b[0] - a[0]) for a, b in zip(arm.cmds, arm.cmds[1:])]
+        self.assertEqual(len(steps), 2, arm.cmds)
+        self.assertTrue(all(st < 3.5 for st in steps), arm.cmds)
+        self.assertEqual(arm.cmds[-1], (99.79, -800.0))
+        arm = Arm(100.0, short=3.5)                                     # 多转的那一下(大动作)只转了一点：再转一次
+        approach_id1(arm, 106.0, 99.79, -800.0)
+        self.assertEqual(arm.cmds[:2], [(106.0, -800.0), (106.0, -800.0)], arm.cmds)
+        self.assertEqual(arm.cmds[-1], (99.79, -800.0))
 
     def test_sim_ap_stops_within_atol_like_stm32(self):
         """(10-27)模拟里的 AP 和 arm.c 的 Servos_To 一样：离目标 ATOL 以内不转；小动作停在离目标还差 0.15~0.3° 的地方；大动作照旧到目标。"""

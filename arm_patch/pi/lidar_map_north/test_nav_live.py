@@ -578,6 +578,20 @@ class LiveTests(unittest.TestCase):
                       inputs=[(lambda: True, 'zmargin 50')], screen_zone=None, end_on='zmargin 毫米(0~30)')
         self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_align_margin_mm'), 5.0)
 
+    def test_rtol_command_saves(self):
+        """(10-27 晚)rtol 1 1.5：存进配置 mission_cfg 的 zone_cal_fine_tol_mm(1、3 号环微调)、zone_vel_tol_mm(2 号环车轮)；
+        只输入 rtol 看现在多少(和 tol_mm.RING 取小的)；超出 0.3~5 不改。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(tol_mm=dict(RING=3.0))),
+                      inputs=[(lambda: True, 'rtol 0.8 1.2')], screen_zone=None, end_on='已设置 rtol 0.8 1.2')
+        mc = self.cfg_after.get('mission_cfg') or {}
+        self.assertEqual((mc.get('zone_cal_fine_tol_mm'), mc.get('zone_vel_tol_mm')), (0.8, 1.2))
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(tol_mm=dict(RING=3.0))),
+                      inputs=[(lambda: True, 'rtol')], screen_zone=None, end_on='改：rtol')
+        self.assertIn('1、3 号环摄像头微调对到 1mm 以内、2 号环车轮对到 1.5mm 以内', self.log)
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(zone_vel_tol_mm=1.5)),
+                      inputs=[(lambda: True, 'rtol 9 1')], screen_zone=None, end_on='0.3~5')
+        self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_vel_tol_mm'), 1.5)
+
     def test_turnloc_command_saves(self):
         """(10-27)turnloc off：存进配置 reloc_before_turn=false(每个弯直接转)，并提醒风险；turnloc on 改回来。"""
         self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),

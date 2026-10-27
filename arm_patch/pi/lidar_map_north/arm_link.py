@@ -3,6 +3,7 @@
 link 就是 stm32_link.Stm32Link(或 FakeLink 之类有 request(text, timeout, collect=True) 的对象)。
 每条指令发一行，等 DONE / ERR；STM32 的指令说明见 STM32 工程里的 arm.h。
 """
+import math
 import re
 import time
 
@@ -26,6 +27,26 @@ _TIMEOUTS = (
 
 # 这些指令会动 ID1/ID2 但不回报角度，执行后缓存的角度就过期了
 _MOVING = ('OBS', 'GRAB', 'PICK', 'PLACE', 'TAKE', 'DROP', 'STOW', 'PARK', 'STBY', 'TRAY', 'PRE')
+
+
+SLOW_STEP_DEG = 3.5     # (10-27 晚)STM32 一下转 4.5° 以内才按 15°/s 慢慢转、停得准(main.c SERVO_FINE_DEG)；4.5° 以上是快速转的，停的地方差 1° 多
+
+
+def approach_id1(arm, pre1, fin1, a2, slow_max=SLOW_STEP_DEG):
+    """(10-27 晚)ID1 先转到 pre1(往车上转盘那边多转的地方，这一下快慢不管)，再从那边转回 fin1 到位，ID2 一起转到 a2。
+    转回来这一段每一下不超过 slow_max 度(太长就分几下转)：每一下都慢慢转、停得准，每次走的路一样长，手臂被带过去的量也一样。
+    多转的这一下停得离 pre1 太远(没转过去、转反了)就再转一次。"""
+    arm.ap(float(pre1), float(a2))
+    want = float(pre1) - float(fin1)
+    got = arm.angle[1]
+    if got is not None and (float(got) - float(fin1)) * want < 0.6 * want * want:
+        arm.ap(float(pre1), float(a2))
+        got = arm.angle[1]
+    rem = (float(got) if got is not None else float(pre1)) - float(fin1)
+    n = max(1, int(math.ceil(abs(rem) / float(slow_max) - 1e-9)))
+    for i in range(1, n):
+        arm.ap(float(fin1) + rem * (n - i) / n, float(a2))
+    arm.ap(float(fin1), float(a2))
 
 
 def _timeout_for(text):
@@ -426,6 +447,9 @@ class ArmActuators:
         # (10-27 实车"调了这么久机械臂位置基本没有变")id1_comp > 0：每一下 ID1 往转的方向多给这么多度。STM32 的 AP 离目标还差 ATOL(0.3°)
         #   以内就算到了、停下(还差不到 ATOL 的干脆不转)，零点几度的小修正等于没转；多给一点，停下的地方才是要的地方
         self.id1_comp = 0.0
+        # (10-27 晚)id1_always：ID1 每一下(不管往哪边)都先往 id1_from 那边多转 id1_backlash 再转回来——ID1 还有摩擦，零点几度的一小下
+        #   舵机转了、手臂被卡着不动，下一下才一起跳过去；每次同一个动作到位，手臂被带动的量每次一样
+        self.id1_always = False
 
     def reset_disp(self):
         self.disp = {'S': 0.0, 'F': 0.0}
@@ -440,12 +464,15 @@ class ArmActuators:
         bl = float(getattr(self, 'id1_backlash', 0.0) or 0.0)
         side = 1.0 if float(getattr(self, 'id1_from', 1.0)) >= 0.0 else -1.0
         comp = float(getattr(self, 'id1_comp', 0.0) or 0.0)
+        always = bool(getattr(self, 'id1_always', False))
         last = (1.0 if d_id1 > 0 else -1.0) if abs(float(d_id1)) > 1e-6 else 0.0   # 最后一下 ID1 往哪边转
-        if bl > 0.0 and float(d_id1) * side > 1e-6:
+        if bl > 0.0 and (float(d_id1) * side > 1e-6 or (always and abs(float(d_id1)) > 1e-6)):
             # 这一下要往 id1_from 那一边转：只转过去，舵机先走完齿轮间隙手臂才动、最后还停在间隙另一边。先多转 bl 再转回来
-            self.arm.ap(a1_0 + d_id1 + side * bl, a2_0 + d_id2)
-            last = -side
-        self.arm.ap(a1_0 + d_id1 + last * comp, a2_0 + d_id2)
+            #   (id1_always：往另一边修也这样，最后一下每次都是从 id1_from 那边转同样多到位)
+            # (10-27 晚)转回来这一段每一下不到 4.5°(STM32 才慢慢转、停得准)，多转得多就分几下转(approach_id1)
+            approach_id1(self.arm, a1_0 + d_id1 + side * bl, a1_0 + d_id1 - side * comp, a2_0 + d_id2)
+        else:
+            self.arm.ap(a1_0 + d_id1 + last * comp, a2_0 + d_id2)
         a1_1, a2_1 = self.arm.angle[1], self.arm.angle[2]
         if a1_1 is None or a2_1 is None:
             return None                                   # 没读回来，按指令的量算

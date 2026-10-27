@@ -1060,6 +1060,35 @@ def main():
             if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
             write_json_safe(p_,file_cfg())
             print(f'已设置 zmargin {v_:g}：车轮对准 2 号环时车身离工位最少留 {v_:g}mm(下一次 go / race 起作用，存进配置)',flush=True);return
+        if k=='rtol':
+            # (10-27 晚 用户"最后每一个环还是有一点点偏差")圆环对准到多少毫米以内算好：1、3 号环摄像头微调 mission_cfg.zone_cal_fine_tol_mm、
+            #   2 号环车轮 zone_vel_tol_mm(都和 tol_mm.RING 取小的)。越小放得越准，多修几下、多花几秒
+            from mission_hooks import DEFAULTS as MD_
+            mc_=dict(raw_cfg.get('mission_cfg') or {})
+            try:base_=float((mc_.get('tol_mm') or {}).get('RING') or MD_['tol_mm']['RING'])
+            except (TypeError,ValueError):base_=float(MD_['tol_mm']['RING'])
+            def eff_(key,v_=None):
+                v_=mc_.get(key,MD_.get(key)) if v_ is None else v_
+                try:v_=float(v_ or 0.0)
+                except (TypeError,ValueError):v_=0.0
+                return min(base_,v_) if v_>0 else base_
+            if len(parts)==1:
+                print(f'现在：1、3 号环摄像头微调对到 {eff_("zone_cal_fine_tol_mm"):g}mm 以内、2 号环车轮对到 {eff_("zone_vel_tol_mm"):g}mm 以内才算对准'
+                      f'(都不超过配置里的 tol_mm.RING={base_:g})。改：rtol 1、3号环毫米 2号环毫米，例如 rtol 1 1.5(越小放得越准，多修几下、多花几秒)',flush=True);return
+            try:a_,b_=(float(parts[1]),float(parts[2])) if len(parts)==3 else (None,None)
+            except ValueError:a_=b_=None
+            if a_ is None or not (0.3<=a_<=5.0 and 0.3<=b_<=5.0):raise ValueError('格式：rtol 1、3号环毫米 2号环毫米(0.3~5)，例如 rtol 1 1.5')
+            mc_['zone_cal_fine_tol_mm']=a_;mc_['zone_vel_tol_mm']=b_;raw_cfg['mission_cfg']=mc_
+            p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+            if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+            write_json_safe(p_,file_cfg())
+            try:                                           # mtest 等测试命令已经建好的任务钩子也马上改(go / race 每次按配置新建)
+                import mission_cli as mcli_
+                hh_=mcli_._S.get('hooks')
+                if hh_ is not None:hh_.cfg['zone_cal_fine_tol_mm']=a_;hh_.cfg['zone_vel_tol_mm']=b_
+            except Exception:pass
+            print(f'已设置 rtol {a_:g} {b_:g}：1、3 号环微调对到 {eff_("",a_):g}mm 以内、2 号环车轮对到 {eff_("",b_):g}mm 以内(马上起作用，存进配置)'
+                  +(f'；超过 tol_mm.RING={base_:g} 的按 {base_:g}' if max(a_,b_)>base_ else ''),flush=True);return
         if k=='r2off':
             # (10-24 用户"故意对偏的那个红色十字去掉")r2off 去掉了：圆环这边的爪子点(红十字)直接挪，效果一样
             print('r2off(故意对偏)已经去掉了：粗加工区、暂存区的爪子点(圆环画面里的红十字)在 arm_calib 看圆环的那几步里输入 g 左右 上下 直接挪'
@@ -1261,6 +1290,7 @@ def main():
     print('分段调试：go step = 每到一站停下等 n；停在 QR/RAW/ROUGH/TEMP 时 F 20 / S -10 / R 2 慢慢挪车，save = 存成这一站新的停车点(下一次 go 用)。',flush=True)
     print('工位对 2 号环只用车轮(手臂不补)：zmargin 5 = 车轮挪的时候车身离粗加工区/暂存区最少留 5mm(只输入 zmargin 看现在多少)。',flush=True)
     print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
+    print('rtol 1 1.5 = 1、3 号环摄像头微调对到 1mm、2 号环车轮对到 1.5mm 以内才算对准(越小放得越准、多花几秒；只输入 rtol 看现在多少)。',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)
