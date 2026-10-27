@@ -938,6 +938,11 @@ git_log.txt                ← 分支最近 120 条提交记录
 - **10-26 原料区最后一个夹完直接收臂(用户"最后一个夹取完了把爪子缩回来就完事了啊还把爪子转过去干嘛呢")：**
   `raw_near_check_last` 默认 False(True = 以前的这一批都夹过以后再转回原料盘上方看 3 秒，夹过的还在上面就再夹)；
   _raw_near_any 和 _raw_ct_body(非最近那格)最后一个夹到就 break，不再 _raw_ct_pose 转回看的姿态，_stow_quiet 收臂。
+  10-27 用户又问了一次("夹取最后一个物料完成之后机械臂不应该再转到原料区域那边去了吧应该就直接回到待机状态走了吧")：
+  查了全部原料区做法，固定抓取位(_raw_grabpos_loop，raw_center + raw_grab_fixed)夹完最后一个还 OBS RAW 一次，也改成直接收臂；
+  _raw_any / _grab_item 本来就是每个开始前才 OBS，最后一个以后不转。sim：after_last_grab(最后一条 GRAB 以后第一条转手臂的指令)
+  RawNearSlotTests.test_last_grab_stows_without_swinging_back、RawFollowTests.test_fixed_grab_spot_last_grab_stows 都是 STOW。
+  收臂 STOW：存了待机姿态(STBY SAVE)就回到它，没存回 A1H/A2R。用户车上用的是最近那格(rteach RAW near)，1026b 起就是这样。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

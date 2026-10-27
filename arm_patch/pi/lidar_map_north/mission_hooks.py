@@ -4230,6 +4230,10 @@ class MissionHooks:
                 self.in_tray[it.slot] = it
                 todo.remove(it)
                 self._show_stats()
+                if not todo:
+                    # (10-27 用户"夹取最后一个物料完成之后机械臂不应该再转到原料区域那边去了，应该直接回到待机状态走")
+                    self.log(f'    ({it.color_name} 是这一批最后一个：夹完直接收臂，不再转回原料盘上方)')
+                    break
             try:
                 self.arm.obs('RAW', open_claw=True)                    # 回到看原料盘的姿态(车没动，还对着抓取位)
             except ArmAbort:

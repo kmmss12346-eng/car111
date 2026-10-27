@@ -2012,6 +2012,13 @@ DEFAULT_KEYS_1010I = ('raw_any_order', 'raw_wheels_first', 'wheels_first', 'take
 ARM_VERBS = ('AP', 'AD', 'AF', 'OBS', 'STOW', 'TAKE', 'GRAB', 'PICK', 'DROP', 'LIFT', 'CLAW', 'PARK')
 
 
+def after_last_grab(requests):
+    """(10-27)最后一条 GRAB 以后发的第一条转手臂的指令(OBS / AP / STOW …)；没有返回 None。"""
+    k = max(i for i, q in enumerate(requests) if q.startswith('GRAB'))
+    nxt = [q for q in requests[k + 1:] if q.split()[0] in ('OBS', 'AP', 'APZ', 'AD', 'AF', 'STOW', 'PRE', 'TAKE', 'GRAB', 'PICK', 'PARK')]
+    return nxt[0] if nxt else None
+
+
 def plate_world(seed, **kw):
     """原料盘转 3 秒停 6 秒(真车上大约这样)；画面比例和真车一样。"""
     kw.setdefault('plate_stop_s', 6.0)
@@ -2137,6 +2144,21 @@ class RawFollowTests(unittest.TestCase):
         self.assertIn('认出了 3 个停靠位', text)
         self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
         self.assertAlmostEqual(h.act.disp['S'], 0.0, delta=1.0)
+
+    def test_fixed_grab_spot_last_grab_stows(self):
+        """(10-27 用户"夹取最后一个物料完成之后机械臂不应该再转到原料区域那边去了，应该直接回到待机状态走")
+        固定抓取位的做法：这一批最后一个夹完，下一条转手臂的指令就是收臂 STOW(不再 OBS RAW 转回原料盘上方)。"""
+        w = self._center_world(2)
+        lines = []
+        h = make(w, dict(raw_follow=True, raw_center=True, a1_range=[0.0, 720.0]), log=lines.append)
+        h._ensure(w.link)
+        h.store.put('RAW', 'arm', -w.scale['RAW'] * w.Rcam @ np.diag([w.k2, w.k1]))
+        run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('固定抓取位', text)
+        self.assertEqual(h.stats.grab_ok - w.air, 3, text[-3000:])
+        self.assertIn('是这一批最后一个：夹完直接收臂', text)
+        self.assertEqual(after_last_grab(w.requests), 'STOW', w.requests[-12:])
 
     def test_center_old_firmware_steps(self):
         """STM32 是旧程序(不认 V)：改回一步一步挪，照样对准、夹到。"""
@@ -3197,6 +3219,15 @@ class RawNearSlotTests(unittest.TestCase):
             self.assertIn('这一批都夹过了：再看一眼', text)
             self.assertIn('还在原料盘上', text)
             self.assertEqual((self._in_tray(w), h.stats.grab_ok, w.air, w.collisions), (3, 3, 1, 0), text[-3000:])
+
+    def test_last_grab_stows_without_swinging_back(self):
+        """(10-26、10-27 用户"夹取最后一个物料完成之后机械臂不应该再转到原料区域那边去了，应该直接回到待机状态走")
+        最近那格：这一批最后一个夹完，下一条转手臂的指令就是收臂 STOW(不再 OBS RAW / AP 转回原料盘上方)。"""
+        for seed in (1, 2):
+            w, h, text = self._near_run(seed)
+            self.assertEqual((self._in_tray(w), h.stats.grab_ok), (3, 3), text[-3000:])
+            self.assertIn('是这一批最后一个：夹完直接收臂', text)
+            self.assertEqual(after_last_grab(w.requests), 'STOW', w.requests[-12:])
 
     def test_second_visit_goes_back_to_where_the_first_visit_stopped(self):
         """(10-26 用户"第二轮运行夹取第二轮物料的时候还能在同样的地方吗")原料区也一样：第二次来停得和第一次差了一截，
