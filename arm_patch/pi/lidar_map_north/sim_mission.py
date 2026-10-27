@@ -70,7 +70,7 @@ class SimWorld:
                  missing_batch1=(), fail_cmd=None, abort_at=None, params=None, cam_deg=None, f_gain=1.0, park=None,
                  park_side=None, plate_stop_s=None, plate_move_s=3.0, plate_off_mm=0.0, plate_off_tan=0.0, raw_scale=None, tilt=None, ap_bias=None,
                  qr_window=None, qr_latch_moving=False, qr_stale=None, park_cmd=True, zone_fw=None, lift_boot='ENC', ap_fine_extra_s=0.0, apn_fw=True, plate_r=150.0, plate_jitter_deg=0.0,
-                 arm_r_mm=None):
+                 arm_r_mm=None, id1_backlash_deg=0.0):
         self.rng = np.random.default_rng(seed)
         self.lay = np.random.default_rng([int(seed), 7])   # 每次到停车点的停车误差、原料盘上物料的位置：单独的随机数(程序多拍一张、多动一下也不改变场地)
         self.t = 0.0
@@ -83,6 +83,8 @@ class SimWorld:
         self.params['ARMOK'] = 1.0 if armok else 0.0
         self.lift_known = True                # 和 STM32 一样：开机就认为升降在离最低点 60mm
         self.lift_mm = 60.0
+        # (10-27 实车 ID1 有齿轮间隙)舵机转到 a1，手臂(爪子、摄像头)只在舵机顶到间隙一边的时候才跟着动(见 a1 的 setter)；0 = 没有间隙
+        self.id1_backlash_deg = float(id1_backlash_deg)
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
         self.claw_open = True
@@ -183,6 +185,28 @@ class SimWorld:
         self.vision = SimVision(self)
 
     # ------------------------------------------------------------------ 时间
+    @property
+    def a1(self):
+        """ID1 舵机的角度(STM32 回读的 ANG 1 就是它)。"""
+        return self._a1
+
+    @a1.setter
+    def a1(self, v):
+        """(10-27)ID1 齿轮间隙 id1_backlash_deg：舵机转到 v，手臂实际的角度 a1_act 只有舵机顶到间隙一边时才被带着走
+        (往大转：手臂 = 舵机 - 间隙/2；往小转：手臂 = 舵机 + 间隙/2；换方向的头一个间隙舵机转了手臂不动)。"""
+        self._a1 = float(v)
+        b = float(self.__dict__.get('id1_backlash_deg', 0.0) or 0.0)
+        act = self.__dict__.get('_a1_act')
+        if b <= 0.0 or act is None:
+            self._a1_act = self._a1
+        else:
+            self._a1_act = min(max(act, self._a1 - 0.5 * b), self._a1 + 0.5 * b)
+
+    @property
+    def a1_act(self):
+        """手臂(爪子、摄像头)实际转到的 ID1 角度：没有齿轮间隙时就是舵机的角度。"""
+        return self._a1_act
+
     def advance(self, s):
         vl = self.__dict__.get('vel')
         if vl and s > 0:                                   # 底盘按 V 的速度走(超过 400ms 没新的 V 就停)
@@ -229,7 +253,7 @@ class SimWorld:
         tall = [k for k in (1, 2, 3) if len(self.rings.get((self.zone, k)) or []) >= 2]
         if not tall:
             return
-        s1, s2 = self.a1, self.a2
+        s1, s2, s_act = self.a1, self.a2, self._a1_act
         path = [(s1, s2 + (a2 - s2) * i / 30.0) for i in range(31)] + [(s1 + (a1 - s1) * i / 30.0, a2) for i in range(31)]
         try:
             for self.a1, self.a2 in path:
@@ -239,6 +263,7 @@ class SimWorld:
                     break
         finally:
             self.a1, self.a2 = s1, s2
+            self._a1_act = s_act
 
     def _servos_to(self, a1, a2, speed, fine=False):
         P = self.params
@@ -379,7 +404,7 @@ class SimWorld:
         (10-19)arm_r_mm(真车的手臂)：摄像头装在爪子上，ID1 转多少画面也跟着转多少。"""
         rc = self.Rcam
         if self.arm_r and self.a1_ref is not None:
-            ph = math.radians(self.a1 - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            ph = math.radians(self.a1_act - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
             c, s = math.cos(ph), math.sin(ph)
             rc = rc @ np.array([[c, s], [-s, c]])               # 画面看到的 = 世界反着转 ph
         return rc @ self._rot(zone).T
@@ -390,10 +415,10 @@ class SimWorld:
             return np.array([0.0, 0.0])
         if self.arm_r:
             r = self.arm_r + self.k2 * (self.a2 - self.a2_ref)
-            ph = math.radians(self.a1 - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            ph = math.radians(self.a1_act - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
             arm = np.array([-self.arm_r + r * math.cos(ph), r * math.sin(ph)])
         else:
-            arm = np.array([self.k2 * (self.a2 - self.a2_ref), self.k1 * (self.a1 - self.a1_ref)])
+            arm = np.array([self.k2 * (self.a2 - self.a2_ref), self.k1 * (self.a1_act - self.a1_ref)])
         d = arm + np.array([-self.off_s, self.off_f])
         return self.stop_err + self._rot() @ d
 
@@ -3957,8 +3982,11 @@ class ZoneArmGeomTests(unittest.TestCase):
         self.assertNotIn('只转手臂', text)
 
     def test_ring_out_of_reach_moves_the_car_and_realigns_ring2(self):
-        """1、3 号环要转的角度超出 ID1 的限位：这个环照旧挪车对准；车挪过以后回到 2 号环重新对准再放(不按旧角度放歪)。"""
-        w = SimWorld(seed=3, code=self.CODE, arm_r_mm=300.0)
+        """1、3 号环要转的角度超出 ID1 的限位：这个环照旧挪车对准；车挪过以后回到 2 号环重新对准再放(不按旧角度放歪)。
+        (10-27)种子 3 换成 0：这条老退路(没用 arm_calib 调 1、3 号环、够不着就挪车)在模拟里本来就有约六分之一的种子会在"回到 2 号环
+        重新对准"时把挪车以后爪子下面那个环当成 2 号环(zone_backlash_deg=0 时种子 4、6 也这样)；10-27 对准前回到 A1P 多转了一下
+        齿轮间隙，随机数跟着变，种子 3 碰上了。用户的车用 arm_calib 调过的做法，不走这条路。"""
+        w = SimWorld(seed=0, code=self.CODE, arm_r_mm=300.0)
         a1p = w.params['A1P']
         lines = []
         h = self._make(w, dict(a1_range=[a1p - 20.0, a1p + 20.0]), lines=lines)     # 转 27° 就够不着了
@@ -4153,6 +4181,29 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual((out[False][0], out[False][1]), (2, 0), out)   # 现在：1、3 号环都调到对准
         self.assertLess(max(out[False][2].values()), max(out[True][2].values()), out)
         self.assertLess(max(out[False][2].values()), 2.0, out)
+
+    def test_ring13_fine_tune_with_id1_backlash(self):
+        """(10-27 实车"调了这么久但是机械臂位置基本没有变"、蓝色放偏)ID1 有 2° 齿轮间隙：以前微调是从 2 号环那边转过去对的，
+        调完去车上转盘夹物料、再从转盘那边转回这个角度，手臂实际停的地方差一个间隙(1 号环偏 11mm)。现在每一下都从车上转盘那一边
+        转到位(zone_backlash_deg)，微调好的位置就是放下的位置。"""
+        out = {}
+        for old in (True, False):
+            errs, cut = [], 0
+            for seed in range(3):
+                w = self._world(seed, id1_backlash_deg=2.0)
+                lines = []
+                h = self._make(w, dict(zone_backlash_deg=0.0) if old else None, lines=lines)
+                for z in h._teach_all.values():                      # 调的角度差一点点：微调只要小修正
+                    z['1'] = [z['1'][0] + 0.6, z['1'][1]]
+                    z['3'] = [z['3'][0] - 0.6, z['3'][1]]
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
+                errs += [e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH' and k in (1, 3)]
+                cut += sum(1 for l in lines if '微调到上限了' in l or '微调没对上' in l)
+            out[old] = (max(errs), cut)
+        print(f'\n  [ID1 齿轮间隙 2°] 1、3 号环放置误差最大：以前 {out[True][0]:.1f}mm，现在 {out[False][0]:.1f}mm')
+        self.assertGreater(out[True][0], 5.0, out)
+        self.assertLess(out[False][0], 2.0, out)
+        self.assertEqual(out[False][1], 0, out)                     # 现在每个环都调到对准
 
     def test_ring1_cross_is_where_ring1_goes(self):
         """(10-26)1 号环有自己的十字(claw_px.RING1)：往右挪了 15 像素，1 号环就照着这个十字对，放的位置跟着挪(3 号环、2 号环不受影响)。"""

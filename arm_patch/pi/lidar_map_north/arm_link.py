@@ -419,6 +419,10 @@ class ArmActuators:
         self.fine_speed = int(fine_speed_rpm)
         self.log = log
         self.disp = {'S': 0.0, 'F': 0.0}      # 到这个停车点以来底盘累计动了多少毫米(S 向左为正，F 向前为正)
+        # (10-27 实车 ID1 齿轮间隙)id1_backlash > 0：arm_move 的每一下 ID1 最后都从 id1_from 那一边到位(+1 = 从大往小转到位)，
+        #   要往那一边转就先多转 id1_backlash 度再转回来。mission_hooks 的 1、3 号环微调时设，平时 0
+        self.id1_backlash = 0.0
+        self.id1_from = 1.0
 
     def reset_disp(self):
         self.disp = {'S': 0.0, 'F': 0.0}
@@ -430,6 +434,11 @@ class ArmActuators:
         a1_0, a2_0 = self.arm.angle[1], self.arm.angle[2]
         if a1_0 is None or a2_0 is None:
             raise ArmError('读不到 ID1/ID2 的角度(A? 没有回 ANG)，检查总线舵机')
+        bl = float(getattr(self, 'id1_backlash', 0.0) or 0.0)
+        side = 1.0 if float(getattr(self, 'id1_from', 1.0)) >= 0.0 else -1.0
+        if bl > 0.0 and float(d_id1) * side > 1e-6:
+            # 这一下要往 id1_from 那一边转：只转过去，舵机先走完齿轮间隙手臂才动、最后还停在间隙另一边。先多转 bl 再转回来
+            self.arm.ap(a1_0 + d_id1 + side * bl, a2_0 + d_id2)
         self.arm.ap(a1_0 + d_id1, a2_0 + d_id2)
         a1_1, a2_1 = self.arm.angle[1], self.arm.angle[2]
         if a1_1 is None or a2_1 is None:

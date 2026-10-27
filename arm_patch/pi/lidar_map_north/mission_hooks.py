@@ -323,6 +323,9 @@ DEFAULTS = dict(
     zone_cal_fine_s=10.0,               #   (10-27 用户"把微调时间放长直到调好为止"，以前 2 秒)一直调到对准(偏差在 tol_mm.RING 以内)为止，这么多秒只是防卡死的上限
                                         #   (不算转过去的时间，正常一两秒就好)；到上限还没对准：比调的角度更准就按现在的放，不然按调的角度放
     zone_cal_fine_iter=12,              #   (10-27，以前 3)最多修正几次：和上面一样只是上限，对准了就停
+    zone_backlash_deg=2.0,              # (10-27 实车 ID1 齿轮间隙约 2°：微调时手臂一下都不动，调好了放下去 3 号环还偏)手臂转到圆环上方的角度时，
+                                        #   ID1 最后一下总是从车上转盘那一边转到位(和夹着物料从转盘转回来放的方向一样)：要往转盘那边转就先多转这么多度
+                                        #   再转回来。1、3 号环微调、对准 2 号环前回到 A1P、放之前回到对准角度"再转一次"都这样。0 = 不管间隙(以前)
     zone_cal_fine_max_mm=30.0,          #   一开始就差这么多以上：多半认错了环(或者车停偏太多)，不信它，按调的角度放
     zone_smooth=True,                   # 对准 2 号环(align_by 是 wheels 时)：像原料区一样车轮连续慢慢走(只发 V 速度，不转车头)，边走边每帧认 2 号环，
                                         #   越近越慢，停着看几帧确认对准；跟丢了停下重新找。要 STM32 认 V、vcal RING 量过车轮和画面的对应关系
@@ -6932,17 +6935,29 @@ class MissionHooks:
         kind = f'RING{int(ring)}'
         P = self.arm.params() or {}
         self._ring_ready = self._at_obs = False
+        # (10-27 实车 ID1 齿轮间隙)从车上转盘那一边转到位：调完去转盘夹物料、再从转盘转回来放，两次手臂停的地方才一样
+        bl, side = self._id1_backlash(a1)
         if P.get('ZOBRNG') is not None:
-            self.arm.apz(a1, a2, float(P['ZOBRNG']))          # 边转边升降到看圆环的高度(空爪)
+            self.arm.apz(a1 + side * bl, a2, float(P['ZOBRNG']))   # 边转边升降到看圆环的高度(空爪)
         else:
+            self.arm.ap(a1 + side * bl, a2)
+        if bl > 0.0:
             self.arm.ap(a1, a2)
         self._ring_ready = True                               # 张着爪停在圆环上方的观察高度
         t0 = self.now()
         kw = self._arm_only_kw(a1, a2)
         kw['timeout_s'] = max(0.3, float(cfg.get('zone_cal_fine_s', 10.0)))
         kw['max_iter'] = int(cfg.get('zone_cal_fine_iter', 12))
-        res = self.servo.run('RING', self._ring_measure(kind), self.vision.scale('RING'), cfg['tol_mm']['RING'],
-                             allow_chassis=False, label=f'{zone}环{ring}微调', bounds=self.vision.bounds(kind), confirm=False, **kw)
+        act = getattr(self.servo, 'act', None)
+        was = (getattr(act, 'id1_backlash', 0.0), getattr(act, 'id1_from', 1.0))
+        if act is not None:
+            act.id1_backlash, act.id1_from = bl, side         # 微调的每一下也从转盘那一边到位(不然往回的小修正全被间隙吃掉，手臂不动)
+        try:
+            res = self.servo.run('RING', self._ring_measure(kind), self.vision.scale('RING'), cfg['tol_mm']['RING'],
+                                 allow_chassis=False, label=f'{zone}环{ring}微调', bounds=self.vision.bounds(kind), confirm=False, **kw)
+        finally:
+            if act is not None:
+                act.id1_backlash, act.id1_from = was
         took = self.now() - t0
         if res is None:
             self.log(f'    ★ 环{ring} 微调：没结果({took:.1f} 秒)：按调的角度放')
@@ -6968,6 +6983,26 @@ class MissionHooks:
                  f'：还差 {float(res.err_mm):.1f}mm' + (f'(一开始差 {e0:.1f}mm)' if e0 is not None else '') +
                  f'，手臂比调的角度多转 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.1f}°，用了 {took:.1f} 秒')
         return b1, b2
+
+    def _id1_backlash(self, a1):
+        """(10-27 实车 ID1 齿轮间隙约 2°)手臂转到圆环上方 a1 时，最后一下从哪边转到位：和夹着物料从车上转盘转回来放的方向一样
+        (side = +1：车上转盘的 A1D 比 a1 大，从大的那边往小转到位；-1 反过来)。返回 (间隙度数 zone_backlash_deg, side)。"""
+        bl = max(0.0, float(self.cfg.get('zone_backlash_deg', 2.0) or 0.0))
+        try:
+            a1d = float((self.arm.params() or {}).get('A1D'))
+        except ArmAbort:
+            raise
+        except Exception:
+            a1d = None
+        return bl, (1.0 if a1d is None or a1d >= float(a1) else -1.0)
+
+    def _ap_from_tray_side(self, a1, a2, cur1=None):
+        """手臂转到 (a1, a2)，ID1 最后一下从车上转盘那一边到位(_id1_backlash)：现在在 a1 的另一边(要往转盘那边转)、
+        或者不知道现在在哪(cur1=None)，就先多转一个间隙再转回来。"""
+        bl, side = self._id1_backlash(a1)
+        if bl > 0.0 and (cur1 is None or (float(a1) - float(cur1)) * side > 0.0):
+            self.arm.ap(float(a1) + side * bl, float(a2))
+        self.arm.ap(float(a1), float(a2))
 
     def _zone_arm_fine(self, zone, ring, a1, a2, covered=None):
         """(10-19)空爪转到 ring 号环上方 (a1, a2)，只动手臂(车不动)用摄像头对准这个环；covered = 码垛：环上已经有这个颜色的物料，
@@ -7123,7 +7158,8 @@ class MissionHooks:
             try:
                 a1, a2 = self.arm.read_angles()
                 if a1 is not None and a2 is not None and (abs(a1 - float(P['A1P'])) > 0.15 or abs(a2 - float(P['A2P'])) > 1.5):
-                    self.arm.ap(float(P['A1P']), float(P['A2P']))     # 精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)
+                    # 精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)；(10-27)ID1 从车上转盘那一边到位(齿轮间隙)
+                    self._ap_from_tray_side(float(P['A1P']), float(P['A2P']), cur1=a1)
             except ArmAbort:
                 raise
             except ArmError:
@@ -9041,7 +9077,10 @@ class MissionHooks:
                 self.log(f'    ★ 回不到对准姿态：还差 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°，照常放')
                 return
             self.log(f'    回到对准姿态差了 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°，再转一次')
-            self.arm.ap(a1, a2)
+            if from_tray:
+                self._ap_from_tray_side(a1, a2, cur1=b1)       # (10-27)转过头了要往回转：先多转一个齿轮间隙再回来，还是从转盘那边到位
+            else:
+                self.arm.ap(a1, a2)
 
     # ------------------------------------------------------------------ 底盘沿车头方向在圆环间挪动
     def _ring1_dir(self, zone):
