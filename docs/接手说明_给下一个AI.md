@@ -1177,6 +1177,8 @@ git_log.txt                ← 分支最近 120 条提交记录
     (先 sync_now)把 ZHI ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG 都加 4mm、存进 stm32_params(10-27 的值：ZHI/ZOBRAW/ZOBRNG 120→124、
     ZGRAB/ZDROP 102→106、ZSTK 67→71)；`zup -4` 还原；`zup 4 ZHI …` 只改列出来的。超过 LFMAX 提醒(升降最高只到 LFMAX，没自动改)；
     改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
+    **用户跑了 zup 4 以后说"不对不是的，只需要把这个最高点改上去就好了，其他的点不要改"**：用户要的只是 ZHI 120→124。
+    让用户 `zup -4 ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG` 改回去(车上实际的值：ZGRAB 102、ZDROP 104、ZPLC 2、ZSTK 67、ZOBRAW/ZOBRNG 120)。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准
