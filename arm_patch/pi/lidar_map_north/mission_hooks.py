@@ -377,7 +377,8 @@ DEFAULTS = dict(
     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
                                         #   观察姿态(A1P/A2P)一下都不动；只差一点、打滑、到能挪的边上、次数用完都不交给手臂补，车轮接着修
                                         #   (最多 zone_wheels_moves 次)，最后还差不到 accept_mm 照样放，不然这个区这次不放。False = 以前(剩下的手臂补)
-    zone_wheels_moves=8,                #   只用车轮时最多挪几次
+    zone_wheels_moves=15,               #   只用车轮时最多挪几次((10-28 用户"二号环必须一直对准"：实车粗加工区第二轮挪了 8 次还差 6.4mm 就停了)以前 8)
+    zone_p2_timeout_s=20.0,             #   (10-28)2 号环被第一批的物料盖住、一步一步对准时最多用多少秒(以前和别的一样 zone_timeout_s，车上 6 秒，还差 8mm 就停了)
     zone_wheels_s_mm=150.0,             #   只用车轮时横移最多离停车点多少毫米(按地图查过：车身不压工位/黄色区、不出场地、不碰障碍物，碰就少挪)
     zone_wheels_f_mm=150.0,             #   只用车轮时沿圆环那一排最多挪多少毫米(以看三个环时算出的 2 号环位置为中心，同样按地图查)
     zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)沿圆环那一排离停车点这么近以内不按地图查：
@@ -6355,8 +6356,11 @@ class MissionHooks:
             if self._no_time('pick', '取回(物料留在粗加工区，放在那儿也算分)'):
                 break
             t_it = self.now()
-            self._pickback_item(item, 'ROUGH')
+            ok = self._pickback_item(item, 'ROUGH')
             self._note_item('pick', t_it)
+            if not self.nogo:
+                self.stats.grab(bool(ok))                        # (10-28 用户"从粗加工区域抓取上来也要算一次抓取")
+                self._show_stats()
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在圆环上方)，再挪底盘
         self._zone_back('ROUGH')
 
@@ -7170,15 +7174,17 @@ class MissionHooks:
             self.log(f'    2 号环对准结果：还差 {sm["err_mm"]:.1f}mm({sm.get("how") or "车轮"})')
             self._zone_v_only = not sm.get('sf')            # 停着算好再挪用的是 S/F：挪回停车点也用 S/F
         else:
-            self._goto_ring(zone, 2)
+            low = (self.on_ring.get((zone, 2)) or [None])[-1]
+            self._goto_ring(zone, 2, strafe=low is None)
             if wheels or cal:
                 self._obs_fixed()
             else:
                 self._obs_ring()
             kw = self._wheels_kw() if (wheels or cal) else self._zone_servo_kw()
-            low = (self.on_ring.get((zone, 2)) or [None])[-1]
             if low is not None:                          # 暂存区第二批：2 号环上放着第一批的物料(白心被盖住)：认物料顶面/圆环外圈
-                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal))
+                more = self._p2_cover_kw(zone) if (wheels or cal) else None
+                res, _how = self._align_covered(low.color, 'STACK', f'{zone}对准2号环', confirm=False, wheels=(wheels or cal),
+                                                extra_kw=more, tol=self._ring_tol('zone_vel_tol_mm') if (wheels or cal) else None)
             else:
                 res = self.servo.run('RING', self._ring_measure(), self.vision.scale('RING'),
                                      cfg['tol_mm']['RING'], allow_chassis=True, label=f'{zone}对准2号环',
@@ -7201,6 +7207,34 @@ class MissionHooks:
                  ('按 arm_calib 调的角度' if cal else '示教的、或者按环距算的') + ')，车不再动')
         self._teach_fix[zone] = self._teach_photo(zone) if not cal else {1: (0.0, 0.0), 3: (0.0, 0.0)}
         return self._p2[zone]
+
+    def _p2_cover_kw(self, zone):
+        """(10-28 实车暂存区第二批：2 号环上放着第一批的物料，一步一步对准时横移只许离停车点 ±ring_strafe_max_mm(20mm)、
+        zone_timeout_s(6 秒)就停，还差 8mm)对准盖住的 2 号环：横移范围和车轮连续对准一样——往工位那边按地图只留
+        zone_align_margin_mm，离停车点 zone_trust_s_mm 以内黄色区/场地边不按地图查(车停偏了地图不准)；时间 zone_p2_timeout_s。
+        返回给 servo.run 的参数(chassis_s_range 相对现在的位置)。"""
+        cfg = self.cfg
+        kw = dict(timeout_s=float(cfg.get('zone_p2_timeout_s', 20.0)))
+        pose0 = self._stop_pose(zone)
+        if pose0 is None or cfg.get('chassis_strafe', False):
+            return kw
+        obs = self._map_obstacles()
+        wk = (zone, max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))))
+        far = max(float(cfg.get('zone_trust_s_mm', 60.0) or 0.0), float(cfg.get('ring_strafe_max_mm') or 0.0))
+        s0, f0 = float(self.act.disp['S']), float(self.act.disp['F'])
+
+        def ok_(s):
+            return self._body_clear(pose0, (s, f0), obs, work=wk, hard_only=True)[0]
+
+        def room(sign):
+            s = 0.0
+            while s + 1.0 <= far and ok_(sign * (s + 1.0)):
+                s += 1.0
+            if s == 0.0 and not ok_(0.0) and any(ok_(sign * k) for k in range(2, int(far) + 1)):
+                s = far                                  # 停车点本来就离工位不到余量：往外挪不限
+            return s
+        kw['chassis_s_range'] = (-room(-1.0) - s0, room(1.0) - s0)
+        return kw
 
     def _ring2_smooth(self, zone):
         """(10-20 用户"工位就像原料区对圆盘那样定位 2 号环这个点，车不要乱跑；找不到环不要后退，往前慢慢去找")只动车轮对准 2 号环：
@@ -9012,18 +9046,25 @@ class MissionHooks:
             raise DroppedError(f'{ex}(已经松手)') from ex
 
     # ------------------------------------------------------------------ 白心被物料盖住时对准(取回、码垛)
-    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None):
+    def _align_covered(self, color, key, label, confirm, wheels=False, arm_kw=None, extra_kw=None, tol=None):
         """对准一个白心被物料盖住的圆环(取回：上面就是要夹的物料；码垛：上面是下面那层)：
         1 claw_px.PICK 量过、认得到这个颜色的物料：把物料顶面对到 PICK 点(最准，不用认圆环)
         2 否则认圆环(vclaw RING 量过圆环大小时，白心被盖住也能认最外圈)
         wheels=True：只动车轮(手臂不动)。arm_kw：(10-19)只动手臂、车不动(这些是给 servo.run 的参数，见 _arm_only_kw)。
+        tol：(10-28)对准到多少毫米以内(和 tol_mm[key] 取小的；盖住的 2 号环和平时的 2 号环一样按 rtol 的第二个数，
+        只是车轮一步一步对准时最小到 servo.wheels_only_tol_mm(2mm)，以前按码垛的 tol_mm.STACK 2.5mm)。
         返回 (Result, '物料'/'圆环')；物料和圆环都看不到返回 (None, None)。"""
         v, cfg = self.vision, self.cfg
-        tol, acc = cfg['tol_mm'][key], cfg['accept_mm'][key]
+        tol, acc = (min(float(cfg['tol_mm'][key]), float(tol)) if tol else cfg['tol_mm'][key]), cfg['accept_mm'][key]
         if wheels:
             acc = self._wheels_accept(key)
         n = cfg.get('zone_frames') or None
-        kwf = self._wheels_kw if wheels else self._zone_servo_kw
+        kwf0 = self._wheels_kw if wheels else self._zone_servo_kw
+
+        def kwf():
+            kw_ = kwf0()
+            kw_.update(extra_kw or {})                   # (10-28)对准盖住的 2 号环：横移范围、时间另算(_p2_cover_kw)
+            return kw_
         allow = True
         if arm_kw is not None:
             kwf, allow = (lambda: dict(arm_kw)), False
@@ -9246,15 +9287,16 @@ class MissionHooks:
         v = float(offs.get(str(ring), 0.0))
         return -v if self.ring_rev else v
 
-    def _goto_ring(self, zone, ring):
+    def _goto_ring(self, zone, ring, strafe=True):
         """底盘沿圆环那一排前后挪到这个圆环正对爪子的位置。
         到工位时摄像头看清过三个环(_survey)：按看到的位置直接开过去；没看清：圆环的名义位置 + 前面圆环对准时学到的停车误差。
-        工位里不横移(chassis_strafe=False)：离圆环远一点近一点由手臂伸缩补。"""
+        工位里不横移(chassis_strafe=False)：离圆环远一点近一点由手臂伸缩补。strafe=False：(10-28)只动车轮时也不顺便横移
+        (2 号环被第一批的物料盖住：看三个环时认不清，按它算的远近会挪反)。"""
         d = self.act.disp
         f = self.ring_f.get((zone, int(ring)))
         if f is not None:
             dF = int(round(f - d['F']))
-            dS = self._ring_dS(zone, ring) if self._by_wheels(zone) else 0
+            dS = self._ring_dS(zone, ring) if (strafe and self._by_wheels(zone)) else 0
             if abs(dF) < float(self.cfg.get('ring_move_min_mm') or 0.0):
                 if not dS:
                     return                                       # 很近：手臂(只动车轮时：对准时的车轮)够得着，底盘不动

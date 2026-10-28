@@ -305,7 +305,7 @@ class KeepaliveParkTests(unittest.TestCase):
         h, lines = hooks(w)
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START2'), log=lines.append)
         self.assertEqual(w.parked, 1)
-        self.assertEqual((w.screen['t2'], w.screen['t3']), ('GRAB 3', 'PLACE 6'))
+        self.assertEqual((w.screen['t2'], w.screen['t3']), ('GRAB 6', 'PLACE 6'))   # (10-28)抓取含粗加工区取回的 3 个
         self.assertEqual((w.screen['t0'], w.screen['t7']), ('156+123+', '516+231'))
 
     def test_no_park_after_abort(self):
@@ -351,7 +351,7 @@ class ErrorTests(unittest.TestCase):
         text = '\n'.join(lines)
         self.assertIn('STOW 没成', text)                         # (10-23)ArmLink 原样再发一次(以前是 _stow_retry 的"再收一次")
         self.assertIn('再发一次', text)
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (3, 6), text[-2000:])   # 这一轮照常做完
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 6), text[-2000:])   # 这一轮照常做完(抓取含粗加工区取回的 3 个)
         self.assertEqual(set(w.screen), {'t0', 't7', 't2', 't3'})   # (10-23)屏上只有任务码、抓取数、放置数(不写阶段 DONE)
 
 

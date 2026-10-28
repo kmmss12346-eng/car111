@@ -26,7 +26,7 @@ def full():
                     st = h.stats
                     fired = w.count.get(verb, 0) >= n
                     perfect = (not exc and (w.air, w.loose, w.collisions) == (0, 0, 0)
-                               and (st.grab_ok, st.place_ok) == (6, 12) and not h.disabled)
+                               and (st.grab_ok, st.place_ok) == (12, 12) and not h.disabled)   # (10-28)抓取含粗加工区取回：6 + 6
                     if fired and not perfect:
                         bad += 1
                         print(f'{verb:6s} n={n} {"/".join(extra) or "-":6s} seed={seed} grab {st.grab_ok}/{st.grab_total} '

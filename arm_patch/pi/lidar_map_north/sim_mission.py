@@ -1225,7 +1225,7 @@ class MissionSimTests(unittest.TestCase):
             self.assertEqual(w.air, 0, f'seed {seed}: 夹空了 {w.air} 次')
             self.assertEqual(w.loose, 0, f"seed {seed}: 物料掉在半路上 {w.loose} 次")
             self.assertEqual(w.collisions, 0, f'seed {seed}: 碰倒/叠错 {w.collisions} 次')
-            self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), f'seed {seed}')
+            self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (12, 12, 12, 12), f'seed {seed}')
             self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()), f'seed {seed}: {rings_summary(w, "ROUGH")}')
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, f'seed {seed}')
             self.assertEqual(w.tray, {1: None, 2: None, 3: None})
@@ -1252,7 +1252,7 @@ class MissionSimTests(unittest.TestCase):
         run_mission(w, h)
         s = w.screen
         # (10-23 用户"按要求帮我显示好必要的字")屏上只有：任务码两行、正确抓取数、正确放置数；阶段、提示、B1/B2 都不写
-        self.assertEqual(s, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 6', 't3': 'PLACE 12'})
+        self.assertEqual(s, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 12', 't3': 'PLACE 12'})
         self.assertTrue(all(all(ord(ch) < 128 for ch in v) for v in s.values()))
         scr = [r for r in w.requests if r.startswith('SCR ')]
         self.assertTrue(scr)
@@ -1266,17 +1266,19 @@ class MissionSimTests(unittest.TestCase):
         h = make(w)
         run_mission(w, h)
         self.assertEqual([o for o, _t in w.scr_log][:2], ['t0', 't7'])       # 读到码以前屏上什么都没有：最先写的是任务码
-        self.assertEqual([t for o, t in w.scr_log if o == 't2'], [f'GRAB {i}' for i in range(7)] + ['GRAB 6'])
+        self.assertEqual([t for o, t in w.scr_log if o == 't2'], [f'GRAB {i}' for i in range(13)] + ['GRAB 12'])
+        k = next(i for i, r in enumerate(w.requests) if r.startswith('PICK'))
+        self.assertEqual(next(r for r in w.requests[k:] if r.startswith('SCR t2')), 'SCR t2 GRAB 4')   # (10-28)从粗加工区取回一个也马上算一次抓取
         self.assertEqual([t for o, t in w.scr_log if o == 't3'], [f'PLACE {i}' for i in range(13)] + ['PLACE 12'])
         g1 = next(i for i, r in enumerate(w.requests) if r.startswith('GRAB'))
         self.assertIn('SCR t2 GRAB 0', w.requests[:g1])                     # 第一个物料夹起来以前就有抓取0、放置0
         self.assertIn('SCR t3 PLACE 0', w.requests[:g1])
         k = max(i for i, r in enumerate(w.requests) if r == 'PARK')
         self.assertEqual([r for r in w.requests[k + 1:] if r.startswith('SCR')],
-                         ['SCR t0 156+123+', 'SCR t7 516+231', 'SCR t2 GRAB 6', 'SCR t3 PLACE 12'])
+                         ['SCR t0 156+123+', 'SCR t7 516+231', 'SCR t2 GRAB 12', 'SCR t3 PLACE 12'])
         w2 = SimWorld(seed=1, code=self.CODE)
         run_mission(w2, make(w2, dict(screen_counts_live=False, screen_stats_live=True)))
-        self.assertEqual([t for o, t in w2.scr_log if o in ('t2', 't3')], ['GRAB 6', 'PLACE 12'])   # false：回到启停区才写(旧键不再读)
+        self.assertEqual([t for o, t in w2.scr_log if o in ('t2', 't3')], ['GRAB 12', 'PLACE 12'])   # false：回到启停区才写(旧键不再读)
 
     def test_screen_rewritten_after_screen_reboot_at_home(self):
         """(10-27)回到启停区收臂、升降停 60 的时候屏掉电重启(画面全没了)：树莓派收完臂再把任务码、抓取数、放置数写一遍
@@ -1284,7 +1286,7 @@ class MissionSimTests(unittest.TestCase):
         w = SimWorld(seed=1, code=self.CODE)
         w.screen_wipe_at = ('PARK', 1)
         run_mission(w, make(w))
-        self.assertEqual(w.screen, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 6', 't3': 'PLACE 12'})
+        self.assertEqual(w.screen, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 12', 't3': 'PLACE 12'})
         w = SimWorld(seed=1, code=self.CODE)
         w.screen_wipe_at = ('PARK', 1)
         w.scr_fail = ['SCR t3 PLACE 12', 'SCR t3 PLACE 12']                # 跑的时候、回家以后第一次都没写成
@@ -1349,7 +1351,7 @@ class MissionSimTests(unittest.TestCase):
         lines = []
         h = make(w, log=lines.append)
         run_mission(w, h, log=lines.append)
-        self.assertEqual(h.stats.grab_ok, 5)
+        self.assertEqual(h.stats.grab_ok, 10)                         # (10-28)原料区 5 + 粗加工区取回 5
         temp = rings_summary(w, 'TEMP')
         self.assertEqual(temp[1], [1, 1])
         self.assertEqual(temp[3], [6, 6])
@@ -1382,7 +1384,7 @@ class MissionSimTests(unittest.TestCase):
             w = SimWorld(seed=300 + seed, code=self.CODE, ap_atol=False)
             h = make(w, dict(LIVE_DEFAULTS))
             run_mission(w, h)
-            self.assertEqual(h.stats.grab_ok, 6)
+            self.assertEqual(h.stats.grab_ok, 12)
             self.assertEqual(h.stats.place_ok, 12)
             self.assertEqual(w.air, 0)
             self.assertLess(max(e for (_, _, _, e, st) in w.placed if not st), 2.5)
@@ -1414,8 +1416,8 @@ class MissionSimTests(unittest.TestCase):
         lines = []
         h = make(w, log=lines.append)
         run_mission(w, h, log=lines.append)
-        self.assertEqual(h.stats.grab_total, 6)
-        self.assertEqual(h.stats.grab_ok, 6, '\n'.join(lines)[-3000:])
+        self.assertEqual(h.stats.grab_total, 12)                        # (10-28)原料区 6 + 粗加工区取回 6(再抓的那一次不重复算)
+        self.assertEqual(h.stats.grab_ok, 12, '\n'.join(lines)[-3000:])
         self.assertIn('再抓一次', '\n'.join(lines))
         self.assertTrue(any(r == 'STOW' for r in w.requests))
 
@@ -1430,7 +1432,7 @@ class MissionSimTests(unittest.TestCase):
         self.assertIn('先放回转盘', text)
         self.assertIsNone(h.disabled, text[-3000:])
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (12, 12, 12, 12), text[-3000:])
         self.assertEqual(w.tray, {1: None, 2: None, 3: None})
 
     def test_time_limit_skips_remaining_work(self):
@@ -2117,7 +2119,7 @@ class PlaceOrderTests(unittest.TestCase):
         run_mission(w, h, log=lines.append)
         text = '\n'.join(lines)
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
         self.assertEqual([r for r in w.requests if r.startswith('GRAB')], ['GRAB 1 H', 'GRAB 2 H', 'GRAB 3 H'] * 2, text[-3000:])
         self.assertEqual([r for r in w.requests if r.startswith('PICK')], ['PICK 1 H', 'PICK 2 H', 'PICK 3 H'] * 2, text[-3000:])
         self.assertEqual([(p[0], p[1], p[2]) for p in w.placed if p[0] == 'ROUGH'],
@@ -3458,7 +3460,7 @@ class RawNearSlotTests(unittest.TestCase):
             run_mission(w, h, log=lines.append)
             text = '\n'.join(lines)
             self.assertEqual(text.count('原料区(最近那格)'), 2, text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (6, 6, 12, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.grab_total, h.stats.place_ok, h.stats.place_total), (12, 12, 12, 12), text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]}, f'seed {seed}')
 
@@ -3854,7 +3856,7 @@ class WheelsAlignTests(unittest.TestCase):
             self._assert_arm_still(rec, text)
             self.assertGreaterEqual(rec['runs'], 18)                         # 9 次平放 + 3 次码垛 + 6 次取回
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (12, 12, 12), text[-3000:])
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
             for z in ('ROUGH', 'TEMP'):
                 self.assertLessEqual(rec['s_max'].get(z, 0.0), h.cfg['ring_strafe_max_mm'], (z, rec['s_max']))
@@ -3942,7 +3944,7 @@ class WheelsAlignTests(unittest.TestCase):
             text = '\n'.join(lines)
             self._assert_arm_still(rec, text)
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
 
     def _strafe_blocked(self, side_mm):
@@ -4020,7 +4022,7 @@ class ZoneArmGeomTests(unittest.TestCase):
 
     def _ok(self, w, h, text):
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-4000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-4000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (12, 12, 12), text[-4000:])
         self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
         self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
 
@@ -4181,7 +4183,7 @@ class ZoneCalTests(unittest.TestCase):
 
     def _ok(self, w, h, text):
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-4000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-4000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (12, 12, 12), text[-4000:])
         self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
         self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
 
@@ -4399,7 +4401,7 @@ class ZoneCalTests(unittest.TestCase):
                 text = '\n'.join(lines)
                 if same:
                     self.assertEqual((w.air, w.loose, w.collisions, w.sweep_hits), (0, 0, 0, 0), text[-3000:])
-                    self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (3, 6, 6), text[-3000:])
+                    self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 6, 6), text[-3000:])
                 for (z, k, _c, e, _st) in w.placed:
                     errs[k].append(e)
                 cams += sum(1 for l in lines if '微调' in l and '只动手臂' in l)
@@ -4934,6 +4936,38 @@ class ZoneCalTests(unittest.TestCase):
         i = text.rfind('▶ TEMP 放')
         self.assertIn('只转手臂(比 2 号环多转', text[i - 3000:])            # 1、3 号环照旧只转手臂(第二轮按第一轮微调好的角度)
 
+    def test_covered_ring2_with_car_limits_still_aligns(self):
+        """(10-28 实车暂存区第二批，用户"二号环必须一直对准")2 号环被第一批的物料盖住、一步一步对准：以前先按看三个环时(认错了)算的远近
+        横移 20mm(挪反了)，再只许离停车点 ±ring_strafe_max_mm(车上 20mm)、zone_timeout_s(车上 6 秒)就停，还差 8mm。现在盖住时不先横移，
+        横移范围按地图(往工位那边离工位留 zone_align_margin_mm)、最多 zone_p2_timeout_s 秒：车停偏 35mm 也对到容差以内，三个都码好。"""
+        import re
+        for seed in (31, 32):
+            w = self._world(seed, park={'TEMP': -10.0}, park_side={'TEMP': 35.0}, stop_err_mm=0.5)
+            lines = []
+            pose = [415.0, 1250.0, 90.0]          # 车头朝北：左边(雷达那边)朝西 = 暂存区；车身西边 415-130-45=240，离区 90mm
+            h = self._make(w, dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0), lines=lines, raw={'stops': {'TEMP': pose}})
+            orig = w.vision.ring_px
+
+            def ring_px(n=None, expect=None, any_size=False, max_px=None):
+                if w.zone == 'TEMP' and h.on_ring.get(('TEMP', 2)):
+                    w.advance(_frames_dt(n))
+                    return None                                     # 白心被盖住：这个认法认不出
+                return orig(n, expect, any_size, max_px)
+            w.vision.ring_px = ring_px
+            ds0 = h._ring_dS
+            h._ring_dS = lambda zone, ring: (-20 if zone == 'TEMP' and h.on_ring.get(('TEMP', 2)) else ds0(zone, ring))   # 看三个环时认错了
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            part = text[text.rfind('2 号环上放着第一批的物料'):]          # 第二批到暂存区
+            self.assertIn('2 号环上放着第一批的物料(白心盖住了)', part, text[-3000:])
+            self.assertNotIn('横移 -20mm(按看圆环时算的远近)', part, part[:3000])
+            self.assertIn('2 号环对准结果：Result(ok=True', part, part[:3000])
+            m = re.search(r'2 号环对准结果：Result\(ok=True, err=([\d.]+)mm', part)
+            self.assertLessEqual(float(m.group(1)), 2.0, part[:3000])     # 按 2 号环的容差(车轮一步一步对最小 2mm；以前按码垛的 2.5mm)
+            self._ok(w, h, text)
+            far = [e for (z, _k, _c, e, st) in w.placed if z == 'TEMP' and st]
+            self.assertLess(max(far), 3.0, far)
+
     def test_obs_error_is_removed_before_aligning(self):
         """OBS 大动作到位差 1°(ATOLC)：对准 2 号环前手臂先精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)，1、3 号环才放得准。"""
         errs = {}
@@ -5160,7 +5194,7 @@ class StackCarryTests(unittest.TestCase):
             h, text = self._run(w, True)
             self.assertEqual(w.sweep_hits, 0, text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 12, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (12, 12, 12), text[-3000:])
             self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
             self.assertEqual(text.count('路上要经过已经叠了两层的'), 1, text[-3000:])
 
@@ -5172,7 +5206,7 @@ class StackCarryTests(unittest.TestCase):
             h, text = self._run(w, True)
             self.assertEqual(w.sweep_hits, 0, text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
             self.assertIn('停下往里缩到 ID2 -1100°', text)
             aps = self._last_carry(w)
             self.assertEqual(aps[0], (436.0, -1000.0), aps)                      # 绕过电池盒(R1T1)，还伸在 R2T
@@ -5262,7 +5296,7 @@ class StackCarryTests(unittest.TestCase):
             h, text = self._run(w, True)
             self.assertEqual(w.sweep_hits, 0, text[-3000:])
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
             self.assertEqual(text.count('码垛(第二层一律这样走)') + text.count('路上要经过已经叠了两层的'), 3, text[-3000:])
             takes = [n for n, q in enumerate(w.requests) if q.startswith('TAKE')]
             for t in takes[-3:]:
@@ -5310,7 +5344,7 @@ class PreArmTests(unittest.TestCase):
             self.assertEqual(d0, d1)
             for w, h, text in ((w0, h0, t0), (w1, h1, t1)):
                 self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-                self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+                self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
             o0, o1 = w0.time_by_verb.get('OBS', 0.0), w1.time_by_verb.get('OBS', 0.0)
             self.assertLess(o1, o0 * 0.7, (o0, o1))                # 每个工位第一次 OBS 几乎不花时间(后面放第 2、3 个的 OBS 照旧)
             self.assertLess(w1.t, w0.t - 3.0, (w0.t, w1.t))
@@ -5326,7 +5360,7 @@ class PreArmTests(unittest.TestCase):
         w, h, done, text = self._run(0, pre_fw=False)
         self.assertEqual(sum(1 for q in w.requests if q.startswith('PRE')), 1, text)
         self.assertIn('不认识 PRE', text)
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
 
     def test_no_code_no_pre(self):
         w, h, done, text = self._run(0, qr_present=False)
@@ -5396,7 +5430,7 @@ class SingleGlitchTests(unittest.TestCase):
             self.assertGreaterEqual(w.count.get(fc[0], 0), fc[1], fc)          # 真的出过错
             self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), (fc, text[-3000:]))
             self.assertIsNone(h.disabled, (fc, text[-3000:]))
-            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), (fc, text[-3000:]))
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), (fc, text[-3000:]))
 
     def test_init_retried_at_next_stop(self):
         """开头 GET 连着两次没回话(初始化时多问的那一次也没回)：到下一站再初始化一次，照样 6 个全抓、12 个全放。"""
@@ -5417,7 +5451,7 @@ class SingleGlitchTests(unittest.TestCase):
         text = '\n'.join(lines)
         self.assertIn('到这一站再试一次', text)
         self.assertIsNone(h.disabled, text[-2000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
 
     def test_lift_after_release_counts_as_placed(self):
         """松手以后抬起来连着两次出错：物料已经在环上了(算放了)，只收臂，不当还夹着放回转盘。"""
@@ -5442,7 +5476,7 @@ class SingleGlitchTests(unittest.TestCase):
         self.assertIn('已经放在环', text)
         self.assertNotIn('先放回转盘', text)
         self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
-        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 12), text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
 
     def test_raw_near_slot_survives_one_glitch(self):
         t = RawNearSlotTests()
