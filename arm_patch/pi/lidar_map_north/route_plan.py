@@ -77,6 +77,10 @@ YELLOW_MARGIN_MM = 50
 YELLOW_MIN_MARGIN_MM = 35
 YELLOW_FLOOR_MM = 35             # 400 宽的车道(车宽含雷达 300)居中两边各 50，栅格 25 最多偏 12.5：35 是还一定开得过去的最大值
 YELLOW_NOTE_MM = 40              # 一段路线离黄色区不到这么多(而且比希望的 yellow_margin_mm 近)才在 note 里提示“走这段要特别注意”
+# (10-28 实车：障碍物不在中间那条 400 宽的车道里，去粗加工区就从中间穿，可车走在离西边黄色区 35mm、离东边 65mm 的地方(按硬余量 35 也算开得过去)，
+#   推算的车位一路偏几厘米就压到黄色区。按 45 规划时同一条车道走正中间(两边约 50mm)，还快 0.3 秒)先按离黄色区 yellow_prefer_floor_mm 规划，
+#   规划不出来、或者有停车点因此要挪开，再按原来的硬余量(yellow_floor_mm)规划。0 = 以前的做法
+YELLOW_PREFER_FLOOR_MM = 45
 ZONE_MARGIN_MM = 30              # 暂存区/粗加工区
 RAW_MARGIN_MM = 30               # 原料转盘
 EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
@@ -1685,6 +1689,13 @@ def plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None):
         tries = [dict(cfg, lane_block='soft')]
         if cap is not None:
             tries.append(dict(cfg, lane_block='soft', strafe_max_mm_per_leg=None))
+        pf = float(cfg.get('yellow_prefer_floor_mm', YELLOW_PREFER_FLOOR_MM) or 0.0)
+        if pf > _margins(cfg)['ymin'] + 0.5:
+            legs, why, planner = _plan_mission(dict(tries[0], yellow_floor_mm=pf), obstacles, start_pose, stop_names, start_pivot)
+            if why == 'OK' and not any(lg.get('goal_shift') for lg in legs):
+                planner.fallback = False
+                planner.lane_fallback = False
+                return legs, why, planner
         first = None
         for c2 in tries:
             legs, why, planner = _plan_mission(c2, obstacles, start_pose, stop_names, start_pivot)

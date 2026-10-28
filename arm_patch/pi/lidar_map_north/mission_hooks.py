@@ -388,6 +388,15 @@ DEFAULTS = dict(
     zone_trust_f_mm=120.0,              #   还差 20mm 整个区不放)照摄像头看到的 2 号环挪、离停车点横着 zone_trust_s_mm、沿那一排 zone_trust_f_mm 以内：
                                         #   黄色区、场地边、别的工位不按地图查(地图按"车正好停在停车点"算，车停偏了几厘米它就不准；对上 2 号环时
                                         #   车就在 arm_calib 调 2 号环时车停的地方)。离这个工位照样留 zone_align_margin_mm，障碍物照样查。0 = 以前的做法
+    zone_gap_trust=True,                # (10-28 实车暂存区 2 号环要往白色区横移 74mm，按推算的位置只许 25mm，整个区不放，车走后雷达定位：车其实偏东 95mm)
+                                        #   同一个 2 号环手臂姿态、两个工位圆环摆法一样：对上 2 号环时车身离白色区本来就一样远。这一轮第一次对上
+                                        #   (一般是粗加工区)时按地图车身离白色区 zone_gap_ref_min_mm + zone_align_margin_mm 以上，就当基准：后面对 2 号环
+                                        #   离停车点横着 zone_gap_trust_s_mm 以内不再按地图查工位(推算的车位偏了几厘米，对上时离白色区和基准一样远)；
+                                        #   做完按两次差多少挪回真正的停车点(路线下一段不带着偏差走)。False = 以前的做法
+    zone_gap_ref_min_mm=15.0,
+    zone_gap_trust_s_mm=150.0,
+    zone_gap_fix_min_mm=8.0,            #   推算的车位偏得比这少：做完照旧挪回推算的停车点
+    zone_gap_fix_max_mm=150.0,          #   偏得比这多不信(多半认错了)：照旧挪回推算的停车点
     zone_align_margin_mm=5.0,          #   (10-27 用户"轮子不是可以自由移动吗"：车身离粗加工区 20mm，按导航的余量 30mm 只许横移 9mm，还差 12.6mm 整个区不放)
                                         #   车轮对准 2 号环时车身离这个工位最少留多少毫米(车慢慢挪、摄像头看着，不用导航那么大的余量)；只管这个工位，
                                         #   离黄色区、场地边、别的区照旧按 qr_zone_margin_mm。规则：车身(机械臂除外)压进工位这一轮就结束，不能小于 0
@@ -876,6 +885,8 @@ class MissionHooks:
         self._p2_at = {}                    # (10-19)区 -> 对准 2 号环时车在哪(底盘位移 S、F)：车挪过就要重新对准
         self._anchor0 = {}                  # (10-26)区 -> 第一次来对准(2 号环/原料盘中心)时车在哪(相对规定的停车点：S、F)
         self._anchor_now = None             #   这一趟对准时的 (区, (S, F))；task() 开头清掉
+        self._gap_ref = None                # (10-28)这一轮第一次对上 2 号环时车身离那个工位白色区多远(按地图)：(区, mm)，见 _gap_mark
+        self._gap_now = None                #   这一趟对上 2 号环时的 (区, mm)；task() 开头清掉
         self._p2_failed = set()             # (10-20)这一趟 2 号环没对准的区：后面的物料不再试(省时间)，直接照旧一个环一个环对准
         self._zone_v_only = False           # (10-20)这一趟工位里车只用 V 动过(没发 S/F)：做完挪回停车点也只用 V(不转车头)
         self.ring_uv = {}                   # (10-20)(区, 圆环号) -> (画面里 u, v, 那时底盘 S, F)：看三个环时记下的，对准 2 号环时按它找
@@ -930,6 +941,7 @@ class MissionHooks:
         self.act.reset_disp()                       # 路线把车开到了新的停车点，位移从 0 重新算
         self.learn = {'S': 0.0, 'F': 0.0}
         self._anchor_now = None
+        self._gap_now = None
         self.visits[role] = self.visits.get(role, 0) + 1
         t_start = self.now()
         self._items_t = 0.0
@@ -4028,6 +4040,94 @@ class MissionHooks:
                 return False, f'离障碍物({ox:.0f},{oy:.0f})太近'
         return True, ''
 
+    def _zone_gap(self, pose, d, zone):
+        """(10-28)车从停车点 pose 挪 d = [横移(左+), 前进] 毫米以后，车身(含雷达)离这个工位(粗加工区/暂存区)白色区多远(mm，压进去是负的)。
+        和 _body_clear 一样按"车正好停在停车点"算；按两个外框在几个方向上最多分开多少算(横平竖直时就是真实距离)。算不了返回 None。"""
+        rc = self.raw_cfg
+        try:
+            import route_plan as rp
+            r = tuple(getattr(rp, {'TEMP': 'TEMP_ZONE', 'ROUGH': 'ROUGH_ZONE'}[zone]))
+        except KeyError:
+            return None
+        except Exception:
+            r = {'TEMP': (0, 910, 150, 1490), 'ROUGH': (910, 0, 1490, 150)}.get(zone)
+            if r is None:
+                return None
+        x0, y0, h = pose
+        a = math.radians(h)
+        fx, fy = math.cos(a), math.sin(a)
+        lx, ly = -fy, fx
+        x, y = x0 + float(d[1]) * fx + float(d[0]) * lx, y0 + float(d[1]) * fy + float(d[0]) * ly
+        L = float(rc.get('car_length_mm', 290.0))
+        W = float(rc.get('car_width_mm', 260.0))
+        ov = float(rc.get('lidar_overhang_mm', 45.0))
+        corners = [(x + u * fx + v * lx, y + u * fy + v * ly) for u in (-L / 2.0, L / 2.0) for v in (-W / 2.0, W / 2.0 + ov)]
+        best = -math.inf
+        for ax in ((1.0, 0.0), (0.0, 1.0), (fx, fy), (lx, ly)):
+            pa = [cx * ax[0] + cy * ax[1] for cx, cy in corners]
+            pb = [px * ax[0] + py * ax[1] for px in (r[0], r[2]) for py in (r[1], r[3])]
+            best = max(best, min(pa) - max(pb), min(pb) - max(pa))
+        return float(best)
+
+    def _gap_mark(self, zone, err_mm):
+        """(10-28 实车：暂存区 2 号环要往白色区横移 74mm，按推算的位置车身离暂存区只剩 -44mm，只许挪 25mm，整个区不放；车开走后
+        雷达定位：车在暂存区其实比推算的偏东 95mm)2 号环对上了：记下这时车身离这个工位白色区多远(按地图)。同一个 2 号环手臂姿态、
+        两个工位的圆环摆法一样，对上 2 号环时车身离白色区本来就一样远：这一轮第一次对上的(一般是粗加工区)当基准 _gap_ref，
+        别的时候按地图算出来不一样，差的就是推算的车位偏了多少(_gap_trusted、_gap_fix)。mtest(车是手放的)不记。"""
+        if self._stop_name is None or self.act is None or zone not in ('ROUGH', 'TEMP'):
+            return
+        pose0 = self._stop_pose(zone)
+        if pose0 is None:
+            return
+        d = self.act.disp
+        g = self._zone_gap(pose0, (float(d['S']), float(d['F'])), zone)
+        if g is None:
+            return
+        self._gap_now = (zone, g)
+        if (self._gap_ref is None and err_mm is not None and math.isfinite(float(err_mm))
+                and float(err_mm) <= max(3.0, self._ring_tol('zone_vel_tol_mm'))):
+            self._gap_ref = (zone, g)
+            name = {'ROUGH': '粗加工区', 'TEMP': '暂存区'}[zone]
+            self.log(f'    (2 号环对上时车身离{name}白色区 {g:.0f}mm(按推算的位置)：这一轮以它为准，别的工位对上 2 号环时车身离白色区也是这么远)')
+
+    def _gap_trusted(self, zone):
+        """(10-28)这一轮的基准(第一次对上 2 号环时车身离白色区多远)够远(zone_align_margin_mm + zone_gap_ref_min_mm 以上)：
+        照摄像头对 2 号环时离停车点横着 zone_gap_trust_s_mm 以内不再按地图查工位(推算的车位偏了几厘米，对上时离白色区和基准一样远)。
+        返回基准 mm；没有基准、不够远、关着(zone_gap_trust)返回 None。"""
+        ref, cfg = self._gap_ref, self.cfg
+        if ref is None or not cfg.get('zone_gap_trust', True) or zone not in ('ROUGH', 'TEMP'):
+            return None
+        need = max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))) + float(cfg.get('zone_gap_ref_min_mm', 15.0))
+        return float(ref[1]) if float(ref[1]) >= need else None
+
+    def _gap_fix(self, zone):
+        """(10-28 实车：暂存区推算的车位偏了 95mm，做完挪回推算的停车点再往北开，车身压到西北黄色区)这一趟对上 2 号环时按地图车身离
+        白色区 g，基准是 g_ref：推算的车位往白色区那边偏了 c = g_ref - g(c > 0：车其实离白色区更远)。做完挪回真正的停车点
+        (推算的停车点再往白色区那边挪 c)，路线下一段照样按停车点算、不带着这个偏差走。返回横移目标(底盘位移 S，相对推算的停车点)或 None。"""
+        cfg, now = self.cfg, self._gap_now
+        g_ref = self._gap_trusted(zone)
+        if now is None or now[0] != zone or g_ref is None:
+            return None
+        c = g_ref - float(now[1])
+        if abs(c) < float(cfg.get('zone_gap_fix_min_mm', 8.0)):
+            return None
+        name = {'ROUGH': '粗加工区', 'TEMP': '暂存区'}[zone]
+        if abs(c) > float(cfg.get('zone_gap_fix_max_mm', 150.0)):
+            self.log(f'    ★ 按推算的位置这一次对上 2 号环时车身离{name}白色区 {now[1]:.0f}mm，基准是 {g_ref:.0f}mm，差 {abs(c):.0f}mm：'
+                     '差太多不信(多半认错了)，照旧挪回推算的停车点')
+            return None
+        pose0 = self._stop_pose(zone)
+        g0 = self._zone_gap(pose0, (0.0, 0.0), zone) if pose0 is not None else None
+        g1 = self._zone_gap(pose0, (1.0, 0.0), zone) if pose0 is not None else None
+        if g0 is None or g1 is None or abs(g1 - g0) < 0.5:
+            return None
+        tw = 1.0 if g1 < g0 else -1.0                        # 横移往哪边是往白色区那边
+        self.log(f'    推算的车位偏了：对上 2 号环时车身离{name}白色区按推算的位置是 {now[1]:.0f}mm，可同一个手臂姿态'
+                 + ('在这一轮第一次对上时' if self._gap_ref[0] == zone else f'在{dict(ROUGH="粗加工区", TEMP="暂存区")[self._gap_ref[0]]}对上时')
+                 + f'是 {g_ref:.0f}mm：车其实离白色区{"远" if c > 0 else "近"} {abs(c):.0f}mm。做完挪回真正的停车点'
+                 f'(离白色区 {g0:.0f}mm)，后面的路线不带着这个偏差走')
+        return tw * c
+
     def _raw_center_search(self, wait):
         """停车点认不出原料盘中心：车轮依次挪到 raw_center_search_mm 里的位置去找，认出来就停在那里返回 (圆心, 半径)；
         都认不出就挪回停车点、返回 None。"""
@@ -6489,8 +6589,20 @@ class MissionHooks:
         if not self._can_work():
             return
         batch = 1 if visit <= 1 else 2
+        if batch == 2:
+            left = [it for it in self.plan.items(1) if same_item(self.in_tray.get(it.slot), it)]
+            if left:
+                # (10-28 用户"暂停区域识别不到应该继续识别啊不应该直接走啊"：第一轮暂存区 2 号环没对上，第一批留在车上，
+                #   第二轮原料区夹不了、到暂存区也只找第二批，什么都没做)第一批还在车上：先把它们放到自己的环上，再码第二批
+                self.log('    第一批的 ' + '、'.join(it.color_name for it in left) + ' 还在车上(上一趟暂存区没放成)：先放到它们自己的环上')
+                self._temp_pass(1, left)
+                if not self._can_work():
+                    return
+        self._temp_pass(batch)
+
+    def _temp_pass(self, batch, items=None):
         todo = []
-        for item in self.plan.items(batch):
+        for item in (items if items is not None else self.plan.items(batch)):
             if not same_item(self.in_tray.get(item.slot), item):
                 self.log(f'    转盘 {item.slot} 号槽里没有 {item.color_name}(不在车上)，不放')
                 continue
@@ -7173,6 +7285,7 @@ class MissionHooks:
                 return None
             self.log(f'    2 号环对准结果：还差 {sm["err_mm"]:.1f}mm({sm.get("how") or "车轮"})')
             self._zone_v_only = not sm.get('sf')            # 停着算好再挪用的是 S/F：挪回停车点也用 S/F
+            err2 = sm['err_mm']
         else:
             low = (self.on_ring.get((zone, 2)) or [None])[-1]
             self._goto_ring(zone, 2, strafe=low is None)
@@ -7196,12 +7309,14 @@ class MissionHooks:
                                                 else '这个区照旧一个环一个环对准'))
                 self._p2_failed.add(zone)
                 return None
+            err2 = res.err_mm
         a1, a2 = self.arm.read_angles()
         if a1 is None or a2 is None:
             return None
         self._p2[zone] = (a1, a2)
         self._p2_at[zone] = (float(self.act.disp['S']), float(self.act.disp['F']))
         self._anchor_mark(zone)
+        self._gap_mark(zone, err2)
         self._learn_from(zone, 2)
         self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环只转手臂过去(' +
                  ('按 arm_calib 调的角度' if cal else '示教的、或者按环距算的') + ')，车不再动')
@@ -7211,8 +7326,8 @@ class MissionHooks:
     def _p2_cover_kw(self, zone):
         """(10-28 实车暂存区第二批：2 号环上放着第一批的物料，一步一步对准时横移只许离停车点 ±ring_strafe_max_mm(20mm)、
         zone_timeout_s(6 秒)就停，还差 8mm)对准盖住的 2 号环：横移范围和车轮连续对准一样——往工位那边按地图只留
-        zone_align_margin_mm，离停车点 zone_trust_s_mm 以内黄色区/场地边不按地图查(车停偏了地图不准)；时间 zone_p2_timeout_s。
-        返回给 servo.run 的参数(chassis_s_range 相对现在的位置)。"""
+        zone_align_margin_mm，离停车点 zone_trust_s_mm 以内黄色区/场地边不按地图查(车停偏了地图不准)；这一轮有基准(_gap_trusted)
+        时离停车点 zone_gap_trust_s_mm 以内工位也不查；时间 zone_p2_timeout_s。返回给 servo.run 的参数(chassis_s_range 相对现在的位置)。"""
         cfg = self.cfg
         kw = dict(timeout_s=float(cfg.get('zone_p2_timeout_s', 20.0)))
         pose0 = self._stop_pose(zone)
@@ -7221,6 +7336,8 @@ class MissionHooks:
         obs = self._map_obstacles()
         wk = (zone, max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))))
         far = max(float(cfg.get('zone_trust_s_mm', 60.0) or 0.0), float(cfg.get('ring_strafe_max_mm') or 0.0))
+        if self._gap_trusted(zone) is not None:              # (10-28)这一轮有基准：工位也不按地图查(推算的车位偏了)，只查障碍物
+            far, wk = max(far, float(cfg.get('zone_gap_trust_s_mm', 150.0) or 0.0)), None
         s0, f0 = float(self.act.disp['S']), float(self.act.disp['F'])
 
         def ok_(s):
@@ -7328,16 +7445,21 @@ class MissionHooks:
         k_lo, k_hi = (0.3, 3.0) if unsure else (0.6, 1.6)   # 按车实际走的修对应关系时，大小能改多少(大小没核对过/不对改过的放宽)
         trust_s = max(0.0, float(cfg.get('zone_trust_s_mm', 60.0) or 0.0))
         trust_f = max(0.0, float(cfg.get('zone_trust_f_mm', 120.0) or 0.0))
+        g_ref = self._gap_trusted(zone)                       # (10-28)这一轮有基准：对上时车身离白色区和基准一样远，工位也不按地图查
+        if g_ref is not None:
+            trust_s = max(trust_s, float(cfg.get('zone_gap_trust_s_mm', 150.0) or 0.0))
 
         def map_ok(q):
             """(10-28 用户"二号环一定要对准")车轮照摄像头看到的 2 号环挪到 q(底盘位移，相对停车点)，按地图查行不行。地图是按
             "车正好停在停车点"算的，车停偏了几厘米就不准：离停车点横着 zone_trust_s_mm、沿那一排 zone_trust_f_mm 以内只查这个工位
             (照样留 zone_align_margin_mm)和障碍物，黄色区、场地边、别的工位不查——对上 2 号环时车就在 arm_calib 调 2 号环时车停的地方。
+            这一轮有基准(_gap_trusted)：这个工位也不查(推算的车位偏了，对上 2 号环时车身离白色区和基准一样远)，只查障碍物。
             返回 (行不行, 原因)。"""
             ok, why = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk)
             if ok or abs(float(q[0])) > trust_s or abs(float(q[1])) > trust_f:
                 return ok, why
-            ok2, why2 = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk, hard_only=True)
+            ok2, why2 = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=(None if g_ref is not None else wk),
+                                         hard_only=True)
             if ok2:
                 note.setdefault('trust_why', why)
             return ok2, why2
@@ -7714,8 +7836,14 @@ class MissionHooks:
                 tgt, cl = clamp_to(a + d, a)
                 if note.get('trust_why') and not note.get('trust_log'):
                     note['trust_log'] = True
-                    self.log(f'    (地图说"{note["trust_why"]}"：地图按车正好停在停车点算，车停偏了几厘米就不准。照摄像头看到的 2 号环挪'
-                             f'(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内；离工位照样留 {wk[1]:g}mm))')
+                    if g_ref is not None:
+                        rz = {'ROUGH': '粗加工区', 'TEMP': '暂存区'}.get(self._gap_ref[0], self._gap_ref[0])
+                        self.log(f'    (地图说"{note["trust_why"]}"：地图按推算的车位算，推算的车位偏了。同一个 2 号环手臂姿态'
+                                 f'{"这一轮第一次" if self._gap_ref[0] == zone else "在" + rz}对上时车身离白色区 {g_ref:.0f}mm，'
+                                 f'这里对上也一样：照摄像头看到的 2 号环挪(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内))')
+                    else:
+                        self.log(f'    (地图说"{note["trust_why"]}"：地图按车正好停在停车点算，车停偏了几厘米就不准。照摄像头看到的 2 号环挪'
+                                 f'(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内；离工位照样留 {wk[1]:g}mm))')
                 da = np.round(tgt - a)
                 if float(np.linalg.norm(da)) < 1.0:
                     if cl:
@@ -9466,12 +9594,21 @@ class MissionHooks:
     def _zone_back_target(self, zone):
         """做完挪回停车点挪到哪(底盘位移 S、F)。(0, 0) = 这一次停的地方。这一趟对准过、以前也对准过：挪到第一次停的地方
         (这一次比第一次偏了多少就多挪多少)，路线下一段照样按停车点算，车轮打滑的误差不再一圈圈累计。
-        差得不到 zone_anchor_min_mm 不多挪；超过 zone_anchor_max_mm 多半认错了，不信，照旧挪回这一次停的地方。"""
+        差得不到 zone_anchor_min_mm 不多挪；超过 zone_anchor_max_mm 多半认错了，不信，照旧挪回这一次停的地方。
+        (10-28)横移按 _gap_fix：对上 2 号环时车身离白色区和这一轮的基准差多少，推算的车位就偏了多少，挪回真正的停车点。"""
+        fix = self._gap_fix(zone)
+        if fix is None:
+            return self._zone_back_anchor(zone)
+        return fix, self._zone_back_anchor(zone, f_only=True)[1]   # 横移按 _gap_fix，前后照旧按第一次停的地方
+
+    def _zone_back_anchor(self, zone, f_only=False):
         cfg = self.cfg
         now, a0 = self._anchor_now, self._anchor0.get(zone)
         if not cfg.get('zone_anchor', True) or now is None or now[0] != zone or a0 is None or now[1] is a0:
             return 0.0, 0.0
         es, ef = a0[0] - now[1][0], a0[1] - now[1][1]          # 这一次停的位置比第一次 往左 es、往前 ef
+        if f_only:
+            es = 0.0
         e = math.hypot(es, ef)
         if e < float(cfg.get('zone_anchor_min_mm', 8.0)):
             return 0.0, 0.0

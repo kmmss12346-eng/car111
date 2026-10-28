@@ -38,9 +38,14 @@ class YellowMarginTests(unittest.TestCase):
 
     def test_default_is_50_and_floor_35(self):
         # (10-26 用户"多留点冗余出来一定不要碰到黄色区域")希望 50、最低 35；配置里写的 30(车上以前配的)也按 35
+        # (10-28)先按 yellow_prefer_floor_mm(45)规划，规划得出来就用它；0 = 以前直接按 35
         legs, why, pl = rp.plan_mission(dict(CFG), [], START, MISSION)
         self.assertEqual(why, 'OK')
         self.assertEqual(pl.yellow_margin, 50)
+        self.assertEqual(pl.yellow_min, 45)
+        self.assertGreaterEqual(yellow_gap(CFG, legs), 45 - 0.1)
+        legs, why, pl = rp.plan_mission(dict(CFG, yellow_prefer_floor_mm=0), [], START, MISSION)
+        self.assertEqual(why, 'OK')
         self.assertEqual(pl.yellow_min, 35)
         self.assertGreaterEqual(yellow_gap(CFG, legs), 35 - 0.1)
         pl = rp.Planner(dict(CFG, yellow_margin_mm=50, yellow_min_margin_mm=30), [])
@@ -61,6 +66,23 @@ class YellowMarginTests(unittest.TestCase):
             self.assertGreaterEqual(L['yellow_mm'], 35 - 0.1)
             self.assertEqual('只留了' in (L.get('note') or ''), L['yellow_mm'] < 40 - 0.5, L)
         self.assertGreaterEqual(yellow_gap(cfg, legs), 35 - 0.1)
+
+    def test_center_lane_is_driven_in_the_middle(self):
+        # (10-28 实车：两个障碍物在两边的车道里，中间那条 400 宽的车道空着，去粗加工区从中间穿；按硬余量 35 车走在离西边黄色区 35mm、
+        # 离东边 65mm 的地方，推算的车位一路偏几厘米就压到黄色区)先按 45 规划：同一条车道走正中间(两边约 50mm)，用时最多多 1~2 秒
+        stops = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1080, 2185, 180], ROUGH=[1135, 330, 0], TEMP=[310, 1275, -90])
+        cfg = dict(CFG, stops=stops, strafe_max_mm_per_leg=None)
+        obs = [(754, 1257, 25.0), (1523, 1247, 25.0)]
+        res = {}
+        for pf in (45, 0):
+            legs, why, _ = rp.plan_mission(dict(cfg, yellow_prefer_floor_mm=pf), obs, (2208, 233, 90), ['QR', 'RAW', 'ROUGH'])
+            self.assertEqual(why, 'OK')
+            leg = legs[-1]
+            self.assertTrue(any(c == 'F' and abs(v) >= 1500 for c, v in leg['cmds']), leg['cmds'])   # 从中间车道穿过去
+            res[pf] = (leg['yellow_mm'], sum(L['time_s'] for L in legs))
+        self.assertGreaterEqual(res[45][0], 45 - 0.1, res)
+        self.assertLess(res[0][0], 40, res)                                  # 以前：贴着一边走
+        self.assertLessEqual(res[45][1], res[0][1] + 2.0, res)
 
     def test_never_below_min_tier(self):
         # 最低也要 55mm：中间车道(最多 50)过不去，外圈又被堵 → 规划失败并说明原因，不会悄悄贴着黄色区走

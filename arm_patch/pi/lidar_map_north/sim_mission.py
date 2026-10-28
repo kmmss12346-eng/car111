@@ -4968,6 +4968,62 @@ class ZoneCalTests(unittest.TestCase):
             far = [e for (z, _k, _c, e, st) in w.placed if z == 'TEMP' and st]
             self.assertLess(max(far), 3.0, far)
 
+    def test_temp_trusts_the_camera_when_dead_reckoning_is_off(self):
+        """(10-28 实车：到暂存区摄像头说车离圆环那一排远了 74mm、要往白色区横移 74mm；按推算的车位车身离暂存区只剩 -44mm，只许挪 25mm，
+        还差 40mm 整个区不放，第一批留在车上、第二轮什么都没做。车开走后雷达定位：车在暂存区其实偏东 95mm)同一个 2 号环手臂姿态在粗加工区
+        对上时车身离白色区 50mm(这一轮的基准)：暂存区照摄像头挪，两批都放好；做完挪回真正的停车点(推算的停车点再往白色区挪约 94mm)。
+        zone_gap_trust=False 就是以前(限住、暂存区不放)；基准离白色区太近(粗加工区对上时只有 10mm)也不信。"""
+        for trust, rough_y in ((True, 330.0), (False, 330.0), (True, 290.0)):
+            w = self._world(5, park={'TEMP': 10.0}, park_side={'TEMP': 74.0}, stop_err_mm=0.5)
+            lines = []
+            stops = {'ROUGH': [1135.0, rough_y, 0.0],   # 车头朝东：右边朝南 = 粗加工区，车身南边 330-130=200，离区 50mm
+                     'TEMP': [355.0, 1275.0, 90.0]}     # 车头朝北：左边(雷达那边)朝西 = 暂存区，车身西边 355-175=180，离区 30mm
+            h = self._make(w, dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0, zone_gap_trust=trust), lines=lines,
+                           raw={'stops': stops})
+            backs = []
+            zb = h._zone_back
+
+            def back(zone, zb=zb, h=h, backs=backs):
+                r = zb(zone)
+                backs.append((zone, round(float(h.act.disp['S']))))
+                return r
+            h._zone_back = back
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            if trust and rough_y > 300:
+                self.assertIn('这一轮以它为准', text)
+                self.assertIn('这里对上也一样', text, text[-3000:])
+                self.assertIn('推算的车位偏了', text)
+                self._ok(w, h, text)
+                temp_back = [s for z, s in backs if z == 'TEMP']
+                self.assertTrue(len(temp_back) == 2 and all(85 <= s <= 100 for s in temp_back), (backs, text[-3000:]))
+                self.assertTrue(all(abs(s) <= 3 for z, s in backs if z == 'ROUGH'), backs)    # 粗加工区本来就准：照旧挪回停车点
+            else:
+                self.assertIn('车身离暂存区不到 5mm', text, text[-3000:])
+                self.assertEqual(len([p for p in w.placed if p[0] == 'TEMP']), 0, text[-3000:])
+                self.assertNotIn('推算的车位偏了', text)
+
+    def test_temp_leftovers_from_round1_are_placed_in_round2(self):
+        """(10-28 用户"暂停区域识别不到应该继续识别啊不应该直接走啊"：第一轮暂存区 2 号环没对上，第一批留在车上；第二轮原料区夹不了，
+        到暂存区也只找第二批，什么都没做)第二轮到暂存区：第一批还在车上就先放到它们自己的环上。"""
+        w = self._world(6, stop_err_mm=0.5)
+        lines = []
+        stops = {'TEMP': [355.0, 1275.0, 90.0]}         # 车头朝北：左边朝西 = 暂存区，车身离区 30mm
+        h = self._make(w, dict(zone_gap_trust=False), lines=lines, raw={'stops': stops})
+        arrive0 = w.arrive
+
+        def arrive(role, batch=1):
+            w.park_side['TEMP'] = 74.0 if (role == 'TEMP' and batch == 1) else 0.0   # 第一轮车停偏 74mm：按地图拦住、不放
+            return arrive0(role, batch)
+        w.arrive = arrive
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('车身离暂存区不到 5mm', text)
+        self.assertIn('还在车上(上一趟暂存区没放成)：先放到它们自己的环上', text, text[-3000:])
+        self.assertEqual(rings_summary(w, 'TEMP'), {1: [1], 2: [5], 3: [6]}, text[-3000:])
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (6, 6), text[-3000:])
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+
     def test_obs_error_is_removed_before_aligning(self):
         """OBS 大动作到位差 1°(ATOLC)：对准 2 号环前手臂先精确回到 A1P/A2P(arm_calib 调 1、3 号环时手臂就在这里)，1、3 号环才放得准。"""
         errs = {}
