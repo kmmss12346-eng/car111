@@ -16,6 +16,7 @@
     z -10         调升降(任何一步都能用)
     o   c         夹爪张开 / 夹紧
     u             两个舵机松开，用手直接摆；摆好以后回车 = 读出角度并保存
+                  ((10-28)圆环上方那三步：回车先让 ID1 和比赛时一样从车上转盘那边转回摆好的角度，看准了再回车才存)
     r             重新读一下两个舵机现在的角度
     t             (车上转盘去圆环那几步 R1T2/R2T/R1T1/R2SPD)按 STM32 里已经保存的值真走一遍：去车上转盘 -> 去 2 号环 -> 回车上转盘
                   (码垛躲避那两步 STKA2/STKA1)按现在调的值走一遍码垛的路：去车上转盘 -> 绕电池盒到 STKA1 -> 往里缩到 STKA2
@@ -29,8 +30,8 @@
                   先把爪子调到正好能夹住物料，再照抄这两个数，绿十字就到物料中心上了。只输入 g = 看绿十字现在在哪
                   (10-24 看圆环的那几步：A1P、ZPLC、ZOBRNG)挪的是圆环画面里的红十字(粗加工区、暂存区的爪子点)，
                   和原料的绿十字分开存、互不影响。爪子在 2 号环正上方时照抄画面上 off 后面那两个数，红十字就到 2 号环中心上了
-                  (10-26 R1、R3 两步)挪的是 1 号环的橙十字 / 3 号环的蓝十字：比赛时手臂转到这两个环以后，摄像头只动手臂
-                  把这个环的中心对到它自己的十字上再放(车不动，(10-27)一直调到对准为止，最多 10 秒)。三个十字互不影响
+                  (10-26 R1、R3 两步)挪的是 1 号环的橙十字 / 3 号环的蓝十字：主程序 rfine on 时，比赛时手臂转到这两个环以后
+                  摄像头只动手臂把这个环的中心对到它自己的十字上再放((10-28)默认 rfine off：按存的角度直接放)。三个十字互不影响
     回车(或 ok)   保存当前值，下一步
     s             跳过这一步(保持原来的值)
     b             回上一步
@@ -63,6 +64,10 @@ try:
 except ImportError:                      # 车上的 arm_link.py 还是旧的
     def lift_slip_text(line):
         return None
+try:
+    from arm_link import approach_id1
+except ImportError:                      # 车上的 arm_link.py 还是旧的：调圆环那几步照旧直接转过去
+    approach_id1 = None
 
 ROOT = Path(__file__).resolve().parent
 
@@ -180,21 +185,23 @@ STEPS = [
               '比赛时车轮先把 2 号环对到这里；接下来两步调 1、3 号环，这期间车别动。\n'
               '(10-24)画面里的红十字 = 粗加工区、暂存区这边的爪子点：比赛时车轮把 2 号环中心(黄十字)对到红十字上。\n'
               '爪子摆到 2 号环正上方以后，画面上 off 后面那两个数就是 2 号环离红十字多少：输入 g 加这两个数，红十字就挪到 2 号环中心上\n'
-              '(只改圆环这边的，原料的绿十字不动)；先 z -40 降低看准爪子在不在正上方，再升回来、在原来的高度挪红十字。'),
+              '(只改圆环这边的，原料的绿十字不动)；先 z -40 降低看准爪子在不在正上方，再升回来、在原来的高度挪红十字。\n'
+              '(10-28)这一步和下面 1、3 号环两步：ID1 每一下(1 +1、1 -1……)都先往车上转盘那边多转约 5° 再慢慢转回来到位，\n'
+              '和比赛时手臂转到圆环上方的动作一样(ID1 有齿轮间隙，到位的方向不一样停的地方差约 1cm)，稍慢一点是正常的。\n'
+              '用手摆(u)的：回车以后先照这个动作转回去，看准了再回车才存。'),
     # (10-20 用户)1、3 号环：车不动，只转手臂过去。存的是比 2 号环(A1P/A2P)多转多少，粗加工区、暂存区共用(两个区圆环一样摆)
     dict(key='R1', kind='ringpose', ring=1, title='1 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动(上一步爪子在 2 号环正上方)。把爪子移到 1 号环中心的正上方：1 +5 / 1 -5 转、2 +50 / 2 -50 伸缩，\n'
               '或者 u 松开舵机用手摆，摆好回车。存的是比 2 号环多转了多少度，粗加工区、暂存区都用它。\n'
               '比赛时车只对准 2 号环一次，1、3 号环按这里的角度直接转过去放、取，车不动。高处看不准可以先 z -40 降低一点再看。\n'
               '以前存过的话手臂先转到存过的位置，对就直接回车。要重调：python3 arm_calib.py --from A1P，先看爪子正对 2 号环再做这两步。\n'
-              '(10-26)画面里的橙十字 = 1 号环自己的十字：比赛时手臂按这里的角度转过去以后，摄像头只动手臂(车不动，调到对准为止，最多 10 秒)\n'
-              '把 1 号环中心(黄十字)对到橙十字上再放。爪子摆到 1 号环正上方以后(先 z -40 降低看准，再升回来)，画面上 off 后面\n'
-              '那两个数就是 1 号环离橙十字多少：输入 g 加这两个数，橙十字就挪到 1 号环中心上(只改 1 号环的，红十字、3 号环的不动)。\n'
-              '橙十字已经挪准了的话，也可以直接把 1 号环中心(黄十字)对到橙十字上再回车。'),
+              '(10-28)比赛时默认不再用摄像头微调(按这里存的角度直接放)，爪子一定要摆准在 1 号环中心正上方；ID1 每一下都从车上转盘那边到位。\n'
+              '画面里的橙十字 = 1 号环自己的十字，只在主程序 rfine on(打开 1、3 号环摄像头微调)时用：爪子摆到 1 号环正上方以后\n'
+              '(先 z -40 降低看准，再升回来)，输入 g 加画面上 off 后面那两个数，橙十字就挪到 1 号环中心上(只改 1 号环的)。'),
     dict(key='R3', kind='ringpose', ring=3, title='3 号环上方的姿态(比 2 号环多转多少)', setup='ring',
          text='车别动。手臂转到了 2 号环上方(以前存过 3 号环就是存过的位置)：把爪子移到 3 号环中心的正上方(和上一步一样调)，摆好回车。\n'
-              '(10-26)画面里的蓝十字 = 3 号环自己的十字(比赛时摄像头只动手臂把 3 号环中心对到它上再放)：爪子摆到 3 号环正上方以后，\n'
-              '输入 g 加画面上 off 后面那两个数，蓝十字就挪到 3 号环中心上(只改 3 号环的)。蓝十字挪准了也可以直接把黄十字对到它上。'),
+              '(10-28)比赛时默认按这里存的角度直接放(不用摄像头微调)：爪子要摆准在 3 号环中心正上方。画面里的蓝十字 = 3 号环自己的十字，\n'
+              '只在主程序 rfine on 时用：爪子摆到 3 号环正上方以后，输入 g 加画面上 off 后面那两个数，蓝十字就挪到 3 号环中心上(只改 3 号环的)。'),
     # (10-20 用户：夹着物料去圆环怕刮到电池盒)车上转盘 <-> 地上圆环这条路单独一组(和原料区 A1T1~A2SPD 一样的意思)。
     # (10-21 用户"从车上转盘到暂存区先转一个角度再伸长再转一个角度再缩回，让我自由调"；"ID1 连续转动，不要伸缩一下就停一下")按从车上转盘出去的顺序调；
     #   比赛时 ID1 一直转不停：转过 R1T2 开始伸到 R2T，转过 R1T1 开始缩到圆环那边要的长度；回车上转盘反过来(R2STG=1 才分段停下来走)。
@@ -254,6 +261,7 @@ CAM_STEPS = {'A1G': 'raw', 'ZGRAB': 'raw', 'A2GB': 'raw', 'CLWOR': 'raw', 'ZOBRA
 REMOVED_STEPS = ('PL1', 'PL2')          # (10-20 用户"把 28、29 步的补偿去掉")以前的第一层/第二层放置补偿，比赛时也不再用
 OPEN_KEYS = ('CLWO', 'CLWOR', 'CLWOT')  # 夹爪张开的三个角度(10-20)：其他地方 / 原料盘上方 / 车上转盘上方
 RING_TEACH_FILE = 'ring_teach.json'     # 和 mission_cfg.ring_teach_file 一样：R1/R3 两步把 1、3 号环比 2 号环多转多少存在这里
+TRAY_SIDE_STEPS = ('A1P', 'R1', 'R3')   # (10-28)这三步 ID1 每一下都和比赛时一样从车上转盘那边转到位(Wizard._ring_ap)
 VIEW_LOG = '/tmp/vlive_wizard.log'
 
 
@@ -319,6 +327,21 @@ class SerialLink:
             pass
 
 
+class _ApArm:
+    """(10-28)给 arm_link.approach_id1 用的手臂：ap() 发 AP，STM32 回的 ANG 行就是转到的角度(angle[1]、angle[2])。"""
+
+    def __init__(self, wiz):
+        self.wiz = wiz
+        self.angle = {1: None, 2: None}
+
+    def ap(self, a1, a2):
+        self.angle = {1: None, 2: None}
+        for line in self.wiz.do(f'AP {a1:.3f} {a2:.3f}', quiet=True):
+            m = re.match(r'ANG (\d) (-?\d+(?:\.\d+)?)', line)
+            if m:
+                self.angle[int(m.group(1))] = float(m.group(2))
+
+
 class Wizard:
     def __init__(self, link, cfg_path, inp=input, out=print, view=False, popen=None, sleep=time.sleep):
         self.link = link
@@ -341,6 +364,8 @@ class Wizard:
         self.z_cmd = None                # 最后一次让升降去的高度(一样就不重复发)
         self.store_unset = set()         # (10-24)配置 mission_cfg 里还没调过的码垛躲避值(STKA1/STKA2)：self.P 里放的是比赛时的默认
         self.spacing = 150.0             # 相邻圆环中心距(mission_cfg.ring_spacing_mm)：算离各个环多远用
+        self.ring_over = 0.0             # (10-28)调圆环那三步 ID1 先往车上转盘那边多转几度(0 = 不多转)、最后一下多给几度：check() 按配置算
+        self.ring_comp = 0.0
 
     # ------------------------------------------------------------ 和 STM32 说话
     def do(self, cmd, quiet=False):
@@ -405,6 +430,32 @@ class Wizard:
         self.released = False
         self.do(f'AP {a1:g} {a2:g}')
         self._last_pose = (float(a1), float(a2))
+
+    def _tray_side(self, st):
+        """(10-28)这一步 ID1 每一下都从车上转盘那边转到位(_ring_ap)：2 号环、1 号环、3 号环上方那三步(TRAY_SIDE_STEPS)。
+        配置里 zone_backlash_deg 是 0(不管齿轮间隙)、车上 arm_link.py 是旧的就照旧直接转。"""
+        key = st['key'] if isinstance(st['key'], str) else st['key'][0]
+        return key in TRAY_SIDE_STEPS and approach_id1 is not None and self.ring_over > 0.0 and 'A1D' in self.P
+
+    def _ring_ap(self, a1, a2):
+        """(10-28 用户"只要我调整圆环2……环1和环3放置的位置相对于2调整之后应该是也是好调整的啊为什么没有什么效果呢")
+        手臂转到 (a1, a2)，ID1 和比赛时转到圆环上方一样(mission_hooks._ap_from_tray_side)从车上转盘那边到位：先往车上转盘那边
+        多转 ring_over 度，再分几下慢慢转回来，最后一下往转的方向多给 ring_comp 度(STM32 差 ATOL 以内就停)。
+        ID1 有约 2.3° 齿轮间隙：以前这里最后一下往哪边转看人怎么调，存下来的角度和比赛时转过去停的地方差一个间隙
+        (1 号环那里约 1cm)，2 号环调准了，1、3 号环比着它调的角度比赛时还是偏。返回 ID1 转到的角度。"""
+        side = 1.0 if float(self.P['A1D']) >= float(a1) else -1.0
+        self.released = False
+        arm = _ApArm(self)
+        approach_id1(arm, float(a1) + side * self.ring_over, float(a1) - side * self.ring_comp, float(a2))
+        self._last_pose = (float(a1), float(a2))
+        self.out(f'  > AP {a1:g} {a2:g}(ID1 先往车上转盘那边多转到 {a1 + side * self.ring_over:g}°，再慢慢转回来，和比赛时一样)')
+        if arm.angle[1] is not None:
+            return float(arm.angle[1])
+        try:
+            return self.angle(1)
+        except CalError:
+            self.out(f'  (转完读不到 ID1 的角度，先当它到了 {a1:g}°)')
+            return float(a1)
 
     def claw_to(self, us):
         us = int(round(max(CLAW_RANGE[0], min(CLAW_RANGE[1], us))))
@@ -530,10 +581,12 @@ class Wizard:
             self.lift_to(P['ZDROP'])
         elif kind in ('ring', 'ring_down', 'ring_obs'):
             o = self._ring_teach_now(st['ring']) if st['kind'] == 'ringpose' else None
-            if o:                                          # 1、3 号环存过：从存过的位置开始(对就直接回车)
-                self.pose(P['A1P'] + o[0], P['A2P'] + o[1])
+            # 1、3 号环存过：从存过的位置开始(对就直接回车)
+            a1, a2 = (P['A1P'] + o[0], P['A2P'] + o[1]) if o else (P['A1P'], P['A2P'])
+            if self._tray_side(st):
+                self._ring_ap(a1, a2)                      # (10-28)和比赛时一样从车上转盘那边转到位
             else:
-                self.pose(P['A1P'], P['A2P'])
+                self.pose(a1, a2)
         elif kind == 'stow':
             self.pose(P['A1H'], P['A2R'])
         elif kind in ('detour1', 'detour2', 'detour3'):
@@ -842,6 +895,17 @@ class Wizard:
             self.spacing = float(mc.get('ring_spacing_mm') or 150.0)
         except (TypeError, ValueError):
             self.spacing = 150.0
+        # (10-28)调圆环那三步的 ID1 到位(_ring_ap)和比赛时一样(mission_hooks._id1_backlash / _id1_comp)：
+        #   多转 zone_backlash_deg + zone_backlash_extra_deg(最多 8°)，最后一下多给 zone_atol_comp(没设 = STM32 的 ATOL × 0.7)
+        try:
+            bl = max(0.0, float(mc.get('zone_backlash_deg', 2.0) or 0.0))
+            if bl > 0.0:
+                bl = min(8.0, bl + max(0.0, float(mc.get('zone_backlash_extra_deg', 3.0) or 0.0)))
+            comp = mc.get('zone_atol_comp')
+            comp = max(0.0, float(comp)) if comp is not None else max(0.0, 0.7 * float(self.P.get('ATOL', 0.3)))
+        except (TypeError, ValueError):
+            bl, comp = 5.0, 0.21
+        self.ring_over, self.ring_comp = bl, comp
         self.store_unset = set()
         for key, name in STORE_KEYS.items():
             try:
@@ -1195,7 +1259,16 @@ class Wizard:
                         raise
                     self.out(f'  (读不到 ID{sid} 的角度，按上一次的 {base:g}° 算；老是读不到要查 ID{sid} 的线)')
             want = base + v if rel else v
-            got = self.servo_to(sid, want)
+            if sid == 1 and self._tray_side(st):
+                # (10-28)调 2 号环、1 号环、3 号环：ID1 每一下都从车上转盘那边转到位(和比赛时一样)，存下来的角度比赛时才停在同一个地方
+                try:
+                    a2 = self.angle(2)                    # 用手摆过也按现在的伸缩
+                except CalError:
+                    a2 = self.cur.get(2) if self.cur.get(2) is not None else float(P['A2P'])
+                got = self._ring_ap(want, a2)
+                self.cur[2] = a2
+            else:
+                got = self.servo_to(sid, want)
             self.cur[sid] = got
             if abs(got - want) > 1.0:
                 self.out(f'  注意：ID{sid} 停在 {got:g}°，没到 {want:g}°(到限位了，或者被挡住了)')
@@ -1218,6 +1291,14 @@ class Wizard:
 
     def _accept(self, st):
         k = st['kind']
+        if self.released and self._tray_side(st):
+            # (10-28)用手摆的：齿轮间隙靠在哪一边不一定和比赛时一样。先照比赛时的动作(从车上转盘那边)转回摆好的角度，看准了再回车才存
+            self._read_servos()
+            self._ring_ap(self.cur[1], self.cur[2])
+            self._read_servos()
+            self.out('  舵机重新出力了：ID1 和比赛时一样从车上转盘那边转回到你摆的角度(手臂可能跟着挪了一点点)。'
+                     '看一眼爪子还在不在环中心正上方：偏了用 1 +0.5 / 1 -0.5 再调，对了再回车保存')
+            return None
         if k == 'choice':
             self.save({'AEXT': self.P['AEXT']})
             return +1

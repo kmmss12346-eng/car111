@@ -1047,6 +1047,30 @@ git_log.txt                ← 分支最近 120 条提交记录
   4413e14 的固件部分留着：屏重新上电时把画过的字(任务码、抓取数、放置数)全部重画(scr_last/Screen_Redraw)，和树莓派的改动无关、不影响对准。
   这两样别再加回去，除非用户再要。用户同时说"现在这个二号也对不齐了"：撤回的两处都不碰 2 号环对准；恢复以后还对不齐，
   先看标定(A1P/A2P、红十字、停车点)和机械(10-27 早上 ID2 齿条滑过齿)，要日志里 2 号环那几行。
+- **10-28 用户"摄像头微调整没有什么效果啊……退回到那个没有添加摄像头对准的那个版本……只有把这个屏幕显示加上去"、"去这个暂停区域的时候
+  这个车老是会压到这个黄色的区域"(照片：粗加工区去暂存区，在西南角转完弯以后)。我复述的三件用户回"对"：**
+  1. 1、3 号环摄像头微调默认关：`zone_cal_fine` 默认 False(DEFAULTS 和两处 cfg.get)、apply_mission_config OLD_DEFAULTS True→False、
+     主程序 `rfine on/off`(rtol 在关着时提示第一个数不起作用)。没整个退回旧包：ID1 同一个动作到位、回 A1P 多转再转回来、rtol 这些都留着。
+     arm_calib 调 A1P、R1、R3 三步(TRAY_SIDE_STEPS)ID1 每一下都和比赛时一样从车上转盘那边到位(`Wizard._ring_ap` = arm_link.approach_id1：
+     多转 zone_backlash_deg + zone_backlash_extra_deg(5°，最多 8°)，最后一下多给 zone_atol_comp / 0.7×ATOL；这一步开始、`1 ±x` 调 ID1、
+     u 用手摆以后的第一次回车都这样转，第一次回车只转回去、看准了再回车才存)。原因：以前存下来的角度看最后一下往哪边调，和比赛时停的地方差
+     一个间隙(2.3°，1 号环那里约 1cm)；车轮把 2 号环对到爪子下面时车跟着挪了这一截，1、3 号环比着 2 号环调的就偏(调好 2 号环，1、3 号环还偏)。
+     测试：test_arm_calib.TraySideRingTests(假 STM32 加了 ATOL 提前停 `_ap1` 和 ID1 间隙 `bl`/`arm1`；以前的做法 1 号环比 2 号环多转的
+     和比赛时差 0.8°)；sim ZoneCalTests.test_rings_placed_at_the_calibrated_angles_without_the_camera(SimWorld 新加 `a1_cal_off` = 调 A1P 时手臂
+     真正在哪：和比赛时同一边 → 三个环最大 1.6mm；靠在另一边 → 1、3 号环 5~7mm)。以前测微调的 5 个测试改成 zone_cal_fine=True 跑。
+     **用户要重做 `python3 arm_calib.py --from A1P`**；回主程序输入 `rfine` 看是不是 off(车上 mission_cfg 里存着 zone_cal_fine true 就 `rfine off`)。
+  2. 屏：重新加回 4413e14 的树莓派部分(screen_counts_live：读到码以后一直显示抓取/放置数，回家收臂后重写)。固件部分(屏重新上电重画)本来就在。
+  3. 粗加工区 → 暂存区：路线 S-25、F-885、R-90、F-885、S+25，转完弯往北贴着西南黄色区(x=550，规划离 65mm)走。前一条 F-885 走多走少
+     (加上工位里车轮挪回停车点的误差)转完弯就是往黄色区那边的横向偏差；这个弯转的时候离东西远(120mm)，转弯前定位不触发，
+     转弯后定位以前要下一条 ≥ 1200mm(而且默认关)。改：auto_run `_after_turn` 加 `_near_yellow`：转完弯接下来那条直行(≥ reloc_near_min_mm 300)
+     按推算的位置离黄色区(`yellow_clearance`，只算黄色区)不到 `reloc_near_yellow_mm`(80)、上次定位以后又走了 ≥ reloc_near_min_travel_mm(300)：
+     雷达定位、修车头、横向修到 reloc_turn_tol_mm(8) 以内再走。开关 `reloc_after_turn_near`(顶层配置，默认 True，和 turnloc 分开)。
+     按车上配置规划两个区的整场：只有这一个弯(两批各一次)触发，别的弯后面那条离黄色区 ≥ 105mm 或者是很短的横移。模拟(test_nav_drive 的 SimCar：
+     距离 -4%~+2%、陀螺漂移、转弯残差 0.3°，60 次)：这一段离黄色区最近 22mm → 50mm；整场雷达定位多 1 次(两次里有一次顶掉了后面一个转弯前定位)。
+     test_nav_drive.test_reloc_after_turn_next_to_yellow。
+  - **发现了没改(要用户点头)：** 取回时的直接取(_pickback_item：_goto_recorded → _return_to_pose(from_tray=not _ring_ready))从别的环直接转过来，
+     不走"同一个动作"：大动作停偏(最多 1.2°)加上齿轮间隙靠到另一边(2.3°)，取的地方和放的地方能差 1cm 多。模拟(间隙 2.3°、整场两批)第二轮
+     粗加工区放的顺序最后是 1 号环、取回先取 2 号环时夹空。改法：直接取也按 from_tray(同一个动作)，每个多约 1 秒。新的 sim 测试只跑第一轮避开了它。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import unittest
+import unittest.mock
 
 import arm_calib
 from arm_calib import Wizard, CalError, STEPS, STEP_KEYS
@@ -39,6 +40,9 @@ class FakeStm32:
         self.tt = 2608
         self.block1 = None
         self.top = None                  # (10-21)升降机构真正能到的最高(超过就顶住，STM32 回 LIFTSLIP)
+        self.atol = 0.3                  # (10-28)AP 转 ID1 和真的 STM32 一样提前停(_ap1)；None = 正好转到
+        self.bl = 0.0                    # (10-28)ID1 齿轮间隙(度)
+        self.arm1 = 323.0                # (10-28)手臂真正转到的角度：舵机带着走，落后间隙的一半
         self.sent = []
 
     def _servo(self, sid, deg):
@@ -48,6 +52,19 @@ class FakeStm32:
             deg = self.block1
         self.ang[sid] = deg
         self.released[sid] = False
+        if sid == 1:
+            self.arm1 = min(max(self.arm1, deg - self.bl / 2.0), deg + self.bl / 2.0)
+
+    def _ap1(self, deg):
+        """(10-28)AP 转 ID1 和真的 STM32 一样(arm.c Servos_To)：离目标 ATOL 以内不转；不到 4.5° 是慢慢转的，差 0.7×ATOL 就停
+        (实车差 0.15~0.3°)；4.5° 以上快速转(这里当它正好到)。ID2 照旧正好到(伸缩差零点几度没关系)。"""
+        d = deg - self.ang[1]
+        if self.atol is None or abs(d) >= 4.5:
+            self._servo(1, deg)
+        elif abs(d) > self.atol:
+            self._servo(1, deg - math.copysign(0.7 * self.atol, d))
+        else:
+            self.released[1] = False
 
     def request(self, text, timeout=5.0):
         self.sent.append(text)
@@ -84,7 +101,7 @@ class FakeStm32:
             self._servo(int(p[1]), float(p[2]))
             return 'DONE', [f'ANG {p[1]} {self.ang[int(p[1])]:.4f}']
         if v == 'AP':
-            self._servo(1, float(p[1]))
+            self._ap1(float(p[1]))
             self._servo(2, float(p[2]))
             return 'DONE', [f'ANG 1 {self.ang[1]:.4f}', f'ANG 2 {self.ang[2]:.4f}']
         if v == 'U':
@@ -125,6 +142,7 @@ class Script:
         if isinstance(it, tuple) and it[0] == 'hand':
             assert self.stm.released[1] and self.stm.released[2], '舵机没松开就用手摆'
             self.stm.ang[1], self.stm.ang[2] = it[1], it[2]
+            self.stm.arm1 = it[1] + (it[3] if len(it) > 3 else 0.0)     # (10-28)第 4 个数 = 手臂比舵机读数多转多少(间隙里靠在哪)
             return ''
         return it
 
@@ -223,14 +241,15 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(saved['R1'], (12.0, -30.0))
         self.assertEqual(saved['R3'], (-12.5, 20.0))
         i = self.stm.sent.index('AF 2 -892')                               # R1 调完，R3 开始前手臂回到 2 号环上方
-        self.assertIn('AP 323 -862', self.stm.sent[i:])
+        self.assertIn('AP 322.790 -862.000', self.stm.sent[i:])            # (10-28)从车上转盘那边到位：最后一下多给 0.7×ATOL
         self.assertNotIn('A1P', load(cfg)['stm32_params'])                 # 1、3 号环不改 STM32 参数
         out = '\n'.join(self.lines)
         self.assertIn('还没存过', out)
         self.assertIn('1、3 号环的角度存在', out)
-        self.assertIn('AP 324 -860', self.stm.sent)
+        k = self.stm.sent.index('AP 319.000 -860.000')                     # R1 从以前存的位置开始：(这个假车上转盘在 323°)
+        self.assertEqual(self.stm.sent[k + 2], 'AP 324.210 -860.000')      # 先往车上转盘那边多转 5°，再分两下转回来
         saved = self.run_wiz(['q'], cfg=cfg, start=STEP_KEYS.index('R1'))  # 再进来：手臂直接到存过的位置，没改直接 q 不啰嗦
-        self.assertIn('AP 335 -892', self.stm.sent)
+        self.assertIn('AP 335.210 -892.000', self.stm.sent)
         self.assertIn('原来存的 +12.00 -30.00', '\n'.join(self.lines))
         self.assertFalse(any('还没保存' in l for l in self.lines), self.lines)
         self.assertEqual(saved, {})
@@ -938,6 +957,111 @@ class TakeLikeRaceTests(unittest.TestCase):
     def test_take_only_on_height_steps(self):
         stm, cfg, lines = self._run(['take', 'q'], key='ZGRAB')
         self.assertNotIn('TRAY', stm.sent)
+
+
+class TraySideRingTests(unittest.TestCase):
+    """(10-28 用户"只要我调整圆环2就应该能给他对准吧，环1和环3放置的位置相对于2调整之后应该是也是好调整的啊为什么没有什么效果呢")
+    ID1 有约 2.3° 齿轮间隙：比赛时手臂每次从车上转盘那边转到圆环上方，arm_calib 调 2 号环、1 号环、3 号环这三步的每一下也要这样到位，
+    存下来的角度比赛时才停在调的时候爪子所在的地方。车上转盘在 400°，三个环都在它下面(和实车一样：A1D 比三个环都大)。"""
+    BL = 2.3
+
+    class Race:
+        """比赛时的手臂(mission_hooks._ap_from_tray_side)：approach_id1 发 AP，回的 ANG 是转到的角度。"""
+        def __init__(self, stm):
+            self.stm = stm
+            self.angle = {1: None, 2: None}
+
+        def ap(self, a1, a2):
+            _rep, info = self.stm.request(f'AP {a1:.3f} {a2:.3f}')
+            for line in info:
+                m = re.match(r'ANG (\d) (-?\d+(?:\.\d+)?)', line)
+                if m:
+                    self.angle[int(m.group(1))] = float(m.group(2))
+
+    def _stm(self):
+        stm = FakeStm32()
+        stm.P.update(A1D=400.0, A1P=323.0, A2P=-862.0)
+        stm.bl = self.BL
+        return stm
+
+    def _run(self, stm, items, key='A1P', mission=None):
+        cfg = make_cfg()
+        if mission:
+            c = load(cfg)
+            c['mission_cfg'] = dict(mission)
+            with open(cfg, 'w', encoding='utf-8') as f:
+                json.dump(c, f)
+        lines, at_enter = [], []
+        feed = Script(stm, items)
+
+        def inp(prompt):
+            it = feed(prompt)
+            if it == '':
+                at_enter.append((stm.ang[1], stm.arm1))   # 回车保存时舵机读数、手臂真正在哪
+            return it
+        Wizard(stm, cfg, inp=inp, out=lines.append, sleep=lambda s: None).run(STEP_KEYS.index(key))
+        return cfg, lines, at_enter
+
+    def _race_arm(self, stm, a1, a2):
+        """比赛时从车上转盘(A1D)转到 (a1, a2)：手臂真正转到哪。"""
+        stm._servo(1, stm.P['A1D'])
+        arm_calib.approach_id1(self.Race(stm), a1 + 5.0, a1 - 0.21, a2)
+        return stm.arm1
+
+    def test_ring_one_tuned_against_ring_two_lands_the_same_in_the_race(self):
+        tune = ['1 -2', '1 +1', '',                      # 2 号环(A1P)：最后一下往车上转盘那边调
+                '1 +3', '1 -1', '1 +0.5', '',            # 1 号环(R1)
+                'q']
+        stm = self._stm()
+        cfg, lines, at = self._run(stm, tune)
+        (s2, arm2), (s1, arm1) = at[0], at[1]
+        for s, arm in at[:2]:
+            self.assertAlmostEqual(arm - s, self.BL / 2, places=2)          # 每一下都从车上转盘那边到位：手臂靠在同一边
+        self.assertAlmostEqual(stm.P['A1P'], s2, places=3)
+        d1 = load(os.path.join(os.path.dirname(cfg), 'ring_teach.json'))['ROUGH']['1'][0]
+        self.assertAlmostEqual(d1, s1 - s2, places=2)
+        race2 = self._race_arm(stm, stm.P['A1P'], -862.0)
+        race1 = self._race_arm(stm, stm.P['A1P'] + d1, -862.0)
+        self.assertAlmostEqual(race1 - race2, arm1 - arm2, places=2)       # 比赛时 1 号环比 2 号环多转的 = 调的时候爪子多转的
+        self.assertAlmostEqual(race2, arm2, places=2)
+        self.assertTrue(any('先往车上转盘那边多转到' in l for l in lines), lines)
+        sent = stm.sent
+        k = sent.index('AP 330.000 -862.000')                             # 1 +3(到 325°)：先多转 5° 到 330°，再分两下慢慢转回来
+        steps = [float(c.split()[1]) for c in sent[k:k + 3]]
+        self.assertTrue(all(0 < a - b < 3.5 for a, b in zip(steps, steps[1:])), steps)
+        self.assertFalse(any(c.startswith('AF 1 ') for c in sent), sent)   # ID1 不再用 AF 直接转过去
+        # 以前(直接转过去，最后一下往哪边看怎么调)：调的时候爪子多转的和比赛时多转的差零点几度(1 号环那里几毫米)
+        stm = self._stm()
+        cfg, _lines, at = self._run(stm, tune, mission={'zone_backlash_deg': 0})
+        (s2, arm2), (s1, arm1) = at[0], at[1]
+        self.assertIn('AF 1 325', stm.sent)
+        race2 = self._race_arm(stm, s2, -862.0)
+        race1 = self._race_arm(stm, s1, -862.0)
+        self.assertGreater(abs((race1 - race2) - (arm1 - arm2)), 0.5)
+
+    def test_hand_pose_reapproaches_and_needs_a_second_enter(self):
+        """u 用手摆的：回车先照比赛时的动作转回摆好的角度(手臂会挪一点)，看准了再回车才存。"""
+        stm = self._stm()
+        cfg, lines, at = self._run(stm, ['u', ('hand', 330.0, -870.0, -0.8), '1 -1.95', '', 'q'], key='R1')
+        path = os.path.join(os.path.dirname(cfg), 'ring_teach.json')
+        self.assertIn('AP 335.000 -870.000', stm.sent)                     # 回车：先往车上转盘那边多转再转回来
+        self.assertTrue(any('舵机重新出力了' in l for l in lines), lines)
+        self.assertEqual(len(at), 2)                                       # 第一次回车只转回去，不存
+        self.assertAlmostEqual(at[0][1], 329.2, places=2)                  # 用手摆的：手臂在 329.2°(舵机读数 330°)
+        self.assertEqual(load(path)['ROUGH']['1'], [5.05, -8.0])
+        self.assertAlmostEqual(at[1][1], 329.2, places=2)                  # 调回去以后存的：手臂正好在用手摆的地方
+
+    def test_other_steps_and_switches(self):
+        stm = self._stm()
+        self._run(stm, ['1 +1', '', 'q'], key='A1G')                       # 原料盘上方的姿态照旧
+        self.assertIn('AF 1 324', stm.sent)
+        stm = self._stm()
+        self._run(stm, ['q'], key='ZPLC')                                  # 量高度那几步照旧直接转到 2 号环上方
+        self.assertIn('AP 323 -862', stm.sent)
+        stm = self._stm()
+        with unittest.mock.patch.object(arm_calib, 'approach_id1', None):  # 车上的 arm_link.py 是旧的
+            self._run(stm, ['1 +1', '', 'q'], key='R1')
+        self.assertIn('AF 1 324', stm.sent)
 
 
 if __name__ == '__main__':

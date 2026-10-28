@@ -96,11 +96,17 @@ class SimWorld:
         self.ap_fast_err = bool(ap_fast_err)
         self.a1, self.a2 = self.params['A1H'], self.params['A2R']
         self.a1_ref = self.a2_ref = None
+        # (10-28)arm_calib 调 A1P 时爪子正对 2 号环，手臂真正在 A1P + a1_cal_off(有齿轮间隙时：调的时候最后一下从哪边转到位，
+        #   手臂就靠在间隙哪一边)；0 = 正好在 A1P(以前的模拟)。1、3 号环比 2 号环多转的(ring_teach)也是在这里量的
+        self.a1_cal_off = 0.0
         self.claw_open = True
         self.claw_hold = False                # 和 arm.c 的 claw_hold 一样：GRAB/PICK/TAKE 夹紧了 = True，张开 = False；True 时 GRAB/PICK/TAKE 回 ERR HOLD
         self.tt_slot = 1
         self.tt_ready = 0.0
         self.screen = {}
+        self.scr_log = []                     # (10-27)每次写成的屏 (控件, 字)，按先后
+        self.screen_wipe_at = None            # (10-27)例如 ('PARK', 1) = 第 1 次 PARK 时屏掉电重启、画面全没了(这里当作 STM32 什么都没重画)
+        self.scr_fail = []                    # (10-27)这些 SCR 指令(原样)第一次发时回 ERR TIMEOUT(串口偶尔一次没回话)
         self.requests = []
         self.abort_flag = False
         self.abort_at = abort_at              # 例如 ('GRAB', 2) = 第 2 次 GRAB 时被急停
@@ -433,7 +439,7 @@ class SimWorld:
         (10-19)arm_r_mm(真车的手臂)：摄像头装在爪子上，ID1 转多少画面也跟着转多少。"""
         rc = self.Rcam
         if self.arm_r and self.a1_ref is not None:
-            ph = math.radians(self.a1_act - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            ph = math.radians(self.a1_act - self.a1_ref - self.a1_cal_off) * (1.0 if self.k1 >= 0 else -1.0)
             c, s = math.cos(ph), math.sin(ph)
             rc = rc @ np.array([[c, s], [-s, c]])               # 画面看到的 = 世界反着转 ph
         return rc @ self._rot(zone).T
@@ -444,10 +450,10 @@ class SimWorld:
             return np.array([0.0, 0.0])
         if self.arm_r:
             r = self.arm_r + self.k2 * (self.a2 - self.a2_ref)
-            ph = math.radians(self.a1_act - self.a1_ref) * (1.0 if self.k1 >= 0 else -1.0)
+            ph = math.radians(self.a1_act - self.a1_ref - self.a1_cal_off) * (1.0 if self.k1 >= 0 else -1.0)
             arm = np.array([-self.arm_r + r * math.cos(ph), r * math.sin(ph)])
         else:
-            arm = np.array([self.k2 * (self.a2 - self.a2_ref), self.k1 * (self.a1_act - self.a1_ref)])
+            arm = np.array([self.k2 * (self.a2 - self.a2_ref), self.k1 * (self.a1_act - self.a1_ref - self.a1_cal_off)])
         d = arm + np.array([-self.off_s, self.off_f])
         return self.stop_err + self._rot() @ d
 
@@ -540,6 +546,8 @@ class SimWorld:
             self.trk = None                                    # 别的转动指令接管舵机：APN 的目标作废
         self.advance(DUR.get(verb.rstrip('?'), 0.0) if verb != 'A?' else DUR['A'])
         n = self.count[verb] = self.count.get(verb, 0) + 1
+        if self.screen_wipe_at and verb == self.screen_wipe_at[0] and n == self.screen_wipe_at[1]:
+            self.screen = {}                                   # (10-27)这条指令做的时候屏掉电重启：画面全没了
         if self.abort_at and verb == self.abort_at[0] and n == self.abort_at[1]:
             return False, 'ERR ABORT', info
         fail_at = None
@@ -620,8 +628,12 @@ class SimWorld:
                 self.qr_code = None
             return True, 'DONE', info
         if verb in ('SCR', 'SCMD'):
+            if verb == 'SCR' and text in self.scr_fail:
+                self.scr_fail.remove(text)
+                return False, 'ERR TIMEOUT', info
             if verb == 'SCR' and len(parts) >= 3:
                 self.screen[parts[1]] = text.split(' ', 2)[2]
+                self.scr_log.append((parts[1], self.screen[parts[1]]))
             return True, 'DONE', info
         if verb == 'CLAW':
             if parts[1] in ('OR', 'OT') and not self.claw3_fw:
@@ -1246,6 +1258,40 @@ class MissionSimTests(unittest.TestCase):
         self.assertTrue(scr)
         self.assertEqual({r.split()[1] for r in scr}, {'t0', 't7', 't2', 't3'}, scr)
         self.assertFalse([r for r in scr if '/' in r], '跑的过程中也只写做成的个数(GRAB 3，不写 GRAB 3/6)')
+
+    def test_screen_counts_shown_while_running(self):
+        """(10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码就显示抓取0 放置0，做成一个改一次；
+        回到启停区收臂以后任务码、抓取数、放置数都再写一次(收臂时屏可能掉电重启过)。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        h = make(w)
+        run_mission(w, h)
+        self.assertEqual([o for o, _t in w.scr_log][:2], ['t0', 't7'])       # 读到码以前屏上什么都没有：最先写的是任务码
+        self.assertEqual([t for o, t in w.scr_log if o == 't2'], [f'GRAB {i}' for i in range(7)] + ['GRAB 6'])
+        self.assertEqual([t for o, t in w.scr_log if o == 't3'], [f'PLACE {i}' for i in range(13)] + ['PLACE 12'])
+        g1 = next(i for i, r in enumerate(w.requests) if r.startswith('GRAB'))
+        self.assertIn('SCR t2 GRAB 0', w.requests[:g1])                     # 第一个物料夹起来以前就有抓取0、放置0
+        self.assertIn('SCR t3 PLACE 0', w.requests[:g1])
+        k = max(i for i, r in enumerate(w.requests) if r == 'PARK')
+        self.assertEqual([r for r in w.requests[k + 1:] if r.startswith('SCR')],
+                         ['SCR t0 156+123+', 'SCR t7 516+231', 'SCR t2 GRAB 6', 'SCR t3 PLACE 12'])
+        w2 = SimWorld(seed=1, code=self.CODE)
+        run_mission(w2, make(w2, dict(screen_counts_live=False, screen_stats_live=True)))
+        self.assertEqual([t for o, t in w2.scr_log if o in ('t2', 't3')], ['GRAB 6', 'PLACE 12'])   # false：回到启停区才写(旧键不再读)
+
+    def test_screen_rewritten_after_screen_reboot_at_home(self):
+        """(10-27)回到启停区收臂、升降停 60 的时候屏掉电重启(画面全没了)：树莓派收完臂再把任务码、抓取数、放置数写一遍
+        (以前同样的字不重发，屏上就什么都没有了)；写失败(串口一次没回话)再写一次。"""
+        w = SimWorld(seed=1, code=self.CODE)
+        w.screen_wipe_at = ('PARK', 1)
+        run_mission(w, make(w))
+        self.assertEqual(w.screen, {'t0': '156+123+', 't7': '516+231', 't2': 'GRAB 6', 't3': 'PLACE 12'})
+        w = SimWorld(seed=1, code=self.CODE)
+        w.screen_wipe_at = ('PARK', 1)
+        w.scr_fail = ['SCR t3 PLACE 12', 'SCR t3 PLACE 12']                # 跑的时候、回家以后第一次都没写成
+        lines = []
+        run_mission(w, make(w, log=lines.append), log=lines.append)
+        self.assertEqual(w.screen['t3'], 'PLACE 12')
+        self.assertIn('串口屏 t3 写入失败', '\n'.join(lines))
 
     def test_chassis_returns_to_stop_point(self):
         w = SimWorld(seed=2, code=self.CODE)
@@ -4155,8 +4201,8 @@ class ZoneCalTests(unittest.TestCase):
             self.assertNotIn('车轮边走边对准 2 号环', text)                # (10-21 用户)不再一开始就边走边对
             self.assertIn('按 arm_calib 调的角度只转手臂', text)
             self.assertNotIn('只动手臂对准', text)                         # 1、3 号环不再用以前那种一步一步的摄像头对准
-            self.assertIn('空爪先用摄像头只动手臂微调', text)              # (10-26)第一轮：转过去以后空爪用摄像头只动手臂微调
-            self.assertIn('按这个区第一次用摄像头微调好的角度', text)      #   第二轮直接用第一轮微调好的
+            self.assertIn('车不动、不再用摄像头对', text)                  # (10-28 用户"摄像头微调整没有什么效果")默认 rfine off：
+            self.assertNotIn('空爪先用摄像头只动手臂微调', text)           #   1、3 号环按调的角度直接放，不用摄像头微调
             for bad in ('照旧一个环一个环', '照旧挪车对准', '一步一步挪着对准'):
                 self.assertNotIn(bad, text)                                # 没有任何挪车对准的退路
             self.assertIn('车没动、只转手臂放的，不再对准', text)
@@ -4220,7 +4266,7 @@ class ZoneCalTests(unittest.TestCase):
         for old in (True, False):
             w = self._world(1, ap_fine_extra_s=0.8)
             lines = []
-            h = self._make(w, dict(zone_cal_fine_s=2.0, zone_cal_fine_iter=3) if old else None, lines=lines)
+            h = self._make(w, dict(zone_cal_fine=True, **(dict(zone_cal_fine_s=2.0, zone_cal_fine_iter=3) if old else {})), lines=lines)
             for z in h._teach_all.values():                      # 调的时候 ID1 差了 1.5°
                 z['1'] = [z['1'][0] + 1.5, z['1'][1]]
                 z['3'] = [z['3'][0] - 1.5, z['3'][1]]
@@ -4246,7 +4292,7 @@ class ZoneCalTests(unittest.TestCase):
             for seed in range(3):
                 w = self._world(seed, id1_backlash_deg=2.0)
                 lines = []
-                h = self._make(w, dict(zone_backlash_deg=0.0) if old else None, lines=lines)
+                h = self._make(w, dict(zone_cal_fine=True, **(dict(zone_backlash_deg=0.0) if old else {})), lines=lines)
                 for z in h._teach_all.values():                      # 调的角度差一点点：微调只要小修正
                     z['1'] = [z['1'][0] + 0.6, z['1'][1]]
                     z['3'] = [z['3'][0] - 0.6, z['3'][1]]
@@ -4275,8 +4321,8 @@ class ZoneCalTests(unittest.TestCase):
                                                                              #   (实车 A1D 比三个环都大，模拟里比三个环都小，反过来一样)
                 w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
                 lines = []
-                h = self._make(w, dict(zone_backlash_extra_deg=0.0, zone_atol_comp=0.0, zone_same_approach=False,
-                                       zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None) if old else None, lines=lines)
+                h = self._make(w, dict(zone_cal_fine=True, **(dict(zone_backlash_extra_deg=0.0, zone_atol_comp=0.0, zone_same_approach=False,
+                                                                 zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None) if old else {})), lines=lines)
                 for z in h._teach_all.values():                      # 调的角度差 1.6°(实车一开始差 6.6~7.4mm)
                     z['1'] = [z['1'][0] + 1.6, z['1'][1]]
                     z['3'] = [z['3'][0] - 1.6, z['3'][1]]
@@ -4309,7 +4355,7 @@ class ZoneCalTests(unittest.TestCase):
                 w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}        # 和实车一样 1 号环的角度离车上转盘最远
                 w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
                 lines = []
-                cfg = dict(self.CAR_TOL)
+                cfg = dict(self.CAR_TOL, zone_cal_fine=True)
                 if old:
                     cfg.update(zone_backlash_extra_deg=1.0, zone_same_approach=False, zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None)
                 h = self._make(w, cfg, lines=lines)
@@ -4330,6 +4376,40 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(out[False][1], 1.2, out)
         self.assertEqual(out[False][2], 0, out)                       # 都"微调好了"
         self.assertLessEqual(out[False][3], 3.5, out)
+
+    def test_rings_placed_at_the_calibrated_angles_without_the_camera(self):
+        """(10-28 用户"摄像头微调整没有什么效果啊……只要我调整圆环2就应该能给他对准吧，环1和环3……相对于2调整之后应该是也是好调整的")
+        默认不用摄像头微调(zone_cal_fine 关)：车轮把 2 号环对准，1、3 号环按 arm_calib 调的角度直接转过去放。实车 ID1 有 2.3° 间隙：
+        arm_calib 调 A1P、R1、R3 时最后一下从哪边转到位，手臂就靠在间隙哪一边(a1_cal_off)。现在调环那三步的每一下也从车上转盘那边到位
+        (和比赛时一样)：间隙、摩擦、快速转停偏、容差 3mm 下三个环都放准，不花微调的时间。以前调的时候最后一下可以往车上转盘那边转，
+        手臂靠在另一边：车轮把 2 号环对到爪子下面时车跟着挪了一个间隙，1、3 号环就偏好几毫米(调好 2 号环，1、3 号环还是偏)。
+        只跑第一轮(两个区各放 3 个)。"""
+        out = {}
+        for same in (True, False):
+            errs, cams = {1: [], 2: [], 3: []}, 0
+            for seed in range(4):
+                w = self._world(seed, id1_backlash_deg=2.3, id1_stick_deg=0.8, ap_fast_err=True)
+                w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}            # 和实车一样 1 号环的角度离车上转盘最远
+                w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
+                side = 1.0 if w.params['A1D'] >= w.params['A1P'] else -1.0   # 往 -side 转到位：手臂比舵机多 side × 间隙/2
+                w.a1_cal_off = (1.0 if same else -1.0) * side * 0.5 * w.id1_backlash_deg
+                lines = []
+                h = self._make(w, dict(self.CAR_TOL), lines=lines)
+                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
+                text = '\n'.join(lines)
+                if same:
+                    self.assertEqual((w.air, w.loose, w.collisions, w.sweep_hits), (0, 0, 0, 0), text[-3000:])
+                    self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (3, 6, 6), text[-3000:])
+                for (z, k, _c, e, _st) in w.placed:
+                    errs[k].append(e)
+                cams += sum(1 for l in lines if '微调' in l and '只动手臂' in l)
+            out[same] = ({k: round(max(v), 2) for k, v in errs.items()}, cams)
+        print(f'\n  [不用摄像头微调，按调的角度放；间隙 2.3° + 摩擦 + 容差 3mm] 三个环放置误差最大：'
+              f'调的时候和比赛时一样从车上转盘那边到位 {out[True][0]}；调的时候手臂靠在间隙另一边 {out[False][0]}')
+        self.assertEqual(out[True][1], 0)
+        self.assertLess(max(out[True][0].values()), 2.0, out)
+        self.assertLess(out[False][0][2], 2.0, out)                             # 2 号环照样准(车轮对的)
+        self.assertGreater(min(out[False][0][1], out[False][0][3]), 4.0, out)   # 1、3 号环偏好几毫米
 
     def test_ring_tol_is_the_smaller_one(self):
         """(10-27 晚)zone_cal_fine_tol_mm / zone_vel_tol_mm 和 tol_mm.RING 取小的；None 就是 tol_mm.RING。"""
@@ -4390,7 +4470,7 @@ class ZoneCalTests(unittest.TestCase):
         res = {}
         for shift in (0.0, 15.0):
             w = self._world(1)
-            h = self._make(w)
+            h = self._make(w, dict(zone_cal_fine=True))                         # (10-28)十字只在 rfine on 时用
             c = w.vision.claw('RING')
             if shift:
                 w.vision.cfg['claw_px']['RING1'] = [c[0] + shift, c[1]]

@@ -496,6 +496,42 @@ class MiscDriveTests(unittest.TestCase):
                        start=dict(est=(1200.0, 330.0, 0.0), ref=(1200.0, 330.0, 0.0)), caps={'rdec': False})
         self.assertEqual(ctx.calls, 1)
 
+    def test_reloc_after_turn_next_to_yellow(self):
+        # (10-28 用户"从这个粗加工区域来这个暂停区域的时候这一段转弯之后老是喜欢压线")粗加工区 -> 暂存区(车上的路线)：后退 885 到西南角，
+        # 原地转 -90°，再后退 885 往北贴着西南黄色区(离 65mm)走。后退少走 5%：停在西南角时往东差 44mm，转完弯就是往黄色区那边的横向偏差。
+        # 默认转完弯先雷达定位、横移挪回规划的线上再走；关掉(reloc_after_turn_near=false)车身离黄色区只剩二十毫米
+        def run(near):
+            car = SimCar((1200.0, 340.0, 0.0), scale=-0.05)
+            ctx = SimCtx(car)
+            legs = [dict(stop='TEMP', goal=(340.0, 1200.0, -90.0), cmds=[('S', -25), ('F', -885), ('R', -90), ('F', -885), ('S', 25)])]
+            logs = []
+            auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=Hooks(car), speeds={},
+                           motion=None, cfg=dict(CFG, reloc_stops=[], reloc_after_turn_near=near),
+                           start=dict(est=(1200.0, 340.0, 0.0), ref=(1200.0, 340.0, 0.0)), caps={'rdec': False})
+            north = [q for q in car.trace if abs(wrap(q[2] + 90.0)) < 5.0 and 450.0 < q[1] < 1100.0]   # 往北贴着黄色区走的那一段
+            return car, ctx, logs, min(auto_run.yellow_clearance(CFG, q, 'F', 0) for q in north)
+        car, ctx, logs, worst = run(False)
+        self.assertEqual(ctx.calls, 0)
+        self.assertLess(worst, 25.0, '不定位：贴着黄色区只剩二十毫米')
+        car, ctx, logs, worst = run(True)
+        self.assertEqual(ctx.calls, 1)
+        self.assertTrue(any('离黄色区只有 65mm' in l for l in logs), logs)
+        self.assertTrue(any('转弯后、贴着黄色区的直行前雷达定位' in l for l in logs), logs)
+        i = [c[0] for c in car.sent].index('R')
+        c, v, sp = car.sent[i + 1]
+        self.assertEqual((c, sp), ('S', 60), car.sent)                 # 转完弯：慢速横移(车头朝南，往西是右移)挪回规划的线上
+        self.assertTrue(-50 <= v <= -38, car.sent)
+        self.assertGreater(worst, 55.0)
+        # 别的弯不定位：二维码 -> 原料区(车上的路线)转完弯往西走，离东北黄色区 140mm
+        car = SimCar((2100.0, 1350.0, 90.0), scale=-0.05)
+        car.T = 90.0
+        ctx = SimCtx(car)
+        legs = [dict(stop='A', goal=(1200.0, 2160.0, 180.0), cmds=[('F', 810), ('R', 90), ('F', 900)])]
+        auto_run.drive(ctx, car, auto_run.flatten(0, legs), log=lambda m: None, stop_wait=0, hooks=Hooks(car), speeds={},
+                       motion=None, cfg=dict(CFG, reloc_stops=[]),
+                       start=dict(est=(2100.0, 1350.0, 90.0), ref=(2100.0, 1350.0, 90.0)), caps={'rdec': False})
+        self.assertEqual(ctx.calls, 0)
+
     def test_reloc_before_tight_turn(self):
         # 沿中间车道往南开到 (1200,375) 再原地转(车角离粗加工区约 30mm)；前进多走 4% -> 实际已经往南多走了 29mm。
         # 转之前按推算位置算离得太近(比可能差的距离还近)：先雷达定位、修回转弯点再转，车角不碰粗加工区

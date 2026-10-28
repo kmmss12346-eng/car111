@@ -316,10 +316,12 @@ DEFAULTS = dict(
     zone_a2_margin_deg=15.0,            #   离 ID2 限位至少这么多度
     # (10-20 用户)arm_calib 里调过 1、3 号环(ring_teach.json 里 src=arm_calib)的粗加工区/暂存区：车只把 2 号环对准一次，之后车一下都不动；
     #   1、3 号环按调的角度(比 2 号环多转多少)直接转过去放、取，不再挪车。没调过：大声提醒，照旧一个环一个环挪车对准
-    zone_cal_fine=True,                 # (10-26 用户"到指定位置之后再通过摄像头微调机械臂的位置……车的位置不动，对准之间必须控制在两秒左右")
+    zone_cal_fine=False,                # (10-26 用户"到指定位置之后再通过摄像头微调机械臂的位置……车的位置不动，对准之间必须控制在两秒左右")
                                         #   调过的 1、3 号环：空爪先转到调的角度上方(看圆环的高度)，摄像头只动手臂把这个环的中心对到它自己的十字
                                         #   (claw_px.RING1 / RING3，没调过就是红十字)上，再去车上转盘夹物料、回到对准的角度放。记下来，
-                                        #   这个区第二轮(码垛也是)直接用，不再对。False = 以前的直接按调的角度放
+                                        #   这个区第二轮(码垛也是)直接用，不再对。False = 以前的直接按调的角度放。
+                                        #   (10-28 用户"摄像头微调整没有什么效果……退回到那个没有添加摄像头对准的那个版本")默认关：车轮对准 2 号环，
+                                        #   1、3 号环按 arm_calib 调的角度直接转过去放；主程序 rfine on 打开
     zone_cal_fine_s=10.0,               #   (10-27 用户"把微调时间放长直到调好为止"，以前 2 秒)一直调到对准(偏差在 tol_mm.RING 以内)为止，这么多秒只是防卡死的上限
                                         #   (不算转过去的时间，正常一两秒就好)；到上限还没对准：比调的角度更准就按现在的放，不然按调的角度放
     zone_cal_fine_iter=12,              #   (10-27，以前 3)最多修正几次：和上面一样只是上限，对准了就停
@@ -438,7 +440,9 @@ DEFAULTS = dict(
     stop_aliases=None,                  # 停车点名字不叫 QR/RAW/ROUGH/TEMP/START 时，例如 {'ROUGH': ['PROC']}
     screen=dict(code='t0', code2='t7', stage='t1', grab='t2', place='t3', msg='t4', b1='t5', b2='t6'),
     screen_show=('code', 'code2', 'grab', 'place'),   # (10-23 用户"按要求显示必要的字")屏上只写这几样：任务码两行、抓取数、放置数
-    screen_stats_live=False,            # (10-23 晚)抓取数、放置数只在回到启停区以后写(新固件画成中文"抓取3  放置5")；true = 跑的时候也写
+    screen_counts_live=True,            # (10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码以后最下面一行一直显示
+                                        #   "抓取n 放置n"(新固件画成中文；从 0 开始，做成一个改一次，回到启停区再写一次)；
+                                        #   false = 10-23 的做法(回到启停区才写)。以前的键 screen_stats_live 不再读(车上配置里可能存着它的旧默认值 false)
                                         #   (赛规：一直显示任务码，回家后显示正确抓取数、正确放置数)；阶段、提示、B1/B2 只在终端日志里   # 任务码分两行(字高 ≥12mm 一行放不下)：t0=前两组，t7=后两组
 )
 
@@ -1043,7 +1047,7 @@ class MissionHooks:
                 if ok is False:
                     raise ArmError('QR CLR 没有回 DONE')
                 self._screen_clear()                # (10-23)清屏：上一次的任务码擦掉，读到码再写
-                self._show_stats()                  # screen_stats_live=true 才写 GRAB 0、PLACE 0(默认回家才写)
+                self._show_stats()                  # 已经有任务码才写抓取0、放置0(一般这时还没读到码：屏上什么都没有)
                 self._prep['qr'] = True
                 self.log('  已清掉 STM32 里存的旧任务码(QR CLR)，屏上的字也清了(读到任务码再显示)')
             except Exception as ex:
@@ -1468,13 +1472,15 @@ class MissionHooks:
 
     # ------------------------------------------------------------------ 小工具
     def _ui(self, key, text):
+        """写屏。返回 False = 写了但没写成(串口没回话之类)；别的情况(写成了、不用写)返回 True/None。"""
         if self.arm is None:
-            return
+            return None
         if key not in (self.cfg.get('screen_show') or ()):   # (10-23)屏上只写赛规要的：任务码、抓取数、放置数
-            return
+            return None
         obj = self.cfg['screen'].get(key)
         if obj:
-            self.arm.screen(obj, text)
+            return self.arm.screen(obj, text)
+        return None
 
     def _screen_clear(self):
         """(10-23)清屏回到比赛布局(STM32 的 ZONE LOCK)：上一次跑留下的任务码、旧的字都擦掉。旧固件不认 ZONE 就算了。"""
@@ -1508,9 +1514,10 @@ class MissionHooks:
 
     def _show_stats(self):
         # (10-23)屏上只写做成的个数(GRAB 3、PLACE 5)，和回家以后一样：赛规要显示"正确抓取数量和正确放置数量"，3/6 这种裁判看不懂。
-        # (10-23 晚用户"回启停区后显示中文抓取 n 放置 n")跑的时候不写(屏上只有任务码)，回到启停区(_start)才写；
-        #   新固件把 GRAB 3 画成"抓取3"。screen_stats_live=true 跑的时候也写
-        if not self.cfg.get('screen_stats_live', False):
+        #   新固件把 GRAB 3 画成"抓取3"。
+        # (10-27 用户"屏幕只显示数字抓取和放置的个数没有显示了")读到任务码以后就写(抓取0 放置0)，做成一个改一次(同样的字不重发)；
+        #   读到码以前不写(开跑前屏上什么都没有)。screen_counts_live=false：跑的时候不写，回到启停区(_start)才写
+        if not self.cfg.get('screen_counts_live', True) or self.plan is None:
             return
         self._ui('grab', self.stats.final_grab_text())
         self._ui('place', self.stats.final_place_text())
@@ -6794,7 +6801,7 @@ class MissionHooks:
                     self.log(f'    ({zone} 1、3 号环按 arm_calib 调的角度：车对准 2 号环以后不动，只转手臂过去放、取'
                              f'(比 2 号环多转 1 号 ID1 {out[1][0]:+.1f}°/ID2 {out[1][1]:+.0f}°，3 号 ID1 {out[3][0]:+.1f}°/ID2 {out[3][1]:+.0f}°)'
                              + (f'；转过去以后空爪先用摄像头只动手臂微调，一直调到对准(最多 {float(self.cfg.get("zone_cal_fine_s", 10.0)):g} 秒)再放'
-                                if self.cfg.get('zone_cal_fine', True) else '') + ')')
+                                if self.cfg.get('zone_cal_fine', False) else '') + ')')
                 else:
                     self.log(f'    ({zone} 1、3 号环按以前 rteach 示教的角度，转过去以后还用摄像头再对一次。'
                              '建议在 arm_calib 里重新调：python3 arm_calib.py --from A1P)')
@@ -8111,7 +8118,7 @@ class MissionHooks:
             self.log('    环2：就在对准的这个环，不再对准')
         elif T.get('cal'):
             # (10-20 用户)arm_calib 调过：直接按调的角度转过去(放置补偿默认不加，见 place_comp_on)，绝不挪车
-            fine_on = bool(self.cfg.get('zone_cal_fine', True)) and not self.nogo
+            fine_on = bool(self.cfg.get('zone_cal_fine', False)) and not self.nogo
             learned = (self._zone_learn.get(zone) or {}).get(ring) if fine_on else None
             d1, d2 = learned if learned is not None else T[ring]
             tgt = self._cal_target(ring, p2[0] + d1, p2[1] + d2)
@@ -9443,10 +9450,19 @@ class MissionHooks:
     def _start(self, visit):
         if self.arm is not None:
             self.park()                                          # 收臂、升降停到开机高度 60(下次上电编码器能认出来)；夹着东西时不做
+            reset = getattr(self.arm, 'screen_reset', None)
+            if reset is not None:
+                reset()                                          # (10-27)收臂、升降停 60 时屏可能掉电重启过(画面全没了)：写过的字也再写一次
+            if self.plan is not None:
+                l0, l1 = self.plan.screen_code(self._code_plus())
+                self._ui('code', l0)
+                self._ui('code2', l1)
         s = self.stats
         self._ui('stage', 'DONE')
-        self._ui('grab', s.final_grab_text())                    # 回家以后只显示做成的个数(赛规要"正确的数量")
-        self._ui('place', s.final_place_text())
+        for key, text in (('grab', s.final_grab_text()), ('place', s.final_place_text())):   # 回家以后只显示做成的个数(赛规要"正确的数量")
+            if self._ui(key, text) is False:
+                self.sleep(0.2)
+                self._ui(key, text)                              # (10-27)没写成(串口偶尔一次没回话)：再写一次
         self._ui('msg', f'T={self.elapsed():.0f}s')
         self.log(f'  ■ 回到启停区。用时 {self.elapsed():.0f}s；屏上显示 {s.final_grab_text()}、{s.final_place_text()}'
                  f'(抓了 {s.grab_total} 次、放了 {s.place_total} 次)')

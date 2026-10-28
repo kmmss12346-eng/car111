@@ -407,6 +407,22 @@ def moves_clearance(cfg, obstacles, pose, cmds, step_mm=10.0, step_deg=2.0, mode
     return best, at, what, p
 
 
+def yellow_clearance(cfg, pose, cmd, val, step_mm=20.0, model=None):
+    """(10-28)从 pose 走一条直行 cmd val，一路上车身(含雷达)离黄色区最近多少 mm(只算黄色区：场地边线、工位、转盘不算)。"""
+    model = model or body_model(cfg)
+    rects = [_rect_poly(r) for r in YELLOW]
+    best = math.inf
+    n = max(1, int(math.ceil(abs(float(val)) / step_mm)))
+    for k in range(n + 1):
+        poly, disk = body_poly(apply_move(pose, cmd, float(val) * k / n), model)
+        for r, rp in zip(YELLOW, rects):
+            d = _poly_dist(poly, rp)
+            if disk:
+                d = min(d, _pt_rect(disk[0], disk[1], r) - disk[2])
+            best = min(best, d)
+    return best
+
+
 def _plan_check(cfg, obstacles, pose, cmds):
     """route_plan 里有 moves_clear 时也问它(margin 0 = 真的会压上/出界才算不行)。返回 None = 没意见，否则一句原因。
     本来就不够的(车已经离得很近)，只要不比现在更近也放行。"""
@@ -1163,12 +1179,26 @@ class _Drive:
             return None
         return {'F': 'S', 'S': 'F'}.get(self.seq[self.k + 1][1])
 
+    def _near_yellow(self, nxt):
+        """(10-28 用户"从这个粗加工区域来这个暂停区域的时候这一段转弯之后老是喜欢压线")转完弯接下来这一条直行贴着黄色区走
+        (按推算的位置离黄色区不到 reloc_near_yellow_mm)：前一条直行走多走少的误差、转弯时车挪的一点，转完弯都成了往黄色区那边的
+        横向偏差，一路带着走就压线。返回这一条离黄色区最近多少 mm(要先定位)；不用定位返回 None。
+        短的(< reloc_near_min_mm)、刚定位过(上次定位以后不到 reloc_near_min_travel_mm，比如转弯前刚定位)的不定位。"""
+        g = self.cfg.get
+        lim = float(g('reloc_near_yellow_mm', 80) or 0.0)
+        if (lim <= 0.0 or not g('reloc_after_turn_near', True) or abs(float(nxt[1])) < float(g('reloc_near_min_mm', 300))
+                or self.travel < float(g('reloc_near_min_travel_mm', 300))):
+            return None
+        best = yellow_clearance(self.cfg, self.nav.real(), nxt[0], nxt[1])
+        return best if best < lim else None
+
     def _after_turn(self):
         """路线中间转完弯、接下来是一条长直行(>= reloc_split_mm)、上次定位以后又走了 >= reloc_min_travel_mm：先用雷达定位一次。
         前一条长直行走多走少的误差，转弯以后就变成了横向偏差，一路带着往黄区/工位区那边偏；在这里修掉
-        (车头和横向偏差马上修，沿着下一条方向的偏差并进下一条)。"""
+        (车头和横向偏差马上修，沿着下一条方向的偏差并进下一条)。
+        (10-28)接下来这一条贴着黄色区走(_near_yellow)也定位(默认就用，和 reloc_after_turn 无关)，横向偏差修到 reloc_turn_tol_mm 以内。"""
         g = self.cfg.get
-        if not (self.nav.world and self.reloc_on and g('reloc_after_turn', False)):    # (10-23)默认不用：只有回启停区才用雷达定位
+        if not (self.nav.world and self.reloc_on):
             return
         nxt = None
         for j in range(self.k + 1, len(self.seq)):
@@ -1178,15 +1208,23 @@ class _Drive:
             if c in ('F', 'S'):
                 nxt = (c, self.seq[j][2])
                 break
-        if nxt is None or abs(nxt[1]) < float(g('reloc_split_mm', 1200)) or self.travel < max(self.min_travel, 1.0):
+        if nxt is None:
             return
+        near = self._near_yellow(nxt)
+        # (10-23)长直行前定位默认不用：只有回启停区才用雷达定位
+        long_ = (bool(g('reloc_after_turn', False)) and abs(nxt[1]) >= float(g('reloc_split_mm', 1200))
+                 and self.travel >= max(self.min_travel, 1.0))
+        if near is None and not long_:
+            return
+        if near is not None:
+            self.log(f'    (转完弯接下来这一条离黄色区只有 {near:.0f}mm：前面走多走少的误差转完弯都成了横向偏差，先雷达定位、修正了再走)')
         meas = self._count(_reloc(self.ctx, self.nav.real(), int(g('reloc_turn_frames', 4))))   # 路线中间：少拍几帧，快
         if not meas.get('ok'):
             self.log(f"    ◆ 转弯后雷达定位没成功：{meas.get('why')}。照推算的走。")
             return
         self.travel = 0.0
         p = meas['pose']
-        self.log(f"    ◆ 转弯后、长直行前雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°"
+        self.log(f"    ◆ 转弯后、{'贴着黄色区的' if near is not None else '长'}直行前雷达定位：车在 ({p[0]:.0f},{p[1]:.0f}) 车头{p[2]:.1f}°"
                  f"（{meas.get('inlier', 0)*100:.0f}%的点对上，残差{meas.get('rms', 0):.1f}mm，ICP {meas.get('t', 0):.2f}秒）")
         self.nav.measured(p, self.e_last)
         need = float(g('reloc_check_margin_mm', 10))
@@ -1200,7 +1238,8 @@ class _Drive:
                 self._turn(v, self.nav.est[2], '(修车头)', toward_zero=True)
         f, s = self.nav.owed()
         side = ('F', f) if nxt[0] == 'S' else ('S', s)       # 和下一条直行垂直的那个方向
-        if abs(side[1]) >= float(g('reloc_lateral_tol_mm', 15)):
+        tol = float(g('reloc_turn_tol_mm', 8) if near is not None else g('reloc_lateral_tol_mm', 15))   # (10-28)贴着黄色区：修得细一点
+        if abs(side[1]) >= tol:
             c, v = side[0], int(round(side[1]))
             v2 = clamp_move(self.cfg, obs, self.nav.real(), c, v, need)
             if abs(v2) >= STOP_MIN_MM:

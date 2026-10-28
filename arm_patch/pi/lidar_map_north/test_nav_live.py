@@ -592,6 +592,19 @@ class LiveTests(unittest.TestCase):
                       inputs=[(lambda: True, 'rtol 9 1')], screen_zone=None, end_on='0.3~5')
         self.assertEqual((self.cfg_after.get('mission_cfg') or {}).get('zone_vel_tol_mm'), 1.5)
 
+    def test_rfine_command_saves(self):
+        """(10-28 用户"摄像头微调整没有什么效果啊……退回到那个没有添加摄像头对准的那个版本")rfine：1、3 号环摄像头微调默认关；
+        rfine on 存进配置 mission_cfg.zone_cal_fine=true，rfine off 改回来。"""
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'rfine')], screen_zone=None, end_on='改：rfine')
+        self.assertIn('现在：rfine off', self.log)
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'rfine on')], screen_zone=None, end_on='已设置 rfine on')
+        self.assertIs((self.cfg_after.get('mission_cfg') or {}).get('zone_cal_fine'), True)
+        self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(zone_cal_fine=True)),
+                      inputs=[(lambda: True, 'rfine off')], screen_zone=None, end_on='已设置 rfine off')
+        self.assertIs((self.cfg_after.get('mission_cfg') or {}).get('zone_cal_fine'), False)
+
     def test_turnloc_command_saves(self):
         """(10-27)turnloc off：存进配置 reloc_before_turn=false(每个弯直接转)，并提醒风险；turnloc on 改回来。"""
         self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
