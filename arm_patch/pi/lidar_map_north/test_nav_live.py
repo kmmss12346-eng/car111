@@ -310,7 +310,8 @@ class LiveTests(unittest.TestCase):
     def setUp(self):
         WORLD.clear()
 
-    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same', argv_extra=(), expect_done=True, end_on=None):
+    def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same', argv_extra=(), expect_done=True, end_on=None,
+                 done_when=None):
         with open(USER_CFG, encoding='utf-8') as f:
             raw = json.load(f)
         WORLD['mount'] = {k: raw[k] for k in ('lidar_forward_mm', 'lidar_left_mm', 'lidar_yaw_deg', 'sdk_y_sign')}
@@ -334,7 +335,7 @@ class LiveTests(unittest.TestCase):
         out = Out()
         self.out_text = out.text
         timers = []
-        state = {'done': False, 'end_on': end_on}            # end_on：日志里出现这句就算跑完
+        state = {'done': False, 'end_on': end_on}            # end_on：日志里出现这句就算跑完；done_when(日志)：它说完了才算(跑两轮时用)
 
         def show(*a, **k):
             t_end = time.monotonic() + timeout
@@ -344,8 +345,12 @@ class LiveTests(unittest.TestCase):
                     for f, a2, k2 in t.cbs:
                         f(*a2, **k2)
                 txt = out.text()
-                if t_fin is None and ('路线全部走完' in txt or '★ 已停止' in txt or '★ 出错停止' in txt or '★ 比赛流程' in txt
-                                      or (state.get('end_on') and state['end_on'] in txt)):
+                if done_when is not None:
+                    fin = done_when(txt)
+                else:
+                    fin = ('路线全部走完' in txt or '★ 已停止' in txt or '★ 出错停止' in txt or '★ 比赛流程' in txt
+                           or (state.get('end_on') and state['end_on'] in txt))
+                if t_fin is None and fin:
                     t_fin = time.monotonic()
                 if t_fin is not None and time.monotonic() - t_fin > 0.6:
                     state['done'] = True
@@ -642,6 +647,78 @@ class LiveTests(unittest.TestCase):
         self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, reloc_before_turn=False),
                       inputs=[(lambda: True, 'turnloc on')], screen_zone=None, end_on='已设置 turnloc on')
         self.assertIs(self.cfg_after.get('reloc_before_turn'), True)
+
+    def test_fixroute_save_then_fixed_race(self):
+        """(10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")先正常 race 2 跑一整轮，fixroute save 存下路线和地图，
+        fixroute on；车放回起点再 race 2：只等屏上按 START，按了以后不扫描、不规划(原地等 → 第二站动作 → 再等)，按存好的路线跑完回到
+        启停区，路上雷达定位照常(用存的地图)。还没存不能打开；启停区不对不开跑。"""
+        start = (2250.0, 150.0, 90.0)
+        mark = {}
+
+        def said(t, n=1):
+            return lambda: self.out_text().count(t) >= n
+
+        def back_to_start():
+            # 第二轮之前把车放回起点(和真的拍视频一样)；记下第二轮从哪开始
+            if '已打开写死模式' not in self.out_text():
+                return False
+            car = WORLD['car']
+            with car.lock:
+                car.x, car.y, car.yaw = start
+                car.g_off = 0.0
+                car.T = car.yaw
+                mark.update(trace=len(car.trace), req=len(car.requests), sent=len(car.sent))
+            return True
+        inputs = [(lambda: True, 'fixroute on'), (said('还没存写死路线'), 'race 2'), (said('路线全部走完'), 'fixroute save'),
+                  (said('已存好写死路线'), 'fixroute on'), (said('已打开写死模式'), 'race 1'), (said('写死路线是启停区 2 的'), 'fixroute'),
+                  (lambda: said('现在：写死模式开着')() and back_to_start(), 'race 2')]
+        car = self.run_live(2, dict(scale=0.01, drift_deg=0.05, resid_deg=0.2), timeout=150.0,
+                            cfg_extra=dict(race_auto=False, race_start='now', fixed_wait1_s=0.5, fixed_wait2_s=0.4),
+                            inputs=inputs, screen_zone=None,
+                            done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t)
+        log = self.log
+        self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
+        first, fx = log[:log.index('已存好写死路线')], log[log.rindex('★ 按了 START'):]
+        self.assertIn('第一次扫描', first)
+        self.assertIn('规划全程路线', first)
+        self.assertIn('存在 fixed_route.json', log)
+        self.assertIn('写死路线是启停区 2 的，现在是启停区 1', log)
+        # 第二轮：屏上出 START(ZONE 2)、按了以后锁屏，不扫描、不规划，原地等两次
+        reqs = car.requests[mark['req']:]
+        self.assertEqual(reqs[0], 'ZONE 2', reqs[:5])
+        self.assertIn('ZONE LOCK', reqs)
+        self.assertIn('① 写死模式：不扫描、不规划', fx)
+        self.assertIn('③ 写死模式：不扫描，原地等 0.4 秒', fx)
+        self.assertIn('写死模式：不规划，直接用存好的路线', fx)
+        self.assertIn('④ 写死路线', fx)
+        for word in ('第一次扫描', '第二次扫描', '扫描完成', '站点扫描', '规划全程路线', '开跑前规划'):
+            self.assertNotIn(word, fx)
+        import re
+        m = re.search(r'\(开跑到现在 ([\d.]+) 秒\)', fx)
+        self.assertTrue(m and float(m.group(1)) >= 0.5, fx[:2000])
+        self.assertGreaterEqual(fx.count('雷达定位：车在'), 4, '写死模式路上照样用雷达定位(按存的地图)')
+        # 第二轮跑的就是存下来的路线：转弯、前进、横移的指令和第一轮差不多一样(修正的小动作不算)
+        big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
+        self.assertGreaterEqual(len(big), 8, big)
+        goal = auto_run.inset_goal(start, self.cfg_after)
+        p = car.pose()
+        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'写死模式没回到出发位置：{p}')
+        tr = car.trace[mark['trace']:]
+        k0 = next(i for i, q in enumerate(tr) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
+        self.assertGreaterEqual(edge_min(tr[k0:], self.cfg_after), 0.0)
+        self.assertIs(self.cfg_after.get('fixed_route'), True, 'fixroute on 存进配置')
+
+    def test_fixroute_off_by_default_and_needs_a_saved_route(self):
+        """fixroute 看现在：默认关着；没存过路线 fixroute save 要先有两次扫描、fixroute on 不打开。"""
+        self.run_live(2, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                      inputs=[(lambda: True, 'fixroute'), (lambda: '改：fixroute save' in self.out_text(), 'fixroute save'),
+                              (lambda: '还没有两次扫描' in self.out_text(), 'fixroute on')],
+                      screen_zone=None, end_on='还没存写死路线')
+        log = self.log
+        self.assertIn('现在：写死模式关着', log)
+        self.assertIn('还没有两次扫描', log)
+        self.assertNotIn('已打开写死模式', log)
+        self.assertNotIn('fixed_route', self.cfg_after)
 
     def test_race_zone1(self):
         # (10-23)终端 race 1 选 1 区(屏上不显示区号，只有 START)

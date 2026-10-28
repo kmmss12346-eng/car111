@@ -1593,6 +1593,22 @@ class MissionSimTests(unittest.TestCase):
         h.arm = BadRead([(2.0, 0.0)])
         h._return_to_pose(300.0, -500.0)
         self.assertEqual(len(h.arm.cmds), 1)
+        h.arm = Arm([(2.0, 0.0)] * 5)                          # (10-28)retries=1(1、3 号环)：转不到最多再转 1 次，照常放
+        h._return_to_pose(300.0, -500.0, retries=1)
+        self.assertEqual(len(h.arm.cmds), 2)
+        h.arm = Arm([(2.0, 0.0)] * 5)
+        h._return_to_pose(300.0, -500.0, retries=0)
+        self.assertEqual(len(h.arm.cmds), 1)
+
+    def test_ring13_turns_back_at_most_once(self):
+        """(10-28 用户"角度实在转不动转不过去……除了 2 号环之外的 1、3 号环的对准时间要缩短")夹着物料转回 1、3 号环的角度：
+        差得多最多再转 ring13_return_retries 次(默认 1)；2 号环照旧最多 2 次。"""
+        h = make(SimWorld(seed=3, code=self.CODE))
+        self.assertEqual([h._ring_retries(r) for r in (1, 2, 3)], [1, 2, 1])
+        h.cfg['ring13_return_retries'] = 2
+        self.assertEqual([h._ring_retries(r) for r in (1, 2, 3)], [2, 2, 2])
+        h.cfg['ring13_return_retries'] = 0
+        self.assertEqual([h._ring_retries(r) for r in (1, 2, 3)], [0, 2, 0])
 
 
 class ZoneFlowTests(unittest.TestCase):
@@ -4478,6 +4494,23 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual((h._ring_tol('zone_cal_fine_tol_mm'), h._ring_tol('zone_vel_tol_mm')), (3.0, 3.0))
         h = self._make(self._world(0))                                  # 模拟默认 tol_mm.RING 1.2
         self.assertEqual((h._ring_tol('zone_cal_fine_tol_mm'), h._ring_tol('zone_vel_tol_mm')), (1.0, 1.2))
+
+    def test_ring13_placement_turns_back_at_most_once(self):
+        """(10-28)arm_calib 调过的区：放 1、3 号环时(夹着物料从车上转盘转回来)差得多只再转 1 次，2 号环照旧 2 次；照样都放好。"""
+        w = self._world(2)
+        h = self._make(w)
+        got = []
+        orig = h._return_to_pose
+
+        def rec(a1, a2, from_tray=False, retries=2):
+            if from_tray:
+                got.append(retries)
+            return orig(a1, a2, from_tray=from_tray, retries=retries)
+        h._return_to_pose = rec
+        run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+        rings = [k for (z, k, _c, _e, _st) in w.placed if z == 'ROUGH']
+        self.assertEqual(sorted(rings), [1, 2, 3])
+        self.assertEqual(got[-3:], [2 if k == 2 else 1 for k in rings], (got, rings))
 
     def test_approach_id1_slow_steps_from_the_tray_side(self):
         """(10-27 晚)arm_link.approach_id1：先转到多转的地方(快慢不管)，转回来每一下不到 3.5°(STM32 一下 4.5° 以内才慢慢转、停得准)；

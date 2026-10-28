@@ -350,6 +350,8 @@ DEFAULTS = dict(
                                         #   "再转一次"，ID1 往转的方向多给这么多度，停下的地方才是要的地方。None = ATOL 的 0.7 倍；0 = 不补(以前)
     return_tol_fine_deg=0.15,           # (10-27)从车上转盘转回对准的角度(放 1、2、3 号环之前)：差这么多以上就再转一次(以前 0.4°，
                                         #   1 号环离转轴最远，0.4° 在那里约 1.7mm)；zone_atol_comp 是 0 时照旧按 return_tol_deg
+    ring13_return_retries=1,            # (10-28 用户"角度实在转不动转不过去……除了 2 号环之外的 1、3 号环的对准时间要缩短")夹着物料转回 1、3 号环
+                                        #   的角度以后差得多最多再转几次(以前和 2 号环一样 2 次；一次要 1~1.5 秒)。2 号环照旧 2 次
     zone_cal_fine_tol_mm=1.0,           # (10-27 晚)1、3 号环摄像头微调对到多少毫米以内才算"微调好了"(和 tol_mm.RING 取小的)。以前按 tol_mm.RING，
                                         #   车上是 3mm：差 2.9mm 也算好了、按这个放。主程序 rtol 看/改
     zone_cal_fine_max_mm=30.0,          #   一开始就差这么多以上：多半认错了环(或者车停偏太多)，不信它，按调的角度放
@@ -6942,9 +6944,9 @@ class MissionHooks:
                 self.holding = item
                 adj = self.place_adj('STACK' if stack else 'RING')
                 if adj is not None:                              # pcal 量过：落点按这一层的补偿挪
-                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True)
+                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True, retries=self._ring_retries(ring))
                 else:
-                    self._return_to_pose(a1, a2, from_tray=True)     # 回到记下的角度
+                    self._return_to_pose(a1, a2, from_tray=True, retries=self._ring_retries(ring))     # 回到记下的角度
                 self._drop(stack)                                # 下降、松手、抬起
                 held = False
                 self.holding = None
@@ -8304,7 +8306,7 @@ class MissionHooks:
         else:
             self.arm.ap(wps[0][0], wps[0][1])
         a1c = self._carry_rest(wps, a1t)
-        self._return_to_pose(a1c, a2t, from_tray=False)
+        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))
         return True
 
     def _carry_rest(self, wps, a1t):
@@ -8365,7 +8367,7 @@ class MissionHooks:
         else:
             self.arm.ap(wps[0][0], wps[0][1])
         a1c = self._carry_rest(wps, a1t)                        # 只往里缩；缩着只转(最后转到目标环那一下同一个动作到位)
-        self._return_to_pose(a1c, a2t, from_tray=False)          # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
+        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))   # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
         return True
 
     def _place_item_arm(self, item, zone, ring, stack, label, T):
@@ -8461,7 +8463,7 @@ class MissionHooks:
             adj = self.place_adj(key)
             ta1, ta2 = a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0)
             if not (stack and self._stack_carry(zone, ring, p2, T, ta1, ta2)):
-                self._return_to_pose(ta1, ta2, from_tray=True)
+                self._return_to_pose(ta1, ta2, from_tray=True, retries=self._ring_retries(ring))
             self._drop(stack)
             held = False
             self.holding = None
@@ -9557,8 +9559,17 @@ class MissionHooks:
         else:
             self.arm.ap(a1, a2)
 
-    def _return_to_pose(self, a1, a2, from_tray=False):
-        """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。
+    def _ring_retries(self, ring):
+        """(10-28)夹着物料转回 ring 号环的角度以后，差得多最多再转几次：1、3 号环 ring13_return_retries(默认 1)，2 号环照旧 2 次。"""
+        if int(ring) == 2:
+            return 2
+        try:
+            return max(0, int(self.cfg.get('ring13_return_retries', 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _return_to_pose(self, a1, a2, from_tray=False, retries=2):
+        """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 retries 次(默认 2)。
         from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。
         (10-27 晚)from_tray 且 zone_same_approach：大幅转回来先停在往车上转盘那边多转(间隙 + zone_backlash_extra_deg)的地方，再转回来到位
         ——和 1、3 号环微调的每一下、对准 2 号环前回 A1P 是同一个动作，手臂停的地方就是对准时停的地方(这时不学多转/少转、不用 return_preload_deg)。"""
@@ -9604,7 +9615,7 @@ class MissionHooks:
             # (10-27)ID1 "再转一次"多给了补偿(_ap_from_tray_side)，比 ATOL 小的差也转得动：差 return_tol_fine_deg 以上就再转
             #   (1 号环离转轴最远，以前的 0.4° 在那里约 1.7mm)。ID2 每度不到 0.1mm，照旧
             tol1 = float(self.cfg.get('return_tol_fine_deg') or 0.15)
-        for k in range(3):
+        for k in range(retries + 1):
             self.sleep(0.2)
             try:
                 b1, b2 = self.arm.read_angles()
@@ -9619,7 +9630,7 @@ class MissionHooks:
                                   max(-2.5, min(2.5, self._ret_bias[1] + 0.6 * (b2 - a2)))]
             if b1 is None or b2 is None or (abs(b1 - a1) <= tol1 and abs(b2 - a2) <= tol):
                 return
-            if k == 2:
+            if k == retries:
                 if abs(b1 - a1) <= tol and abs(b2 - a2) <= tol:      # 只是没到 return_tol_fine_deg 那么细：以前就算回到了
                     self.log(f'    回到对准姿态还差 ID1 {b1 - a1:+.2f}°、ID2 {b2 - a2:+.2f}°(再细舵机转不动了)，照常放')
                 else:

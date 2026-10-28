@@ -20,6 +20,7 @@ from stm32_link import Stm32Link,FakeLink
 from auto_run import (run_mission,Abort,apply_zone,zone_snapshot,zone_restore,mission_names,race_flow,run_bg,park_arm,quit_park,
     home_route_legs,home_approach,Nav,firmware_caps,zone_request,DEFAULT_SECOND_MOVES)
 import reloc
+import fixed_route
 
 STOP_NAMES_LIVE = ('QR', 'RAW', 'ROUGH', 'TEMP')   # (10-23)go step 到这几站停下时能挪车、save 存停车点(和 route_plan.STOP_NAMES 一样)
 ROOT=Path(__file__).resolve().parent
@@ -235,6 +236,32 @@ def main():
     def mission_cfg():
         mc=dict(raw_cfg);mc.update(car_length_mm=config.get('car_length_mm',290),car_width_mm=config.get('car_width_mm',260))
         return mc
+    # (10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")写死路线(fixroute，见 fixed_route.py)
+    fixed_path=fixed_route.path_for(args.config);fix_cache={}
+    def fixed_on():
+        return bool(raw_cfg.get('fixed_route',False))
+    def fixed_snap():
+        """存好的写死路线和地图(文件没变就用上次读的，按 START 以后不用再读)。没存、读不出来抛 ValueError。"""
+        try:st_=fixed_path.stat();key_=(st_.st_mtime_ns,st_.st_size)
+        except OSError:key_=None
+        if key_ is None or fix_cache.get('key')!=key_:
+            fix_cache.clear();fix_cache.update(snap=fixed_route.load(fixed_path),key=key_)
+        return fix_cache['snap']
+    def fixed_apply():
+        """界面线程：把存好的地图(两次扫描、障碍物)和路线放进来，和刚扫描、规划完一样(雷达定位按这张地图)。"""
+        snap=copy.deepcopy(state['fix_snap'])
+        history.views[:]=snap['views'];history.objects[:]=snap['objects']
+        state.update({k_:snap.get(k_) for k_ in fixed_route.STATE_KEYS})
+        state.update(legs=snap['legs'],plan_start=snap.get('plan_start'),path=list(snap.get('path') or []),reason='ROUTE OK',
+                     legs_partial=False,replan_from=None,plan_key=None)
+        state['plan_obj_key']=obj_key();state['fixed_loaded']=True
+        redraw()
+    def fixed_second_pose():
+        """界面线程：第二站动作做完(不扫描)，车位当成存的时候第二次扫描的车位。"""
+        c1=history.views[1]['config']
+        state['config']=validate_config(dict(state['config'],car_x_mm=float(c1['car_x_mm']),car_y_mm=float(c1['car_y_mm']),
+                                             car_yaw_deg=float(c1['car_yaw_deg'])))
+        redraw()
     def select_zone(z):
         """切换启停区(只在还没扫描/重新开始时)：起点车位、START 停车点、PREHOME、第二站动作一次改完，并清空历史。"""
         s=apply_zone(raw_cfg,z,zone_snap)
@@ -400,7 +427,8 @@ def main():
             box=Rectangle((r[0],r[1]),r[2]-r[0],r[3]-r[1],fc='red',alpha=.10 if state.get('seal_soft') else .18,ec='red',
                           hatch=None if state.get('seal_soft') else 'xx',lw=1,zorder=3)
             world.add_patch(box);markers.append(box)
-        world.set_title(f"ZONE {raw_cfg.get('start_zone',2)} | {state['reason']}",fontsize=10,color='red' if state['reason']!='ROUTE OK' else 'black')
+        world.set_title(f"ZONE {raw_cfg.get('start_zone',2)} | {state['reason']}"+(' | FIXED ROUTE (fixroute on)' if fixed_on() else ''),
+                        fontsize=10,color='red' if state['reason']!='ROUTE OK' else 'black')
         info.set_text(f"STOPPED views={len(history.views)} | candidates={len(history.objects)} | pose=({c['car_x_mm']:.0f}, {c['car_y_mm']:.0f}, {c['car_yaw_deg']:.1f} deg)\nOriginal v4 exclusion regions retained. Unobserved space is UNKNOWN.")
         fig.canvas.draw_idle()
     def save():
@@ -428,8 +456,12 @@ def main():
     # ---------------------------------------------------------------- 1010 雷达重定位
     def view_pose(v):
         c=v['config'];return (float(c['car_x_mm']),float(c['car_y_mm']),float(c['car_yaw_deg']))
+    ref_lock=threading.Lock()
     def reference(only_first=False):
-        """出发时的参考点云(第一次 + 第二次扫描，换到出发时的车身坐标) + 最近点表；地图变了才重建。"""
+        """出发时的参考点云(第一次 + 第二次扫描，换到出发时的车身坐标) + 最近点表；地图变了才重建。
+        (10-28)写死模式在后台先建，行驶线程同时要用就等它建完(不重复建)。"""
+        with ref_lock:return _reference(only_first)
+    def _reference(only_first):
         vs=[v for v in history.views[:1 if only_first else 2] if v.get('raw_frames')]
         if not vs:return None
         key=tuple((id(v),view_pose(v)) for v in vs);slot='ref1' if only_first else 'ref'
@@ -573,10 +605,15 @@ def main():
             state['err_before']=state['err_count'];before=state['done_count']
             commands.put('__second');self._wait('done_count',before)
         def plan(self):
-            """1010：规划在后台线程里做(不卡界面)，等的时候手臂轻摆；race 时开跑前规划好的路线能用就直接用。"""
+            """1010：规划在后台线程里做(不卡界面)，等的时候手臂轻摆；race 时开跑前规划好的路线能用就直接用。
+            (10-28)写死模式：不规划，直接用存好的路线(fixed_first 放进来的)。"""
             try:run_bg(reference,self.tick,lambda:state['abort'])          # 雷达定位的参考点云(顺便把第二站和第一次扫描对齐)
             except Abort:raise
             except Exception as e:print('  (建雷达定位参考点云出错：',repr(e),')',flush=True)
+            if state.get('fixed_loaded'):
+                print('写死模式：不规划，直接用存好的路线。',flush=True)
+                if not state['home_routes']:start_home_routes()
+                return state.get('turn_back',0) or 0,list(state['legs']),state['reason']
             cur_ok=state['legs'] and state['reason']=='ROUTE OK' and not state.get('legs_partial') and state.get('plan_obj_key')==obj_key()
             if not cur_ok and not try_reuse_preplan():
                 state['plan_start']=None;state['replan_from']=None
@@ -616,6 +653,27 @@ def main():
                     time.sleep(0.1)
                 return state['step_ans']
             finally:state['step_wait']=False
+        def fixed_route(self):
+            """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。"""
+            if not fixed_on():return None
+            return dict(wait1=float(raw_cfg.get('fixed_wait1_s',3.0)),wait2=float(raw_cfg.get('fixed_wait2_s',3.0)),t0=state.get('run_t0'))
+        def fixed_first(self):
+            """(10-28)写死模式代替第一次扫描：存好的地图和路线放进来；雷达定位的参考点云在后台先建(原地等的这几秒里建完)。"""
+            try:snap=fixed_snap()
+            except ValueError as e:raise Abort(str(e))
+            why=fixed_route.check(snap,int(raw_cfg.get('start_zone',2) or 2))
+            if why:raise Abort(why)
+            state['fix_snap']=snap;state['fixed_loaded']=False
+            self._gui('__fixload')
+            if not state.get('fixed_loaded'):raise Abort('存好的写死路线没放进来(见上面的提示)')
+            print('  写死路线：'+fixed_route.describe(snap),flush=True)
+            def build():
+                try:reference()
+                except Exception as e:print('  (建雷达定位参考点云出错：',repr(e),')',flush=True)
+            threading.Thread(target=build,daemon=True).start()
+        def fixed_second(self):
+            """(10-28)写死模式代替第二次扫描：车位当成存的时候第二站的车位。"""
+            self._gui('__fixsecond')
         def second_failed(self):
             """第二次扫描两次都失败：有开跑前的预先规划就把车位当成推算的第二站车位，用那条路线。返回能不能接着跑。"""
             pp=state.get('preplan')
@@ -688,6 +746,8 @@ def main():
         return h
     def mission_body(first_scan,scanned=False):
         hooks=None
+        state['run_t0']=time.monotonic();state['fixed_loaded']=False      # (10-28)写死模式第一次原地等从这里(按 START)算
+        fixed=first_scan and not scanned and fixed_on()
         try:
             hooks=make_hooks();state['hooks']=hooks or state.get('hooks')
             if first_scan:
@@ -695,7 +755,9 @@ def main():
                 state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
                 state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None;state['second_failed']=False   # 不用上一次的路线
                 if not scanned:state['preplan']=None;state['home_routes']={}          # go：没有开跑前的预先规划
-            run_mission(Ctx(),link,log=log,first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,cfg=raw_cfg,scanned=scanned)
+            # 写死模式二维码那里不做站点扫描(不找新障碍物：路线写死了)
+            run_mission(Ctx(),link,log=log,first_scan=first_scan,stop_wait=args.stop_wait,hooks=hooks,
+                        cfg=dict(raw_cfg,rescan_stops=[]) if fixed else raw_cfg,scanned=scanned)
         except Abort as e:
             print('★ 已停止：',e,flush=True)
             after_error(hooks)
@@ -706,7 +768,7 @@ def main():
             if hooks is not None:
                 try:hooks.close()                               # 释放摄像头，下一次 go 才能再打开
                 except Exception:pass
-            state['replan_from']=None;state['plan_start']=None;state['stm_target_yaw']=None
+            state['replan_from']=None;state['plan_start']=None;state['stm_target_yaw']=None;state['fixed_loaded']=False
             if state.get('legs_partial'):state['legs']=[];state['reason']='用过站点重新规划：drive 前先 route'
     def after_error(hooks):
         """出错停下(不是急停)：收臂、升降停 60mm(手里可能有物料时 hooks.park 会跳过)。急停后不自动动。"""
@@ -756,6 +818,8 @@ def main():
                     try:save()
                     except Exception as e:print('保存失败：',e,flush=True)
                 elif k=='__redraw':redraw()
+                elif k=='__fixload':fixed_apply()
+                elif k=='__fixsecond':fixed_second_pose()
             except Exception as e:
                 print('未执行：',e,flush=True)
                 if k in ('__scan','__second'):state['err_count']+=1     # 等扫描的那边马上知道失败了
@@ -938,11 +1002,21 @@ def main():
                 if len(parts)>2 or (len(parts)==2 and parts[1] not in ('1','2')):raise ValueError('格式：race 1 或 race 2(抽到几区就输几；不写就用现在的启停区)')
                 z_=int(parts[1]) if len(parts)==2 else int(raw_cfg.get('start_zone',2) or 2)
                 if len(parts)==1:print(f'race 没写启停区：用现在的启停区 {z_}(抽到别的区：abort 以后输入 race 1 或 race 2)',flush=True)
+                if fixed_on():
+                    # (10-28)写死模式：先看存好的路线能不能跑(没存、启停区不对，车不动)
+                    snap_=fixed_snap();why_=fixed_route.check(snap_,z_)
+                    if why_:raise ValueError(why_)
+                    print('★ 写死模式(fixroute on)：只等屏上按 START；按了以后不扫描、不规划，按存好的路线跑：'+fixed_route.describe(snap_)
+                          +'。改回自己规划：abort 以后 fixroute off',flush=True)
                 state['abort']=False;state['aborted']=False;state['confirm']=None;state['auto']=True
                 threading.Thread(target=race_thread,args=(z_,),daemon=True).start();return
             state['step_mode']=k in ('go','drive') and len(parts)>1 and parts[1].lower()=='step'
             if state['step_mode']:print('分段调试：每到一站先停下等你输入 n 才做任务，做完再等 n 才开往下一站(skip = 跳过这一站的任务)',flush=True)
             if k=='go' and history.views:raise ValueError('go 要从头开始：先 reset 清空历史，并把车放回起点')
+            if k=='go' and fixed_on():
+                snap_=fixed_snap();why_=fixed_route.check(snap_,int(raw_cfg.get('start_zone',2) or 2))
+                if why_:raise ValueError(why_)
+                print('★ 写死模式(fixroute on)：go 不扫描、不规划，按存好的路线跑：'+fixed_route.describe(snap_)+'。改回自己规划：fixroute off',flush=True)
             if k=='go':
                 # 上一次跑完 reset 以后 state['config'] 还是第二站/站点扫描的车位：第一次扫描要按本区的起点车位算
                 state['config']=validate_config(dict(state['config'],car_x_mm=float(raw_cfg['car_x_mm']),car_y_mm=float(raw_cfg['car_y_mm']),car_yaw_deg=float(raw_cfg['car_yaw_deg'])))
@@ -957,7 +1031,12 @@ def main():
         if k=='zone' and state.get('race') and len(parts)==2 and parts[1] in ('1','2'):
             # race 还在等 START：改启停区(会重新扫描)；START 还是要在屏上按
             ok_,rep_,_=zone_request(link,'ZONE '+parts[1])
-            print(f'已改成启停区 {parts[1]}(重新扫描)' if ok_ else f'STM32 不认 ZONE {parts[1]}：{rep_}',flush=True);return
+            print(f'已改成启停区 {parts[1]}(重新扫描)' if ok_ else f'STM32 不认 ZONE {parts[1]}：{rep_}',flush=True)
+            if ok_ and fixed_on():
+                try:why_=fixed_route.check(fixed_snap(),int(parts[1]))
+                except ValueError as e:why_=str(e)
+                if why_:print('  ★ 写死模式：'+why_+'(按了 START 也跑不了)',flush=True)
+            return
         if state['busy']:raise ValueError('正在扫描，请等待完成')
         if k=='list':print_objects();return
         if state['auto'] and k!='pts':raise ValueError('一键流程正在运行(输入 abort 可以中止)，等结束再用 '+k)
@@ -985,6 +1064,30 @@ def main():
             # (10-24)比赛前自检：只问、只看文件，车和手臂都不动(self_check.py)
             if state['busy'] or state['auto']:raise ValueError('正在跑：跑完再 check')
             import self_check;self_check.run(link,raw_cfg,args.port,lambda m:print(m,flush=True),root=str(ROOT));return
+        if k=='fixroute':
+            # (10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")写死路线：见 fixed_route.py
+            sub_=parts[1].lower() if len(parts)>1 else ''
+            if len(parts)>2 or sub_ not in ('','save','on','off'):
+                raise ValueError('格式：fixroute save(存刚才的路线和地图) / fixroute on(写死模式) / fixroute off(改回自己规划) / fixroute(看现在)')
+            w1_,w2_=float(raw_cfg.get('fixed_wait1_s',3.0)),float(raw_cfg.get('fixed_wait2_s',3.0))
+            if sub_=='save':
+                snap_=fixed_route.snapshot(state,history.views,history.objects,int(raw_cfg.get('start_zone',2) or 2))
+                fixed_route.save(fixed_path,snap_);fix_cache.clear()
+                print('已存好写死路线：'+fixed_route.describe(snap_)+f'(存在 {fixed_path.name})。'
+                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
+            if sub_=='on':
+                snap_=fixed_snap()                          # 没存过就报错，不打开
+                save_cfg_keys({'fixed_route':True})
+                print(f'已打开写死模式(存进配置)：race 1 / race 2 以后只等屏上按 START；按了以后原地等 {w1_:g} 秒(不扫描) → 第二站动作 → '
+                      f'再等 {w2_:g} 秒(不扫描) → 不规划，按存好的路线跑(二维码那里不做站点扫描，雷达定位照常)。存的路线：'
+                      +fixed_route.describe(snap_)+'。改回自己规划：fixroute off',flush=True);return
+            if sub_=='off':
+                save_cfg_keys({'fixed_route':False})
+                print('已关掉写死模式(存进配置)：race / go 照常自己扫描、规划',flush=True);return
+            try:d_=fixed_route.describe(fixed_snap())
+            except ValueError as e:d_=str(e)
+            print(('现在：写死模式开着(fixroute on)' if fixed_on() else '现在：写死模式关着(race / go 自己扫描、规划)')+'。存的路线：'+d_
+                  +'。改：fixroute save / fixroute on / fixroute off',flush=True);return
         if k=='zup':
             # (10-28 用户"把所有的就是高度往上面提高四毫米变成124")升降的高度参数一起加减：zup 4 / zup -4 / zup 4 ZHI，见 zshift.py
             import zshift
@@ -1152,7 +1255,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_jog(c,val):
         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
@@ -1326,6 +1429,8 @@ def main():
     print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
     print('rtol 1 1.5 = 1、3 号环摄像头微调对到 1mm、2 号环车轮对到 1.5mm 以内才算对准(越小放得越准、多花几秒；只输入 rtol 看现在多少)。',flush=True)
     print('rfine on / off = 1、3 号环要不要用摄像头只动手臂微调(默认 off：按 arm_calib 调的角度直接放；只输入 rfine 看现在是哪个)。',flush=True)
+    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；只输入 fixroute 看现在。',flush=True)
+    if fixed_on():print('★ 写死模式开着(fixroute on)：race / go 不扫描、不规划，按存好的路线跑。改回自己规划：fixroute off',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
     print('1010：每个停车点先用雷达定位再修正；回家前停在 PREHOME(离启停区 250mm)定位，最后几步慢速、按实际车身限幅，不出场地。',flush=True)

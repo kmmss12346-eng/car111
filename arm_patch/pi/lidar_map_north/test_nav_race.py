@@ -175,6 +175,32 @@ class RaceTests(unittest.TestCase):
         with self.assertRaises(Abort):
             run_race([(0, 0)] * 100, dict(abort_at=105.0))
 
+    def test_fixed_route_waits_for_screen_start_without_scanning(self):
+        """(10-28)写死模式(ctx.fixed_route())：race_start 是 now 也等屏上按 START；等的时候不扫描、不预先规划、不看车挪没挪；
+        选了区就告诉屏 READY，按了 START 先锁屏(屏幕变回白色)再开跑。"""
+        class FixedCtx(RaceCtx):
+            def fixed_route(self):
+                return dict(wait1=3.0, wait2=3.0, t0=None)
+
+            def still_check(self):
+                self.calls.append(('still',))
+                return dict(moved=True, why='雷达看到车挪了')
+        for cfg in ({'race_check_s': 1, 'race_start': 'screen'}, {'race_check_s': 1}):
+            clock = Clock()
+            car = SimCar((2250.0, 150.0, 90.0), zone_script=[(0, 0)] * 2 + [(2, 0)] * 30 + [(2, 1)])
+            ctx = FixedCtx(clock, gyro=lambda t: 90.0 + (t % 7))          # 陀螺仪一直在变：写死模式不管
+            runs, logs = [], []
+            st = auto_run.race_flow(ctx, car, logs.append, cfg, lambda z, sc: runs.append((z, sc)), now=clock.now, sleep=clock.sleep)
+            self.assertEqual(st, 'started')
+            self.assertEqual(car.requests[0], 'ZONE 2', '屏上出 START')
+            self.assertEqual(ctx.calls, [('zone', 2)], '不扫描、不预先规划、不看车挪没挪')
+            self.assertEqual([r for r in car.requests if r.startswith('ZONE MSG')], ['ZONE MSG READY Z2'])
+            self.assertEqual(car.requests[-1], 'ZONE LOCK')
+            self.assertEqual(runs, [(2, False)])
+            self.assertTrue(any('写死模式' in l and '可以按屏上的 START' in l for l in logs), logs)
+            self.assertFalse(any('还没扫描就按了 START' in l for l in logs), logs)
+            self.assertEqual(car.sent, [], '开跑前车不能动')
+
     def test_race_now_starts_directly(self):
         """(10-23 晚 用户"开跑前全黑、不出 START，race 2 直接开跑")默认：清屏(不发 ZONE n，屏上不出 START)，切到选的区马上开跑；
         不等车静止、开跑前不扫描(开跑后再扫)；旧固件不认识 ZONE 也照样开跑。"""
@@ -445,6 +471,76 @@ class RunMissionTests(unittest.TestCase):
                 calls.append('task ' + stop)
         auto_run.run_mission(MissionCtx(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=Old(), cfg={})
         self.assertIn('task QR', calls)
+
+    def test_fixed_route_waits_instead_of_scanning(self):
+        """(10-28)写死模式：两次扫描都不做、不规划——开跑(t0)以后原地等到 wait1 秒(机械臂准备也算在里面)，第二站动作，再原地等 wait2 秒，
+        然后按存好的路线跑；日志里写明是写死模式。"""
+        calls = []
+        stamp = {}
+
+        class FixedCtx(MissionCtx):
+            t0 = None
+
+            def fixed_route(self):
+                return dict(wait1=0.4, wait2=0.3, t0=self.t0)
+
+            def fixed_first(self):
+                calls.append('fixed_first')
+
+            def fixed_second(self):
+                calls.append('fixed_second')
+                stamp['second'] = time.monotonic()
+
+            def plan(self):
+                calls.append('plan')
+                return 0, [{'stop': 'QR', 'cmds': [('R', -90), ('F', 300)]}], 'ROUTE OK'
+
+        class Link(RecLink):
+            def second_move(self, rel=None, log=None):
+                stamp['move'] = time.monotonic()
+                return RecLink.second_move(self, rel, log)
+        ctx = FixedCtx(calls)
+        ctx.t0 = time.monotonic()
+        logs = []
+        auto_run.run_mission(ctx, Link(calls), log=logs.append, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual(calls[:8], ['start_clock', 'ping', 'prepare', 'home', 'fixed_first', 'second_move', 'fixed_second', 'plan'])
+        self.assertNotIn('scan', calls)
+        self.assertNotIn('second', calls)
+        self.assertIn('task QR', calls)
+        self.assertGreaterEqual(stamp['move'] - ctx.t0, 0.4 - 0.01, '开跑以后先原地等 wait1 秒')
+        self.assertGreaterEqual(stamp['second'] - stamp['move'], 0.3 - 0.01, '第二站动作以后再原地等 wait2 秒')
+        text = '\n'.join(logs)
+        self.assertIn('① 写死模式：不扫描、不规划', text)
+        self.assertIn('③ 写死模式：不扫描，原地等 0.3 秒', text)
+        self.assertIn('④ 写死路线', text)
+        for word in ('第一次扫描', '第二次扫描', '规划用时', '路线规划完成'):
+            self.assertNotIn(word, text)
+        # 关着(fixed_route 返回 None)：和以前一样扫描两次、规划
+        calls.clear()
+
+        class Off(MissionCtx):
+            def fixed_route(self):
+                return None
+        auto_run.run_mission(Off(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual(calls[:7], ['start_clock', 'ping', 'prepare', 'home', 'scan', 'second_move', 'second'])
+
+    def test_fixed_route_abort_while_waiting(self):
+        calls = []
+
+        class FixedCtx(MissionCtx):
+            def aborted(self):
+                return 'fixed_first' in calls
+
+            def fixed_route(self):
+                return dict(wait1=5.0, wait2=5.0, t0=time.monotonic())
+
+            def fixed_first(self):
+                calls.append('fixed_first')
+        t = time.monotonic()
+        with self.assertRaises(Abort):
+            auto_run.run_mission(FixedCtx(calls), RecLink(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertLess(time.monotonic() - t, 1.0, '等的时候 abort 马上停')
+        self.assertNotIn('second_move', calls, '车没动')
 
     def test_prepare_error_does_not_stop(self):
         calls = []

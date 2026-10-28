@@ -99,6 +99,15 @@ class SelfCheckTests(unittest.TestCase):
             bad = self_check.run(FakeLink(), self._cfg(), os.path.join(d, 'no_lidar'), lambda s: None, root=d)
             self.assertFalse(any('LFCHK' in b for b in bad), bad)
 
+    def test_fixed_route_left_on_is_flagged(self):
+        """(10-28)写死模式(给老师的对比视频)开着：★ 提醒比赛前 fixroute off；关着不提。"""
+        with tempfile.TemporaryDirectory() as d:
+            self._files(d)
+            bad = self_check.run(FakeLink(), dict(self._cfg(), fixed_route=True), os.path.join(d, 'no_lidar'), lambda s: None, root=d)
+            self.assertTrue(any('写死模式开着' in b and 'fixroute off' in b for b in bad), bad)
+            bad = self_check.run(FakeLink(), self._cfg(), os.path.join(d, 'no_lidar'), lambda s: None, root=d)
+            self.assertFalse(any('写死模式' in b for b in bad), bad)
+
     def test_no_link(self):
         lines = []
         bad = self_check.run(None, {}, '/nonexistent', lines.append, root=tempfile.gettempdir())

@@ -1631,10 +1631,26 @@ def sync_changed(link, params, log=print):
     return link.sync_params(todo, log=log)
 
 
+def _hold(ctx, tick, t_end, sleep=time.sleep):
+    """(10-28)写死模式原地等到 t_end(不扫描)：一边看 abort，一边 tick。"""
+    while True:
+        if getattr(ctx, 'aborted', lambda: False)():
+            raise Abort('收到 abort')
+        left = t_end - time.monotonic()
+        if left <= 0:
+            return
+        if tick is not None:
+            tick()
+        sleep(min(0.05, left))
+
+
 def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0.8, hooks=None, cfg=None, scanned=False):
     """first_scan=True: 完整流程(scanned=True：第一次扫描开跑前已经做好了，屏幕选区一键启动时)；False: 只按当前已规划的路线行驶。
-    1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。"""
+    1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。
+    (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。"""
     cfg = cfg or {}
+    fx = ctx.fixed_route() if (first_scan and not scanned and hasattr(ctx, 'fixed_route')) else None
+    t_go = float((fx or {}).get('t0') or time.monotonic())
     if first_scan:
         _call(hooks, 'start_clock')                 # 比赛计时从这里开始
     tick = make_tick(hooks, cfg)
@@ -1663,7 +1679,12 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         ok, reply = link.home()
         if not ok:
             raise Abort(f'STM32 不认识 HOME：{reply}（STM32 程序是不是新版）')
-        if not scanned:
+        if fx:
+            log(f'① 写死模式：不扫描、不规划，用存好的地图和路线；原地等 {float(fx["wait1"]):g} 秒(从开跑算，机械臂准备也在里面)……')
+            ctx.fixed_first()
+            _hold(ctx, tick, t_go + float(fx['wait1']))
+            log(f'  (开跑到现在 {time.monotonic() - t_go:.1f} 秒)')
+        elif not scanned:
             log('① 第一次扫描：车保持不动……')
             t_ph = time.monotonic()
             try:
@@ -1687,36 +1708,45 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
             raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
         log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
-        time.sleep(float(cfg.get('second_settle_s', settle_s)) if cfg else settle_s)
-        log('③ 第二次扫描：车保持不动……')
-        t_ph = time.monotonic()
-        try:
-            ctx.second()
-        except Abort as e:
-            # 10-12：开跑以后雷达偶尔卡一下就整轮停在第二站，太亏：重扫一次；还不行就用开跑前(第一次扫描)规划好的路线
-            if getattr(ctx, 'aborted', lambda: False)():
-                raise
-            log(f'  ★ 第二次扫描失败({e})：再扫一次……')
+        if fx:
+            t_ph = time.monotonic()
+            getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
+            log(f'③ 写死模式：不扫描，原地等 {float(fx["wait2"]):g} 秒……')
+            _hold(ctx, tick, t_ph + float(fx['wait2']))
+            ctx.fixed_second()
+        else:
+            time.sleep(float(cfg.get('second_settle_s', settle_s)) if cfg else settle_s)
+            log('③ 第二次扫描：车保持不动……')
+            t_ph = time.monotonic()
             try:
                 ctx.second()
-            except Abort as e2:
-                if getattr(ctx, 'aborted', lambda: False)() or not (hasattr(ctx, 'second_failed') and ctx.second_failed()):
+            except Abort as e:
+                # 10-12：开跑以后雷达偶尔卡一下就整轮停在第二站，太亏：重扫一次；还不行就用开跑前(第一次扫描)规划好的路线
+                if getattr(ctx, 'aborted', lambda: False)():
                     raise
-                log(f'  ★ 第二次扫描又失败({e2})：按推算的第二站车位，用开跑前规划好的路线接着跑')
-    if first_scan:
+                log(f'  ★ 第二次扫描失败({e})：再扫一次……')
+                try:
+                    ctx.second()
+                except Abort as e2:
+                    if getattr(ctx, 'aborted', lambda: False)() or not (hasattr(ctx, 'second_failed') and ctx.second_failed()):
+                        raise
+                    log(f'  ★ 第二次扫描又失败({e2})：按推算的第二站车位，用开跑前规划好的路线接着跑')
+    if first_scan and not fx:
         log(f'  (第二次扫描用时 {time.monotonic() - t_ph:.1f} 秒)')
     caps = firmware_caps(link, cfg)
     t_ph = time.monotonic()
     turn_back, legs, reason = ctx.plan()
-    log(f'  (规划用时 {time.monotonic() - t_ph:.1f} 秒)')
+    if not fx:
+        log(f'  (规划用时 {time.monotonic() - t_ph:.1f} 秒)')
     if reason != 'ROUTE OK' or not legs:
         raise Abort(f'没有可用路线：{reason}')
     seq = flatten(turn_back, legs)
     n, tot = summarize(seq)
     motion = Motion(cfg)
     est = motion.route_time([(c, v) for _, c, v in seq if c])
-    log(f'④ 路线规划完成：{n} 条指令，前进/后退共 {tot["F"]:.0f} mm，横移 {tot["S"]:.0f} mm，转弯累计 {tot["R"]:.0f}°，预计行驶 {est:.0f} 秒'
-        + ('；STM32 支持 0.1° 转角' if caps.get('rdec') else ''))
+    log(('④ 写死路线(存好的，没有规划)：' if fx else '④ 路线规划完成：')
+        + f'{n} 条指令，前进/后退共 {tot["F"]:.0f} mm，横移 {tot["S"]:.0f} mm，转弯累计 {tot["R"]:.0f}°，预计行驶 {est:.0f} 秒'
+        + ('；STM32 支持 0.1° 转角' if caps.get('rdec') else '') + (f'；开跑到现在 {time.monotonic() - t_go:.1f} 秒' if fx else ''))
     if hasattr(ctx, 'print_route'):
         ctx.print_route()                          # 开跑前把路线列出来(不再等人输入 y)
     else:
@@ -1926,7 +1956,8 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
       ZONE MSG 照样发，新固件不显示)；车又被挪动(陀螺仪变了 >2° 或雷达看到挪了)或者终端 zone 1/2 改了区，就重新扫描；
       STM32 重启过(ZONE? 回 0 区，START 没了)：再发一次 ZONE n；
     3 屏上按 START：ZONE LOCK，start_run(区, 扫过没有) 开跑，之后不再问任何问题。
-    固件不认识 ZONE(回 ERR)：返回 'nozone'，用配置里的 start_zone 和终端的 go 启动。"""
+    固件不认识 ZONE(回 ERR)：返回 'nozone'，用配置里的 start_zone 和终端的 go 启动。
+    (10-28)写死模式(ctx.fixed_route() 不是 None)：不管 race_start，都等屏上按 START；等的时候不扫描、不规划、不看车挪没挪。"""
     g = (cfg or {}).get
     poll_s = float(g('race_poll_s', 0.3))
     still_s = float(g('race_still_s', 2.0))
@@ -1939,7 +1970,8 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
         want = 2
     if want not in (1, 2):
         want = 2
-    if str(g('race_start', 'now') or 'now').lower() != 'screen':
+    fixed = ctx.fixed_route() if hasattr(ctx, 'fixed_route') else None
+    if not fixed and str(g('race_start', 'now') or 'now').lower() != 'screen':
         zone_request(link, 'ZONE LOCK')              # 清屏，屏上不出 START(旧固件不认识也照样开跑)
         log(f'★ 启停区 {want}：直接开跑(抽到别的区：abort 以后输入 race 1 或 race 2)。开跑以后不要再碰车和电脑。')
         ctx.zone_select(want)
@@ -1950,8 +1982,11 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
         log(f'STM32 不认识 ZONE 指令({rep})：屏上没有 START。用配置里的 start_zone={g("start_zone", 2)}，'
             '终端输入 zone 1 / zone 2 选区，再输入 go 开始。')
         return 'nozone'
-    log(f'启停区 {want}(抽到别的区：abort 以后输入 race 1 或 race 2)。把车放好，等终端说"可以按 START"以后按屏上的 START。'
-        '终端输入 abort 取消。')
+    if fixed:
+        log(f'写死模式，启停区 {want}：把车放好，按屏上的 START 开跑(不扫描、不规划，按存好的路线跑)。终端输入 abort 取消。')
+    else:
+        log(f'启停区 {want}(抽到别的区：abort 以后输入 race 1 或 race 2)。把车放好，等终端说"可以按 START"以后按屏上的 START。'
+            '终端输入 abort 取消。')
     zone = None
     t_resend = now()
     scanned = False
@@ -1993,21 +2028,24 @@ def race_flow(ctx, link, log, cfg, start_run, now=time.monotonic, sleep=time.sle
             sleep(poll_s)
             continue
         if z != zone:
-            log(f'  启停区 {z}。把车放好别动……')
+            log(f'  启停区 {z}。把车放好别动……' if not fixed else f'  启停区 {z}：写死模式，可以按屏上的 START 了。')
             ctx.zone_select(z)
             zone = z
             scanned = False
             yaws = []
             t_zone = now()
             plan_seen = None
-            msg('PLACE CAR')
+            msg(f'READY Z{zone}' if fixed else 'PLACE CAR')
         if s == 1:
             log(f'★ 按了 START：启停区 {zone}，开跑！')
-            if not scanned:
+            if not scanned and not fixed:
                 log('  (还没扫描就按了 START：开跑后马上扫描)')
             zone_request(link, 'ZONE LOCK')
             start_run(zone, scanned)
             return 'started'
+        if fixed:
+            sleep(poll_s)                                  # 写死模式：只等 START
+            continue
         y = ctx.gyro_yaw() if hasattr(ctx, 'gyro_yaw') else None
         t = now()
         if not scanned:

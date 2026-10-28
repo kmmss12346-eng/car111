@@ -97,6 +97,9 @@ def run(link, raw_cfg, lidar_port, log, root='.'):
     lv = str(((raw_cfg or {}).get('speed_saved') or {}).get('level') or 'normal')
     log(f'  · 底盘速度：speed {lv}(直行 {(raw_cfg or {}).get("route_speed_rpm", 220)}、横移 {(raw_cfg or {}).get("strafe_speed_rpm", 170)} 转/分)'
         + ('。提速：speed fast，再 turntune' if lv == 'normal' else '。车头偏、停不准就 speed normal 还原'))
+    if (raw_cfg or {}).get('fixed_route'):
+        # (10-28)写死路线(给老师的对比视频)：比赛时忘了关，race 就不扫描、不规划
+        no('写死模式开着(fixroute on)：race 不扫描、不规划，按存好的路线跑。比赛要自己规划：fixroute off')
     if (raw_cfg or {}).get('boot_race'):
         log(f'  · 开机自动比赛开着：下次开电闸按启停区 {raw_cfg.get("start_zone")} 直接开跑(只用一次)')
     else:

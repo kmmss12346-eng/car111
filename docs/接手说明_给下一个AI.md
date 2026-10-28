@@ -1179,6 +1179,29 @@ git_log.txt                ← 分支最近 120 条提交记录
     改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
     **用户跑了 zup 4 以后说"不对不是的，只需要把这个最高点改上去就好了，其他的点不要改"**：用户要的只是 ZHI 120→124。
     让用户 `zup -4 ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG` 改回去(车上实际的值：ZGRAB 102、ZDROP 104、ZPLC 2、ZSTK 67、ZOBRAW/ZOBRNG 120)。
+- **10-28 深夜(2) 写死路线 fixroute(用户"我们老师要求我们交两个视频对比一下一个是写死的一个是自己规划的……先做好这个写死的")：**
+  用户一开始说"装模做样扫描一下"时以为是交比赛的视频，那时没做；后来说清楚是交给老师、明说是写死版的对比视频，才做。
+  用户确认过的流程(复述后用户说"行你的建议行开始改吧")：按屏上红色 START → 屏变白 → 原地等 3 秒(不扫描，机械臂准备算在里面)
+  → 第二站动作 → 再等 3 秒(不扫描) → 不规划，按存好的路线跑；二维码不做站点扫描；每站雷达定位照常(用存的地图)；
+  跑得越快越好(`speed max`，已有)；1、3 号环转不到少修几次。日志、地图标题都写明写死模式("FIXED ROUTE")，等的时候没有扫描。
+  - `fixed_route.py`：snapshot(state, views, objects, zone) 存 legs + STATE_KEYS(turn_back、route_ref、plan_obs…) + 前两次扫描的 views
+    (含 raw_frames，雷达定位的参考点云要用) + objects；plan_start 跑完被清掉，用 legs[0]['start']。save 紧凑 JSON、先写 .tmp、旧的留 .bak；
+    load 列表换回元组；check 只查启停区；文件 = 配置文件旁边的 fixed_route.json。
+  - map_merge_live：`fixroute save / on / off / (看)`，`fixed_route` 存进配置。race / go 在写死模式先 fixed_snap + check(没存、区不对车不动)。
+    Ctx.fixed_route() 返回 wait1/wait2(`fixed_wait1_s` / `fixed_wait2_s`，默认 3)和 t0(mission_body 开头的 run_t0 = 按 START)；
+    fixed_first：界面线程 `__fixload`(fixed_apply：history.views/objects、legs 等放回去，plan_obj_key=obj_key，fixed_loaded=True)，
+    后台先 reference()(reference 加了 ref_lock，行驶线程同时要用就等它)；fixed_second：`__fixsecond` 车位 = 存的第二次扫描车位。
+    Ctx.plan 看到 fixed_loaded 直接返回存的路线。mission_body 写死时 cfg=dict(raw_cfg, rescan_stops=[])(QR 不站点扫描)。
+  - auto_run：run_mission 的 fx(ctx.fixed_route())：① fixed_first + `_hold` 到 t0+wait1；② 第二站照常；③ tick.moved() + `_hold` wait2 + fixed_second；
+    不打"第二次扫描用时/规划用时"，④ 写"写死路线(存好的，没有规划)"和开跑到现在几秒。race_flow 写死模式不管 race_start 都等屏上 START，
+    等的时候不扫描/不预先规划/不看车挪没挪，选了区就 msg READY。
+  - 1、3 号环：`ring13_return_retries`(默认 1)，`_ring_retries(ring)`(2 号环 2)传给 `_return_to_pose(retries=)`：只动手臂放(_place_item_arm)、
+    码垛(_stack_carry/_stack_in)、车轮一个环一个环对的那条也是。两个视频都这样(对比公平)。
+  - self_check：`fixed_route` 开着打 ★(比赛前忘了 fixroute off，race 就不扫描不规划)；test_self_check.test_fixed_route_left_on_is_flagged。
+  - 测试：test_fixed_route(8)、test_nav_race 三条(race_flow 写死、run_mission 写死的顺序和等待、等的时候 abort)、
+    test_nav_live.test_fixroute_save_then_fixed_race(正常 race 2 → save → on → race 1 被拒 → 车放回起点 race 2：屏上 START、不扫描不规划、
+    路上雷达定位 ≥4 次、回到启停区)、test_fixroute_off_by_default_and_needs_a_saved_route；sim_mission 两条(retries)。
+  - 还没做：自己规划的那个视频要不要也用屏上 START(race_start screen：开跑前扫描、预先规划，按了 START 只做第二次扫描)——等用户说。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准
