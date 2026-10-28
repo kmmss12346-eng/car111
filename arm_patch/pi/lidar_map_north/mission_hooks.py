@@ -383,7 +383,11 @@ DEFAULTS = dict(
     zone_map_free_mm=60.0,              #   (10-21 夜实车：2 号环偏 46mm，按地图查把后退限成 30mm，还差 16mm 就不放了)沿圆环那一排离停车点这么近以内不按地图查：
                                         #   地图查是按"车正好停在规划的停车点"算的，车本来就停偏了才要挪；对准的地方就是 arm_calib 调 2 号环时车停的地方
     zone_map_free_s_mm=10.0,            #   横着(往工位那边/往外)只有这么近以内不查：横着挪压进工位、别的颜色区域这一轮就结束了，照样按地图查
-    zone_align_margin_mm=5.0,           #   (10-27 用户"轮子不是可以自由移动吗"：车身离粗加工区 20mm，按导航的余量 30mm 只许横移 9mm，还差 12.6mm 整个区不放)
+    zone_trust_s_mm=60.0,               # (10-28 用户"二号环一定要对准"：实车粗加工区 2 号环要往外横移 31mm，按地图限成 20mm("离黄色区/工位太近")，
+    zone_trust_f_mm=120.0,              #   还差 20mm 整个区不放)照摄像头看到的 2 号环挪、离停车点横着 zone_trust_s_mm、沿那一排 zone_trust_f_mm 以内：
+                                        #   黄色区、场地边、别的工位不按地图查(地图按"车正好停在停车点"算，车停偏了几厘米它就不准；对上 2 号环时
+                                        #   车就在 arm_calib 调 2 号环时车停的地方)。离这个工位照样留 zone_align_margin_mm，障碍物照样查。0 = 以前的做法
+    zone_align_margin_mm=5.0,          #   (10-27 用户"轮子不是可以自由移动吗"：车身离粗加工区 20mm，按导航的余量 30mm 只许横移 9mm，还差 12.6mm 整个区不放)
                                         #   车轮对准 2 号环时车身离这个工位最少留多少毫米(车慢慢挪、摄像头看着，不用导航那么大的余量)；只管这个工位，
                                         #   离黄色区、场地边、别的区照旧按 qr_zone_margin_mm。规则：车身(机械臂除外)压进工位这一轮就结束，不能小于 0
     zone_obs_fine=True,                 #   对准前手臂精确回到 A1P/A2P(OBS 大动作只到 1° 以内；arm_calib 调 1、3 号环时手臂就在 A1P/A2P，差 1° 到 1、3 号环会偏两三毫米)
@@ -1519,6 +1523,10 @@ class MissionHooks:
         #   读到码以前不写(开跑前屏上什么都没有)。screen_counts_live=false：跑的时候不写，回到启停区(_start)才写
         if not self.cfg.get('screen_counts_live', True) or self.plan is None:
             return
+        now = (self.stats.grab_ok, self.stats.place_ok)
+        if now != getattr(self, '_stats_logged', None):
+            self._stats_logged = now                       # (10-28)日志里也记一笔：屏上的数是什么时候改的
+            self.log(f'    (屏上：抓取{now[0]}  放置{now[1]})')
         self._ui('grab', self.stats.final_grab_text())
         self._ui('place', self.stats.final_place_text())
 
@@ -3962,10 +3970,11 @@ class MissionHooks:
             self.log(f'    (读地图障碍物出错：{ex!r})')
             return []
 
-    def _body_clear(self, pose, d, obstacles, work=None):
+    def _body_clear(self, pose, d, obstacles, work=None, hard_only=False):
         """车从停车点 pose 挪 d = [横移(左+), 前进] 毫米以后，车身(含雷达)离场地边、黄色区/工位、障碍物够不够远(原料转盘不查：
         往原料盘那边能挪多少另外限着)。work = (工位 'ROUGH'/'TEMP', 余量 mm)：离这个工位只按这个余量查(10-27：车轮对准 2 号环时用，
-        比导航的 qr_zone_margin_mm 小)，别的照旧。返回 (行不行, 原因)。"""
+        比导航的 qr_zone_margin_mm 小)，别的照旧。hard_only：(10-28)只查 work 这个工位和障碍物(场地边、黄色区、别的工位不查；
+        车轮照摄像头对准 2 号环时用，见 _p2_align 的 map_ok)。返回 (行不行, 原因)。"""
         cfg, rc = self.cfg, self.raw_cfg
         x0, y0, h = pose
         a = math.radians(h)
@@ -3992,11 +4001,13 @@ class MissionHooks:
                      zones['TEMP'], zones['ROUGH']]
         rects += [tuple(r) for r in (rc.get('extra_blocked_rects') or [])]
         wz = zones.get(work[0]) if work else None
-        if any(cx < zm or cx > field - zm or cy < zm or cy > field - zm for cx, cy in corners):
+        if not hard_only and any(cx < zm or cx > field - zm or cy < zm or cy > field - zm for cx, cy in corners):
             return False, '会出场地'
         for r in rects:
             x0_, y0_, x1_, y1_ = (float(t) for t in r[:4])
             w_ = wz is not None and tuple(float(t) for t in r[:4]) == tuple(float(t) for t in wz[:4])
+            if hard_only and not w_:
+                continue
             m_ = max(0.0, float(work[1])) if w_ else zm
             sep = False
             for ax in ((1.0, 0.0), (0.0, 1.0), (fx, fy), (lx, ly)):
@@ -7281,6 +7292,21 @@ class MissionHooks:
         static, seen, trk = [], [], []                        # 车上不动的假圆环；最近认到的 (像素, 拍时车走了多少)；认准的 2 号环
         note = dict(size=0, static=0, jfix_at=None, jlog=False, slip=False, jsave=unsure)
         k_lo, k_hi = (0.3, 3.0) if unsure else (0.6, 1.6)   # 按车实际走的修对应关系时，大小能改多少(大小没核对过/不对改过的放宽)
+        trust_s = max(0.0, float(cfg.get('zone_trust_s_mm', 60.0) or 0.0))
+        trust_f = max(0.0, float(cfg.get('zone_trust_f_mm', 120.0) or 0.0))
+
+        def map_ok(q):
+            """(10-28 用户"二号环一定要对准")车轮照摄像头看到的 2 号环挪到 q(底盘位移，相对停车点)，按地图查行不行。地图是按
+            "车正好停在停车点"算的，车停偏了几厘米就不准：离停车点横着 zone_trust_s_mm、沿那一排 zone_trust_f_mm 以内只查这个工位
+            (照样留 zone_align_margin_mm)和障碍物，黄色区、场地边、别的工位不查——对上 2 号环时车就在 arm_calib 调 2 号环时车停的地方。
+            返回 (行不行, 原因)。"""
+            ok, why = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk)
+            if ok or abs(float(q[0])) > trust_s or abs(float(q[1])) > trust_f:
+                return ok, why
+            ok2, why2 = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk, hard_only=True)
+            if ok2:
+                note.setdefault('trust_why', why)
+            return ok2, why2
         out = dict(ok=False, err_mm=None, why='', how='车轮')
         try:
             v.live_goal = (float(goalp[0]), float(goalp[1]))
@@ -7399,7 +7425,7 @@ class MissionHooks:
             if pose0 is not None:
                 s_ok = max(-scap, min(scap, s_t))
                 for _k in range(60):
-                    if self._body_clear(pose0, (s_ok, float(need[1])), obs, work=wk)[0]:
+                    if map_ok((s_ok, float(need[1])))[0]:
                         break
                     s_ok = s_ok - math.copysign(min(5.0, abs(s_ok)), s_ok)
                     if abs(s_ok) < 1e-6:
@@ -7593,7 +7619,7 @@ class MissionHooks:
                 横着往工位那边挪照样按地图查(压进工位/别的颜色区域这一轮就结束了；离这个工位只留 zone_align_margin_mm)。"""
                 if abs(float(q[0])) <= free_s and abs(float(q[1])) <= free_f:
                     return True
-                ok, why = self._body_clear(pose0, (float(q[0]), float(q[1])), obs, work=wk)
+                ok, why = map_ok(q)
                 if not ok:
                     note['clamp_why'] = why
                 return ok
@@ -7652,6 +7678,10 @@ class MissionHooks:
                     self.log(f'    ★ 车离圆环那一排的远近和调 2 号环的时候差了约 {abs(float(a[0] + d[0])):.0f}mm(车停偏了)：车轮横着挪过去'
                              + (f'(最多 {scap:.0f}mm)' if abs(float(a[0] + d[0])) > scap else ''))
                 tgt, cl = clamp_to(a + d, a)
+                if note.get('trust_why') and not note.get('trust_log'):
+                    note['trust_log'] = True
+                    self.log(f'    (地图说"{note["trust_why"]}"：地图按车正好停在停车点算，车停偏了几厘米就不准。照摄像头看到的 2 号环挪'
+                             f'(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内；离工位照样留 {wk[1]:g}mm))')
                 da = np.round(tgt - a)
                 if float(np.linalg.norm(da)) < 1.0:
                     if cl:

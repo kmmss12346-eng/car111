@@ -4635,7 +4635,8 @@ class ZoneCalTests(unittest.TestCase):
             for free in (60.0, 0.0):
                 w = self._world(3, park={'ROUGH': park}, stop_err_mm=0.5)
                 lines = []
-                h = self._make(w, dict(zone_map_free_mm=free), lines=lines, raw={'stops': {'ROUGH': pose}})
+                extra = dict(zone_map_free_mm=free) if free > 0 else dict(zone_map_free_mm=0.0, zone_trust_s_mm=0.0, zone_trust_f_mm=0.0)
+                h = self._make(w, extra, lines=lines, raw={'stops': {'ROUGH': pose}})
                 run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
                 w.arrive('ROUGH', 1)
                 h.task('ROUGH', w.link, lines.append)
@@ -4677,6 +4678,36 @@ class ZoneCalTests(unittest.TestCase):
                 self.assertLessEqual(s_end[0], 10, s_end)
                 self.assertEqual(h.stats.place_ok, 0, text[-3000:])
                 self.assertIn('2 号环正下方离工位太近', text)
+
+    def test_ring2_follows_the_camera_when_the_map_says_too_close_to_yellow(self):
+        """(10-28 实车粗加工区第二轮：停车点 (1070,330) 车头朝东，2 号环要往外(往北)横移 31mm，按地图("车正好停在停车点")
+        车身离西南黄色区只剩 19mm，限成 20mm，还差 20mm 整个区不放。用户"二号环一定要对准")车停偏了地图就不准：照摄像头看到的
+        2 号环挪(离停车点横着 60mm 以内不按地图查黄色区)，三个都放了。zone_trust_s_mm=0 就是以前：限住、这个区不放。
+        往工位那边挪照样只留 zone_align_margin_mm(test_stop_close_to_zone_wheels_reach_ring2_without_arm)。"""
+        import re
+        pose = [1070.0, 330.0, 0.0]            # 车头朝东：左边(雷达那边)朝北 = 西南黄色区，车身北边 330+170=500，离黄色区 50mm
+        for trust in (60.0, 0.0):
+            w = self._world(3, park={'ROUGH': 0.0}, park_side={'ROUGH': 35.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, dict(zone_trust_s_mm=trust), lines=lines, raw={'stops': {'ROUGH': pose}})
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            w.arrive('ROUGH', 1)
+            h.task('ROUGH', w.link, lines.append)
+            text = '\n'.join(lines)
+            s_end = [int(m) for m in re.findall(r'车轮停在 横移 ([+-]\d+)mm', text)]
+            self.assertTrue(s_end, text[-3000:])
+            if trust > 0:
+                self.assertIn('地图按车正好停在停车点算', text)
+                self.assertNotIn('这个区这次不放', text)
+                self.assertGreaterEqual(abs(s_end[0]), 33, (s_end, text[-3000:]))
+                self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+                self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+                errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
+                self.assertLess(max(errs), 3.0, errs)
+            else:
+                self.assertIn('离黄色区/工位太近', text)
+                self.assertLessEqual(abs(s_end[0]), 21, s_end)
+                self.assertEqual(h.stats.place_ok, 0, text[-3000:])
 
     def test_calc_wheels_only_never_moves_the_arm_and_reaches_far(self):
         """(10-21 用户"修正距离可以放开")车离圆环那一排远了 100mm(以前车轮横移最多 70mm、剩下的手臂补)：知道停车点在地图上哪儿
