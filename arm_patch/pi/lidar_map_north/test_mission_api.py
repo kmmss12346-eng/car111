@@ -372,13 +372,45 @@ class QrSearchTests(unittest.TestCase):
         return w, h, '\n'.join(lines)
 
     def test_offsets_follow_the_scanner_geometry(self):
+        """qr_search_order='list'(以前的做法)：按 qr_targets_mm 写的顺序。"""
         w = SimWorld(seed=3, code=CODE)
-        h, _ = hooks(w)
+        h, _ = hooks(w, dict(qr_search_order='list'))
         got = h._qr_offsets((2100.0, 1200.0, 90.0))
         self.assertEqual(got, [(1200.0, 125.0), (1260.0, 185.0), (1140.0, 65.0), (1320.0, 245.0)])   # 1080 和停车点差不多，不再挪
         got = h._qr_offsets((2100.0, 1200.0, -90.0))                 # 车头朝南(只看几何)：扫码器在 y=1325，往前开 y 变小；1320 和停车点差不多
         self.assertEqual([f for _t, f in got], [125.0, 65.0, 185.0, 245.0])
         self.assertEqual(h._qr_offsets((2100.0, 1200.0, 0.0)), [])   # 车头朝东(对着码板)：前后挪对不上，不挪
+
+    def test_offsets_nearest_first_without_going_back_and_forth(self):
+        """(10-28 实车：扫码器在停车点对着 1125，按 1200→1260→1320→1080 找，在 1080 才读到，来回多走 240mm、QR 用了 16 秒)
+        默认先去近的那一头、再一路扫到另一头：1080(后退 45)、1200、1260、1320。"""
+        w = SimWorld(seed=3, code=CODE)
+        h, _ = hooks(w)
+        got = h._qr_offsets((2100.0, 1250.0, 90.0))                  # 扫码器在 y=1125
+        self.assertEqual(got, [(1080.0, -45.0), (1200.0, 75.0), (1260.0, 135.0), (1320.0, 195.0)])
+        got = h._qr_offsets((2100.0, 1200.0, 90.0))                  # 扫码器在 y=1075：都在前面，从近到远
+        self.assertEqual([t for t, _f in got], [1140.0, 1200.0, 1260.0, 1320.0])
+        got = h._qr_offsets((2100.0, 1320.0, 90.0))                  # 扫码器在 y=1195：后面的近(1140 差 55)，先往后扫完再往前
+        self.assertEqual([f for _t, f in got], [-55.0, -115.0, 65.0, 125.0])
+
+    def test_qr_ready_reads_once_and_the_task_uses_it(self):
+        """(10-28 用户"一读取二维码就直接走了")导航在 QR 点做站点扫描之前问 qr_ready：码已经读到了(路上读到的)回 True(导航不扫)，
+        QR 这一站直接用、不再等不再挪；停车点读不到回 False(照旧先扫)；不是 QR 点、qr_skip_scan=false 一律回 False。"""
+        from sim_mission import FakeCtx
+        for window, cfg, want in ((None, None, True), ((1000.0, 1001.0), None, False), (None, dict(qr_skip_scan=False), False)):
+            w = SimWorld(seed=3, code=CODE, qr_window=window)
+            h, lines = hooks(w, cfg, raw=RAW)
+            h.ctx = FakeCtx(None)
+            h.prepare(w.link, lines.append)
+            w.arrive('QR')
+            self.assertFalse(h.qr_ready('RAW', w.link))
+            self.assertEqual(h.qr_ready('QR', w.link), want, (window, cfg))
+            if want:
+                n0 = len([r for r in w.requests if r == 'QR?'])
+                h.task('QR', w.link, lines.append)
+                self.assertEqual(h.plan.code, CODE)
+                self.assertEqual(f_moves(w), [])
+                self.assertEqual(len([r for r in w.requests if r == 'QR?']), n0, '读到的码直接用，不再问')
 
     def test_found_on_arrival_does_not_move(self):
         w, h, text = self.run_qr(None)
@@ -386,11 +418,11 @@ class QrSearchTests(unittest.TestCase):
         self.assertEqual(f_moves(w), [])
 
     def test_search_moves_until_read_and_returns(self):
-        """码板在 1260 附近(扫码器挪 185mm 才看得到)：前进 125、再 60 读到，最后退回停车点(合起来 0)。"""
+        """码板在 1260 附近(扫码器挪 185mm 才看得到)：从近到远前进 65、60、60 读到，最后退回停车点(合起来 0)。"""
         w, h, text = self.run_qr((160.0, 210.0))
         self.assertEqual(h.plan.code, CODE, text)
         mv = f_moves(w)
-        self.assertEqual(mv[:2], [125, 60], text)
+        self.assertEqual(mv[:3], [65, 60, 60], text)
         self.assertEqual(mv[-1], -185, text)
         self.assertLess(abs(h.act.disp['F']), 1e-6)
         self.assertIn('读到了(扫码器对着 1260 左右)', text)

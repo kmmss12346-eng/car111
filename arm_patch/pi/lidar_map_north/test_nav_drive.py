@@ -460,6 +460,32 @@ class GuardTests(unittest.TestCase):
 
 
 class MiscDriveTests(unittest.TestCase):
+    def test_qr_station_scan_skipped_when_code_already_read(self):
+        """(10-28 用户"一读取二维码就直接走了，不要在二维码区域停留太长时间")到 QR 点任务码已经读到了(hooks.qr_ready 回 True)：
+        不做站点扫描(省 2~3 秒)；没读到照旧先扫。"""
+        for ready in (True, False):
+            car = SimCar((2100.0, 400.0, 90.0))
+            scans = []
+
+            class Ctx(SimCtx):
+                def station_scan(self, stop, ref, remaining, est=None):
+                    scans.append(stop)
+                    return dict(replanned=False)
+
+            class H(Hooks):
+                def qr_ready(self, stop, link=None):
+                    return ready
+            legs = [dict(stop='QR', goal=(2100.0, 1200.0, 90.0), cmds=[('F', 800)]),
+                    dict(stop='RAW', goal=(2100.0, 1600.0, 90.0), cmds=[('F', 400)])]
+            logs = []
+            h = H(car)
+            auto_run.drive(Ctx(car), car, auto_run.flatten(0, legs), log=logs.append, stop_wait=0, hooks=h, speeds={},
+                           motion=None, cfg=dict(CFG), start=dict(est=(2100.0, 400.0, 90.0), ref=(2100.0, 400.0, 90.0)),
+                           caps={'rdec': False})
+            self.assertEqual([st for st, _p in h.at], ['QR', 'RAW'], logs)
+            self.assertEqual(scans, [] if ready else ['QR'], logs)
+            self.assertEqual(any('不做站点扫描' in l for l in logs), ready, logs)
+
     def test_turn_back_sweep_warned(self):
         # 第二站 (2208,233) 车头 30°，转回 90° 时车角扫出东边线一点：只提醒，照常走
         car = SimCar((2208.0, 233.0, 30.0))

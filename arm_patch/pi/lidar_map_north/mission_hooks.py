@@ -87,6 +87,10 @@ DEFAULTS = dict(
     qr_search=True,                     # 到 QR 点读不到码：车沿车道前后挪，让扫码器依次对着码板可能的位置再读
     qr_first_wait_s=0.6,                # 到 QR 点先原地查这么久(路上可能已经读到了)
     qr_targets_mm=[1200.0, 1260.0, 1140.0, 1320.0, 1080.0],     # 扫码器依次对着码板的这些位置(沿码板方向的场地坐标；码板中心每场随机在 1100~1300)
+    qr_search_order='near',             # (10-28 实车：扫码器在停车点对着 1125，按 1200→1260→1320→1080 找，在 1080 才读到，来回多走 240mm、用了 16 秒)
+                                        #   'near' = 先去近的那一头、再一路扫到另一头(不来回跑)；'list' = 按 qr_targets_mm 写的顺序(以前的做法)
+    qr_skip_scan=True,                  # (10-28 用户"一读取二维码就直接走了，不要在二维码区域停留太长时间")到 QR 点任务码已经读到了(路上读到的)：
+                                        #   不做站点扫描(找新障碍物，2~3 秒)，读完直接走。false = 照旧先扫
     qr_dwell_s=0.8,                     # 每个位置停多久查 QR?
     qr_board_axis='y',                  # 码板沿哪个方向摆(在东墙上：y)
     qr_scanner_from_rear_mm=20.0,       # 扫码器装在车的右后方：离车尾多少毫米
@@ -299,6 +303,10 @@ DEFAULTS = dict(
                                         #   第一次测量之前手臂伸缩(必要时 ID1)就先补上
     tilt_warn_deg=3.0,                  # 斜到这么多度就在终端打 ★ 提醒"把车摆正"
     survey_frames=None,                    # 到工位看三个圆环时拍几帧
+    survey_look_again=True,             # (10-28)只看到两个环、"爪子下面这个是 2 号"和"那一头看得到却没有环"两种认法对不上、或者两头都在画面外
+                                        #   (车可能停偏了一个环)：底盘沿这一排挪过去看一眼再定，再挪回 2 号环那边。False = 照以前按"车停在 2 号环"算
+    survey_look_max_mm=220.0,           # 上面那一眼底盘最多挪多少毫米(挪这么多还看不到那一头就不挪，按"车停在 2 号环"算)
+    survey_look_speed=60.0,             # 上面那一眼(和看完挪回 2 号环那边)用 V 走，最快多少 mm/s；0 = 用 F
     servo=dict(),                                                # 覆盖 visual_servo.DEFAULTS
     servo_cal_file='servo_cal.json',
     vision_cal_file='vision_cal.json',
@@ -394,6 +402,12 @@ DEFAULTS = dict(
                                         #   离停车点横着 zone_gap_trust_s_mm 以内不再按地图查工位(推算的车位偏了几厘米，对上时离白色区和基准一样远)；
                                         #   做完按两次差多少挪回真正的停车点(路线下一段不带着偏差走)。False = 以前的做法
     zone_gap_ref_min_mm=15.0,
+    zone_gap_ref_mm=45.0,               # (10-28 实车粗加工区第一次：2 号环要往白色区横移 63mm，按推算的位置只许 45mm，这一轮还没有基准，整个区不放)
+                                        #   默认基准：2 号环手臂姿态对上时车身离白色区大约这么远(实车：雷达核对过的一次 51mm，粗加工区对上时按地图 38~63mm)。
+                                        #   这一轮还没对上过、或者对上时按地图算出来太近(推算的车位偏了)，照摄像头对 2 号环时也按它信摄像头；
+                                        #   只用来"信不信摄像头"，推算的车位偏了多少照旧按这一轮实际对上的算。0 = 没有基准就照地图查(以前的做法)。
+                                        #   ★ 重调过 2 号环手臂姿态(arm_calib --from A1P)：车停在调的地方量一下车身离白色区多少毫米改这里；
+                                        #   要是车贴着白色区调的(不到 20mm)，改成 0
     zone_gap_trust_s_mm=150.0,
     zone_gap_fix_min_mm=8.0,            #   推算的车位偏得比这少：做完照旧挪回推算的停车点
     zone_gap_fix_max_mm=150.0,          #   偏得比这多不信(多半认错了)：照旧挪回推算的停车点
@@ -886,6 +900,7 @@ class MissionHooks:
         self._anchor0 = {}                  # (10-26)区 -> 第一次来对准(2 号环/原料盘中心)时车在哪(相对规定的停车点：S、F)
         self._anchor_now = None             #   这一趟对准时的 (区, (S, F))；task() 开头清掉
         self._gap_ref = None                # (10-28)这一轮第一次对上 2 号环时车身离那个工位白色区多远(按地图)：(区, mm)，见 _gap_mark
+        self._qr_cached = None              # (10-28)导航问 qr_ready 时读到的任务码：QR 这一站直接用
         self._gap_now = None                #   这一趟对上 2 号环时的 (区, mm)；task() 开头清掉
         self._p2_failed = set()             # (10-20)这一趟 2 号环没对准的区：后面的物料不再试(省时间)，直接照旧一个环一个环对准
         self._zone_v_only = False           # (10-20)这一趟工位里车只用 V 动过(没发 S/F)：做完挪回停车点也只用 V(不转车头)
@@ -925,6 +940,34 @@ class MissionHooks:
         """(10-12/10-20)导航说：这次停的位置比规定的停车点往前 fwd、往左 left 毫米(规定的点被障碍物挡住、开不过去、压到工位，规划时挪的)。
         到了做任务时：地图检查按真正停的位置算；工位对 2 号环横移、往前找，原料区找圆心能挪的范围都放宽这么多。"""
         self._stop_shift[str(stop)] = (float(fwd), float(left))
+
+    def qr_ready(self, stop, link=None):
+        """(10-28 用户"一读取二维码就直接走了，不要在二维码区域停留太长时间")导航到了 QR 点、做站点扫描(找新障碍物，2~3 秒)之前问：
+        任务码是不是已经有了(路上扫码器读到的、配置里手动给的)。有了返回 True：导航不扫，直接做 QR 这一站(马上就走)。
+        只问一次 QR?(不等)；读到的码记下来，QR 这一站直接用。qr_skip_scan=false、不是 QR 点、机械臂不能用：返回 False(照旧先扫)。"""
+        cfg = self.cfg
+        if not cfg.get('qr_skip_scan', True) or role_of(stop, cfg.get('stop_aliases')) != 'QR' or self._aborted:
+            return False
+        if self.plan is not None or self._qr_cached or str(cfg.get('qr_fixed_code') or '').strip():
+            return True
+        if self.arm is None:
+            if link is None:
+                return False
+            try:
+                self._ensure_arm_only(link)
+            except Exception:
+                return False
+        try:
+            code = self.arm.qr()
+        except ArmAbort as ex:
+            self._aborted = True
+            raise Abort(str(ex))
+        except ArmError:
+            return False
+        if not code:
+            return False
+        self._qr_cached = code
+        return True
 
     def task(self, stop, link, log):
         self.log = log or self.log
@@ -1708,7 +1751,9 @@ class MissionHooks:
             self.log('    ★ 手动给的任务码格式不对(要像 652+312+526+231)：改成正常扫码')
         self._ui('stage', 'QR SCAN')
         search = bool(cfg.get('qr_search', True))
-        code = self._qr_poll(float(cfg.get('qr_first_wait_s', 0.6)) if search else float(cfg['qr_timeout_s']))
+        code, self._qr_cached = self._qr_cached, None               # (10-28)导航问 qr_ready 时已经读到了：直接用
+        if not code:
+            code = self._qr_poll(float(cfg.get('qr_first_wait_s', 0.6)) if search else float(cfg['qr_timeout_s']))
         if not code and search:
             code = self._qr_search()
         if not code:
@@ -1737,8 +1782,9 @@ class MissionHooks:
 
     def _qr_again(self):
         """QR 点没读到码：到后面的停车点再问一次(STM32 / USB 扫码器在路上读到的码也会存着)。"""
+        code, self._qr_cached = self._qr_cached, None               # 导航问 qr_ready 时读到了、QR 这一站却没做(分段调试跳过…)
         try:
-            code = self.arm.qr()
+            code = code or self.arm.qr()
         except ArmAbort:
             raise
         except ArmError:
@@ -1830,6 +1876,20 @@ class MissionHooks:
                 continue                                    # 太远 / 和已经看过的位置差不多(扫码器在停车点时就对着它)
             out.append((float(t), float(round(f))))
             done.append(f)
+        if str(cfg.get('qr_search_order', 'near')).lower() == 'near' and len(out) > 1:
+            # (10-28 实车：扫码器在停车点对着 1125，按 1200→1260→1320→1080 找，在 1080 才读到，来回多走了 240mm)
+            #   往前的、往后的各自从近到远；先扫完一边再扫另一边(不来回跑)，挑平均走得少的那种(码在每个位置的可能一样)
+            back = sorted([o for o in out if o[1] < 0], key=lambda o: -o[1])
+            fwd = sorted([o for o in out if o[1] >= 0], key=lambda o: o[1])
+
+            def cost(seq):
+                cur = tot = acc = 0.0
+                for _t, f in seq:
+                    tot += abs(f - cur)
+                    cur = f
+                    acc += tot
+                return acc
+            out = min((back + fwd, fwd + back), key=cost)
         return out
 
     def _qr_obstacles(self):
@@ -4088,24 +4148,37 @@ class MissionHooks:
                 and float(err_mm) <= max(3.0, self._ring_tol('zone_vel_tol_mm'))):
             self._gap_ref = (zone, g)
             name = {'ROUGH': '粗加工区', 'TEMP': '暂存区'}[zone]
-            self.log(f'    (2 号环对上时车身离{name}白色区 {g:.0f}mm(按推算的位置)：这一轮以它为准，别的工位对上 2 号环时车身离白色区也是这么远)')
+            need = max(0.0, float(self.cfg.get('zone_align_margin_mm', 5.0))) + float(self.cfg.get('zone_gap_ref_min_mm', 15.0))
+            if g >= need:
+                self.log(f'    (2 号环对上时车身离{name}白色区 {g:.0f}mm(按推算的位置)：这一轮以它为准，别的工位对上 2 号环时车身离白色区也是这么远)')
+            else:
+                dflt = float(self.cfg.get('zone_gap_ref_mm', 45.0) or 0.0) >= need
+                self.log(f'    (2 号环对上时按推算的位置车身离{name}白色区 {g:.0f}mm，不到 {need:g}mm：不拿它当这一轮的基准(多半是推算的车位偏了)；'
+                         + (f'别的工位照摄像头对 2 号环时按默认基准 zone_gap_ref_mm({float(self.cfg.get("zone_gap_ref_mm", 45.0)):g}mm)信摄像头)'
+                            if dflt else '别的工位照旧按地图查)'))
 
-    def _gap_trusted(self, zone):
+    def _gap_trusted(self, zone, measured=False):
         """(10-28)这一轮的基准(第一次对上 2 号环时车身离白色区多远)够远(zone_align_margin_mm + zone_gap_ref_min_mm 以上)：
         照摄像头对 2 号环时离停车点横着 zone_gap_trust_s_mm 以内不再按地图查工位(推算的车位偏了几厘米，对上时离白色区和基准一样远)。
-        返回基准 mm；没有基准、不够远、关着(zone_gap_trust)返回 None。"""
+        这一轮还没有基准、或者按地图算出来不够远(推算的车位偏了)：按默认基准 zone_gap_ref_mm(measured=True 时不用默认的：
+        _gap_fix 推算车位偏了多少只按这一轮实际对上的算)。返回基准 mm；都不够远、关着(zone_gap_trust)返回 None。"""
         ref, cfg = self._gap_ref, self.cfg
-        if ref is None or not cfg.get('zone_gap_trust', True) or zone not in ('ROUGH', 'TEMP'):
+        if not cfg.get('zone_gap_trust', True) or zone not in ('ROUGH', 'TEMP'):
             return None
         need = max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))) + float(cfg.get('zone_gap_ref_min_mm', 15.0))
-        return float(ref[1]) if float(ref[1]) >= need else None
+        if ref is not None and float(ref[1]) >= need:
+            return float(ref[1])
+        if measured:
+            return None
+        g = float(cfg.get('zone_gap_ref_mm', 45.0) or 0.0)
+        return g if g >= need else None
 
     def _gap_fix(self, zone):
         """(10-28 实车：暂存区推算的车位偏了 95mm，做完挪回推算的停车点再往北开，车身压到西北黄色区)这一趟对上 2 号环时按地图车身离
         白色区 g，基准是 g_ref：推算的车位往白色区那边偏了 c = g_ref - g(c > 0：车其实离白色区更远)。做完挪回真正的停车点
         (推算的停车点再往白色区那边挪 c)，路线下一段照样按停车点算、不带着这个偏差走。返回横移目标(底盘位移 S，相对推算的停车点)或 None。"""
         cfg, now = self.cfg, self._gap_now
-        g_ref = self._gap_trusted(zone)
+        g_ref = self._gap_trusted(zone, measured=True)
         if now is None or now[0] != zone or g_ref is None:
             return None
         c = g_ref - float(now[1])
@@ -7336,7 +7409,8 @@ class MissionHooks:
         obs = self._map_obstacles()
         wk = (zone, max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))))
         far = max(float(cfg.get('zone_trust_s_mm', 60.0) or 0.0), float(cfg.get('ring_strafe_max_mm') or 0.0))
-        if self._gap_trusted(zone) is not None:              # (10-28)这一轮有基准：工位也不按地图查(推算的车位偏了)，只查障碍物
+        if float(cfg.get('zone_trust_s_mm', 60.0) or 0.0) > 0 and self._gap_trusted(zone) is not None:
+            # (10-28)这一轮有基准：工位也不按地图查(推算的车位偏了)，只查障碍物
             far, wk = max(far, float(cfg.get('zone_gap_trust_s_mm', 150.0) or 0.0)), None
         s0, f0 = float(self.act.disp['S']), float(self.act.disp['F'])
 
@@ -7445,8 +7519,8 @@ class MissionHooks:
         k_lo, k_hi = (0.3, 3.0) if unsure else (0.6, 1.6)   # 按车实际走的修对应关系时，大小能改多少(大小没核对过/不对改过的放宽)
         trust_s = max(0.0, float(cfg.get('zone_trust_s_mm', 60.0) or 0.0))
         trust_f = max(0.0, float(cfg.get('zone_trust_f_mm', 120.0) or 0.0))
-        g_ref = self._gap_trusted(zone)                       # (10-28)这一轮有基准：对上时车身离白色区和基准一样远，工位也不按地图查
-        if g_ref is not None:
+        g_ref = self._gap_trusted(zone) if trust_s > 0 else None   # (10-28)这一轮有基准：对上时车身离白色区和基准一样远，工位也不按地图查
+        if g_ref is not None:                                       #   (zone_trust_s_mm=0：完全按地图，基准也不用)
             trust_s = max(trust_s, float(cfg.get('zone_gap_trust_s_mm', 150.0) or 0.0))
 
         def map_ok(q):
@@ -7836,11 +7910,16 @@ class MissionHooks:
                 tgt, cl = clamp_to(a + d, a)
                 if note.get('trust_why') and not note.get('trust_log'):
                     note['trust_log'] = True
-                    if g_ref is not None:
+                    if g_ref is not None and self._gap_ref is not None and g_ref == float(self._gap_ref[1]):
                         rz = {'ROUGH': '粗加工区', 'TEMP': '暂存区'}.get(self._gap_ref[0], self._gap_ref[0])
                         self.log(f'    (地图说"{note["trust_why"]}"：地图按推算的车位算，推算的车位偏了。同一个 2 号环手臂姿态'
                                  f'{"这一轮第一次" if self._gap_ref[0] == zone else "在" + rz}对上时车身离白色区 {g_ref:.0f}mm，'
                                  f'这里对上也一样：照摄像头看到的 2 号环挪(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内))')
+                    elif g_ref is not None:
+                        self.log(f'    (地图说"{note["trust_why"]}"：地图按推算的车位算，推算的车位常常偏几厘米。2 号环手臂姿态对上时车身离白色区'
+                                 f'大约 {g_ref:.0f}mm(默认基准 zone_gap_ref_mm' + ('' if self._gap_ref is None else
+                                 f'；这一轮对上时按地图算是 {float(self._gap_ref[1]):.0f}mm，推算的车位偏了') +
+                                 f')，不会压进去：照摄像头看到的 2 号环挪(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内))')
                     else:
                         self.log(f'    (地图说"{note["trust_why"]}"：地图按车正好停在停车点算，车停偏了几厘米就不准。照摄像头看到的 2 号环挪'
                                  f'(离停车点横着 {trust_s:.0f}mm、沿那一排 {trust_f:.0f}mm 以内；离工位照样留 {wk[1]:g}mm))')
@@ -8553,6 +8632,7 @@ class MissionHooks:
             self._ring_odd_size()
             self.log('    ★ 画面里看不到圆环：按配置里的圆环间距走')
             return
+        d0 = dict(self.act.disp)                                 # 看这一眼时底盘在哪(下面可能挪一下再看，记录都按这一眼算)
         self._ring_rmed = float(np.median([r[2] for r in rings]))   # (10-20)圆环在画面里多大(最外圈半径)：对准 2 号环时只认这么大的
         jf, measured = self._jac_f(rings)
         if jf is None:
@@ -8626,18 +8706,22 @@ class MissionHooks:
             near = int(np.argmin(dist))
             before, after = inside(pts[0] - step), inside(pts[1] + step)
             end_first = 0 if (before and not after) else (1 if (after and not before) else None)   # "那一头看得到却没有环"推出来的
+            first = 1 if near == 0 else 0                        # 当作离爪子点近的那个是中间(2 号)
+            # (10-28 实车暂存区：车停得比 2 号环往前偏了约 110mm，只看到 2、3 号，按"离爪子近的是 2 号"整排认错一位)
+            #   "那一头没有环"和它对不上、或者两头都在画面外(看不出来)：底盘挪过去看一眼再定(_survey_two)
+            two = dict(missed=end_first is not None and end_first != first, cheap=not (before or after))
             if float(dist[near]) <= 0.35 * sp_px:
                 # 爪子下面(附近)就有一个环：车按要求停在 2 号环前面，它就是 2 号。
-                # 另一边那个环没认出来(被爪子挡住、反光……)时，"那一头没有环"会推错成停在 1 号/3 号，整排认错一位，所以不信它
-                first = 1 if near == 0 else 0
-                if end_first is not None and end_first != first:
-                    self.log('    ★ 画面里' + ('左(上)' if near == 0 else '右(下)') + '边那个圆环没认出来(被爪子挡住了？反光？)：'
-                             '按"车停在 2 号环"算，爪子下面这个是 2 号')
+                # 另一边那个环没认出来(被爪子挡住、反光……)时，"那一头没有环"会推错成停在 1 号/3 号，整排认错一位，所以不只信它
+                if two['missed'] or not (before or after):
+                    first = self._survey_two(zone, pts, step, jf, first, rmax, sp_px, near, **two)[0]
             elif end_first is not None and not covered:
                 first = end_first                                # 车停在两个环中间：看哪一头是这一排的尽头
             else:
-                first = 1 if near == 0 else 0                    # 认不准：当作离爪子点近的那个是中间(2 号)
-                guess = True
+                looked = False                                   # 认不准(离爪子都挺远，或者圆环上放着物料可能只是没认出来)
+                if not (before and after) and end_first != first:
+                    first, looked = self._survey_two(zone, pts, step, jf, first, rmax, sp_px, near, **two)
+                guess = not looked
         else:
             first = 1                                            # 只看到一个：当作中间那个(2 号)
             guess = True
@@ -8686,7 +8770,7 @@ class MissionHooks:
         if far > 2.6 * sp_mm:
             self.log(f'    ★ 算出来要挪 {far:.0f}mm 才到圆环，不对劲(认错了？)：这次按配置里的间距走')
             return
-        d = self.act.disp
+        d = d0                                                   # 按看这一眼时的底盘位置记(_survey_two 可能挪过)
         for k, f, _side in parts:
             self.ring_f[(zone, k)] = d['F'] + f
         for k, q in zip(ids, pos):                               # (10-20)对准 2 号环时按这个位置找(车轮连续对准)
@@ -8710,10 +8794,20 @@ class MissionHooks:
         seen = '、'.join(str(ids[i]) for i in range(3) if any(np.hypot(*(pos[i] - p)) < 0.3 * sp_px for p in pts))
         self.log('    圆环在画面里：' + '  '.join(f'({r[0]:.0f},{r[1]:.0f}) 半径{r[2]:.0f}' for r in rings) +
                  f'；爪子点 ({cu:.0f},{cv_:.0f})')
-        self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素：' +
+        mf = float(self.act.disp['F']) - float(d['F'])           # 再看一眼挪过车：下面的"前进/后退"按挪之前那一眼算
+        self.log(f'    看到 {len(rings)} 个圆环(认出 {seen} 号)，每毫米 {scale:.2f} 像素' +
+                 (f'(按挪之前那一眼算，车已经{"前进" if mf > 0 else "后退"}了 {abs(mf):.0f}mm)' if abs(mf) >= 1.0 else '') + '：' +
                  '  '.join(f'环{k} ' + ('不用挪' if abs(f) < 1 else ('前进' if f > 0 else '后退') + f' {abs(f):.0f}mm') +
                            f'(横向差约 {side / scale:.0f}mm)' for k, f, side in sorted(parts)))
         self._survey_tilt(zone, jf, axis, nrm, tilt, jn, perp0, seen_pts, sp_px, float(d['F']))
+        if abs(mf) >= 1.0 and (zone, 2) in self.ring_f:
+            # 再看一眼挪过车：先按看到的挪回 2 号环那边(最多挪回看第一眼的地方，走过的路)，再照常对准——对准时车要沿这一排挪很远的话，
+            #   画面里一头的环出去、另一头的进来，挪完认 2 号环会认错一个间距
+            lo_, hi_ = sorted((float(d['F']), float(self.act.disp['F'])))
+            back = min(max(float(self.ring_f[(zone, 2)]), lo_), hi_) - float(self.act.disp['F'])
+            if abs(back) >= 5.0:
+                self.log(f'    底盘{"前进" if back > 0 else "后退"} {abs(back):.0f}mm 挪回 2 号环那边，再对准')
+                self._survey_move(back)
         worst = max(side for _k, _f, side in parts) / scale
         if worst > 40.0:
             smax = float(cfg.get('ring_strafe_max_mm') or 0.0)
@@ -8725,6 +8819,122 @@ class MissionHooks:
             if not 0.75 <= ratio <= 1.33:
                 self.log(f'    ★ 按底盘走的距离算是每毫米 {np.hypot(*jf):.2f} 像素，按圆环间距 {sp_mm:g}mm 算是 {scale:.2f}：'
                          '底盘前后走的距离不准(FPPM)，或者圆环间距不是这么多(mission_cfg.ring_spacing_mm)')
+
+    def _survey_two(self, zone, pts, step, jf, first_n, rmax, sp_px, near, missed=False, cheap=False):
+        """(10-28 实车暂存区：车停得比 2 号环往前偏了约 110mm，画面里只看到 2、3 号两个环，按"爪子下面这个是 2 号"认，整排错一位，
+        黄的放到了 3 号环、绿的放到环外)只看到两个环 pts、认不准离爪子近的那个是不是 2 号：两种认法——first_n(离爪子近的是 2 号)和
+        first_e(车停偏了一个环)——说"这一排两头外面一个间距那里有环"的地方不一样(c_e 只有 first_e 说有，c_n 只有 first_n 说有)，
+        底盘沿这一排挪到那个地方进了画面再看一眼定。默认看 c_e(missed：c_n 已经在画面里、没有环)；cheap(两头都在画面外)：
+        挪得少的那头先看，先看的 c_n 没有环再看 c_e 确认(c_e 也没有：按 first_n)。挪之前按地图查一路上车身碰不碰东西，碰就不挪。
+        画面怎么动按这两个环的间距算(比"底盘挪 40mm"测的准)。记录都按挪之前那一眼算(车挪回 2 号环那边见 _survey)。
+        返回 (first, 看成了没有)；没看成按 first_n。"""
+        import numpy as np
+        cfg = self.cfg
+        first_e = 1 - first_n
+        side = '左(上)' if near == 0 else '右(下)'
+        if missed:
+            no = f'    ★ 画面里{side}边那个圆环没认出来(被爪子挡住了？反光？)，也可能是车停偏了一个环：'
+        else:
+            no = '    ★ 只看到两个圆环、两头都在画面外，认不准离爪子近的那个是不是 2 号(车可能停偏了一个环)：'
+        fall = '按离爪子近的那个是 2 号算'
+        if not cfg.get('survey_look_again', True) or self.act is None:
+            self.log(no + fall)
+            return first_n, False
+        sp_mm = float(cfg.get('ring_spacing_mm') or 150.0)
+        jr = (1.0 if float(np.asarray(jf, float) @ step) > 0 else -1.0) * np.asarray(step, float) / sp_mm   # 底盘前进 1mm，圆环在画面里动多少
+        lo, hi = np.asarray(pts[0] - step, float), np.asarray(pts[1] + step, float)
+        c_e, c_n = (hi, lo) if first_e == 0 else (lo, hi)
+        h_img, w_img = self._frame_size()
+        pad = float(rmax) + 15.0
+        look_max = int(float(cfg.get('survey_look_max_mm', 220.0)))
+
+        def seen_at(q):
+            return pad <= float(q[0]) <= w_img - pad and pad <= float(q[1]) <= h_img - pad
+
+        def need(c, at):                                         # 车已经挪了 at：再前后挪多少，c 这个地方进到画面里(够不着返回 None)
+            q0 = c + jr * at
+            k = float(jr @ (np.array([w_img / 2.0, h_img / 2.0]) - q0))
+            if abs(k) <= 1e-6:
+                return None
+            sgn = 1.0 if k > 0 else -1.0                         # 底盘往这边挪，它在画面里往中间走
+            for mm in range(10, look_max + 1, 10):
+                if seen_at(q0 + jr * (sgn * mm)):
+                    return sgn * float(mm + 15)
+            return None
+        f_e, f_n = need(c_e, 0.0), (need(c_n, 0.0) if cheap else None)
+        if f_n is not None and (f_e is None or abs(f_n) < abs(f_e)):
+            order = [(c_n, first_n), (c_e, first_e)]
+        else:
+            order = [(c_e, first_e)]
+        at = 0.0
+        for i, (c, fh) in enumerate(order):
+            f = need(c, at)
+            if f is None:
+                if i == 0:
+                    self.log(no + f'挪 {look_max}mm 也看不到那一头，' + fall)
+                    return first_n, False
+                self.log('    另一头挪过去也看不到：按"那一头没有环"算，车停偏了一个环，离爪子近的那个不是 2 号，重新认')
+                return first_e, True
+            pose0 = self._stop_pose(zone)
+            if pose0 is not None:
+                obs = self._map_obstacles()
+                wk = (zone, max(0.0, float(cfg.get('zone_align_margin_mm', 5.0))))
+                s0, f0 = float(self.act.disp['S']), float(self.act.disp['F'])
+                n_ = max(1, int(abs(f) // 20.0) + 1)
+                for j in range(1, n_ + 1):
+                    ok, why = self._body_clear(pose0, (s0, f0 + f * j / n_), obs, work=wk)
+                    if not ok:
+                        if i == 0:
+                            self.log(no + f'想挪 {abs(f):.0f}mm 过去看一眼，按地图{why}，不挪：' + fall)
+                            return first_n, False
+                        self.log(f'    想挪 {abs(f):.0f}mm 到另一头确认，按地图{why}，不挪：按"那一头没有环"算，车停偏了一个环，'
+                                 '离爪子近的那个不是 2 号，重新认')
+                        return first_e, True
+            self.log((no if i == 0 else '    ') + ('' if i == 0 else '再到另一头确认：') +
+                     f'底盘{"前进" if f > 0 else "后退"} {abs(f):.0f}mm 再看一眼')
+            f_was = float(self.act.disp['F'])
+            self._survey_move(f)
+            at += float(self.act.disp['F']) - f_was
+            self.sleep(0.3)
+            try:
+                rings = self.vision.ring_list(n=cfg.get('survey_frames') or None) or []
+            except VisionError:
+                rings = []
+            new = [np.array([r[0], r[1]], float) for r in rings]
+            gate = 0.3 * float(sp_px)
+            if not any(float(np.hypot(*(q - (np.asarray(p, float) + jr * at)))) <= gate for p in pts for q in new):
+                self.log('    挪完画面里对不上原来那两个环：' + fall)
+                return first_n, False
+            has = any(float(np.hypot(*(q - (c + jr * at)))) <= gate for q in new)
+            if fh == first_n and not has and i + 1 < len(order):
+                self.log('    那一头没有环(也可能没认出来)：')
+                continue
+            first = fh if has else (first_n if fh == first_e else first_e)
+            what = '那一头有环' if has else '那一头没有环'
+            if first == first_n:
+                self.log(f'    {what}：离爪子近的那个就是 2 号' + (f'({side}边那个圆环只是没认出来)' if missed else ''))
+            else:
+                self.log(f'    {what}：车停偏了一个环，离爪子近的那个不是 2 号，重新认')
+            return first, True
+        return first_n, False
+
+    def _survey_move(self, df):
+        """(10-28)看圆环时底盘沿这一排前后挪 df 毫米(再看一眼、挪回 2 号环那边)：先用 V(不转车头，走了多少按 STM32 算的记，
+        和车轮对准 2 号环一样)，最快 survey_look_speed；STM32 不认 V / V 没走到用 F 补上。"""
+        act = self.act
+        s0, f0 = float(act.disp['S']), float(act.disp['F'])
+        vmax = float(self.cfg.get('survey_look_speed', 60.0) or 0.0)
+        if vmax > 0:
+            try:
+                if self._vel_goto(s0, f0 + float(df), tol_mm=2.0, vmax=vmax):
+                    return
+            except ArmAbort:
+                raise
+            except ArmError:
+                pass
+        rest = f0 + float(df) - float(act.disp['F'])
+        if abs(rest) >= 1.0:
+            act.chassis_move(0, rest)
 
     def _ring_scale_seed(self):
         """(10-26 实车：开机后第一次到暂存区只认出一个"圆"，没量出圆环这里每毫米多少像素，还是配置里默认的 2.96：vcal RING 量的

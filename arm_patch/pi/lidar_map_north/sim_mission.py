@@ -1715,21 +1715,26 @@ class ZoneFlowTests(unittest.TestCase):
         h.prepare(w.link, lines.append)
         w.arrive('ROUGH')
         rings = [(338.0, 168.0, 67.0), (554.0, 209.0, 72.0)]
-        h.vision.ring_list = lambda n=None: list(rings)
-        h.vision.claw = lambda what='RING': (337.0, 283.0)
         axis = np.array([216.0, 41.0]) / np.hypot(216.0, 41.0)
+        f0 = h.act.disp['F']
+
+        def ring_list(n=None):                                   # (10-28)车前后挪：圆环沿这一排动(每毫米 1.47 像素)，出了画面看不到
+            q = axis * 1.47 * (h.act.disp['F'] - f0)
+            return [(u + q[0], v + q[1], r) for u, v, r in rings if 0.0 <= u + q[0] <= 640.0]
+        h.vision.ring_list = ring_list
+        h.vision.claw = lambda what='RING': (337.0, 283.0)
         a = math.radians(-35.5)
         jf = 1.99 * np.array([axis[0] * math.cos(a) - axis[1] * math.sin(a), axis[0] * math.sin(a) + axis[1] * math.cos(a)])
         h._jac_f = lambda r, fresh=False: (jf, True)
         h._survey('ROUGH')
-        f0 = h.act.disp['F']
-        f = {k: h.ring_f[('ROUGH', k)] - f0 for k in (1, 2, 3)}
+        f = {k: h.ring_f[('ROUGH', k)] - f0 for k in (1, 2, 3)}         # 按看第一眼时的位置记(再看一眼挪过车)
         text = '\n'.join(lines)
         self.assertLess(abs(f[2]), 25, (f, text))
         self.assertLess(abs(abs(f[1]) - 150), 15, (f, text))
         self.assertLess(abs(abs(f[3]) - 150), 15, (f, text))
         self.assertLess(f[1] * f[3], 0, f)
         self.assertIn('不可信', text)
+        self.assertIn('那一头没有环：离爪子近的那个就是 2 号', text)     # (10-28)两种认法对不上：挪过去看一眼，那头没有环
 
     def test_car_parked_between_rings_still_finds_the_right_rings(self):
         """车停得离 2 号环偏了 55mm(两个环中间偏 2 号)：照样认对、放对。
@@ -1738,6 +1743,19 @@ class ZoneFlowTests(unittest.TestCase):
             for seed, w, h, text in self._run(range(3), dict(cam_deg=90.0, park=park), stops=('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')):
                 self._assert_all_good(w, h, text, seed, batches=1)
                 self.assertEqual(rings_summary(w, 'TEMP'), {1: [1], 2: [5], 3: [6]}, f'{park} seed {seed}')
+
+    def test_car_parked_one_ring_off_looks_again(self):
+        """(10-28 实车暂存区：车停得比 2 号环往前偏了约 110mm，画面里只看到 2、3 号两个环，按"爪子下面这个是 2 号"整排认错一位，
+        黄的放到 3 号环、绿的放到环外)车停偏一个环左右、只看到两个环：底盘挪过去看一眼再认，照样放对；关掉(survey_look_again=False)就认错。"""
+        stops = ('QR', 'RAW', 'ROUGH', 'TEMP', 'START1')
+        for park in (-130.0, -100.0, 100.0, 130.0):              # ±130：一头看得到却没有环(和实车一样)；±100：两头都在画面外
+            for seed, w, h, text in self._run(range(2), dict(cam_deg=90.0, park={'TEMP': park}), stops=stops):
+                self._assert_all_good(w, h, text, seed, batches=1)
+                self.assertEqual(rings_summary(w, 'TEMP'), {1: [1], 2: [5], 3: [6]}, f'{park} seed {seed}\n{text}')
+                self.assertIn('再看一眼', text)
+                self.assertIn('车停偏了一个环，离爪子近的那个不是 2 号', text)
+        for seed, w, h, text in self._run([0], dict(cam_deg=90.0, park={'TEMP': 130.0}), cfg=dict(survey_look_again=False), stops=stops):
+            self.assertNotEqual(rings_summary(w, 'TEMP'), {1: [1], 2: [5], 3: [6]}, text)
 
     def test_covered_end_ring_missed_does_not_shift_numbering(self):
         """暂存区第二批：圆环上都放着第一批的物料，一头那个没认出来：不能当成"那一头没有环"把编号整体挪一位(会叠错颜色)。"""
@@ -4655,13 +4673,14 @@ class ZoneCalTests(unittest.TestCase):
         """(10-27 实车粗加工区"这是为什么没有对准就停了"：存的停车点车身离粗加工区只剩 20mm，2 号环还要往区那边横移 23mm，按导航的
         余量 30mm 只许挪 9mm、还差 12.6mm，整个区不放。用户"不能拿机械臂补……轮子不是可以自由移动吗")车轮对准 2 号环时离这个工位
         只留 zone_align_margin_mm(5mm)：车轮横移 15mm(车身离粗加工区还剩 5mm，不压进去)，还差 8mm 照样放，三个都放了，手臂一下都不补。
-        zone_align_margin_mm=30 就是以前：限住、这个区不放，并且说清楚是 2 号环的手臂姿态调的时候车贴着工位。"""
+        zone_align_margin_mm=30 就是以前：限住、这个区不放，并且说清楚是 2 号环的手臂姿态调的时候车贴着工位。
+        (这里推算的车位是准的、2 号环手臂姿态是车贴着白色区调的：zone_gap_ref_mm=0，不按默认基准信摄像头)"""
         import re
         pose = [1270.0, 345.0, 180.0]          # 车头朝西：左边(雷达那边)朝南 = 粗加工区；车身南边 345-130-45=170，离区 20mm
         for margin in (5.0, 30.0):
             w = self._world(3, park={'ROUGH': 0.0}, park_side={'ROUGH': 23.0}, stop_err_mm=0.5)
             lines = []
-            h = self._make(w, dict(zone_align_margin_mm=margin), lines=lines, raw={'stops': {'ROUGH': pose}})
+            h = self._make(w, dict(zone_align_margin_mm=margin, zone_gap_ref_mm=0.0), lines=lines, raw={'stops': {'ROUGH': pose}})
             run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
             w.arrive('ROUGH', 1)
             h.task('ROUGH', w.link, lines.append)
@@ -4699,7 +4718,7 @@ class ZoneCalTests(unittest.TestCase):
             s_end = [int(m) for m in re.findall(r'车轮停在 横移 ([+-]\d+)mm', text)]
             self.assertTrue(s_end, text[-3000:])
             if trust > 0:
-                self.assertIn('地图按车正好停在停车点算', text)
+                self.assertIn('照摄像头看到的 2 号环挪', text)                # (10-28 晚起按默认基准 zone_gap_ref_mm 信摄像头，说法不一样)
                 self.assertNotIn('这个区这次不放', text)
                 self.assertGreaterEqual(abs(s_end[0]), 33, (s_end, text[-3000:]))
                 self.assertEqual(h.stats.place_ok, 3, text[-3000:])
@@ -4972,14 +4991,17 @@ class ZoneCalTests(unittest.TestCase):
         """(10-28 实车：到暂存区摄像头说车离圆环那一排远了 74mm、要往白色区横移 74mm；按推算的车位车身离暂存区只剩 -44mm，只许挪 25mm，
         还差 40mm 整个区不放，第一批留在车上、第二轮什么都没做。车开走后雷达定位：车在暂存区其实偏东 95mm)同一个 2 号环手臂姿态在粗加工区
         对上时车身离白色区 50mm(这一轮的基准)：暂存区照摄像头挪，两批都放好；做完挪回真正的停车点(推算的停车点再往白色区挪约 94mm)。
-        zone_gap_trust=False 就是以前(限住、暂存区不放)；基准离白色区太近(粗加工区对上时只有 10mm)也不信。"""
-        for trust, rough_y in ((True, 330.0), (False, 330.0), (True, 290.0)):
+        zone_gap_trust=False 就是以前(限住、暂存区不放)。粗加工区对上时按地图只有 10mm(不够当基准)：按默认基准 zone_gap_ref_mm
+        照样信摄像头、两批都放好，推算的车位偏了多少不按它算(做完照旧挪回推算的停车点)；zone_gap_ref_mm=0 就是以前(不信，暂存区不放)。"""
+        for trust, rough_y, ref in ((True, 330.0, None), (False, 330.0, None), (True, 290.0, None), (True, 290.0, 0.0)):
             w = self._world(5, park={'TEMP': 10.0}, park_side={'TEMP': 74.0}, stop_err_mm=0.5)
             lines = []
             stops = {'ROUGH': [1135.0, rough_y, 0.0],   # 车头朝东：右边朝南 = 粗加工区，车身南边 330-130=200，离区 50mm
                      'TEMP': [355.0, 1275.0, 90.0]}     # 车头朝北：左边(雷达那边)朝西 = 暂存区，车身西边 355-175=180，离区 30mm
-            h = self._make(w, dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0, zone_gap_trust=trust), lines=lines,
-                           raw={'stops': stops})
+            cfg = dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0, zone_gap_trust=trust)
+            if ref is not None:
+                cfg['zone_gap_ref_mm'] = ref
+            h = self._make(w, cfg, lines=lines, raw={'stops': stops})
             backs = []
             zb = h._zone_back
 
@@ -4998,10 +5020,38 @@ class ZoneCalTests(unittest.TestCase):
                 temp_back = [s for z, s in backs if z == 'TEMP']
                 self.assertTrue(len(temp_back) == 2 and all(85 <= s <= 100 for s in temp_back), (backs, text[-3000:]))
                 self.assertTrue(all(abs(s) <= 3 for z, s in backs if z == 'ROUGH'), backs)    # 粗加工区本来就准：照旧挪回停车点
+            elif trust and ref is None:
+                self.assertIn('默认基准 zone_gap_ref_mm；这一轮对上时按地图算是 10mm', text, text[-3000:])
+                self.assertNotIn('做完挪回真正的停车点', text)
+                self._ok(w, h, text)
+                self.assertTrue(all(abs(s) <= 3 for z, s in backs), backs)
             else:
                 self.assertIn('车身离暂存区不到 5mm', text, text[-3000:])
                 self.assertEqual(len([p for p in w.placed if p[0] == 'TEMP']), 0, text[-3000:])
-                self.assertNotIn('推算的车位偏了', text)
+                self.assertNotIn('做完挪回真正的停车点', text)
+
+    def test_first_zone_trusts_the_camera_with_the_default_reference(self):
+        """(10-28 实车粗加工区第一次：摄像头说 2 号环要往白色区横移 63mm、前进 67mm，按推算的车位车身离粗加工区只剩 -13mm，只许横移 45mm，
+        这一轮还没有基准，整个区不放)按默认基准 zone_gap_ref_mm(对上时车身离白色区大约 45mm)信摄像头：三个都放准；
+        zone_gap_ref_mm=0 就是以前(限住、这个区不放)。"""
+        for ref in (None, 0.0):
+            w = self._world(7, park={'ROUGH': 67.0}, park_side={'ROUGH': -63.0}, stop_err_mm=0.5)
+            lines = []
+            h = self._make(w, None if ref is None else dict(zone_gap_ref_mm=ref), lines=lines,
+                           raw={'stops': {'ROUGH': [1135.0, 330.0, 0.0]}})   # 车头朝东：右边朝南 = 粗加工区，车身离区 50mm
+            run_mission(w, h, stops=('QR', 'RAW'), log=lines.append)
+            w.arrive('ROUGH', 1)
+            h.task('ROUGH', w.link, lines.append)
+            text = '\n'.join(lines)
+            if ref is None:
+                self.assertIn('默认基准 zone_gap_ref_mm', text, text[-3000:])
+                self.assertEqual(h.stats.place_ok, 3, text[-3000:])
+                self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0), text[-3000:])
+                errs = [e for (z, _k, _c, e, _st) in w.placed if z == 'ROUGH']
+                self.assertLess(max(errs), 3.0, errs)
+            else:
+                self.assertIn('车身离粗加工区不到 5mm', text, text[-3000:])
+                self.assertEqual(h.stats.place_ok, 0, text[-3000:])
 
     def test_temp_leftovers_from_round1_are_placed_in_round2(self):
         """(10-28 用户"暂停区域识别不到应该继续识别啊不应该直接走啊"：第一轮暂存区 2 号环没对上，第一批留在车上；第二轮原料区夹不了，

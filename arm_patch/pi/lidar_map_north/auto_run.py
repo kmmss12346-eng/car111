@@ -1384,6 +1384,10 @@ class _Drive:
             return None
         meas = None
         remaining = [s for s, c, _ in self.seq[self.k+1:] if c is None]
+        if up in self.rescan and hasattr(self.ctx, 'station_scan') and remaining and _call(self.hooks, 'qr_ready', stop, self.link):
+            # (10-28 用户"一读取二维码就直接走了，不要在二维码区域停留太长时间")任务码已经读到了(路上读到的)：不扫(省 2~3 秒)
+            self.log(f'    (任务码已经读到了：{stop} 这里不做站点扫描，读完直接走)')
+            return None
         if up in self.rescan and hasattr(self.ctx, 'station_scan') and remaining:
             t_s = time.monotonic()
             try:
