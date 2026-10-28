@@ -453,6 +453,10 @@ DEFAULTS = dict(
     #   (有 vcal RING 量过的车轮和画面的对应关系时不用这个，按 ring_order 推)
     ring_offset_mm=dict(ROUGH={'1': 150.0, '2': 0.0, '3': -150.0}, TEMP={'1': 150.0, '2': 0.0, '3': -150.0}),
     pickback_fast=True,                 # 粗加工区取回时直接回到放下时记下的底盘位置和手臂角度，只测一次确认，容差内就不重新对准(省 4~5 秒/个)
+    pickback_quick=True,                # (10-27、10-28 用户"粗加工区域放在地上然后重新夹取的时候不要对准直接夹取就行了")车没动、只转手臂放的取回：
+                                        #   一条指令转到放下时的角度(边转边降)直接夹，不再先多转再分两下转回来、不再一遍遍回读再转；
+                                        #   只回读一次，差 pickback_tol_deg 以上(大动作偶尔停偏)才补一下。放的时候照旧精确到位。False = 以前的做法
+    pickback_tol_deg=1.0,
     # (10-22 用户"这个也要按顺序来")粗加工区/暂存区(含码垛)一律按任务码的顺序放(规则：必须按照任务码的顺序和位置放置)。
     #   以前的 place_order='sweep'(顺路 3→2→1)去掉了：车上配置里还写着也不再用
     zone_timeout_s=None,                # 工位里一次对准最多用几秒(到了还差一点点也按 accept_mm 放，不一直磨)
@@ -6537,9 +6541,9 @@ class MissionHooks:
         self._stow_quiet()                                       # 先收臂(放完不缩回时爪子还伸在圆环上方)，再挪底盘
         self._zone_back('ROUGH')
 
-    def _goto_recorded(self, zone, item):
+    def _goto_recorded(self, zone, item, quick=False):
         """取回时直接回到放下那一刻的底盘位置和手臂角度(物料就在那儿)。成功回到返回 True；没有记录或不允许返回 False。
-        回去以后下一步的 servo.run 会先测一次：偏差在容差内就不动，直接夹。"""
+        回去以后下一步的 servo.run 会先测一次：偏差在容差内就不动，直接夹。quick(pickback_quick)：接着直接夹、不用摄像头，见 _quick_to_pose。"""
         rec = self.pose_at.get((zone, item.slot))
         if not rec or not self.cfg.get('pickback_fast', True):
             return False
@@ -6551,6 +6555,9 @@ class MissionHooks:
             self.log(f'    底盘回到放下时的位置：前进 {dF:+d}mm、横移 {dS:+d}mm')
             self._zone_v_only = False
             self.act.chassis_move(dS, dF)
+        if quick:
+            self._quick_to_pose(rec['a1'], rec['a2'])
+            return True
         self._return_to_pose(rec['a1'], rec['a2'], from_tray=not self._ring_ready)   # 刚把上一个夹回转盘：从转盘那边转回来
         zobr = float(self.arm.params().get('ZOBRNG', 0.0))
         if zobr > 0.05:
@@ -6588,7 +6595,7 @@ class MissionHooks:
             rec0, d0 = self.pose_at.get((zone, item.slot)), self.act.disp
             direct = bool(rec0 and rec0.get('arm') and self._p2.get(zone) is not None
                           and abs(float(rec0['S']) - float(d0['S'])) < 2.0 and abs(float(rec0['F']) - float(d0['F'])) < 2.0)
-            recorded = self._goto_recorded(zone, item)
+            recorded = self._goto_recorded(zone, item, quick=direct and bool(cfg.get('pickback_quick', True)))
             if recorded and direct:
                 self.log('    按放下时的角度直接取(车没动、只转手臂放的，不再对准)')
                 if self.nogo:
@@ -9522,6 +9529,33 @@ class MissionHooks:
             return 'vision' if f() is False else None
         except Exception:
             return None
+
+    def _quick_to_pose(self, a1, a2):
+        """(10-27、10-28 用户"粗加工区域放在地上然后重新夹取的时候不要对准直接夹取就行了")取回(车没动、只转手臂放的)：一条指令转到
+        放下时的角度，边转边降到看圆环的高度(ZOBRNG，接着 PICK 从这里往下)；不再先往车上转盘那边多转、再分两下慢慢转回来，也不一遍遍
+        回读再转。物料就在那儿，爪子张开有余量，差零点几度夹得住。只回读一次：大动作偶尔停偏 pickback_tol_deg 以上才补一下。"""
+        try:
+            zr = float((self.arm.params() or {}).get('ZOBRNG', 0.0))
+        except (TypeError, ValueError):
+            zr = 0.0
+        if zr > 0.05:
+            self.arm.apz(a1, a2, zr)
+        else:
+            self.arm.ap(a1, a2)
+        try:
+            b1, b2 = self.arm.read_angles()
+        except ArmAbort:
+            raise
+        except ArmError:
+            return
+        tol = float(self.cfg.get('pickback_tol_deg', 1.0))
+        if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= 10.0 * tol):
+            return
+        self.log(f'    转到放下时的角度差了 ID1 {b1 - a1:+.1f}°、ID2 {b2 - a2:+.0f}°：补一下')
+        if self._same_approach():
+            self._ap_from_tray_side(a1, a2, cur1=b1)
+        else:
+            self.arm.ap(a1, a2)
 
     def _return_to_pose(self, a1, a2, from_tray=False):
         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 2 次。

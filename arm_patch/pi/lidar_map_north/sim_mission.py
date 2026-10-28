@@ -4205,6 +4205,44 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
         self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
 
+    def test_pickback_goes_straight_to_the_placed_angles(self):
+        """(10-27、10-28 用户"粗加工区域放在地上然后重新夹取的时候不要对准直接夹取就行了")粗加工区取回(车没动、只转手臂放的)：
+        一条指令转到放下时的角度(边转边降)直接 PICK，不再先多转再分两下转回来、不再回读再转；整场 6 个都取回、12 个都放对，比以前快。
+        pickback_quick=False 是以前(和放的时候一样的同一个动作到位)。"""
+        t_pick = {}
+        for quick in (True, False):
+            w = self._world(1)
+            lines = []
+            h = self._make(w, dict(pickback_quick=quick), lines=lines)
+            durs = []
+            orig = h._pickback_item
+
+            def timed(item, zone, again=False, _o=orig, _d=durs, _w=w):
+                t0 = _w.t
+                r = _o(item, zone, again)
+                _d.append(_w.t - t0)
+                return r
+            h._pickback_item = timed
+            run_mission(w, h, log=lines.append)
+            text = '\n'.join(lines)
+            self._ok(w, h, text)
+            segs, cur = [], None
+            for l in lines:
+                if l.startswith('  ▶ '):
+                    cur = [] if '取回' in l else None
+                    if cur is not None:
+                        segs.append(cur)
+                elif cur is not None:
+                    cur.append(l)
+            self.assertEqual(len(segs), 6, text[-3000:])
+            pick_text = '\n'.join('\n'.join(s) for s in segs)
+            self.assertIn('按放下时的角度直接取', pick_text)
+            if quick:
+                self.assertNotIn('再转一次', pick_text, pick_text)
+                self.assertNotIn('对准结果', pick_text, pick_text)
+            t_pick[quick] = durs
+        self.assertLess(sum(t_pick[True]), sum(t_pick[False]) - 1.5, t_pick)
+
     def test_full_course_ring2_once_then_car_still(self):
         """整场两批：每个工位只在 2 号环对准一次(10-21：车停着算好、S/F 一次挪过去、停稳再看再补)，之后车不动；1、3 号环按调的角度放，取回直接按放下的角度取；
         12 个都放准；去圆环的 TAKE 都按圆环那边(SIDE RING)绕电池盒。"""
