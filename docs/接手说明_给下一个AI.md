@@ -1168,6 +1168,15 @@ git_log.txt                ← 分支最近 120 条提交记录
     车没动、只转手臂放的取回：`_goto_recorded(quick=True)` → `_quick_to_pose`：一条 APZ 转到放下时的角度、边转边降到 ZOBRNG，直接 PICK；
     只回读一次，差 `pickback_tol_deg`(1°)以上才补一下(`_ap_from_tray_side`)。放的时候照旧精确到位(`_return_to_pose`)。
     sim ZoneCalTests.test_pickback_goes_straight_to_the_placed_angles(取回不出现"再转一次"/"对准结果"，比以前快；模拟里每个省约 0.7 秒)。
+  - 用户又说"这个车上转盘的位置和调试的位置不一样这个总是有误差……会影响物料放置"、"开启启动的时间太长了不行必须五秒内启动"：
+    问了用户是哪种(还没回)。车上转盘：Go_Tray 的大动作都按 ATOLC(1°)到位，ID1 还有 2.3° 间隙、从原料区/圆环两边过来停的地方不一样，
+    TAKE 时爪子偏几毫米、物料在爪子里偏了放到环上也偏；树莓派先摆好不行(Stages/Sweep 会照样绕电池盒重走一遍)，要改固件 Seq_Take
+    在 Go_Tray 之后 ID1 慢慢按 ATOL 从同一边到 A1D。也可能是转盘舵机(TT1~3)停偏。启动：go 之后 sync 0.7 + prepare 2.8 + 第一次扫描 3.0
+    秒才第一次动底盘(第二站)，再第二站 3.4 + 第二次扫描 3.1 + 规划 3.4 才开走；一键启动是整车电闸的话树莓派开机就要几十秒。
+    接着用户"把所有的就是高度往上面提高四毫米变成124"：**新命令 `zup`**(zshift.py，map_merge_live 里接上)：`zup 4` 按 STM32 现在的值
+    (先 sync_now)把 ZHI ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG 都加 4mm、存进 stm32_params(10-27 的值：ZHI/ZOBRAW/ZOBRNG 120→124、
+    ZGRAB/ZDROP 102→106、ZSTK 67→71)；`zup -4` 还原；`zup 4 ZHI …` 只改列出来的。超过 LFMAX 提醒(升降最高只到 LFMAX，没自动改)；
+    改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
 - **10-26 第二轮停在和第一轮同样的地方(用户"这个车在这四个停靠点停稳了但是后面第二轮运行……还能在同样的地方吗，这是一个大问题")：**
   10-23 起路上只在 PREHOME/START 用雷达定位(用户要求)，车轮打滑的误差一路累计，第二轮停的地方会差几厘米(手臂照样准：每次到工位都用
   摄像头对准 2 号环/原料盘中心)。改：`zone_anchor`(默认 True)。对准以后车和工位/原料盘的相对位置每次一样：`_anchor_mark`(在 _p2_align 对准

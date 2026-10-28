@@ -42,6 +42,19 @@ class World(SimCar):
         self.zq = 0
         self.ready_at = None
         self.lock = threading.RLock()
+        self.zp = dict(ZHI=120.0, ZGRAB=102.0, ZDROP=102.0, ZPLC=2.0, ZSTK=67.0, ZOBRAW=120.0, ZOBRNG=120.0, LFMAX=130.0)
+
+    def get_params(self):
+        ps, rep = SimCar.get_params(self)
+        ps.update(self.zp)
+        return ps, rep
+
+    def set_param(self, name, value):
+        if name not in self.zp:
+            return False, 'ERR NAME'
+        self.zp[name] = float(value)
+        self.requests.append(f'SET {name} {float(value):g}')
+        return True, 'DONE'
 
     def _move(self, cmd, val):
         with self.lock:
@@ -604,6 +617,21 @@ class LiveTests(unittest.TestCase):
         self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False, mission_cfg=dict(zone_cal_fine=True)),
                       inputs=[(lambda: True, 'rfine off')], screen_zone=None, end_on='已设置 rfine off')
         self.assertIs((self.cfg_after.get('mission_cfg') or {}).get('zone_cal_fine'), False)
+
+    def test_zup_command_raises_all_heights(self):
+        """(10-28 用户"把所有的就是高度往上面提高四毫米变成124")zup 4：升降的高度参数按 STM32 现在的值都加 4mm(120 -> 124)，
+        发给 STM32、存进配置 stm32_params；格式不对什么都不改。"""
+        car = self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'zup 4')], screen_zone=None, end_on='已改好')
+        sp = self.cfg_after.get('stm32_params') or {}
+        self.assertEqual({k: sp.get(k) for k in ('ZHI', 'ZGRAB', 'ZDROP', 'ZPLC', 'ZSTK', 'ZOBRAW', 'ZOBRNG')},
+                         dict(ZHI=124.0, ZGRAB=106.0, ZDROP=106.0, ZPLC=6.0, ZSTK=71.0, ZOBRAW=124.0, ZOBRNG=124.0))
+        self.assertIn('SET ZHI 124', car.requests)
+        self.assertIn('ZHI 120→124', self.log)
+        car = self.run_live(1, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+                            inputs=[(lambda: True, 'zup abc')], screen_zone=None, end_on='格式：zup')
+        self.assertNotIn('ZHI', self.cfg_after.get('stm32_params') or {})
+        self.assertFalse(any(r.startswith('SET ') for r in car.requests))
 
     def test_turnloc_command_saves(self):
         """(10-27)turnloc off：存进配置 reloc_before_turn=false(每个弯直接转)，并提醒风险；turnloc on 改回来。"""
