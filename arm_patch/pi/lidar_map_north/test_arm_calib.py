@@ -227,9 +227,9 @@ class WizardTests(unittest.TestCase):
         path = os.path.join(os.path.dirname(cfg), 'ring_teach.json')
         with open(path, 'w', encoding='utf-8') as f:                       # 以前 rteach 存的：原料区的不动，1 号环摄像头记的作废
             json.dump({'RAW': {'1': [5, 6]}, 'ROUGH': {'1': [1.0, 2.0], 'e1': [10, 20], 'src': 'rteach'}}, f)
-        saved = self.run_wiz(['1 +11', '2 -32', '',                         # R1：从以前存的 +1/+2 开始调
-                              '1 -12.5', '2 +20', '',                       # R3：没存过，从 2 号环上方开始
-                              'q'], cfg=cfg, start=STEP_KEYS.index('R1'))
+        saved = self.run_wiz(['1 -12.5', '2 +20', '',                       # (10-29 起先调 3 号环)R3：没存过，从 2 号环上方开始
+                              '1 +11', '2 -32', '',                         # R1：从以前存的 +1/+2 开始调
+                              'q'], cfg=cfg, start=STEP_KEYS.index('R3'))
         d = load(path)
         self.assertEqual(d['RAW'], {'1': [5, 6]})
         for zone in ('ROUGH', 'TEMP'):
@@ -240,8 +240,8 @@ class WizardTests(unittest.TestCase):
             self.assertNotIn('e1', d[zone])
         self.assertEqual(saved['R1'], (12.0, -30.0))
         self.assertEqual(saved['R3'], (-12.5, 20.0))
-        i = self.stm.sent.index('AF 2 -892')                               # R1 调完，R3 开始前手臂回到 2 号环上方
-        self.assertIn('AP 322.790 -862.000', self.stm.sent[i:])            # (10-28)从车上转盘那边到位：最后一下多给 0.7×ATOL
+        i = self.stm.sent.index('AF 2 -842')                               # (10-29 起先调 3 号环)R3 调完，R1 从以前存的位置开始
+        self.assertIn('AP 319.000 -860.000', self.stm.sent[i:])
         self.assertNotIn('A1P', load(cfg)['stm32_params'])                 # 1、3 号环不改 STM32 参数
         out = '\n'.join(self.lines)
         self.assertIn('还没存过', out)
@@ -409,10 +409,10 @@ class WizardTests(unittest.TestCase):
         self.wiz = arm_calib.Wizard(self.stm, self.cfg, inp=self.inp, out=self.lines.append, view=True, popen=FakeProc)
         self.wiz.run(STEP_KEYS.index('ZOBRAW'))
         modes = [('--ring' in p.args) for p in started]
-        # 物料 → 圆环 → (关了再开)圆环 → (10-26)进 R1 重新打开，按 1 号环自己的十字(--ringno 1)
+        # 物料 → 圆环 → (关了再开)圆环 → (10-29 起先调 3 号环)进 R3 重新打开，按 3 号环自己的十字(--ringno 3)
         self.assertEqual(modes, [False, True, True, True], [p.args for p in started])
         self.assertEqual([p.args[p.args.index('--ringno') + 1] if '--ringno' in p.args else None for p in started],
-                         [None, None, None, '1'], [p.args for p in started])
+                         [None, None, None, '3'], [p.args for p in started])
         self.assertTrue(all(not p.alive for p in started))                 # 退出时都关了
         self.assertTrue(any('摄像头画面已打开' in l for l in self.lines))
         self.assertTrue(any('摄像头画面已关' in l for l in self.lines))
@@ -1010,6 +1010,7 @@ class TraySideRingTests(unittest.TestCase):
 
     def test_ring_one_tuned_against_ring_two_lands_the_same_in_the_race(self):
         tune = ['1 -2', '1 +1', '',                      # 2 号环(A1P)：最后一下往车上转盘那边调
+                's',                                     # (10-29 起 2 号环以后先调 3 号环)3 号环(R3)跳过
                 '1 +3', '1 -1', '1 +0.5', '',            # 1 号环(R1)
                 'q']
         stm = self._stm()

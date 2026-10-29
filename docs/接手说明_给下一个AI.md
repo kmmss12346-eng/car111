@@ -1389,4 +1389,6 @@ git_log.txt                ← 分支最近 120 条提交记录
   _ap_from_tray_side 一条 AP；_same_approach() 返回 False(码垛 _carry_rest、回 A1P 都不再多转)。代价(模拟里 ID1 间隙 2.3° + 摩擦)：
   三个环放置误差最大约 7mm(以前 2mm 内)。run_live `swing on` 改回以前、`swing off` 不摆。测旧做法的测试都加了 arm_no_swing=False；
   新测试 test_ring13_direct_one_ap_no_turning_back。
+- **10-29(16) 用户"arm_calib 圆环对准的顺序帮我改成对完2号环之后再3号环再1号环"：** arm_calib STEPS 里 R3 挪到 R1 前面(A1P → R3 → R1)，
+  两步的说明跟着改；test_arm_calib 里按顺序喂输入的三个测试跟着改(R3 跳过 's'、先 R3 再 R1、vlive 先 --ringno 3)。
 
