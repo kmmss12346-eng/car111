@@ -4221,6 +4221,20 @@ class ZoneCalTests(unittest.TestCase):
         self.assertEqual(rings_summary(w, 'TEMP'), {1: [1, 1], 2: [5, 5], 3: [6, 6]})
         self.assertTrue(all(v == [] for v in rings_summary(w, 'ROUGH').values()))
 
+    def test_place_align_time_cap_and_direct_pickback(self):
+        """(10-29 用户"粗加工区域放下之后，夹回车上的时候这个地方不需要对准了然后放置的时候的对准时间改成不超过2s")
+        到了 zone_place_align_s 秒、还差不到 zone_place_cap_mm 就不再挪，按现在的位置放；取回都按放下时的角度直接夹。"""
+        w = self._world(1)
+        lines = []
+        h = self._make(w, extra=dict(zone_place_align_s=0.001, zone_place_cap_mm=10.0), lines=lines)
+        run_mission(w, h, log=lines.append)
+        text = '\n'.join(lines)
+        self.assertIn('对准用了', text)
+        self.assertNotIn('取回出错', text)
+        self.assertEqual((h.stats.grab_ok, h.stats.place_ok), (12, 12), text[-3000:])
+        self.assertEqual(text.count('直接取'), 6)
+        self.assertEqual((w.air, w.loose, w.collisions), (0, 0, 0))
+
     def test_pickback_goes_straight_to_the_placed_angles(self):
         """(10-27、10-28 用户"粗加工区域放在地上然后重新夹取的时候不要对准直接夹取就行了")粗加工区取回(车没动、只转手臂放的)：
         一条指令转到放下时的角度(边转边降)直接 PICK，不再先多转再分两下转回来、不再回读再转；整场 6 个都取回、12 个都放对，比以前快。

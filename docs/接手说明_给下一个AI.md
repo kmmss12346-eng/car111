@@ -1375,4 +1375,11 @@ git_log.txt                ← 分支最近 120 条提交记录
   刹车 0.7 秒，F 1700 估 2.9 秒。刹得猛可能打滑：停不准就 speed max 退回。
 - **10-29(12) 用户"走两步的等待时间都改成1.5s吧……把这个假装扫描的时间改成1.5s那两步"：** 写死模式 FIXED_WAIT1_S / FIXED_WAIT2_S 3、2 → 1.5、1.5
   (map_merge_live；配置 fixed_wait1_s / fixed_wait2_s 写了就按配置)。test_nav_live 跟着改。
+- **10-29(13) 用户"粗加工区域放下之后，夹回车上的时候这个地方不需要对准了然后放置的时候的对准时间改成不超过2s"：**
+  ①取回 `pickback_always_direct`(默认 True)：放下时记了位置的都按记下的底盘位置、手臂角度直接夹(以前只有车没动、只转手臂放的)；
+  车要开回去超过 pickback_direct_mm(30)的照旧对准(模拟里挪车放的开回去差几毫米夹不到)；出过错再取一次照旧对准；
+  直接夹转到角度后回读一次只在差 pickback_fault_deg(3°)以上补(SingleGlitch 里大动作停偏不补会撞)。
+  ②放置前对准 2 号环(停着算好再挪 calc)：从第一次算起过了 zone_place_align_s(2 秒)、还差不到 zone_place_cap_mm(3mm)就不再挪，按现在的位置放；
+  差得多照旧挪(试过不管差多少到 2 秒就放：ZoneCalTests 里放偏 8mm)。模拟里挪得快，默认参数下不会触发；实车(一次挪 + 停稳拍 3 帧约 1.5 秒)
+  第二次挪完差 1.4mm 那种就不再挪第三次。新测试 test_place_align_time_cap_and_direct_pickback。
 

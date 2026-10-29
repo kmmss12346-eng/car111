@@ -385,6 +385,9 @@ DEFAULTS = dict(
     zone_calc_moves=4,                  #   最多挪几次(还差的手臂补)
     zone_calc_frames=3,                 #   每次停着拍几帧取中间值((10-29 晚)试过 2：模拟里 2 号环和第二轮停的地方都差一点，没改)
     zone_calc_settle_s=0.15,            #   挪完等这么久再拍(车停稳)((10-29 晚)0.3 -> 0.15，和车轮连续对准的 zone_settle_s 一样)
+    zone_place_align_s=2.0,             #   (10-29 用户"放置的时候的对准时间改成不超过2s")停着算好再挪：从第一次算起过了这么多秒、
+                                        #   还差不到 zone_place_cap_mm 就不再挪，按现在的位置放(至少挪一次)；差得多照旧挪(放偏几毫米就不在环里)。0 = 不限
+    zone_place_cap_mm=3.0,
     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
@@ -470,6 +473,11 @@ DEFAULTS = dict(
                                         #   一条指令转到放下时的角度(边转边降)直接夹，不再先多转再分两下转回来、不再一遍遍回读再转；
                                         #   只回读一次，差 pickback_tol_deg 以上(大动作偶尔停偏)才补一下。放的时候照旧精确到位。False = 以前的做法
     pickback_tol_deg=1.0,
+    pickback_always_direct=True,        # (10-29 用户"在粗加工区域夹取的时候就直接夹取就行了不需要对准每转到对应角度也直接夹取")
+                                        #   放下时记下了位置的都按记下的底盘位置、手臂角度直接夹(放的时候挪过车的也是：车轮先回到那里)，不用摄像头对准；
+                                        #   转到那个角度以后也不再回读补转。False = 以前(只有车没动、只转手臂放的才直接夹，转完差 1° 以上补一下)
+    pickback_direct_mm=30.0,
+    pickback_fault_deg=3.0,             #   直接夹时转到角度以后回读一次：差这么多以上(大动作停偏，舵机出错那种)才补一下，差得少直接夹            #   放的时候挪过车、取回要开回去超过这么多 mm 的照旧对准(开一大段回去会差几毫米)
     # (10-22 用户"这个也要按顺序来")粗加工区/暂存区(含码垛)一律按任务码的顺序放(规则：必须按照任务码的顺序和位置放置)。
     #   以前的 place_order='sweep'(顺路 3→2→1)去掉了：车上配置里还写着也不再用
     zone_timeout_s=None,                # 工位里一次对准最多用几秒(到了还差一点点也按 accept_mm 放，不一直磨)
@@ -6641,9 +6649,14 @@ class MissionHooks:
             rec0, d0 = self.pose_at.get((zone, item.slot)), self.act.disp
             direct = bool(rec0 and rec0.get('arm') and self._p2.get(zone) is not None
                           and abs(float(rec0['S']) - float(d0['S'])) < 2.0 and abs(float(rec0['F']) - float(d0['F'])) < 2.0)
+            arm_only = direct
+            if rec0 and not direct and not again and cfg.get('pickback_always_direct', True):   # 出过错再取一次：照旧对准
+                far = math.hypot(float(rec0['S']) - float(d0['S']), float(rec0['F']) - float(d0['F']))
+                direct = far <= float(cfg.get('pickback_direct_mm', 30.0))   # 车要开回去一大段(挪车放的)：开回去差几毫米，照旧对准
             recorded = self._goto_recorded(zone, item, quick=direct and bool(cfg.get('pickback_quick', True)))
             if recorded and direct:
-                self.log('    按放下时的角度直接取(车没动、只转手臂放的，不再对准)')
+                self.log('    按放下时的角度直接取(车没动、只转手臂放的，不再对准)' if arm_only else
+                         '    按放下时的位置和角度直接取(不再对准)')
                 if self.nogo:
                     return True
                 self._ring_ready = self._at_obs = False
@@ -7962,10 +7975,14 @@ class MissionHooks:
             moves = []
             J = Jc[0]
             em_ = float(np.linalg.norm(c_ - goalp)) / sc
+            t_calc, cap = self.now(), float(cfg.get('zone_place_align_s', 2.0) or 0.0)
             for it in range(calc_n + 1):
                 e_ = c_ - goalp
                 em_ = float(np.linalg.norm(e_)) / sc
                 if em_ <= tol:
+                    return True, False, False, False, em_, False
+                if it > 0 and cap > 0 and self.now() - t_calc >= cap and em_ <= float(cfg.get('zone_place_cap_mm', 3.0)):
+                    self.log(f'    对准用了 {self.now() - t_calc:.1f} 秒(上限 zone_place_align_s {cap:g} 秒)：不再挪，按现在的位置放(还差 {em_:.1f}mm)')
                     return True, False, False, False, em_, False
                 if it > 0 and em_ <= calc_arm and not wonly:
                     return False, False, False, False, em_, True      # 只差一点：车轮小挪动不准，剩下的手臂补
@@ -9618,6 +9635,9 @@ class MissionHooks:
         except ArmError:
             return
         tol = float(self.cfg.get('pickback_tol_deg', 1.0))
+        if self.cfg.get('pickback_always_direct', True):
+            # (10-29 用户"每转到对应角度也直接夹取")差零点几度、一两度都直接夹；只有大动作真的停偏了(舵机出错那种)才补，免得爪子撞到东西
+            tol = max(tol, float(self.cfg.get('pickback_fault_deg', 3.0)))
         if b1 is None or b2 is None or (abs(b1 - a1) <= tol and abs(b2 - a2) <= 10.0 * tol):
             return
         self.log(f'    转到放下时的角度差了 ID1 {b1 - a1:+.1f}°、ID2 {b2 - a2:+.0f}°：补一下')
