@@ -1250,6 +1250,16 @@ def main():
             save_cfg_keys({'stop_exact':parts[1]=='on'})
             print(('已设置 stopexact on：停车点照你输入的停(按地图压到区域也不挪)，存进配置。写死模式改完停车点再输入 fixroute replan' if parts[1]=='on'
                    else '已设置 stopexact off：压到区域的停车点自动挪到最近停得下的位置，存进配置'),flush=True);return
+        if k=='midlane':
+            # (10-29 用户"从原料区域去粗加工区域…走中间这条路的时候靠近暂停区域45mm")去 ROUGH 走中间车道时整段往暂存区那边挪多少 mm
+            from route_plan import MID_LANE_SHIFT_MM
+            if len(parts)==1:
+                print(f'现在：midlane {float(raw_cfg.get("mid_lane_shift_mm",MID_LANE_SHIFT_MM)):g}(去粗加工区走中间车道往暂存区那边挪的 mm，0 = 不挪)。改：midlane 45',flush=True);return
+            if len(parts)!=2:raise ValueError('格式：midlane 45(往暂存区那边挪 45mm) / midlane 0(不挪)')
+            v=float(parts[1])
+            if not 0<=v<=100:raise ValueError('midlane 要在 0~100 mm')
+            save_cfg_keys({'mid_lane_shift_mm':v})
+            print(f'已设置 midlane {v:g}，存进配置。写死模式再输入 fixroute replan 重新规划(看“到 ROUGH”那段的提示)',flush=True);return
         if k=='turnloc':
             # (10-27 用户"到了转弯的地方不应该是立马转过去吗")离黄色区/工位/场地边近的转弯，转之前先停下用雷达确认位置(reloc_before_turn)
             on_=bool(raw_cfg.get('reloc_before_turn',True))

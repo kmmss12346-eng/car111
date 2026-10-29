@@ -10,7 +10,8 @@ import route_plan as rp
 STOPS = {'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
          'START1': [2250, 2250, 90], 'START2': [2250, 150, 90],
          'PREHOME2': [2250, 400, 90], 'PREHOME1': [2250, 2000, 90]}
-CFG = dict(stops=STOPS, car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40,
+CFG = dict(mid_lane_shift_mm=0,  # 这里测规划本身的黄色区余量；去 ROUGH 中间车道往西挪见 MidLaneShiftTests
+           stops=STOPS, car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40,
            lidar_forward_mm=22.453557227708068, lidar_left_mm=134.7743150753031,
            margin_mm=60, strafe_cost_factor=3.0, strafe_max_mm_per_leg=300, turn_margin_mm=20,
            raw_center_mm=[1200, 2480], raw_radius_mm=150, zone_margin_mm=30, drive_mode='mecanum',

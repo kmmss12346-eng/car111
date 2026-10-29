@@ -81,6 +81,11 @@ YELLOW_NOTE_MM = 40              # 一段路线离黄色区不到这么多(而�
 #   推算的车位一路偏几厘米就压到黄色区。按 45 规划时同一条车道走正中间(两边约 50mm)，还快 0.3 秒)先按离黄色区 yellow_prefer_floor_mm 规划，
 #   规划不出来、或者有停车点因此要挪开，再按原来的硬余量(yellow_floor_mm)规划。0 = 以前的做法
 YELLOW_PREFER_FLOOR_MM = 45
+# (10-29 用户"从原料区域去粗加工区域…路线有点偏向扫二维码的那边了，走中间这条路的时候靠近暂停区域45mm")
+#   去 ROUGH 的那一段走中间南北车道(x 1000~1400)时，整段往暂存区(西)挪 mid_lane_shift_mm；只要求不真的压到黄色区，挪不下就少挪。0 = 不挪
+MID_LANE_SHIFT_MM = 45
+MID_LANE_SHIFT_STOPS = ('ROUGH',)
+MID_LANE_YELLOW_MIN_MM = 5       #   挪了以后车身(含雷达)离黄色区最少留这么多
 ZONE_MARGIN_MM = 30              # 暂存区/粗加工区
 RAW_MARGIN_MM = 30               # 原料转盘
 EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
@@ -1640,6 +1645,60 @@ def check_moves(planner, pose, moves):
     return True, 'OK', end
 
 
+def _mid_lane_shift(planner, leg, cfg):
+    """(10-29)这一段走中间南北车道(x 1000~1400，旁边是黄色区)的长直行整段往西(暂存区那边)挪 mid_lane_shift_mm：
+    改它前面最后一条沿 x 的移动和后面第一条沿 x 的移动(一个少走、一个多走，终点不变，不加指令)。
+    对黄色区只要求留 mid_lane_yellow_min_mm，其他区域照原来的余量；挪不下就每次少挪 5mm 再试。返回新的 leg(没挪就是原来的)。"""
+    want = float(cfg.get('mid_lane_shift_mm', MID_LANE_SHIFT_MM) or 0.0)
+    if want <= 0 or leg.get('stop') not in tuple(cfg.get('mid_lane_shift_stops', MID_LANE_SHIFT_STOPS)):
+        return leg
+    cmds = [list(c) for c in leg['cmds']]
+    start = leg['start']
+    yaw = float(start[2])
+    pts = [tuple(start[:2])] + [tuple(p[:2]) for p in leg['poses']]
+    xu = []                                   # 每条指令每 mm 沿世界 x 走多少(R = 0)
+    seg = None
+    for i, (c, v) in enumerate(cmds):
+        if c == 'R':
+            xu.append(0)
+            yaw += v
+            continue
+        a = math.radians(yaw if c == 'F' else yaw + 90.0)
+        xu.append(int(round(math.cos(a))))
+        (x0, y0), (x1, y1) = pts[i], pts[i+1]
+        if (seg is None and c == 'F' and xu[-1] == 0 and 1000 < min(x0, x1) and max(x0, x1) < 1400
+                and abs(y1 - y0) >= 300 and any(min(y0, y1) < b and max(y0, y1) > a_ for a_, b in ((550, 1000), (1400, 1850)))):
+            seg = i
+    if seg is None:
+        return leg
+    j = next((i for i in range(seg - 1, -1, -1) if xu[i]), None)
+    k = next((i for i in range(seg + 1, len(cmds)) if xu[i]), None)
+    if j is None or k is None:
+        return leg
+    ym = max(0.0, float(cfg.get('mid_lane_yellow_min_mm', MID_LANE_YELLOW_MIN_MM)))
+    items = [(it[:7] + tuple(min(m, ym) for m in it[7:11])) if it[1] == 'yellow' else it for it in planner.items]
+    sh = 5.0 * int(want // 5.0)
+    while sh >= 5.0:
+        cm = [list(c) for c in cmds]
+        cm[j][1] -= sh * xu[j]                # 往西 = 世界 x 少 sh
+        cm[k][1] += sh * xu[k]
+        cm = _clean(cm)
+        ok, g, idx, what, poses, mins = _moves_eval(planner.body, items, start, cm)
+        if ok:
+            yg = [mins[q] for q, it in enumerate(items) if it[1] == 'yellow']
+            real = [mins[q] for q, it in enumerate(items) if not (it[1] == 'edge' and it[8] <= 0)]
+            out = dict(leg, cmds=cm, poses=[(p[0], p[1], wrap180(p[2])) for p in poses],
+                       time_s=round(planner.motion.route_time(cm), 2),
+                       yellow_mm=round(min(yg), 1) if yg else None,
+                       min_gap_mm=round(min(real), 1) if real else None)
+            out['note'] = '；'.join(t for t in (leg.get('note') or '', f'中间车道往暂存区那边挪 {sh:.0f}mm(mid_lane_shift_mm)，'
+                                                 f'车身(含雷达)离黄色区最近 {min(yg):.0f}mm' if yg else '') if t)
+            out['mid_lane_shift'] = sh
+            return out
+        sh -= 5.0
+    return leg
+
+
 def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, planner=None, near=False):
     """按停车点顺序逐段规划。start_pose/stops 都是车身中心 (x, y, 车头)。
     start_pivot 给定时直接用它当起点转轴点（例如第二站斜着停、原地转回正后的转轴位置）。
@@ -1661,7 +1720,7 @@ def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, plan
             leg, why = _near_leg(planner, pose, (gx, gy, gyaw), name, why, cfg)
         if leg is None:
             return legs, f'去 {name} 的路线失败：{why}', planner
-        legs.append(leg)
+        legs.append(_mid_lane_shift(planner, leg, cfg))
         g = leg['goal']
         pv = planner.pivot_of(g[0], g[1], g[2])
         pose = (pv[0], pv[1], yaw_of(heading_index(g[2])))

@@ -1346,3 +1346,9 @@ git_log.txt                ← 分支最近 120 条提交记录
   要在比赛停车点上重调 A1P/R1/R3；等用户发前面"圆环在画面里/看到 3 个圆环/夹角"那几行确认。
 - 已知：test_ringdet.SchoolTargetTests.test_empty_target_near_and_under_claw 在这台电脑上早就不过(0d408cf 也不过)：R=90 (337,260) 误差 0.602 像素，
   R=130 (337,283) 最近的结果是个半径 25 的小圆(离真圆心 15 像素)。是校赛靶(粗黑环 + 白心 + 数字)的合成图，和今天的改动无关，没改。
+- **10-29(7) 用户"从这个原料区域去这个粗加工区域的时候这个路线有点偏向扫二维码的那边了可以走中间这条路的时候靠近暂停区域45mm改这个就好了"：**
+  route_plan `_mid_lane_shift`(在 `_plan_mission` 每段规划完调用)：去 mid_lane_shift_stops(默认 ROUGH)的那段，有一条在 x 1000~1400、
+  旁边是黄色区的长南北直行，就把它前面最后一条沿 x 的移动少走、后面第一条沿 x 的移动多走 mid_lane_shift_mm(默认 45)，整段往西挪，
+  终点不变、不加指令；对黄色区只要求 mid_lane_yellow_min_mm(5)，其他区域照原余量，挪不下每次少 5mm。实车那条
+  (RAW 1080,2155 → 后退100…前进1700…后退25)变成后退55…后退5(5mm 的那条 flatten 并进下一条同方向的)，车道里 x 1180→1135。
+  test_route_safety / test_route_margin 测的是规划本身的黄色区余量，CFG 里 mid_lane_shift_mm=0；新测试 MidLaneShiftTests。run_live `midlane N`。

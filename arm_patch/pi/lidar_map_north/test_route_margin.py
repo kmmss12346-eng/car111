@@ -4,7 +4,8 @@ import unittest
 import route_plan as rp
 
 # 停车点、车身尺寸和您的 map_config_start2_roi.json 一样
-CFG = dict(stops={'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
+CFG = dict(mid_lane_shift_mm=0,  # 这里测规划本身的黄色区余量；去 ROUGH 中间车道往西挪见 MidLaneShiftTests
+           stops={'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
                   'START2': [2250, 150, 90]},
            car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40, lidar_forward_mm=22.45, lidar_left_mm=134.77,
            margin_mm=60, strafe_cost_factor=3.0, strafe_max_mm_per_leg=300, turn_margin_mm=20,
@@ -103,6 +104,41 @@ class YellowMarginTests(unittest.TestCase):
         # 车头朝北，车身后边离黄色区只有 10mm(最低要 35)
         self.assertIn('离黄色区不到 35mm', p.why_blocked(1600, 1850 + 145 + 10, 1))
         self.assertEqual(p.why_blocked(1600, 1850 + 145 + 35, 1), '')
+
+
+class MidLaneShiftTests(unittest.TestCase):
+    """(10-29 用户"从原料区域去粗加工区域…走中间这条路的时候靠近暂停区域45mm")去 ROUGH 走中间南北车道时整段往西(暂存区那边)挪。"""
+
+    def plan(self, shift):
+        c = dict(CFG, mid_lane_shift_mm=shift)
+        c['stops'] = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1080, 2155, 180], ROUGH=[1130, 350, 0], TEMP=[310, 1250, -90])
+        legs, why, _ = rp.plan_mission(c, [], (2198, 228, 90), ['QR', 'RAW', 'ROUGH', 'TEMP'])
+        self.assertEqual(why, 'OK')
+        return legs
+
+    @staticmethod
+    def lane_x(leg):
+        xs = [p[0] for p, q in zip(leg['poses'], leg['poses'][1:]) if abs(p[0] - q[0]) < 0.5 and abs(p[1] - q[1]) > 1000]
+        return xs[0]
+
+    def test_rough_leg_moves_45_west_same_goal(self):
+        old, new = self.plan(0), self.plan(45)
+        self.assertAlmostEqual(self.lane_x(old[2]) - self.lane_x(new[2]), 45, delta=0.5)
+        self.assertEqual(len(new[2]['cmds']), len(old[2]['cmds']))          # 不加指令，只改前后两条沿 x 的移动
+        self.assertEqual(new[2]['goal'], old[2]['goal'])
+        self.assertGreaterEqual(new[2]['yellow_mm'], rp.MID_LANE_YELLOW_MIN_MM - 0.1)
+        self.assertIn('往暂存区那边挪 45mm', new[2]['note'])
+        for a, b in zip(old, new):                                          # 别的段不动
+            if a['stop'] != 'ROUGH':
+                self.assertEqual(a['cmds'], b['cmds'])
+        c = dict(CFG)
+        ok, g, idx, what = rp.moves_clear(c, [], new[2]['start'], new[2]['cmds'], margin_mm=0)
+        self.assertTrue(ok, what)
+
+    def test_shrinks_when_45_would_touch_yellow(self):
+        legs = self.plan(80)
+        self.assertGreaterEqual(legs[2]['yellow_mm'], rp.MID_LANE_YELLOW_MIN_MM - 0.1)
+        self.assertLess(legs[2]['mid_lane_shift'], 80)
 
 
 if __name__ == '__main__':
