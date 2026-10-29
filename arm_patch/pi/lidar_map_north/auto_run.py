@@ -1647,7 +1647,9 @@ def _hold(ctx, tick, t_end, sleep=time.sleep):
 def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0.8, hooks=None, cfg=None, scanned=False):
     """first_scan=True: 完整流程(scanned=True：第一次扫描开跑前已经做好了，屏幕选区一键启动时)；False: 只按当前已规划的路线行驶。
     1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。
-    (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。"""
+    (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。
+    (10-29 晚)按了 START 原地等 fixed_wait1_s(默认 3)秒；存的路线是从起点规划的(second_move=False，fixroute replan 默认这样)：
+    不做第二站动作、不再等，直接开。"""
     cfg = cfg or {}
     fx = ctx.fixed_route() if (first_scan and not scanned and hasattr(ctx, 'fixed_route')) else None
     t_go = float((fx or {}).get('t0') or time.monotonic())
@@ -1684,9 +1686,12 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if not ok:
             raise Abort(f'STM32 不认识 HOME：{reply}（STM32 程序是不是新版）')
         if fx:
-            log(f'① 写死模式：不扫描、不规划，用存好的地图和路线；原地等 {float(fx["wait1"]):g} 秒(从开跑算)……')
+            w1 = float(fx.get('wait1') or 0.0)
+            log('① 写死模式：不扫描、不规划，用存好的地图和路线' +
+                (f'；原地等 {w1:g} 秒(从开跑算)……' if w1 > 0 else '；不等，直接开'))
             ctx.fixed_first()
-            _hold(ctx, tick, t_go + float(fx['wait1']))
+            if w1 > 0:
+                _hold(ctx, tick, t_go + w1)
             log(f'  (开跑到现在 {time.monotonic() - t_go:.1f} 秒)')
         elif not scanned:
             log('① 第一次扫描：车保持不动……')
@@ -1703,18 +1708,21 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         else:
             log('① 第一次扫描开跑前已经做好了。')
         rel = cfg.get('second_relative_moves', DEFAULT_SECOND_MOVES)
-        log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
-        t_ph = time.monotonic()
-        ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
-        if not ok:
-            raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
-        err = parse_done(reply).get('err')
-        if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
-            raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
-        log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
+        if fx and not fx.get('second_move', True):
+            log('② 写死模式：存的路线是从起点规划的，不走第二站，直接开')
+        else:
+            log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
+            t_ph = time.monotonic()
+            ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
+            if not ok:
+                raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
+            err = parse_done(reply).get('err')
+            if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
+                raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
+            log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
         if fx:
-            w2 = float(fx.get('wait2') or 0.0)
-            if w2 > 0:                                      # (10-29 晚)默认 0：第二站动作做完直接开
+            w2 = float(fx.get('wait2') or 0.0) if fx.get('second_move', True) else 0.0
+            if w2 > 0:
                 t_ph = time.monotonic()
                 getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
                 log(f'③ 写死模式：不扫描，原地等 {w2:g} 秒……')

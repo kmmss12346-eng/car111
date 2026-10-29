@@ -1179,6 +1179,30 @@ git_log.txt                ← 分支最近 120 条提交记录
     改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
     **用户跑了 zup 4 以后说"不对不是的，只需要把这个最高点改上去就好了，其他的点不要改"**：用户要的只是 ZHI 120→124。
     让用户 `zup -4 ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG` 改回去(车上实际的值：ZGRAB 102、ZDROP 104、ZPLC 2、ZSTK 67、ZOBRAW/ZOBRNG 120)。
+- **10-29(4) 用户"现在先这样你先按照我说的做把这个其他地方放到雷达校准也都去掉，然后……按这个红色按钮之前就把这个准备工作做好就行了，
+  按完红色按钮等三秒就直接跑你先做这个"、"赶紧做好这两个……其他的别管了"(前一句是"算了你把整个时间改短吧能改多短减多短")：**只做了这两件。
+  - 按 START 之前准备(提交 73f6451)：race 写死模式在等 START 之前 sync_changed 同步参数(STM32 重新上电后近百个参数，实车 14.6 秒)、
+    firmware_caps 问 rdec、hooks.prepare(实车 3~8 秒)；按了 START 不再同步(cfg `_presynced`)、不再 GET(r_decimals 带进去)。
+  - 等 3 秒直接跑：合了 10-29(3) 搁置补丁里"不走第二站"那一部分(fixed_route snapshot/load/describe 的 second_move；map_merge_live
+    fixed_from_start / fixed_second_move、fixed_second_pose 用 views[0]、route_start 不用 second_icp、_reference 不报第二站对齐、
+    plan() 写死模式不等参考点云、mission_body cw_=0、fixroute replan 默认从起点规划(配置 fixed_second_move=true 才从第二站)、
+    fixroute save 提示再 replan；auto_run second_move=False 不做第二站动作、不等 wait2)。fixed_wait1_s 默认 3、fixed_wait2_s 默认 0。
+    **用户要在车上输一次 `fixroute replan`**(车不动)，存的路线才是从起点的；不输照旧 3 秒 → 第二站动作 → 直接开。
+  - 路上不雷达定位：写死模式 mission_body 传给 run_mission 的 cfg 加 reloc_before_turn=False、reloc_after_turn_near=False、
+    reloc_after_turn=False、reloc_stops=['PREHOME','START']：只有回家前(PREHOME)和进启停区定位(用户 10-23 也是这么要的；10-27/10-28 加的
+    转弯前、转完弯贴着黄色区的定位在写死模式里关掉)。自己规划的模式不变(`turnloc off` 只关转弯前那种)。
+  - 测试：test_nav_live 写死那轮 '雷达定位：车在' 只有 1 次(PREHOME)、没有转弯前/直行前定位，自己规划那轮 ≥3 次；
+    test_fixroute_replan_from_start_then_fixed_race_goes_straight_away(按 START 前同步、等 3 秒、不走第二站、开跑到现在 2.9~4 秒)；
+    test_nav_race 两条(presync、从起点不等)。
+  - **没上车、撤回的(用户"其他的别管了")：**zone_calc_speed 30→60、raw_center_speed 15→25、做完挪回停车点 vel_back_speed 60、
+    ring13_return_tol_deg 0.45、turntune 后面写 TCLAG、每站"时间花在"各指令用时(arm_link.tstat)、车上配置写着旧默认值时运行时换新值
+    (OLD_SPEED_DEFAULTS)。补丁 `docs/搁置的改动/speedup_rest_1029c.patch`(对这次提交以后的代码)，要用 `git apply` 再跑测试。
+    10-29(3) 的 `speedup_station_nosecond_1029.patch` 里不走第二站那部分已经合进来了，剩下的都在新补丁里。
+  - 整轮时间(实车 10-29 上午写死那次)：按 START→出发 11 秒、到 QR 5.4、QR→RAW 19、RAW 56(原料盘中心偏 87mm、15mm/s 挪了约 9 秒)、
+    RAW→ROUGH 15、ROUGH 93、ROUGH→TEMP 11、TEMP 约 55、TEMP→RAW 约 10、第二批 RAW 约 50：做完一轮、第二轮抓三个要 320 秒左右，
+    比赛一轮只有 180 秒。sim_mission 的 ZoneCal 模拟按用户手臂参数估 ROUGH 56、TEMP 33、RAW 37~42 秒(实车多出来的那部分没查清，
+    补丁里的"时间花在"那一行就是为了查它)。还能省的：RAW 停车点被规划按原料转盘可能的整个范围挪开 100mm(车轮挪回去要 9 秒)、
+    ROUGH 停车点改 (1205,325)、TEMP 改 y≈1300(对准挪车少)，`speed max`，手臂 LFRPM/CLWAIT/ROTSPD 加一点(用户说过升降"不要太快")。
 - **10-29 用户跑了写死模式(ROUGH 1155 300、TEMP 310 1150、ZOBRAW 124)，跑到暂存区按 q/abort：**"暂存区域的y轴不能减少要和原来的一样"、
   "放置二号环的时候……一直有一个偏向3号环的固定偏差"、"启动的按钮也不是红色的是绿色的而且没有覆盖整个屏幕只是覆盖了屏幕的一半"。
   - `fixroute replan`(map_merge_live)：程序重开过、没有扫描时 stop 改了停车点也能更新写死路线：载入存的 views/objects、state['config'] = 存的

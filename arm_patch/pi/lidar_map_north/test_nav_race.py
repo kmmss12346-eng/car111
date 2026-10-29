@@ -599,6 +599,42 @@ class RunMissionTests(unittest.TestCase):
         self.assertIn('GET', calls)
         self.assertIn('SYNC', calls)
 
+    def test_fixed_route_from_start_goes_straight_away(self):
+        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")写死模式、存的路线是从起点规划的(second_move=False)、
+        两次原地等 0 秒：不做第二站动作、不等，按了 START 马上按存好的路线开。"""
+        calls = []
+        stamp = {}
+
+        class FixedCtx(MissionCtx):
+            t0 = None
+
+            def fixed_route(self):
+                return dict(wait1=0.0, wait2=0.0, t0=self.t0, second_move=False)
+
+            def fixed_first(self):
+                calls.append('fixed_first')
+
+            def fixed_second(self):
+                calls.append('fixed_second')
+
+            def plan(self):
+                calls.append('plan')
+                stamp['plan'] = time.monotonic()
+                return 0, [{'stop': 'QR', 'cmds': [('S', 150), ('F', 1100)]}], 'ROUTE OK'
+        ctx = FixedCtx(calls)
+        ctx.t0 = time.monotonic()
+        logs = []
+        auto_run.run_mission(ctx, RecLink(calls), log=logs.append, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
+        self.assertEqual(calls[:7], ['start_clock', 'ping', 'prepare', 'home', 'fixed_first', 'fixed_second', 'plan'])
+        self.assertNotIn('second_move', calls, '不走第二站')
+        self.assertIn('task QR', calls)
+        self.assertLess(stamp['plan'] - ctx.t0, 0.3, '不等')
+        text = '\n'.join(logs)
+        self.assertIn('不等，直接开', text)
+        self.assertIn('② 写死模式：存的路线是从起点规划的，不走第二站，直接开', text)
+        self.assertNotIn('③', text)
+        self.assertNotIn('走第二站：左移', text)
+
     def test_prepare_error_does_not_stop(self):
         calls = []
 

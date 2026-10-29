@@ -2,17 +2,19 @@
 
     fixroute          看写死模式开没开、存的是哪条路线
     fixroute save     把刚才规划好(跑过)的路线和这次的地图存下来(fixed_route.json，和配置文件放在一起)
-    fixroute replan   (10-29)stop 改了停车点以后：车不动，按存着的地图、从存的第二站车位按现在的停车点重新规划，再存(不用再跑一遍)
+    fixroute replan   (10-29)stop 改了停车点以后：车不动，按存着的地图、按现在的停车点重新规划，再存(不用再跑一遍)。
+                      (10-29 晚)默认从起点规划(按了 START 不走第二站，直接开)；配置 fixed_second_move=true 才从存的第二站车位规划
     fixroute on       打开写死模式(存进配置)
     fixroute off      关掉，race / go 照常自己扫描、规划
 
-写死模式 race 1 / race 2：先同步参数、准备机械臂(收臂、清旧任务码、开摄像头)，再等屏上按 START：按了以后原地等 3 秒(不扫描)→ 第二站动作
-(左移、前进、转)→ 不再等，不规划，按存好的路线跑，二维码那里不做站点扫描。
-(10-29 晚 用户"大概要15s，把时间压缩一下，压缩到8s到10s左右"、"你先让这些准备好……我按下之后就可是停三秒直接走了")以前同步参数、
-机械臂准备都在按了 START 以后(STM32 重新上电后同步要十几秒)，还要等 3 秒、第二站、再等 3 秒。现在按 START 到开出启停区约 9.6 秒。
-两次等几秒在配置里改：fixed_wait1_s(默认 3) / fixed_wait2_s(默认 0)。
-跑的时候雷达定位照常做：和存下来的地图(存的时候那两次扫描)对位置。所以障碍物要摆在存的时候的位置，车放在同一个启停区。
-存的路线是从第二站算的(和自己规划时一样)。"""
+写死模式 race 1 / race 2：先同步参数、准备机械臂(收臂、清旧任务码、开摄像头)，再等屏上按 START：按了以后原地等 3 秒(不扫描)，
+不规划，按存好的路线跑，二维码那里不做站点扫描。路线是 fixroute replan 从起点规划的(second_move=False)：等完直接从起点开；
+fixroute save 存的(跑的时候从第二站规划的)先做第二站动作(左移、前进、转)再开。
+(10-29 晚 用户"大概要15s，把时间压缩一下"、"我按下之后就可是停三秒直接走了"、"能改多短减多短")以前同步参数、机械臂准备都在按了 START
+以后(STM32 重新上电后同步要十几秒)，还要等 3 秒、第二站、再等 3 秒、转回来：按 START 到开出启停区约 15 秒，现在约 4 秒。
+两次等几秒在配置里改：fixed_wait1_s(默认 3) / fixed_wait2_s(默认 0，只在走第二站时有用)。
+(10-29 晚 用户"把这个其他地方放到雷达校准也都去掉")跑的时候路上不再停下来用雷达定位(转弯前、转完弯、到站都不定位)，只有回家前(PREHOME)
+和进启停区才和存下来的地图(存的时候那两次扫描)对位置。所以障碍物要摆在存的时候的位置，车放在同一个启停区。"""
 import json
 import os
 import shutil
@@ -33,8 +35,9 @@ def path_for(config_path):
     return Path(config_path).with_name(FILE_NAME)
 
 
-def snapshot(state, views, objects, zone, now=time.localtime):
-    """现在的路线和地图 -> 存进文件的内容。没有两次扫描、没有规划好的全程路线就抛 ValueError(说清楚先做什么)。"""
+def snapshot(state, views, objects, zone, now=time.localtime, second_move=True):
+    """现在的路线和地图 -> 存进文件的内容。没有两次扫描、没有规划好的全程路线就抛 ValueError(说清楚先做什么)。
+    second_move = 这条路线是从第二站车位规划的(跑的时候先做第二站动作)；False = 从起点规划的(按了 START 等完直接开)。"""
     legs = list(state.get('legs') or [])
     if len(views) < 2:
         raise ValueError('还没有两次扫描：先正常跑一次(race 2 / go)，或者 scan → p2 → second 规划好路线，再 fixroute save')
@@ -46,7 +49,8 @@ def snapshot(state, views, objects, zone, now=time.localtime):
         raise ValueError('不知道这条路线是从哪个车位规划的：先 route 规划全程，再 fixroute save')
     out = dict(version=VERSION, saved_at=time.strftime('%m-%d %H:%M', now()), zone=int(zone), legs=legs,
                views=list(views[:2]), objects=list(objects), path=list(state.get('path') or []),
-               plan_start=state.get('plan_start') or legs[0].get('start'))    # 跑完 plan_start 清掉了：第一段的起点就是它
+               plan_start=state.get('plan_start') or legs[0].get('start'),    # 跑完 plan_start 清掉了：第一段的起点就是它
+               second_move=bool(second_move))
     for k in STATE_KEYS:
         out[k] = state.get(k)
     return out
@@ -95,6 +99,7 @@ def load(path):
             snap[k] = tuple(snap[k])
     for k in ('path', 'plan_obs', 'sealed'):
         snap[k] = [tuple(q) for q in snap.get(k) or []]
+    snap['second_move'] = bool(snap.get('second_move', True))   # 10-29 晚以前存的都是从第二站规划的
     return snap
 
 
@@ -124,4 +129,5 @@ def describe(snap):
     legs = snap.get('legs') or []
     t = sum(float(L.get('time_s') or 0.0) for L in legs)
     return (f'启停区 {snap.get("zone")}，{snap.get("saved_at") or "?"} 存的，{len(legs)} 站 ' + '→'.join(str(L.get('stop')) for L in legs)
-            + f'，障碍物 {len(snap.get("objects") or [])} 个' + (f'，预计行驶 {t:.0f} 秒' if t > 0 else ''))
+            + f'，障碍物 {len(snap.get("objects") or [])} 个' + (f'，预计行驶 {t:.0f} 秒' if t > 0 else '')
+            + ('，先走第二站再开' if snap.get('second_move', True) else '，从起点直接开(不走第二站)'))

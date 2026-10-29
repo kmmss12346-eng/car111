@@ -657,7 +657,7 @@ class LiveTests(unittest.TestCase):
     def test_fixroute_save_then_fixed_race(self):
         """(10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")先正常 race 2 跑一整轮，fixroute save 存下路线和地图，
         fixroute on；车放回起点再 race 2：只等屏上按 START，按了以后不扫描、不规划(原地等 → 第二站动作 → 再等)，按存好的路线跑完回到
-        启停区，路上雷达定位照常(用存的地图)。还没存不能打开；启停区不对不开跑。"""
+        启停区；(10-29 晚)路上不再用雷达定位，只有回家前(PREHOME)用存的地图定位。还没存不能打开；启停区不对不开跑。"""
         start = (2250.0, 150.0, 90.0)
         mark = {}
 
@@ -687,6 +687,7 @@ class LiveTests(unittest.TestCase):
         first, fx = log[:log.index('已存好写死路线')], log[log.rindex('★ 按了 START'):]
         self.assertIn('第一次扫描', first)
         self.assertIn('规划全程路线', first)
+        self.assertGreaterEqual(first.count('雷达定位：车在'), 3, '自己规划的那一轮路上照旧雷达定位(只有写死模式不定位)')
         self.assertIn('存在 fixed_route.json', log)
         self.assertIn('写死路线是启停区 2 的，现在是启停区 1', log)
         # 第二轮：屏上出 START(ZONE 2)、按了以后锁屏，不扫描、不规划，原地等两次
@@ -704,7 +705,11 @@ class LiveTests(unittest.TestCase):
         import re
         m = re.search(r'\(开跑到现在 ([\d.]+) 秒\)', fx)
         self.assertTrue(m and float(m.group(1)) >= 0.5, fx[:2000])
-        self.assertGreaterEqual(fx.count('雷达定位：车在'), 4, '写死模式路上照样用雷达定位(按存的地图)')
+        # (10-29 晚 用户"把这个其他地方放到雷达校准也都去掉")写死模式路上不再停下来雷达定位，只有回家前(PREHOME)用存的地图定位
+        self.assertEqual(fx.count('雷达定位：车在'), 1, fx[-4000:])
+        self.assertIn('◆ 雷达定位：车在', fx[fx.index('到达 PREHOME'):], '回家前照样定位')
+        for word in ('转弯前雷达定位', '直行前雷达定位', '转弯后雷达定位'):
+            self.assertNotIn(word, fx)
         # 第二轮跑的就是存下来的路线：转弯、前进、横移的指令和第一轮差不多一样(修正的小动作不算)
         big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
         self.assertGreaterEqual(len(big), 8, big)
@@ -789,6 +794,77 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(goals['TEMP'][:2], [340.0, 1160.0])
         self.assertEqual(len(snap['views']), 2)
         self.assertEqual(len(car.sent), mark['sent'], '重新规划车不动')
+
+    def test_fixroute_replan_from_start_then_fixed_race_goes_straight_away(self):
+        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内"、"按这个红色按钮之前就把这个准备工作做好就行了，按完红色按钮
+        等三秒就直接跑")fixroute replan 默认从起点规划(存 second_move=False)；写死模式 race 2：按 START 之前先同步参数、准备机械臂，
+        按了以后等 3 秒、不走第二站，直接按存好的路线开；路上不用雷达定位(只有回家前)，跑完回到启停区。"""
+        start = (2250.0, 150.0, 90.0)
+        mark = {}
+
+        def said(t, n=1):
+            return lambda: self.out_text().count(t) >= n
+
+        def back_to_start():
+            if '已打开写死模式' not in self.out_text():
+                return False
+            car = WORLD['car']
+            with car.lock:
+                car.x, car.y, car.yaw = start
+                car.g_off = 0.0
+                car.T = car.yaw
+                mark.update(trace=len(car.trace), req=len(car.requests), sent=len(car.sent))
+            return True
+        inputs = [(lambda: True, 'race 2'), (said('路线全部走完'), 'fixroute save'), (said('已存好写死路线'), 'reset'),
+                  (said('已清空历史'), 'fixroute replan'), (said('已重新规划、存好写死路线'), 'fixroute on'),
+                  (lambda: said('已打开写死模式')() and back_to_start(), 'race 2')]
+        car = self.run_live(2, dict(scale=0.01, drift_deg=0.05, resid_deg=0.2), timeout=150.0,
+                            cfg_extra=dict(race_auto=False, race_start='now'), inputs=inputs, screen_zone=None,
+                            done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t,
+                            keep=('fixed_route.json',))
+        log = self.log
+        self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
+        self.assertIn('想按了 START 直接从起点开', log, 'fixroute save 提醒可以 replan')
+        self.assertIn('从起点 (2250,150) 按现在的停车点重新规划(跑的时候不走第二站，按了 START 等完直接开)', log)
+        self.assertIn('从起点直接开(不走第二站)', log)
+        snap = self.kept['fixed_route.json']
+        self.assertIs(snap['second_move'], False)
+        self.assertLess(abs(float(snap['turn_back'] or 0.0)), 0.5, '从起点规划：不用先转回来')
+        s0 = snap['legs'][0]['start']
+        self.assertLess(math.hypot(s0[0] - start[0], s0[1] - start[1]), 1.0, s0)
+        fx = log[log.rindex('★ 按了 START'):]
+        pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
+        self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre, '按 START 之前准备好')
+        self.assertIn('STM32 参数按 START 之前已经同步好了', fx, '按了 START 不再同步')
+        self.assertIn('② 写死模式：存的路线是从起点规划的，不走第二站，直接开', fx)
+        self.assertIn('原地等 3 秒(从开跑算)', fx, '(10-29 晚 用户"按完红色按钮等三秒就直接跑")')
+        import re
+        m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
+        self.assertTrue(m and 2.9 <= float(m[-1]) <= 4.0, (m, fx[:2000]))
+        for word in ('转弯前雷达定位', '直行前雷达定位', '转弯后雷达定位'):
+            self.assertNotIn(word, fx, '写死模式路上不用雷达定位')
+        self.assertIn('◆ 雷达定位：车在', fx[fx.index('到达 PREHOME'):], '回家前照样定位')
+        self.assertNotIn('走第二站：左移', fx)
+        self.assertNotIn('③ 写死模式', fx)
+        for word in ('第一次扫描', '第二次扫描', '规划全程路线'):
+            self.assertNotIn(word, fx)
+        first = [(c, v) for c, v, *_ in car.sent[mark['sent']:]][:3]
+        self.assertNotIn(('R', -60), first, f'不走第二站：{first}')
+        self.assertNotIn(('S', 42), first, f'不走第二站：{first}')
+        # 车就在起点：第一段照存的走，不能按"存的地图里第二站的车位"补偏差(那样会少走 84、少横移 42，二维码那站停偏)
+        plan0 = [(c, v) for c, v in snap['legs'][0]['cmds'] if c in ('F', 'S')]
+        sent0 = [(c, v) for c, v in first if c in ('F', 'S')][:len(plan0)]
+        self.assertEqual([c for c, _ in sent0], [c for c, _ in plan0], (sent0, plan0))
+        for (c, v), (_, w) in zip(sent0, plan0):
+            self.assertLess(abs(v - w), 25, f'第一段 {c} 发了 {v}，存的是 {w}：按错的起点补了偏差')
+        self.assertIn('这次不走第二站，车在起点', fx)
+        self.assertNotIn('第二站雷达对齐：实际车位', fx)
+        goal = auto_run.inset_goal(start, self.cfg_after)
+        p = car.pose()
+        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'写死模式没回到出发位置：{p}')
+        tr = car.trace[mark['trace']:]
+        k0 = next(i for i, q in enumerate(tr) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
+        self.assertGreaterEqual(edge_min(tr[k0:], self.cfg_after), 0.0)
 
     def test_fixroute_off_by_default_and_needs_a_saved_route(self):
         """fixroute 看现在：默认关着；没存过路线 fixroute save 要先有两次扫描、fixroute on 不打开。"""
