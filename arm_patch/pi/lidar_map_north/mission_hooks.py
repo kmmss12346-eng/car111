@@ -308,7 +308,8 @@ DEFAULTS = dict(
     tilt_precorrect=False,               # 车身和圆环那一排不平行(车停斜了)：看三个环时算出斜了几度，挪到每个环以后离圆环远/近多少，
                                         #   第一次测量之前手臂伸缩(必要时 ID1)就先补上
     tilt_warn_deg=3.0,                  # 斜到这么多度就在终端打 ★ 提醒"把车摆正"
-    survey_frames=None,                    # 到工位看三个圆环时拍几帧
+    survey_frames=3,                       # 到工位看三个圆环时拍几帧(None = vision 的 frames 5 帧)。(10-29 晚 用户"粗加工区域和暂存区域的识别时间
+                                           #   太长了要20s左右")None(5 帧) -> 3：实车一帧零点几秒
     survey_look_again=True,             # (10-28)只看到两个环、"爪子下面这个是 2 号"和"那一头看得到却没有环"两种认法对不上、或者两头都在画面外
                                         #   (车可能停偏了一个环)：底盘沿这一排挪过去看一眼再定，再挪回 2 号环那边。False = 照以前按"车停在 2 号环"算
     survey_look_max_mm=220.0,           # 上面那一眼底盘最多挪多少毫米(挪这么多还看不到那一头就不挪，按"车停在 2 号环"算)
@@ -382,8 +383,8 @@ DEFAULTS = dict(
                                         #   算好要挪多少，S/F 一次挪过去，停稳再拍，按这一下实际走的修正车轮和画面的对应关系，还差再算再挪。
                                         #   False = 以前的边走边对(V 连续)
     zone_calc_moves=4,                  #   最多挪几次(还差的手臂补)
-    zone_calc_frames=3,                 #   每次停着拍几帧取中间值
-    zone_calc_settle_s=0.3,             #   挪完等这么久再拍(车停稳)
+    zone_calc_frames=3,                 #   每次停着拍几帧取中间值((10-29 晚)试过 2：模拟里 2 号环和第二轮停的地方都差一点，没改)
+    zone_calc_settle_s=0.15,            #   挪完等这么久再拍(车停稳)((10-29 晚)0.3 -> 0.15，和车轮连续对准的 zone_settle_s 一样)
     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
@@ -503,7 +504,8 @@ PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑
 
 # (10-29 晚 用户"原料区域对准……暂停区域对准……太慢了")车上配置的 mission_cfg 是以前 apply_mission_config 按当时的默认值整个写进去的：
 # 写着这些旧的默认值 = 没人改过，按 DEFAULTS 里现在的值用(MissionHooks._upgrade_old_speeds；不改配置文件)
-OLD_SPEED_DEFAULTS = {'raw_center_speed': (15.0,), 'zone_calc_speed': (20.0, 30.0)}
+OLD_SPEED_DEFAULTS = {'raw_center_speed': (15.0,), 'zone_calc_speed': (20.0, 30.0),
+                      'survey_frames': (None,), 'zone_calc_settle_s': (0.3,)}
 
 
 def deep_merge(base, extra):
@@ -958,14 +960,17 @@ class MissionHooks:
         mc = self.raw_cfg.get('mission_cfg') or {}
         said = []
         for k, olds in OLD_SPEED_DEFAULTS.items():
+            if k not in mc:
+                continue
             v = mc.get(k)
             try:
-                hit = v is not None and any(abs(float(v) - float(o)) < 1e-9 for o in olds)
+                hit = any((v is None and o is None) or (v is not None and o is not None and abs(float(v) - float(o)) < 1e-9)
+                          for o in olds)
             except (TypeError, ValueError):
                 hit = False
             if hit and self.cfg.get(k) != DEFAULTS[k]:
                 self.cfg[k] = DEFAULTS[k]
-                said.append(f'{k} {float(v):g}→{DEFAULTS[k]:g}')
+                said.append(f'{k} {"null" if v is None else format(float(v), "g")}→{DEFAULTS[k]:g}')
         if said:
             self.log('  (配置里这几个对准速度还是以前的默认值，按现在的用：' + '、'.join(said) + ')')
 
@@ -7437,12 +7442,31 @@ class MissionHooks:
         self._p2[zone] = (a1, a2)
         self._p2_at[zone] = (float(self.act.disp['S']), float(self.act.disp['F']))
         self._anchor_mark(zone)
+        self._stop_hint(zone)
         self._gap_mark(zone, err2)
         self._learn_from(zone, 2)
         self.log(f'    2 号环对准了(ID1 {a1:.1f}°、ID2 {a2:.1f}°)：1、3 号环只转手臂过去(' +
                  ('按 arm_calib 调的角度' if cal else '示教的、或者按环距算的') + ')，车不再动')
         self._teach_fix[zone] = self._teach_photo(zone) if not cal else {1: (0.0, 0.0), 3: (0.0, 0.0)}
         return self._p2[zone]
+
+    def _stop_hint(self, zone):
+        """(10-29 晚 用户"粗加工区域和暂存区域的识别时间太长了要20s左右")2 号环对上了：车轮为了对准挪了一大段(实车粗加工区挪了 59mm，
+        要挪 3 次、每次停下拍几帧)，日志里写出"停车点改成对上时车在的地方"的命令，改了以后到了只用挪一点(1、2 次)。每个区只说一次。"""
+        said = self.__dict__.setdefault('_stop_hint_said', set())
+        d = self.act.disp if self.act is not None else None
+        pose = self._stop_pose(zone)
+        if zone in said or d is None or pose is None:
+            return
+        s_, f_ = float(d['S']), float(d['F'])
+        if math.hypot(s_, f_) < float(self.cfg.get('stop_hint_mm', 15.0)):
+            return
+        said.add(zone)
+        x, y, h = pose
+        a = math.radians(h)
+        nx, ny = x + f_ * math.cos(a) - s_ * math.sin(a), y + f_ * math.sin(a) + s_ * math.cos(a)
+        self.log(f'    (车轮为了对上 2 号环挪了 横移 {s_:+.0f}mm、前进 {f_:+.0f}mm：对上时车在 ({nx:.0f},{ny:.0f})。想到了少挪几次、快几秒：'
+                 f'跑完在主程序里输入 stop {self._stop_name or zone} {nx:.0f} {ny:.0f}(它会说能不能停)，写死模式再输入 fixroute replan)')
 
     def _p2_cover_kw(self, zone):
         """(10-28 实车暂存区第二批：2 号环上放着第一批的物料，一步一步对准时横移只许离停车点 ±ring_strafe_max_mm(20mm)、

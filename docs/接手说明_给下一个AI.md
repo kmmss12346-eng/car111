@@ -1179,6 +1179,15 @@ git_log.txt                ← 分支最近 120 条提交记录
     改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
     **用户跑了 zup 4 以后说"不对不是的，只需要把这个最高点改上去就好了，其他的点不要改"**：用户要的只是 ZHI 120→124。
     让用户 `zup -4 ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG` 改回去(车上实际的值：ZGRAB 102、ZDROP 104、ZPLC 2、ZSTK 67、ZOBRAW/ZOBRNG 120)。
+- **10-29(6) 用户"那个第二层的先不要管那里了肯定做不到那里的现在重要的是粗加工区域和暂存区域的识别时间太长了要20s左右，把这里改好能改多短改多短"：**
+  第一批到工位(2 号环没盖住)：到站 → 看三个环(_survey) → 精确回 A1P/A2P(zone_obs_fine、齿轮间隙多转再回来) → find 2 帧 → calc
+  (停着 3 帧 → 挪 → 等 → 3 帧，实车 57→6.5→1.4→0.6mm 三次)。改了：survey_frames None(5 帧)→3、zone_calc_settle_s 0.3→0.15
+  (OLD_SPEED_DEFAULTS 加了这两个，车上配置写着旧值的按新值用)；对上 2 号环以后 `_stop_hint` 在日志写出"对上时车在 (x,y)，
+  stop 区名 x y、fixroute replan"(挪了 stop_hint_mm 15 以上才说，每个区一次)：停车点改到那里，到了只挪一点，省一两次挪动。
+  试过没留下的(都用 sim ZoneCalTests 比过)：zone_calc_frames 3→2(2 号环误差 2.0、第二轮回到第一轮停的地方差 1.5mm，超过测试的 1mm)；
+  刚看过三个环就跳过 find(精确回 A1P 以后画面挪了，几个 1/3 号环、码垛的测试差一点)；大的一下 _vel_goto 放宽到 4%(最多 2.5mm)不蹭到
+  0.6mm(模拟里有时多挪一次，反而慢)。模拟器里第一批工位"看三个环 + 对 2 号环"新旧差不多(7~8 秒；模拟的摄像头、串口都快)，
+  实车估计帧数、等待省 1 秒左右，大头要靠停车点改到对上的地方。rtol 的 2 号环容差(用户设的 1mm)没动。
 - **10-29(5) 用户"这个原料区域对准时间要花10多秒和这个暂停区域对准要画将近20秒的对准时间太慢了帮我减去时间减的越多越好然后给我不要把其他的该乱了"：**
   只改 mission_hooks 的对准速度(和一条测试)：
   - 原料区 `_raw_center_align_smooth`：raw_center_speed 15→40，但开头先按 raw_center_check_speed(15)走，真认出的一帧偏差比开始小了
