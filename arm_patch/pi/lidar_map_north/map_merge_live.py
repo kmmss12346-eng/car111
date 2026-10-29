@@ -240,7 +240,7 @@ def main():
     fixed_path=fixed_route.path_for(args.config);fix_cache={}
     # (10-29 晚)写死模式按了 START 原地等几秒、第二站动作以后再等几秒(配置 fixed_wait1_s / fixed_wait2_s 可改；以前都是 3)。
     #   用户"不是要跳过第二站就是做到我按下红色按钮等三秒然后左移前移旋转然后等2秒就直接动"：停 3 秒 → 第二站动作 → 等 2 秒 → 开
-    FIXED_WAIT1_S,FIXED_WAIT2_S=3.0,2.0
+    FIXED_WAIT1_S,FIXED_WAIT2_S=1.5,1.5     # (10-29 用户"走两步的等待时间都改成1.5s")以前 3、2
     def fixed_on():
         return bool(raw_cfg.get('fixed_route',False))
     def fixed_snap():
@@ -674,7 +674,7 @@ def main():
         def fixed_route(self):
             """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。
             (10-29 晚 用户"实测下来……大概要15s，把时间压缩一下"、"你先让这些准备好……我按下之后就可是停三秒直接走了"、"能改多短减多短")
-            同步参数、机械臂准备挪到按 START 之前(fixed_prestart)；按了 START 原地等 3 秒 → 第二站动作 → 再等 2 秒 → 开。
+            同步参数、机械臂准备挪到按 START 之前(fixed_prestart)；按了 START 原地等 1.5 秒 → 第二站动作 → 再等 1.5 秒 → 开。
             second_move = 存的路线是不是从第二站规划的(fixroute save / replan 都是；配置 fixed_second_move=false 时 replan 从起点规划，
             跑的时候不做第二站动作、不等 wait2)。"""
             if not fixed_on():return None

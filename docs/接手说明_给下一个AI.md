@@ -1373,4 +1373,6 @@ git_log.txt                ← 分支最近 120 条提交记录
   R 的 DONE t= 就是 STM32 里转弯本身的用时)。"等"其实是直行最后的刹车：max 档 SCDEC 150 → 220 转/分刹到 0 要 1.5 秒，最后 0.7 秒慢得像停住
   (Motion 估的 F 1700 = 3.4 秒和实车 3.3 秒对得上)。turbo 改成 SCACC 250 / SCDEC 300 / SSACC 250(都在驱动器斜坡约 357 以内)：
   刹车 0.7 秒，F 1700 估 2.9 秒。刹得猛可能打滑：停不准就 speed max 退回。
+- **10-29(12) 用户"走两步的等待时间都改成1.5s吧……把这个假装扫描的时间改成1.5s那两步"：** 写死模式 FIXED_WAIT1_S / FIXED_WAIT2_S 3、2 → 1.5、1.5
+  (map_merge_live；配置 fixed_wait1_s / fixed_wait2_s 写了就按配置)。test_nav_live 跟着改。
 

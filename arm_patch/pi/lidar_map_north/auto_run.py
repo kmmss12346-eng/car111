@@ -1648,7 +1648,7 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
     """first_scan=True: 完整流程(scanned=True：第一次扫描开跑前已经做好了，屏幕选区一键启动时)；False: 只按当前已规划的路线行驶。
     1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。
     (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。
-    (10-29 晚)按了 START 原地等 fixed_wait1_s(默认 3)秒 → 第二站动作 → 等 fixed_wait2_s(默认 2)秒 → 开；
+    (10-29 晚)按了 START 原地等 fixed_wait1_s(默认 1.5)秒 → 第二站动作 → 等 fixed_wait2_s(默认 1.5)秒 → 开；
     存的路线是从起点规划的(second_move=False，配置 fixed_second_move=false 时 fixroute replan 这样存)：不做第二站动作、不等 wait2。"""
     cfg = cfg or {}
     fx = ctx.fixed_route() if (first_scan and not scanned and hasattr(ctx, 'fixed_route')) else None
