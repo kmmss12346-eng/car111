@@ -1,0 +1,167 @@
+diff --git a/arm_patch/pi/lidar_map_north/mission_cli.py b/arm_patch/pi/lidar_map_north/mission_cli.py
+index 27a12cc..c5087f1 100644
+--- a/arm_patch/pi/lidar_map_north/mission_cli.py
++++ b/arm_patch/pi/lidar_map_north/mission_cli.py
+@@ -1168,8 +1168,15 @@ def _cross_shift(h, parts, state, log):
+     w, hh = float(cam.get('width', 640) or 640), float(cam.get('height', 480) or 480)
+     if not (0.0 <= new[0] <= w and 0.0 <= new[1] <= hh):
+         raise ValueError(f'挪到 ({new[0]:.0f}, {new[1]:.0f}) 就出画面了(画面 {w:.0f}×{hh:.0f})，没改')
+-    from vision import save_vision_cal
+-    path = save_vision_cal(kind, new, h.cfg.get('vision_cal_file') or None)
++    from vision import save_vision_cal, load_vision_cal
++    extra = None
++    if kind in ('RING1', 'RING3'):
++        # (10-29 用户"这个1号环我想改成g R1 -5 -5")rfine off 时不看这个十字：挪了多少也累计下来，放 1、3 号环时换成手臂多转的角度
++        sh = dict(load_vision_cal(h.cfg.get('vision_cal_file') or None).get('ring_shift_px') or {})
++        o = sh.get(kind) or [0.0, 0.0]
++        sh[kind] = [round(float(o[0]) + du, 2), round(float(o[1]) + dv, 2)]
++        extra = {'ring_shift_px': sh}
++    path = save_vision_cal(kind, new, h.cfg.get('vision_cal_file') or None, extra=extra)
+     vis.cfg.setdefault('claw_px', {})[kind] = [new[0], new[1]]
+     name = CROSS_NAMES[kind]
+     mm = ''
+@@ -1179,6 +1186,26 @@ def _cross_shift(h, parts, state, log):
+         pass
+     log(f'{name}：({old[0]:.0f}, {old[1]:.0f}) → ({new[0]:.0f}, {new[1]:.0f})，挪了 {du:+g}, {dv:+g} 像素{mm}。'
+         f'已存进 {path}，下次对准就按它(不用重开主程序)')
++    if extra is not None and not h.cfg.get('zone_cal_fine', False):
++        r = kind[-1]
++        tot = extra['ring_shift_px'][kind]
++        conv = ''
++        try:
++            st = getattr(h, 'store', None)
++            if st is None:
++                from visual_servo import JacStore
++                st = JacStore(h.cfg.get('servo_cal_file'))
++            J = st.get('RING', 'arm')
++            if J is not None:
++                import numpy as np
++                d = np.linalg.solve(np.asarray(J, float), np.asarray(tot, float))
++                conv = f'，放 {r} 号环时手臂多转 ID1 {float(d[1]):+.2f}°、ID2 {float(d[0]):+.1f}°'
++            else:
++                conv = '。★ 还没有画面和手臂的对应关系(vcal RING arm)，放的时候不起作用'
++        except Exception:
++            pass
++        log(f'  (rfine off：{r} 号环按 arm_calib 的角度放，不看这个十字；挪的这些累计 {tot[0]:+g}, {tot[1]:+g} 像素{conv}。'
++            f'和 rfine on 时十字挪这么多效果一样：物料相对圆环往反方向挪。改回去：g R{r} {-tot[0]:g} {-tot[1]:g})')
+     return None
+ 
+ 
+diff --git a/arm_patch/pi/lidar_map_north/mission_hooks.py b/arm_patch/pi/lidar_map_north/mission_hooks.py
+index 8066981..f337963 100644
+--- a/arm_patch/pi/lidar_map_north/mission_hooks.py
++++ b/arm_patch/pi/lidar_map_north/mission_hooks.py
+@@ -8401,6 +8401,10 @@ class MissionHooks:
+             fine_on = bool(self.cfg.get('zone_cal_fine', False)) and not self.nogo
+             learned = (self._zone_learn.get(zone) or {}).get(ring) if fine_on else None
+             d1, d2 = learned if learned is not None else T[ring]
++            sh = None if fine_on else self._ring_shift(ring)       # (10-29)rfine off：g R1 / g R3 挪过的换成手臂多转的角度
++            if sh is not None:
++                d1, d2 = d1 + sh[0], d2 + sh[1]
++                self.log(f'    (g R{ring} 挪过 {sh[2][0]:+g}, {sh[2][1]:+g} 像素：放环{ring} 时手臂多转 ID1 {sh[0]:+.2f}°、ID2 {sh[1]:+.1f}°)')
+             tgt = self._cal_target(ring, p2[0] + d1, p2[1] + d2)
+             if tgt is None:
+                 self.stats.place(False)
+@@ -9559,6 +9563,33 @@ class MissionHooks:
+         else:
+             self.arm.ap(a1, a2)
+ 
++    def _ring_shift(self, ring):
++        """(10-29 用户"这个1号环我想改成g R1 -5 -5")rfine off 时 1、3 号环按 arm_calib 调的角度放，不看这个环自己的十字：
++        g R1 / g R3 挪过多少像素(vision_cal.json 的 ring_shift_px，主程序 g 挪十字时累计)按画面和手臂的对应关系(RING 的手臂 J)
++        换成手臂多转多少度 —— 和 rfine on 时十字挪这么多、摄像头对准后手臂停的地方一样。返回 (ID1 度, ID2 度, (du, dv))；
++        没挪过、没有 J 返回 None。"""
++        if int(ring) == 2:
++            return None
++        k = f'RING{int(ring)}'
++        try:
++            sh = (load_vision_cal(self.cfg.get('vision_cal_file')).get('ring_shift_px') or {}).get(k)
++            du, dv = (float(sh[0]), float(sh[1])) if sh else (0.0, 0.0)
++        except (TypeError, ValueError, IndexError):
++            du, dv = 0.0, 0.0
++        if abs(du) < 1e-6 and abs(dv) < 1e-6:
++            return None
++        J = self.store.get('RING', 'arm') if self.store is not None else None
++        if J is None:
++            if not getattr(self, '_ring_shift_said', False):
++                self._ring_shift_said = True
++                self.log(f'    ★ g R{int(ring)} 挪过 {du:+g}, {dv:+g} 像素，但还没有画面和手臂的对应关系(vcal RING arm)：这次不按它挪')
++            return None
++        try:
++            d = np.linalg.solve(np.asarray(J, float), np.array([du, dv]))     # 十字挪 (du, dv)：圆环在画面里要停在挪过的地方
++        except np.linalg.LinAlgError:
++            return None
++        return float(d[1]), float(d[0]), (du, dv)                              # J 的两列是 (ID2, ID1)
++
+     def _ring_retries(self, ring):
+         """(10-28)夹着物料转回 ring 号环的角度以后，差得多最多再转几次：1、3 号环 ring13_return_retries(默认 1)，2 号环照旧 2 次。"""
+         if int(ring) == 2:
+diff --git a/arm_patch/pi/lidar_map_north/sim_mission.py b/arm_patch/pi/lidar_map_north/sim_mission.py
+index 44f4cb9..a0fad0b 100644
+--- a/arm_patch/pi/lidar_map_north/sim_mission.py
++++ b/arm_patch/pi/lidar_map_north/sim_mission.py
+@@ -4512,6 +4512,32 @@ class ZoneCalTests(unittest.TestCase):
+         self.assertEqual(sorted(rings), [1, 2, 3])
+         self.assertEqual(got[-3:], [2 if k == 2 else 1 for k in rings], (got, rings))
+ 
++    def test_g_r1_shift_moves_ring1_placement_with_rfine_off(self):
++        """(10-29 用户"这个1号环我想改成g R1 -5 -5")rfine off：1 号环按 arm_calib 的角度放，g R1 挪过的像素(ring_shift_px)按手臂的 J
++        换成多转的角度：放的地方跟着挪(和 rfine on 时十字挪这么多一样，物料相对圆环往反方向挪)；2、3 号环不受影响。"""
++        import tempfile
++        res, logs = {}, {}
++        for shift in (None, [-5.0, -5.0]):
++            with tempfile.TemporaryDirectory() as td:
++                w = self._world(1)
++                lines = []
++                h = self._make(w, lines=lines)
++                if shift:
++                    fp = os.path.join(td, 'vision_cal.json')
++                    with open(fp, 'w', encoding='utf-8') as f:
++                        json.dump({'ring_shift_px': {'RING1': shift}}, f)
++                    h.cfg['vision_cal_file'] = fp
++                run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'), log=lines.append)
++                res[bool(shift)] = {k: e for (z, k, _c, e, _st) in w.placed if z == 'ROUGH'}
++                logs[bool(shift)] = '\n'.join(lines)
++        self.assertIn('g R1 挪过 -5, -5 像素：放环1 时手臂多转', logs[True])
++        self.assertNotIn('g R1 挪过', logs[False])
++        want = math.hypot(5.0, 5.0) / self._world(1).scale['RING']            # 像素换成毫米
++        self.assertLess(res[False][1], 2.5, res)
++        self.assertAlmostEqual(res[True][1], want, delta=1.5)                   # 1 号环放的地方挪了约 5.7 像素那么远
++        self.assertLess(abs(res[True][2] - res[False][2]), 0.5, res)            # 2、3 号环不受影响
++        self.assertLess(abs(res[True][3] - res[False][3]), 0.5, res)
++
+     def test_approach_id1_slow_steps_from_the_tray_side(self):
+         """(10-27 晚)arm_link.approach_id1：先转到多转的地方(快慢不管)，转回来每一下不到 3.5°(STM32 一下 4.5° 以内才慢慢转、停得准)；
+         多转的那一下没转过去就再转一次。"""
+diff --git a/arm_patch/pi/lidar_map_north/test_mission_cli.py b/arm_patch/pi/lidar_map_north/test_mission_cli.py
+index 773e879..5c4108a 100644
+--- a/arm_patch/pi/lidar_map_north/test_mission_cli.py
++++ b/arm_patch/pi/lidar_map_north/test_mission_cli.py
+@@ -414,6 +414,27 @@ class CliTests(unittest.TestCase):
+             with self.assertRaises(ValueError):                                  # 一键流程在跑：不改
+                 mission_cli.handle_cli('g', ['g', '5', '0'], link=self.w.link, raw_cfg={}, state={'auto': True}, log=self.log)
+ 
++    def test_g_r1_is_kept_for_rfine_off(self):
++        """(10-29 用户"这个1号环我想改成g R1 -5 -5")g R1 / g R3 除了挪这个环自己的十字，还累计到 vision_cal.json 的 ring_shift_px
++        (rfine off 时放 1、3 号环按它让手臂多转一点)；rfine off 时说清楚换成手臂多转多少度、怎么改回去。"""
++        with tempfile.TemporaryDirectory() as td:
++            self.h.cfg['vision_cal_file'] = os.path.join(td, 'vision_cal.json')
++            self.h.cfg['zone_cal_fine'] = False
++            self.h._ensure_vision()
++            self.lines.clear()
++            self.run_cli('g', 'g R1 -5 -5')
++            self.run_cli('g', 'g R1 2 0')
++            saved = load(self.h.cfg['vision_cal_file'])
++            self.assertEqual(saved['ring_shift_px'], {'RING1': [-3.0, -5.0]})
++            text = '\n'.join(self.lines)
++            self.assertIn('rfine off：1 号环按 arm_calib 的角度放', text, text)
++            self.assertIn('累计 -3, -5 像素', text, text)
++            self.assertIn('改回去：g R1 3 5', text, text)
++            self.lines.clear()
++            self.run_cli('g', 'g 4 0')                                  # 红十字(2 号环)不累计
++            self.assertEqual(load(self.h.cfg['vision_cal_file'])['ring_shift_px'], {'RING1': [-3.0, -5.0]})
++            self.assertNotIn('rfine off', '\n'.join(self.lines))
++
+     def test_vclaw_bad_args_and_needs_zero(self):
+         for bad in ('vclaw', 'vclaw RAW', 'vclaw RAW 9', 'vclaw XYZ'):
+             with self.assertRaises(ValueError):

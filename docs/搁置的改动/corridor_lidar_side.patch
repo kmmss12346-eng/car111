@@ -1,0 +1,201 @@
+diff --git a/arm_patch/pi/lidar_map_north/route_plan.py b/arm_patch/pi/lidar_map_north/route_plan.py
+index c2ad155..210284b 100644
+--- a/arm_patch/pi/lidar_map_north/route_plan.py
++++ b/arm_patch/pi/lidar_map_north/route_plan.py
+@@ -81,6 +81,26 @@ YELLOW_NOTE_MM = 40              # 一段路线离黄色区不到这么多(而
+ #   推算的车位一路偏几厘米就压到黄色区。按 45 规划时同一条车道走正中间(两边约 50mm)，还快 0.3 秒)先按离黄色区 yellow_prefer_floor_mm 规划，
+ #   规划不出来、或者有停车点因此要挪开，再按原来的硬余量(yellow_floor_mm)规划。0 = 以前的做法
+ YELLOW_PREFER_FLOOR_MM = 45
++# (10-29 用户"走中间这个过道的时候……尽量有雷达的那一侧离这个黄色区域的远一点，另一侧的离近一点……雷达很容易出界")
++#   中间两条过道(两边都是黄色区)里：雷达那边多留、另一边少留这么多(见 Body.ylx)，两边一共要留的不变(开得过去的还是开得过去)。
++#   别的地方不变(靠工位、场地边的那几条车道一边不是黄色区，雷达那边多留就得转身，反而慢)
++YELLOW_LIDAR_EXTRA_MM = 25
++# 中间两条过道(车中心在里面时两边都是黄色区)：竖的 x 1000~1400、横的 y 1000~1400；沿过道方向两头各多算半个车长(车身还在黄色区旁边)
++YELLOW_CORRIDORS = ((1000, 550, 1400, 1850), (550, 1000, 1850, 1400))
++
++
++def _corridors(ext):
++    v, h = YELLOW_CORRIDORS
++    return ((v[0], v[1] - ext, v[2], v[3] + ext), (h[0] - ext, h[1], h[2] + ext, h[3]))
++
++
++def _in_corridor(x, y, cors):
++    """车中心 (x, y) 在中间过道里吗(numpy 数组或数都行)。"""
++    out = None
++    for x0, y0, x1, y1 in cors:
++        m = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
++        out = m if out is None else (out | m)
++    return out
+ ZONE_MARGIN_MM = 30              # 暂存区/粗加工区
+ RAW_MARGIN_MM = 30               # 原料转盘
+ EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
+@@ -247,6 +267,13 @@ class Body:
+             self.disk = (lf, ll, r)
+         self.d = float(g('turn_pivot_back_mm', 0))
+         self.l = float(g('turn_pivot_left_mm', 0))
++        # (10-29 用户"走中间这个过道的时候……尽量有雷达的那一侧离这个黄色区域的远一点，另一侧的离近一点就没啥问题了，雷达很容易出界")
++        #   车中心在中间两条过道里时(YELLOW_CORRIDORS，两边都是黄色区)，只对黄色区：雷达圆盘按大 yellow_lidar_extra_mm 算、车身没有雷达的
++        #   那一边按少这么多算。车往没雷达那边让：两边一共要留的不变(开得过去的还是开得过去)。0 = 以前(两边一样)
++        self.ylx = max(0.0, float(g('yellow_lidar_extra_mm', YELLOW_LIDAR_EXTRA_MM) or 0.0)) if self.disk else 0.0
++        if self.ylx > 0:
++            self.ylx = min(self.ylx, self.hw - 10.0)
++        self.cors = _corridors(self.hl)                 # 只在中间两条过道里这样算
+         # 转轴到车身最远点的距离：原地转弯扫过的圆
+         pts = [(sx*self.hl + self.d, sy*self.hw - self.l) for sx in (-1, 1) for sy in (-1, 1)]
+         rr = max(math.hypot(x, y) for x, y in pts)
+@@ -261,7 +288,15 @@ class Body:
+         self.box = (-back, front, -right, left)       # 外框(含雷达)：后、前、右、左
+ 
+     def key(self):
+-        return (self.hl, self.hw, self.disk, self.d, self.l)
++        return (self.hl, self.hw, self.disk, self.d, self.l, self.ylx)
++
++    def side_lr(self, yellow=False):
++        """车身矩形往右、往左伸出多少(车身坐标 y，右为负)。yellow=True：算黄色区用的(没有雷达那一边少 ylx)。"""
++        if not yellow or self.ylx <= 0:
++            return -self.hw, self.hw
++        if self.disk[1] >= 0:                          # 雷达在左边：右边少
++            return -(self.hw - self.ylx), self.hw
++        return -self.hw, self.hw - self.ylx
+ 
+     def center_off(self, yaw):
+         """转轴点 → 车中心(世界坐标的偏移)。"""
+@@ -269,17 +304,18 @@ class Body:
+         c, s = math.cos(a), math.sin(a)
+         return (self.d*c + self.l*s, self.d*s - self.l*c)
+ 
+-    def corners(self, x, y, yaw):
++    def corners(self, x, y, yaw, yellow=False):
+         a = math.radians(yaw); c, s = math.cos(a), math.sin(a)
++        yr, yl = self.side_lr(yellow)
+         return [(x + bx*c - by*s, y + bx*s + by*c)
+-                for bx, by in ((-self.hl, -self.hw), (self.hl, -self.hw), (self.hl, self.hw), (-self.hl, self.hw))]
++                for bx, by in ((-self.hl, yr), (self.hl, yr), (self.hl, yl), (-self.hl, yl))]
+ 
+-    def disk_at(self, x, y, yaw):
++    def disk_at(self, x, y, yaw, yellow=False):
+         if not self.disk:
+             return None
+         a = math.radians(yaw); c, s = math.cos(a), math.sin(a)
+         lf, ll, r = self.disk
+-        return (x + lf*c - ll*s, y + lf*s + ll*c, r)
++        return (x + lf*c - ll*s, y + lf*s + ll*c, r + (self.ylx if yellow else 0.0))
+ 
+ 
+ # 区域：(说明, 种类, x0, y0, x1, y1, 圆角半径, 平移硬余量, 平移希望余量, 转弯硬余量, 转弯希望余量)
+@@ -471,12 +507,25 @@ class _Sweep:
+     def __init__(self, body, items):
+         self.b = body
+         self.items = items
++        self.yidx = [k for k, it in enumerate(items) if it[1] == 'yellow'] if body.ylx > 0 else []
++
++    def _gaps(self, poses, sag=0.0):
++        """车身在 poses 这几个位姿之间扫过的范围(凸包 + 雷达圆心连线)离每个区域多远。
++        (10-29)车中心在中间过道里时，黄色区按黄色区用的车身算(Body.ylx：雷达圆盘大一圈、没有雷达那一边少一截)。"""
++        b = self.b
++        dks = [b.disk_at(*p) for p in poses]
++        seg = [(d[0], d[1]) for d in dks] if dks[0] else None
++        rd = dks[0][2] if dks[0] else 0.0
++        out = _shape_gaps(self.items, _hull([c for p in poses for c in b.corners(*p)]), seg, rd, sag)
++        if self.yidx and any(_in_corridor(p[0], p[1], b.cors) for p in poses):
++            ys = [self.items[k] for k in self.yidx]
++            yg = _shape_gaps(ys, _hull([c for p in poses for c in b.corners(*p, yellow=True)]), seg, rd + b.ylx, sag)
++            for k, g in zip(self.yidx, yg):
++                out[k] = g
++        return out
+ 
+     def pose_gaps(self, pose):
+-        x, y, yaw = pose
+-        dk = self.b.disk_at(x, y, yaw)
+-        return _shape_gaps(self.items, _hull(self.b.corners(x, y, yaw)),
+-                           [(dk[0], dk[1])] if dk else None, dk[2] if dk else 0.0)
++        return self._gaps([tuple(pose[:3])])
+ 
+     def move_gaps(self, pose, cmd, val, pivot=None):
+         """返回 (新位姿, 每个区域的距离, 是否转弯)。pivot=(后, 左) 转轴相对车中心的位置。"""
+@@ -488,10 +537,7 @@ class _Sweep:
+                 nx, ny = x + val*math.cos(a), y + val*math.sin(a)
+             else:
+                 nx, ny = x - val*math.sin(a), y + val*math.cos(a)
+-            hull = _hull(b.corners(x, y, yaw) + b.corners(nx, ny, yaw))
+-            d0, d1 = b.disk_at(x, y, yaw), b.disk_at(nx, ny, yaw)
+-            seg = [(d0[0], d0[1]), (d1[0], d1[1])] if d0 else None
+-            return (nx, ny, yaw), _shape_gaps(self.items, hull, seg, d0[2] if d0 else 0.0), False
++            return (nx, ny, yaw), self._gaps([(x, y, yaw), (nx, ny, yaw)]), False
+         if cmd == 'R':
+             pb, pl = (b.d, b.l) if pivot is None else (float(pivot[0]), float(pivot[1]))
+             a = math.radians(yaw)
+@@ -514,10 +560,7 @@ class _Sweep:
+                 return (px + dx*ca - dy*sa, py + dx*sa + dy*ca, p[2] + ang)
+             for k in range(n):
+                 nxt = rot(cur, st)
+-                hull = _hull(b.corners(*cur) + b.corners(*nxt))
+-                d0, d1 = b.disk_at(*cur), b.disk_at(*nxt)
+-                seg = [(d0[0], d0[1]), (d1[0], d1[1])] if d0 else None
+-                g = _shape_gaps(self.items, hull, seg, d0[2] if d0 else 0.0, sag)
++                g = self._gaps([cur, nxt], sag)
+                 gaps = g if gaps is None else [min(u, v) for u, v in zip(gaps, g)]
+                 cur = nxt
+             return (cur[0], cur[1], wrap180(yaw + val)), gaps, True
+@@ -644,28 +687,50 @@ def _grid_maps(body, items, ox, oy):
+     turn_h = inf.copy(); turn_p = inf.copy()
+     if not items:
+         return dict(node_h=node_h, node_p=node_p, sw_h=sw_h, sw_p=sw_p, turn_h=turn_h, turn_p=turn_p, gap=gap)
+-    hl, hw = body.hl, body.hw
++    hl = body.hl
+     for h in range(4):
+         yaw = h * 90
+         cdx, cdy = body.center_off(yaw)
+         cdx, cdy = round(cdx, 6), round(cdy, 6)
+         X = PX + cdx; Y = PY + cdy
+         fx, fy = DIRS[h]
+-        # 车身矩形在这个车头方向下往西、东、南、北伸出多少
+-        ex = abs(fx)*hl + abs(fy)*hw
+-        ey = abs(fy)*hl + abs(fx)*hw
++        lx, ly = -fy, fx                                   # 车左边的方向
++
++        def ext(yellow):
++            # 车身矩形在这个车头方向下往西、东、南、北伸出多少(相对车中心；黄色区用的没有雷达那一边少 ylx)
++            yr, yl = body.side_lr(yellow)
++            xs_ = [a*fx + b_*lx for a in (-hl, hl) for b_ in (yr, yl)]
++            ys_ = [a*fy + b_*ly for a in (-hl, hl) for b_ in (yr, yl)]
++            return min(xs_), max(xs_), min(ys_), max(ys_)
++        rects = {False: ext(False), True: ext(True)}
+         if body.disk:
+             lf, ll, r = body.disk
+             ddx = lf*fx - ll*fy; ddy = lf*fy + ll*fx
+-        for it in items:
+-            g = _bgap(X - ex, Y - ey, X + ex, Y + ey, it)
+-            gxs = _bgap(X - ex, Y - ey, X + STEP + ex, Y + ey, it)
+-            gys = _bgap(X - ex, Y - ey, X + ex, Y + STEP + ey, it)
++        cm = cmx = cmy = None
++        if body.ylx > 0:
++            cm = _in_corridor(X, Y, body.cors)             # 车中心在中间过道里的节点(往 +x/+y 走一格：两头有一头在里面就算)
++            cmx = cm | _in_corridor(X + STEP, Y, body.cors)
++            cmy = cm | _in_corridor(X, Y + STEP, body.cors)
++
++        def gaps3(it, yel):
++            x0, x1, y0, y1 = rects[yel]
++            g = _bgap(X + x0, Y + y0, X + x1, Y + y1, it)
++            gxs = _bgap(X + x0, Y + y0, X + STEP + x1, Y + y1, it)
++            gys = _bgap(X + x0, Y + y0, X + x1, Y + STEP + y1, it)
+             if body.disk:
++                rr = r + (body.ylx if yel else 0.0)
+                 DX = X + ddx; DY = Y + ddy
+-                g = np.minimum(g, _bgap(DX, DY, DX, DY, it) - r)
+-                gxs = np.minimum(gxs, _bgap(DX, DY, DX + STEP, DY, it) - r)
+-                gys = np.minimum(gys, _bgap(DX, DY, DX, DY + STEP, it) - r)
++                g = np.minimum(g, _bgap(DX, DY, DX, DY, it) - rr)
++                gxs = np.minimum(gxs, _bgap(DX, DY, DX + STEP, DY, it) - rr)
++                gys = np.minimum(gys, _bgap(DX, DY, DX, DY + STEP, it) - rr)
++            return g, gxs, gys
++        for it in items:
++            g, gxs, gys = gaps3(it, False)
++            if cm is not None and it[1] == 'yellow' and np.any(cmx | cmy):
++                ga, gxa, gya = gaps3(it, True)
++                g = np.where(cm, ga, g)
++                gxs = np.where(cmx, gxa, gxs)
++                gys = np.where(cmy, gya, gys)
+             np.minimum(node_h[h], g - it[7], out=node_h[h])
+             np.minimum(node_p[h], g - it[8], out=node_p[h])
+             if it[1] != 'edge' or it[8] > 0:
