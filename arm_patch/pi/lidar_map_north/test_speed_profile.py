@@ -119,6 +119,11 @@ class SwitchTests(unittest.TestCase):
         spf.switch(raw, 'turbo', None)
         sp = raw['stm32_params']
         self.assertEqual((sp['TCV'], sp['TCA'], sp['TCSTOP'], sp['TCTOL']), (200.0, 1200.0, 0.4, 1.0))
+        self.assertEqual(sp['SCDEC'], 300.0)                        # 直线走完刹车快一倍
+        import route_plan as rp
+        t_max = rp.Motion(dict(raw, stm32_params=dict(sp, SCACC=200.0, SCDEC=150.0, SSACC=200.0))).time_of('F', 1700)
+        t_turbo = rp.Motion(raw).time_of('F', 1700)
+        self.assertLess(t_turbo, t_max - 0.4)
         self.assertGreater(sp['TCKP'], kp_max)
         self.assertLessEqual(sp['TCKP'], 10.0)
         self.assertEqual(spf.level(raw), 'turbo')

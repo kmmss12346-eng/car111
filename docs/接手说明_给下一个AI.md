@@ -1369,4 +1369,8 @@ git_log.txt                ← 分支最近 120 条提交记录
   直行完 STM32 只等 SETTLE 60ms；时间在 Car_Turn_Closed 末段：按 TCKP 指数式靠上去(PPD 47、TCKP 6 时间常数约 0.15 秒，20°→0.15° 约 0.7 秒)，
   再要停下误差 ≤ TCTOL 0.5° 连续 3 次。加了 `speed turbo`(speed_profile)：TCV 200、TCA 1200、TCKP ×1.4(≤10)、TCSTOP 0.4、TCTOL 1.0、TCMIN 3，
   直行和 max 一样；从 turbo 换回 fast/max 时 TCSTOP/TCTOL 改回默认。没有实车数据，要实车试(send R 90 看用时、车头误差)。
+- **10-29(11) 用户"直线走完之后不能立马转弯，要等两秒之后才能开始转弯"：** 树莓派/固件在两条指令之间都不等(stm32_link 往返约 0.1 秒，
+  R 的 DONE t= 就是 STM32 里转弯本身的用时)。"等"其实是直行最后的刹车：max 档 SCDEC 150 → 220 转/分刹到 0 要 1.5 秒，最后 0.7 秒慢得像停住
+  (Motion 估的 F 1700 = 3.4 秒和实车 3.3 秒对得上)。turbo 改成 SCACC 250 / SCDEC 300 / SSACC 250(都在驱动器斜坡约 357 以内)：
+  刹车 0.7 秒，F 1700 估 2.9 秒。刹得猛可能打滑：停不准就 speed max 退回。
 
