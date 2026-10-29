@@ -1352,3 +1352,9 @@ git_log.txt                ← 分支最近 120 条提交记录
   终点不变、不加指令；对黄色区只要求 mid_lane_yellow_min_mm(5)，其他区域照原余量，挪不下每次少 5mm。实车那条
   (RAW 1080,2155 → 后退100…前进1700…后退25)变成后退55…后退5(5mm 的那条 flatten 并进下一条同方向的)，车道里 x 1180→1135。
   test_route_safety / test_route_margin 测的是规划本身的黄色区余量，CFG 里 mid_lane_shift_mm=0；新测试 MidLaneShiftTests。run_live `midlane N`。
+- **10-29(8) 用户(截图：TEMP 改到 x 210 后路线走到 x 310 再在停车点往西横移)"只要我改了这个点的位置这个路线就能重新规划就是这个拐角应该是直接到走到前面的"：**
+  原因①：stopexact off 时 TEMP 210 按地图车身压进暂存区 70mm，自动挪回 310(所以"改了没反应")；要 `stopexact on`。
+  ②on 以后 A* 照样在 x 310 那条走(软代价)，最后横移 95~115。改：Planner.leg 里停车点按 stopexact 压进区域(exact_in)时调
+  `_fold_end_strafes`：最后的横移挪到最后一次转弯刚转完(拐角在 x 210 转按地图车角离场地边 15mm，不够 30)，开头的小横移并进后面同方向的移动；
+  按这一段硬余量扫得过、不更慢才用。只影响这种段，测试 StopExactStraightInTests。
+

@@ -141,5 +141,28 @@ class MidLaneShiftTests(unittest.TestCase):
         self.assertLess(legs[2]['mid_lane_shift'], 80)
 
 
+class StopExactStraightInTests(unittest.TestCase):
+    """(10-29 用户"只要我改了这个点的位置这个路线就能重新规划…这个拐角应该是直接到走到前面的")stopexact on、TEMP 改到 x 210
+    (按地图压进暂存区)：不再走到 x 310 再在停车点横移过去，转完弯先横移到 x 210、一条直行开进停车点。"""
+
+    def legs(self, exact):
+        c = dict(CFG, stop_exact=exact, mid_lane_shift_mm=0)
+        c['stops'] = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1200, 2100, 180], ROUGH=[1200, 300, 0], TEMP=[210, 1250, -90])
+        legs, why, _ = rp.plan_mission(c, [(1594, 1250, 25), (732, 1195, 25)], (2198, 228, 90), ['QR', 'RAW', 'ROUGH', 'TEMP', 'RAW'])
+        self.assertEqual(why, 'OK')
+        return legs
+
+    def test_temp_210_drives_straight_in(self):
+        off, on = self.legs(False), self.legs(True)
+        t = on[3]
+        self.assertEqual(t['stop'], 'TEMP')
+        self.assertEqual(tuple(round(v) for v in t['goal']), (210, 1250, -90))
+        self.assertEqual(t['cmds'][-1][0], 'F')                     # 最后一条是直行开进去，不是横移
+        self.assertLess(abs(t['poses'][-2][0] - 210), 0.5)          # 开进去之前已经在 x 210
+        self.assertEqual(tuple(round(v) for v in off[3]['goal']), (310, 1250, -90))   # stopexact off 照旧挪到 310
+        for a, b in zip(off[:3], on[:3]):                            # 别的段不变
+            self.assertEqual(a['cmds'], b['cmds'])
+
+
 if __name__ == '__main__':
     unittest.main()

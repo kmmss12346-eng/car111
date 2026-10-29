@@ -1307,6 +1307,7 @@ class Planner:
         notes = []
         items = list(self.items)
         relaxed = False
+        exact_in = False                              # stopexact on 而且停车点按地图压进区域(暂存区 x 210 那样)
         # 起点、停车点本身离某个区域不够硬余量：只把这个区域放宽到它自己的距离(这一段)，并写进 note
         # (停车点离障碍物不够的，下面单独处理：只在停车点附近放宽)
         sg = self.pose_eval(start_c, items)
@@ -1323,6 +1324,7 @@ class Planner:
                     over.append((gg[k], k))
                     continue
                 low = gg[k] if low is None else min(low, gg[k])
+                exact_in = exact_in or gg[k] < 0
                 notes.append(f'⚠ 停车点 {name} 本身离{it[0]}只有 {gg[k]:.0f}mm(要 {it[7]:.0f}mm)，'
                              f'这一段只在{it[0]}这里放宽到 {gg[k]:.0f}mm，请把停车点往外挪' if gg[k] >= 0 else
                              f'⚠ 停车点 {name} 按地图车身压进{it[0]} {-gg[k]:.0f}mm：stopexact on，照样停在这里(这一段只在{it[0]}这里放宽)')
@@ -1434,6 +1436,10 @@ class Planner:
         # 黄色区：比希望的余量近 → 提示(只有挤不过去的地方才会这样)
         # (10-26)中间 400 宽的车道走在正中间也只有 45~55mm(希望 50)：这是正常的最近路线，不再每段都提示；不到 YELLOW_NOTE_MM 才提示
         chk_items = items if used is None or not used[1] else tiers[used[0]][1]
+        if exact_in:
+            r2 = self._fold_end_strafes(chk_items, start_c, cmds)
+            if r2 is not None:
+                cmds, poses, res = r2['cmds'], r2['poses'], r2
         ym = self.yellow_margin
         ymins = [res['mins'][k] for k, it in enumerate(chk_items) if it[1] == 'yellow']
         ygap = min(ymins) if ymins else math.inf
@@ -1453,6 +1459,64 @@ class Planner:
                    stop_pose=(gx, gy, gyaw), goal_shift=(round(fwd, 1), round(left, 1)) if moved else None,
                    lanes_passed=passed)
         return leg, 'OK'
+
+    def _fold_end_strafes(self, items, start_c, cmds):
+        """(10-29 用户"只要我改了这个点的位置这个路线就能重新规划就是这个拐角应该是直接到走到前面的")stopexact on、停车点压进区域的那一段：
+        一段开头/结尾的横移(S)并进同一世界方向的另一条移动(例如最后往西横移 95 并进拐弯前往西走的那条，拐角直接走到位，
+        开头离开工位的小横移并进后面同方向的那条)，少一条指令。按这一段的硬余量扫一遍过得去、而且更快才用。返回 _finish 那样的 dict 或 None。"""
+        n = len(cmds)
+        if n < 2:
+            return None
+        yaw, ws = float(start_c[2]), []
+        for c, v in cmds:
+            if c == 'R':
+                ws.append(None)
+                yaw += v
+                continue
+            a = math.radians(yaw if c == 'F' else yaw + 90.0)
+            ws.append((int(round(math.cos(a))), int(round(math.sin(a)))))
+
+        def fold(cm, e, rng):
+            if cm[e][0] != 'S' or ws[e] is None:
+                return None
+            u = ws[e]
+            for i in rng:
+                if i == e or ws[i] is None or cm[i][1] == 0:
+                    continue
+                if ws[i] == u or ws[i] == (-u[0], -u[1]):
+                    out = [list(c) for c in cm]
+                    out[i][1] += cm[e][1] * (1 if ws[i] == u else -1)
+                    out[e][1] = 0
+                    return out
+            return None
+        cands = []
+        r = max((i for i in range(n - 1) if cmds[i][0] == 'R'), default=None)
+        if cmds[-1][0] == 'S' and r is not None and r < n - 2:
+            # 拐角那里离场地边太近转不了：最后的横移挪到最后一次转弯刚转完(在停车点前面那块空地上横移)，再一条直行开进停车点
+            cands.append([list(c) for c in cmds[:r + 1]] + [list(cmds[-1])] + [list(c) for c in cmds[r + 1:-1]])
+            ws = ws[:r + 1] + [ws[-1]] + ws[r + 1:-1]
+            cmds = [tuple(c) for c in cands[0]]
+        last = fold(cmds, n - 1, range(n - 2, -1, -1)) if cmds[-1][0] == 'S' else None
+        first = fold(cmds, 0, range(1, n))
+        if last:
+            cands.append(last)
+        if first:
+            cands.append(first)
+            both = fold(first, n - 1, range(n - 2, -1, -1)) if last else None
+            if both:
+                cands.append(both)
+        best = None
+        t0 = self.motion.route_time(cmds)
+        for cm in cands:
+            ws_ = [w for w, c in zip(ws, cm) if c[1] != 0 or c[0] == 'R']
+            cm = [(c, int(v)) for c, v in cm if v != 0 or c == 'R']
+            if len(ws_) != len(cm) or any(c in ('F', 'S') and abs(v) < MIN_MOVE_MM for c, v in cm):
+                continue
+            ok, g, idx, what, poses, mins = _moves_eval(self.body, items, start_c, cm)
+            t = self.motion.route_time(cm)
+            if ok and t < t0 + 1e-6 and (best is None or t < best['time'] - 1e-6):
+                best = dict(ok=True, cmds=cm, poses=[(p[0], p[1], wrap180(p[2])) for p in poses], mins=mins, tiny=0, time=t, what=what)
+        return best
 
     def _direct(self, items, start_c, goal):
         """(10-26)停车点就在车头正前方/正后方(车头一样、同一条直线上)，一条直行开过去按硬余量扫得过：就走这一条。
