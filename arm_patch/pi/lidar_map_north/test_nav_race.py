@@ -542,6 +542,63 @@ class RunMissionTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t, 1.0, '等的时候 abort 马上停')
         self.assertNotIn('second_move', calls, '车没动')
 
+    def test_fixed_route_presynced_waits_3s_then_goes(self):
+        """(10-29 晚 用户"你先让这些准备好最后我按这个红色按钮的时候就不用准备了就是我按下之后就可是停三秒直接走了")写死模式 race：
+        参数按 START 之前已经同步好(cfg _presynced)，按了 START 不再 GET/SET；原地等 wait1 → 第二站动作 → wait2=0 不再等，直接开；
+        r_decimals 按 START 之前问好了，按了以后不再 GET。"""
+        calls = []
+        stamp = {}
+
+        class FixedCtx(MissionCtx):
+            t0 = None
+
+            def fixed_route(self):
+                return dict(wait1=0.4, wait2=0.0, t0=self.t0)
+
+            def fixed_first(self):
+                calls.append('fixed_first')
+
+            def fixed_second(self):
+                calls.append('fixed_second')
+                stamp['second'] = time.monotonic()
+
+            def plan(self):
+                calls.append('plan')
+                return 0, [{'stop': 'QR', 'cmds': [('R', -90), ('F', 300)]}], 'ROUTE OK'
+
+        class Link(RecLink):
+            def get_params(self):
+                calls.append('GET')
+                return {'PSPD': 60.0, 'TCV': 150.0}, 'DONE'
+
+            def sync_params(self, params, log=None):
+                calls.append('SYNC')
+                return []
+
+            def second_move(self, rel=None, log=None):
+                stamp['move'] = time.monotonic()
+                return RecLink.second_move(self, rel, log)
+        ctx = FixedCtx(calls)
+        ctx.t0 = time.monotonic()
+        logs = []
+        auto_run.run_mission(ctx, Link(calls), log=logs.append, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls),
+                             cfg={'stm32_params': {'TCV': 120.0}, '_presynced': True, 'r_decimals': True})
+        self.assertNotIn('GET', calls, '按了 START 不再读参数')
+        self.assertNotIn('SYNC', calls, '按了 START 不再发参数')
+        self.assertEqual(calls[:7], ['start_clock', 'ping', 'prepare', 'home', 'fixed_first', 'second_move', 'fixed_second'])
+        self.assertGreaterEqual(stamp['move'] - ctx.t0, 0.4 - 0.01, '先原地等 wait1')
+        self.assertLess(stamp['second'] - stamp['move'], 0.2, '第二站动作以后不再等')
+        text = '\n'.join(logs)
+        self.assertIn('STM32 参数按 START 之前已经同步好了', text)
+        self.assertNotIn('③', text)
+        # 没有同步好(_presynced 没有)：和以前一样按了 START 再同步
+        calls.clear()
+        ctx.t0 = time.monotonic()
+        auto_run.run_mission(ctx, Link(calls), log=lambda m: None, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls),
+                             cfg={'stm32_params': {'TCV': 120.0}})
+        self.assertIn('GET', calls)
+        self.assertIn('SYNC', calls)
+
     def test_prepare_error_does_not_stop(self):
         calls = []
 

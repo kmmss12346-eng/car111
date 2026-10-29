@@ -1663,10 +1663,14 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if not ok:
             raise Abort(f'STM32 没有回应 PING：{reply}（检查 USART3 接线，和 STM32 程序是不是新版）')
         log('STM32 通信正常。')
-        t_ph = time.monotonic()
-        bad = sync_changed(link, cfg.get('stm32_params'), log=log)
-        if cfg.get('stm32_params'):
-            log(f'STM32 参数已同步(只发有变化的；{time.monotonic() - t_ph:.1f} 秒)' + (f'（{len(bad)} 个失败）' if bad else ''))
+        if cfg.get('_presynced'):
+            # (10-29 晚 用户"我按这个红色按钮的时候就不用准备了")写死模式 race：按 START 之前已经同步好了(STM32 重新上电后要发近百个参数，十几秒)
+            log('STM32 参数按 START 之前已经同步好了。')
+        else:
+            t_ph = time.monotonic()
+            bad = sync_changed(link, cfg.get('stm32_params'), log=log)
+            if cfg.get('stm32_params'):
+                log(f'STM32 参数已同步(只发有变化的；{time.monotonic() - t_ph:.1f} 秒)' + (f'（{len(bad)} 个失败）' if bad else ''))
         if hooks is not None and hasattr(hooks, 'prepare'):
             t_ph = time.monotonic()
             try:
@@ -1709,10 +1713,12 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
             raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
         log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
         if fx:
-            t_ph = time.monotonic()
-            getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
-            log(f'③ 写死模式：不扫描，原地等 {float(fx["wait2"]):g} 秒……')
-            _hold(ctx, tick, t_ph + float(fx['wait2']))
+            w2 = float(fx.get('wait2') or 0.0)
+            if w2 > 0:                                      # (10-29 晚)默认 0：第二站动作做完直接开
+                t_ph = time.monotonic()
+                getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
+                log(f'③ 写死模式：不扫描，原地等 {w2:g} 秒……')
+                _hold(ctx, tick, t_ph + w2)
             ctx.fixed_second()
         else:
             time.sleep(float(cfg.get('second_settle_s', settle_s)) if cfg else settle_s)

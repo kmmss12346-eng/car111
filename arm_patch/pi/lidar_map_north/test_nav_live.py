@@ -696,7 +696,7 @@ class LiveTests(unittest.TestCase):
         self.assertIn('① 写死模式：不扫描、不规划', fx)
         self.assertIn('③ 写死模式：不扫描，原地等 0.4 秒', fx)
         pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
-        self.assertIn('写死模式：按 START 之前先准备机械臂', pre, '(10-29 晚)机械臂在按 START 之前准备好')
+        self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre, '(10-29 晚)按 START 之前准备好')
         self.assertIn('写死模式：不规划，直接用存好的路线', fx)
         self.assertIn('④ 写死路线', fx)
         for word in ('第一次扫描', '第二次扫描', '扫描完成', '站点扫描', '规划全程路线', '开跑前规划'):
@@ -717,8 +717,9 @@ class LiveTests(unittest.TestCase):
         self.assertIs(self.cfg_after.get('fixed_route'), True, 'fixroute on 存进配置')
 
     def test_fixed_race_default_waits_are_short(self):
-        """(10-29 晚 用户"实测下来……大概要15s，把时间压缩一下，压缩到8s到10s左右合理分配一下")写死模式默认：按 START 之前先准备机械臂，
-        按了以后原地等 1.5 秒 → 第二站动作 → 再等 1 秒(以前 3 秒、3 秒，机械臂准备在按了 START 以后)，照样跑完回到启停区。"""
+        """(10-29 晚 用户"实测下来……大概要15s，把时间压缩一下，压缩到8s到10s左右"、"你先让这些准备好最后我按这个红色按钮的时候就不用准备了
+        就是我按下之后就可是停三秒直接走了")写死模式默认：按 START 之前先同步参数、准备机械臂，按了以后不再同步，原地等 3 秒 → 第二站动作
+        → 不再等，直接开(以前同步、准备在按了 START 以后，还要等 3 秒、3 秒)，照样跑完回到启停区。"""
         start = (2250.0, 150.0, 90.0)
         mark = {}
 
@@ -741,17 +742,20 @@ class LiveTests(unittest.TestCase):
                             screen_zone=None, done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t)
         log = self.log
         self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
-        self.assertIn('按了以后原地等 1.5 秒(不扫描) → 第二站动作 → 再等 1 秒(不扫描)', log)
+        self.assertIn('按了以后原地等 3 秒(不扫描) → 第二站动作 → 不规划', log)
         pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
-        self.assertIn('写死模式：按 START 之前先准备机械臂', pre)
+        self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre)
+        self.assertIn('参数同步好了', pre)
         fx = log[log.rindex('★ 按了 START'):]
-        self.assertIn('原地等 1.5 秒(从开跑算)', fx)
-        self.assertIn('③ 写死模式：不扫描，原地等 1 秒', fx)
+        self.assertIn('STM32 参数按 START 之前已经同步好了', fx, '按了 START 不再同步')
+        self.assertNotIn('STM32 参数已同步', fx)
+        self.assertIn('原地等 3 秒(从开跑算)', fx)
+        self.assertNotIn('③ 写死模式', fx, '第二站动作以后不再等')
         self.assertIn('② 走第二站：左移', fx, '第二站动作照旧')
         import re
         m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
         self.assertTrue(m, fx[:2000])
-        self.assertTrue(2.4 <= float(m[-1]) <= 4.5, (m, fx[:2000]))      # 1.5 + 第二站(模拟里很快) + 1
+        self.assertTrue(2.9 <= float(m[-1]) <= 4.5, (m, fx[:2000]))      # 3 + 第二站(模拟里很快)
         big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
         self.assertGreaterEqual(len(big), 8, big)
 
