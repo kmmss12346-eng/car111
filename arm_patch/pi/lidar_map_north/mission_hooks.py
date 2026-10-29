@@ -166,7 +166,13 @@ DEFAULTS = dict(
     raw_orbit_ratio=0.77,               # 还没看到物料时：物料所在圆的半径 ≈ 外圆半径 × 这个
     raw_center_smooth=True,             # (10-16 用户)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心(STM32 的 V 指令)，不再挪一下停一下；
                                         #   STM32 是旧程序(不认 V)时自动改回一步一步挪
-    raw_center_speed=15.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
+    raw_center_speed=40.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
+                                        #   (10-29 晚 用户"原料区域对准时间要花10多秒……减的越多越好")15 -> 40：车停偏 80 多毫米时以前要走 6~7 秒。
+                                        #   开始先按 raw_center_check_speed 走，偏差真的小了 raw_center_check_mm(对应关系方向对)才放到这么快；
+                                        #   偏多少毫米就每秒走多少(越近越慢)，每一下最多走到按这一帧算好的地方就停
+    raw_center_check_speed=15.0,        # (10-29 晚)还没证实车轮和画面的对应关系方向对之前最快多少毫米/秒(就是以前的速度：存反了照样来得及发现、重新测)
+    raw_center_check_mm=5.0,            #   偏差比开始时小了这么多毫米(真认出来的那一帧)算证实了
+    raw_center_good_frames=2,           # (10-29 晚)停下以后连着几帧认出的圆心都在容差以内才算对准(以前写死 3，实车一帧零点几秒)
     raw_center_search_speed=30.0,       # 找中心(挪着找)、只用 V 挪到一个地方(_vel_goto)时车轮最快多少毫米/秒(10-21：20 -> 30)
     raw_center_align_s=25.0,            # 对准中心最多用多少秒
     raw_center_iters=5,                 # 车轮最多挪几次
@@ -381,7 +387,11 @@ DEFAULTS = dict(
     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
                                         #   STM32 不认 V 才用 S/F
-    zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
+    zone_calc_speed=60.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
+                                        #   (10-29 晚 用户"暂停区域对准要花将近20秒的对准时间太慢了")30 -> 60：_vel_goto 按"还差多少走多快"、
+                                        #   串口来回的时间提前停，快到了照样慢下来(最后一两毫米按 1 转/分 一小段一小段走)
+    zone_cover_look_s=3.0,              # (10-29 晚)暂存区第二批 2 号环被第一批的物料盖住：车轮连续对准先停着认 2 号环最多这么多秒，认不出马上改按
+                                        #   物料顶面/圆环外圈一步一步对(以前按 zone_look_s 15 秒干等：白心盖住了本来就认不出)
     # (10-24 用户"故意对偏的那个红色十字去掉，把粗加工区域和暂存区域的十字中心做成可调节的")r2off(ring2_off_mm 故意对偏)去掉了：
     #   2 号环对到圆环这边的爪子点 claw_px.RING(vlive 里的红十字)，在 arm_calib 看圆环的那几步 g 左右 上下 挪它。配置里还写着 ring2_off_mm 也不用
     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
@@ -489,6 +499,11 @@ BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60m
              'POS': '按上次停的位置认的高度', 'SYNC': '开机没读到编码器，后来按编码器认准了'}
 
 PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
+
+
+# (10-29 晚 用户"原料区域对准……暂停区域对准……太慢了")车上配置的 mission_cfg 是以前 apply_mission_config 按当时的默认值整个写进去的：
+# 写着这些旧的默认值 = 没人改过，按 DEFAULTS 里现在的值用(MissionHooks._upgrade_old_speeds；不改配置文件)
+OLD_SPEED_DEFAULTS = {'raw_center_speed': (15.0,), 'zone_calc_speed': (20.0, 30.0)}
 
 
 def deep_merge(base, extra):
@@ -861,6 +876,7 @@ class MissionHooks:
         self.raw_cfg = raw_cfg or {}
         self.cfg = deep_merge(DEFAULTS, self.raw_cfg.get('mission_cfg'))
         self.log = log
+        self._upgrade_old_speeds()
         self.now = now
         self.sleep = sleep
         self.ctx = ctx                      # auto_run.drive 会把 ctx 填进来，用来检查 abort
@@ -936,6 +952,22 @@ class MissionHooks:
         self._raw_seek_S = 0.0
         self._raw_pose = None               # 原料区第一次夹到时对准好的 (ID1, ID2)：后面的物料直接从这里开始
         self._seek = None         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
+
+    def _upgrade_old_speeds(self):
+        """(10-29 晚)配置里对准速度还是以前的默认值(OLD_SPEED_DEFAULTS，没人改过)：这一次运行按现在的默认值用，改过的照旧。"""
+        mc = self.raw_cfg.get('mission_cfg') or {}
+        said = []
+        for k, olds in OLD_SPEED_DEFAULTS.items():
+            v = mc.get(k)
+            try:
+                hit = v is not None and any(abs(float(v) - float(o)) < 1e-9 for o in olds)
+            except (TypeError, ValueError):
+                hit = False
+            if hit and self.cfg.get(k) != DEFAULTS[k]:
+                self.cfg[k] = DEFAULTS[k]
+                said.append(f'{k} {float(v):g}→{DEFAULTS[k]:g}')
+        if said:
+            self.log('  (配置里这几个对准速度还是以前的默认值，按现在的用：' + '、'.join(said) + ')')
 
     # ------------------------------------------------------------------ 给 auto_run 的接口
     def adjust(self, stop, link, log):
@@ -3323,9 +3355,12 @@ class MissionHooks:
         where = '爪子点' if goal is None else '示教时的位置'
         colors = self._raw_center_colors()
         tol = float(cfg.get('raw_center_tol_mm', 4.0)) if tol is None else float(tol)
-        vmax = float(cfg.get('raw_center_speed', 15.0))
+        vmax = float(cfg.get('raw_center_speed', 40.0))
         vmin = float(cfg.get('raw_center_min_speed', 5.0))
         vsearch = float(cfg.get('raw_center_search_speed', 30.0))
+        vcheck = min(vmax, float(cfg.get('raw_center_check_speed', 15.0)))  # (10-29 晚)对应关系方向还没证实之前的最快速度
+        check_mm = float(cfg.get('raw_center_check_mm', 5.0))
+        need_good = max(1, int(cfg.get('raw_center_good_frames', 2) or 3))  # (10-29 晚)停着连几帧在容差以内才算对准
         smax, fmax = (float(x) for x in lim) if lim else (float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0)))
         wait = float(cfg.get('raw_center_wait_s', 12.0))
         keep_s = float(cfg.get('raw_vel_keep_s', 0.15))
@@ -3798,6 +3833,7 @@ class MissionHooks:
             e_start, t_start, reprobed = float(np.linalg.norm(tgt(c, r) - goalp)), self.now(), False
             em = e_start / sc
             k_fr, rim_ok, t_stuck = 0, False, None
+            sure_j = vcheck >= vmax                            # (10-29 晚)偏差真的变小了(对应关系方向对)才放快
             while self.now() < t_end:
                 self._check_abort()
                 pred = c + J @ (pos_est() - p_c)
@@ -3832,6 +3868,8 @@ class MissionHooks:
                 last['c'], last['p'] = c, p_c
                 e = tgt(c + J @ (pos_est() - p_c), r) - goalp  # 认这一帧的时候车又走了一点：按现在的位置算偏差
                 em = float(np.linalg.norm(e)) / sc
+                if not sure_j and seen and em <= e_start / sc - check_mm:
+                    sure_j = True                              # 越走越近：对应关系方向对，可以快走了
                 if self.now() - t_meas > lost_s and search:
                     send(0.0, 0.0)                             # 跟丢了：不干等，停下接着找
                     self.log(f'    ★ 连着 {lost_s:g} 秒认不出圆心(跟丢了)：停下重新找')
@@ -3849,12 +3887,12 @@ class MissionHooks:
                     good += 1 if seen else 0                   # 只有这一帧真认出来了才算(光靠推算不算对准了)
                     t_stuck = None
                     send(0.0, 0.0)
-                    if good >= 3:
+                    if good >= need_good:
                         break
                 else:
                     good = 0
                     d = -np.linalg.solve(J, e)                 # 还要走多少 mm [横移, 前进]
-                    vv = clampv(d * 1.0, vmax)                 # 偏多少毫米就按每秒走多少(越近越慢)
+                    vv = clampv(d * 1.0, vmax if sure_j else vcheck)   # 偏多少毫米就按每秒走多少(越近越慢)
                     nv = float(np.linalg.norm(vv))
                     if 1e-6 < nv < vmin:
                         vv = vv * (vmin / nv)                  # 太慢电机按 0 转/分算会不动：至少 vmin
@@ -3885,6 +3923,7 @@ class MissionHooks:
                     J = np.asarray(J2, float)
                     sk_J[0] = J
                     e_start, t_start = float(np.linalg.norm(tgt(c, r) - goalp)), self.now()
+                    sure_j = vcheck >= vmax                    # 重新测过：再证实一次
                 if self.now() - t_log >= 1.0:
                     dt = self.now() - t_log
                     self.log(f'      {frames / dt:.1f} 帧/秒(认出圆心 {src["2+"]}、一个物料修正 {src["1"]}、推算 {src["推算"]})  '
@@ -3894,7 +3933,7 @@ class MissionHooks:
             finish()
             c = c + J @ (st['p'] - p_c)                        # 停下的地方
             em = float(np.linalg.norm(tgt(c, r) - goalp)) / sc
-            ok = good >= 3
+            ok = good >= need_good
             self._rc_last = dict(ok=ok, err_mm=em, why='' if ok else f'到时间了还差 {em:.1f}mm(要 {tol:g}mm 以内)')
             self.log(f'    {what}离{where} {em:.1f}mm' + ('' if ok else '(没完全对准)'))
             return c, r
@@ -7772,7 +7811,7 @@ class MissionHooks:
         calc_fr = int(cfg.get('zone_calc_frames', 3))
         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
-        calc_v = float(cfg.get('zone_calc_speed', 30.0))
+        calc_v = float(cfg.get('zone_calc_speed', 60.0))
         calc_smooth = bool(cfg.get('zone_calc_smooth', True))
 
         def still_rings():
@@ -8074,8 +8113,12 @@ class MissionHooks:
             return out
         try:
             g0 = c0_from_survey()
-            f = find(g0, look_s if g0 is not None else min(look_s, 3.0))   # 看三个环时没看到 2 号环：不干等，早点往前找
-            if f is None:
+            covered = bool(self.on_ring.get((zone, 2)))      # (10-29 晚)暂存区第二批：2 号环上放着第一批的物料(白心盖住了)
+            t_find = look_s if g0 is not None else min(look_s, 3.0)   # 看三个环时没看到 2 号环：不干等，早点往前找
+            if covered:
+                t_find = min(t_find, float(cfg.get('zone_cover_look_s', 3.0)))
+            f = find(g0, t_find)
+            if f is None and not covered:
                 f = creep()
             if f is None:
                 drv.finish()

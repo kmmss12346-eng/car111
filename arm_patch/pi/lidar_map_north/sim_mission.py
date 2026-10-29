@@ -5019,12 +5019,26 @@ class ZoneCalTests(unittest.TestCase):
                 return None                                         # 白心被盖住：这个认法认不出
             return orig(n, expect, any_size, max_px)
         w.vision.ring_px = ring_px
+        took = []
+        o_sm = h._ring2_smooth
+
+        def smooth(zone, _o=o_sm):
+            t0 = w.t
+            try:
+                return _o(zone)
+            finally:
+                took.append((zone, bool(h.on_ring.get((zone, 2))), w.t - t0))
+        h._ring2_smooth = smooth
         run_mission(w, h, log=lines.append)
         text = '\n'.join(lines)
         self.assertIn('2 号环上放着第一批的物料(白心盖住了)', text)
         self._ok(w, h, text)
         i = text.rfind('▶ TEMP 放')
         self.assertIn('只转手臂(比 2 号环多转', text[i - 3000:])            # 1、3 号环照旧只转手臂(第二轮按第一轮微调好的角度)
+        # (10-29 晚 用户"暂停区域对准要花将近20秒")盖住的 2 号环：车轮连续对准只停着认 zone_cover_look_s(3 秒)就改认物料(以前干等 15 秒)
+        cov = [d for z, c, d in took if z == 'TEMP' and c]
+        self.assertTrue(cov and max(cov) <= 3.0 + 1.5, took)
+        self.assertNotIn('往前慢慢挪着找', text[text.rfind('2 号环上放着第一批的物料') - 2000:])
 
     def test_covered_ring2_with_car_limits_still_aligns(self):
         """(10-28 实车暂存区第二批，用户"二号环必须一直对准")2 号环被第一批的物料盖住、一步一步对准：以前先按看三个环时(认错了)算的远近
