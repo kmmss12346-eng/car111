@@ -4,7 +4,7 @@ import unittest
 import route_plan as rp
 
 # 停车点、车身尺寸和您的 map_config_start2_roi.json 一样
-CFG = dict(mid_lane_shift_mm=0,  # 这里测规划本身的黄色区余量；去 ROUGH 中间车道往西挪见 MidLaneShiftTests
+CFG = dict(mid_lane_shift_mm=0, no_jog_from=[],  # 这里测规划本身的黄色区余量(no_jog 不按地图查，单独测)；去 ROUGH 中间车道往西挪见 MidLaneShiftTests
            stops={'QR': [2100, 1200, 90], 'RAW': [1200, 2100, 180], 'ROUGH': [1200, 340, 0], 'TEMP': [340, 1200, -90],
                   'START2': [2250, 150, 90]},
            car_length_mm=290, car_width_mm=260, lidar_overhang_mm=40, lidar_forward_mm=22.45, lidar_left_mm=134.77,
@@ -110,7 +110,7 @@ class MidLaneShiftTests(unittest.TestCase):
     """(10-29 用户"从原料区域去粗加工区域…走中间这条路的时候靠近暂停区域45mm")去 ROUGH 走中间南北车道时整段往西(暂存区那边)挪。"""
 
     def plan(self, shift):
-        c = dict(CFG, mid_lane_shift_mm=shift)
+        c = dict(CFG, mid_lane_shift_mm=shift, no_jog_from=[])
         c['stops'] = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1080, 2155, 180], ROUGH=[1130, 350, 0], TEMP=[310, 1250, -90])
         legs, why, _ = rp.plan_mission(c, [], (2198, 228, 90), ['QR', 'RAW', 'ROUGH', 'TEMP'])
         self.assertEqual(why, 'OK')
@@ -134,6 +134,24 @@ class MidLaneShiftTests(unittest.TestCase):
         c = dict(CFG)
         ok, g, idx, what = rp.moves_clear(c, [], new[2]['start'], new[2]['cmds'], margin_mm=0)
         self.assertTrue(ok, what)
+
+    def test_raw_stop_already_in_lane_and_no_x_move_after(self):
+        # (10-29 实车：原料区停车点 x 1100、粗加工区 x 1180，以前前面那条沿 x 的移动或后面没有就不挪)
+        c = dict(CFG, mid_lane_shift_mm=45, stop_exact=True, no_jog_from=[])
+        c['stops'] = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1100, 2080, 180], ROUGH=[1180, 300, 0], TEMP=[210, 1250, -90])
+        legs, why, _ = rp.plan_mission(c, [], (2198, 228, 90), ['QR', 'RAW', 'ROUGH'])
+        self.assertEqual(why, 'OK')
+        L = legs[2]
+        self.assertEqual(L.get('mid_lane_shift'), 45)
+        self.assertEqual(tuple(round(v) for v in L['goal']), (1180, 300, 0))
+        self.assertAlmostEqual(self.lane_x(L), 1135, delta=0.5)
+        # midlane 80 -30：原料区后面那一下不走了(转完弯直接往下开)，按地图允许压进黄色区 30mm
+        c.update(mid_lane_shift_mm=80, mid_lane_yellow_min_mm=-30)
+        legs, why, _ = rp.plan_mission(c, [], (2198, 228, 90), ['QR', 'RAW', 'ROUGH'])
+        L = legs[2]
+        self.assertEqual(L['cmds'][0][0], 'R')
+        self.assertAlmostEqual(self.lane_x(L), 1100, delta=0.5)
+        self.assertIn('压进黄色区 30mm', L['note'])
 
     def test_shrinks_when_45_would_touch_yellow(self):
         legs = self.plan(80)
@@ -162,6 +180,30 @@ class StopExactStraightInTests(unittest.TestCase):
         self.assertEqual(tuple(round(v) for v in off[3]['goal']), (310, 1250, -90))   # stopexact off 照旧挪到 310
         for a, b in zip(off[:3], on[:3]):                            # 别的段不变
             self.assertEqual(a['cmds'], b['cmds'])
+
+
+class NoJogTests(unittest.TestCase):
+    """(10-29 用户"原料区域左走一下和这个暂停区域这么走一下就压线了，你不要看地图了")从 RAW、TEMP 出发开头那一下不单独走。"""
+
+    def test_raw_and_temp_departures_start_without_the_small_move(self):
+        c = dict(CFG, stop_exact=True)
+        c.pop('mid_lane_shift_mm', None)
+        c.pop('no_jog_from', None)
+        c['stops'] = dict(CFG['stops'], QR=[2100, 1250, 90], RAW=[1100, 2080, 180], ROUGH=[1180, 300, 0], TEMP=[210, 1250, -90])
+        names = ['QR', 'RAW', 'ROUGH', 'TEMP', 'RAW']
+        legs, why, _ = rp.plan_mission(c, [(1594, 1250, 25), (732, 1195, 25)], (2198, 228, 90), names)
+        self.assertEqual(why, 'OK')
+        rough, temp_raw = legs[2], legs[4]
+        self.assertEqual(rough['cmds'][0][0], 'R')                       # 原料区：转完弯直接往下开
+        self.assertTrue(rough.get('no_jog'))
+        self.assertEqual(temp_raw['cmds'][0][0], 'F')                    # 暂存区：不先横移，直接往北开
+        self.assertTrue(temp_raw.get('no_jog'))
+        for L, n in zip(legs, names):
+            self.assertEqual(tuple(round(v) for v in L['goal'][:2]), tuple(c['stops'][n][:2]))   # 停车点不变
+        off = dict(c, no_jog_from=[])
+        legs2, _, _ = rp.plan_mission(off, [(1594, 1250, 25), (732, 1195, 25)], (2198, 228, 90), names)
+        self.assertEqual(legs2[2]['cmds'][0][0], 'F')                    # no_jog_from=[] 照旧
+        self.assertEqual(legs2[4]['cmds'][0][0], 'S')
 
 
 if __name__ == '__main__':

@@ -1252,14 +1252,17 @@ def main():
                    else '已设置 stopexact off：压到区域的停车点自动挪到最近停得下的位置，存进配置'),flush=True);return
         if k=='midlane':
             # (10-29 用户"从原料区域去粗加工区域…走中间这条路的时候靠近暂停区域45mm")去 ROUGH 走中间车道时整段往暂存区那边挪多少 mm
-            from route_plan import MID_LANE_SHIFT_MM
+            #   第二个数 = 挪了以后离黄色区最少留多少 mm(按地图；负数 = 按地图允许压进去这么多，用户"地图和实际的是不一样的")
+            from route_plan import MID_LANE_SHIFT_MM,MID_LANE_YELLOW_MIN_MM
             if len(parts)==1:
-                print(f'现在：midlane {float(raw_cfg.get("mid_lane_shift_mm",MID_LANE_SHIFT_MM)):g}(去粗加工区走中间车道往暂存区那边挪的 mm，0 = 不挪)。改：midlane 45',flush=True);return
-            if len(parts)!=2:raise ValueError('格式：midlane 45(往暂存区那边挪 45mm) / midlane 0(不挪)')
-            v=float(parts[1])
-            if not 0<=v<=100:raise ValueError('midlane 要在 0~100 mm')
-            save_cfg_keys({'mid_lane_shift_mm':v})
-            print(f'已设置 midlane {v:g}，存进配置。写死模式再输入 fixroute replan 重新规划(看“到 ROUGH”那段的提示)',flush=True);return
+                print(f'现在：midlane {float(raw_cfg.get("mid_lane_shift_mm",MID_LANE_SHIFT_MM)):g} {float(raw_cfg.get("mid_lane_yellow_min_mm",MID_LANE_YELLOW_MIN_MM)):g}'
+                      '(去粗加工区走中间车道往暂存区那边挪的 mm、挪完按地图离黄色区最少留的 mm；0 = 不挪)。改：midlane 45 或 midlane 80 -30',flush=True);return
+            if len(parts) not in (2,3):raise ValueError('格式：midlane 45(往暂存区那边挪 45mm) / midlane 80 -30(挪 80，按地图允许压进黄色区 30mm) / midlane 0(不挪)')
+            v=float(parts[1]);m=float(parts[2]) if len(parts)==3 else float(raw_cfg.get('mid_lane_yellow_min_mm',MID_LANE_YELLOW_MIN_MM))
+            if not 0<=v<=150:raise ValueError('midlane 要在 0~150 mm')
+            if not -60<=m<=50:raise ValueError('离黄色区最少留的要在 -60~50 mm')
+            save_cfg_keys({'mid_lane_shift_mm':v,'mid_lane_yellow_min_mm':m})
+            print(f'已设置 midlane {v:g} {m:g}，存进配置。写死模式再输入 fixroute replan 重新规划(看“到 ROUGH”那段的提示)',flush=True);return
         if k=='turnloc':
             # (10-27 用户"到了转弯的地方不应该是立马转过去吗")离黄色区/工位/场地边近的转弯，转之前先停下用雷达确认位置(reloc_before_turn)
             on_=bool(raw_cfg.get('reloc_before_turn',True))

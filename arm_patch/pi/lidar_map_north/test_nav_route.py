@@ -30,7 +30,7 @@ class RealRouteTests(unittest.TestCase):
         x0, y0, h0 = s['car']
         a = math.radians(h0)
         x2, y2 = x0 + 83 * math.cos(a) - 42 * math.sin(a), y0 + 83 * math.sin(a) + 42 * math.cos(a)   # 第二站
-        legs, why, _ = auto_run._rp.plan_mission(dict(cfg, margin_mm=60), obs, (x2, y2, h0), names, start_pivot=(x2, y2))
+        legs, why, _ = auto_run._rp.plan_mission(dict(cfg, margin_mm=60, no_jog_from=[]), obs, (x2, y2, h0), names, start_pivot=(x2, y2))
         self.assertEqual(why, 'OK')
         car = SimCar((x2, y2, h0 - 60), rdec=True, **car_kw)
         car.T = h0 - 60

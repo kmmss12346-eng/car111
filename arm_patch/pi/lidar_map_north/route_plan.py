@@ -83,9 +83,14 @@ YELLOW_NOTE_MM = 40              # 一段路线离黄色区不到这么多(而�
 YELLOW_PREFER_FLOOR_MM = 45
 # (10-29 用户"从原料区域去粗加工区域…路线有点偏向扫二维码的那边了，走中间这条路的时候靠近暂停区域45mm")
 #   去 ROUGH 的那一段走中间南北车道(x 1000~1400)时，整段往暂存区(西)挪 mid_lane_shift_mm；只要求不真的压到黄色区，挪不下就少挪。0 = 不挪
-MID_LANE_SHIFT_MM = 45
+MID_LANE_SHIFT_MM = 0            #   (10-29 用户改用下面的 no_jog：默认不挪；midlane 45 打开)
 MID_LANE_SHIFT_STOPS = ('ROUGH',)
 MID_LANE_YELLOW_MIN_MM = 5       #   挪了以后车身(含雷达)离黄色区最少留这么多
+# (10-29 用户"原料区域左走一下和这个暂停区域这么走一下就压线了，你不要看地图了地图和实际情况不一样")从这些站出发的那一段，
+#   开头那一下小移动(原料区往车道中间挪、暂存区往外横移，不到 NO_JOG_MAX_MM)不单独走，并进后面同一方向的移动(没有就补在最后)：
+#   不按地图查黄色区和暂存区/粗加工区，只查障碍物和不出场地。no_jog_from = [] 关掉
+NO_JOG_FROM = ('RAW', 'TEMP')
+NO_JOG_MAX_MM = 150
 ZONE_MARGIN_MM = 30              # 暂存区/粗加工区
 RAW_MARGIN_MM = 30               # 原料转盘
 EDGE_MARGIN_MM = 30              # 场地边(启停区里面和旁边除外)
@@ -1737,10 +1742,24 @@ def _mid_lane_shift(planner, leg, cfg):
         return leg
     j = next((i for i in range(seg - 1, -1, -1) if xu[i]), None)
     k = next((i for i in range(seg + 1, len(cmds)) if xu[i]), None)
-    if j is None or k is None:
-        return leg
-    ym = max(0.0, float(cfg.get('mid_lane_yellow_min_mm', MID_LANE_YELLOW_MIN_MM)))
+    if j is None:
+        # (10-29 实车：原料区停车点 x 和车道一样，前面没有沿 x 的移动 → 以前就没挪)在这条直行前面加一条横移
+        a = math.radians(sum(v for c, v in cmds[:seg] if c == 'R') + float(start[2]) + 90.0)
+        cmds.insert(seg, ['S', 0]); xu.insert(seg, int(round(math.cos(a)))); j = seg; seg += 1
+        k = None if k is None else k + 1
+    if k is None:
+        a = math.radians(sum(v for c, v in cmds if c == 'R') + float(start[2]))
+        ux = int(round(math.cos(a)))
+        cmds.append(['F' if ux else 'S', 0]); xu.append(ux or int(round(math.cos(a + math.pi / 2)))); k = len(cmds) - 1
+    ym = float(cfg.get('mid_lane_yellow_min_mm', MID_LANE_YELLOW_MIN_MM))
     items = [(it[:7] + tuple(min(m, ym) for m in it[7:11])) if it[1] == 'yellow' else it for it in planner.items]
+    # 起点/停车点本身离某个区域就不够余量(原料区停车点贴着原料转盘那样)：和规划时一样，这个区域放宽到它自己的距离
+    goal = leg['goal']
+    for pose in (start, goal):
+        gg = planner.pose_eval(tuple(float(v) for v in pose[:3]), items)
+        for q, it in enumerate(items):
+            if gg[q] < it[7] - EPS_MM:
+                items[q] = it[:7] + (gg[q] - 0.5, it[8], min(it[9], gg[q] - 0.5), it[10])
     sh = 5.0 * int(want // 5.0)
     while sh >= 5.0:
         cm = [list(c) for c in cmds]
@@ -1755,12 +1774,60 @@ def _mid_lane_shift(planner, leg, cfg):
                        time_s=round(planner.motion.route_time(cm), 2),
                        yellow_mm=round(min(yg), 1) if yg else None,
                        min_gap_mm=round(min(real), 1) if real else None)
-            out['note'] = '；'.join(t for t in (leg.get('note') or '', f'中间车道往暂存区那边挪 {sh:.0f}mm(mid_lane_shift_mm)，'
-                                                 f'车身(含雷达)离黄色区最近 {min(yg):.0f}mm' if yg else '') if t)
+            yt = ('' if not yg else f'，车身(含雷达)离黄色区最近 {min(yg):.0f}mm' if min(yg) >= 0 else
+                  f'，按地图车身压进黄色区 {-min(yg):.0f}mm(midlane 第二个数允许的)')
+            out['note'] = '；'.join(t for t in (leg.get('note') or '', f'中间车道往暂存区那边挪 {sh:.0f}mm(mid_lane_shift_mm)' + yt) if t)
             out['mid_lane_shift'] = sh
             return out
         sh -= 5.0
     return leg
+
+
+def _no_jog(planner, leg, cfg, prev):
+    """(10-29)从 no_jog_from 里的站出发的这一段：第一条是不到 no_jog_max_mm 的前进/横移(后面还有转弯或别的移动)，
+    就把它并进后面第一条同一世界方向的移动，后面没有就补在最后(终点不变)。
+    只查障碍物(照原来的余量)和场地边(不出场地)，不查黄色区、暂存区/粗加工区、原料转盘(用户：地图和实际不一样)。返回新的 leg(没改就是原来的)。"""
+    if prev not in tuple(cfg.get('no_jog_from', NO_JOG_FROM)):
+        return leg
+    cmds = [list(c) for c in leg['cmds']]
+    if len(cmds) < 2 or cmds[0][0] not in ('F', 'S') or abs(cmds[0][1]) > float(cfg.get('no_jog_max_mm', NO_JOG_MAX_MM)):
+        return leg
+    start = leg['start']
+    yaw, ws = float(start[2]), []
+    for c, v in cmds:
+        if c == 'R':
+            ws.append(None)
+            yaw += v
+            continue
+        a = math.radians(yaw if c == 'F' else yaw + 90.0)
+        ws.append((int(round(math.cos(a))), int(round(math.sin(a)))))
+    u, v0 = ws[0], cmds[0][1]
+    k = next((i for i in range(1, len(cmds)) if ws[i] is not None and (ws[i] == u or ws[i] == (-u[0], -u[1]))), None)
+    if k is not None:
+        cmds[k][1] += v0 * (1 if ws[k] == u else -1)
+    else:
+        a = math.radians(yaw)
+        f = (int(round(math.cos(a))), int(round(math.sin(a))))
+        if f == u or f == (-u[0], -u[1]):
+            cmds.append(['F', v0 * (1 if f == u else -1)])
+        else:
+            l_ = (int(round(math.cos(a + math.pi / 2))), int(round(math.sin(a + math.pi / 2))))
+            cmds.append(['S', v0 * (1 if l_ == u else -1)])
+    cm = _clean(cmds[1:])
+    items = [(it[:7] + (min(it[7], 0.0), min(it[8], 0.0), min(it[9], 0.0), min(it[10], 0.0))) if it[1] == 'edge' else it
+             for it in planner.items if it[1] in ('edge', 'obs')]
+    ok, g, idx, what, poses, mins = _moves_eval(planner.body, items, start, cm)
+    if not ok:
+        out = dict(leg)
+        out['note'] = '；'.join(t for t in (leg.get('note') or '', f'(开头那一下 {cmds[0][0]} {v0} 没并掉：{what})') if t)
+        return out
+    ga, gb = leg['goal'], poses[-1]
+    if math.hypot(ga[0] - gb[0], ga[1] - gb[1]) > 1.0:
+        return leg
+    out = dict(leg, cmds=cm, poses=[(p[0], p[1], wrap180(p[2])) for p in poses], time_s=round(planner.motion.route_time(cm), 2))
+    out['note'] = '；'.join(t for t in (leg.get('note') or '', f'从 {prev} 出发开头那一下({cmds[0][0]} {v0:+d}mm)不单独走，并进后面同方向的移动(no_jog_from，不按地图查黄色区/工位)') if t)
+    out['no_jog'] = True
+    return out
 
 
 def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, planner=None, near=False):
@@ -1784,7 +1851,9 @@ def _plan_mission(cfg, obstacles, start_pose, stop_names, start_pivot=None, plan
             leg, why = _near_leg(planner, pose, (gx, gy, gyaw), name, why, cfg)
         if leg is None:
             return legs, f'去 {name} 的路线失败：{why}', planner
-        legs.append(_mid_lane_shift(planner, leg, cfg))
+        prev = stop_names[len(legs) - 1] if legs else None
+        leg2 = _no_jog(planner, leg, cfg, prev)
+        legs.append(leg2 if leg2 is not leg else _mid_lane_shift(planner, leg, cfg))
         g = leg['goal']
         pv = planner.pivot_of(g[0], g[1], g[2])
         pose = (pv[0], pv[1], yaw_of(heading_index(g[2])))
