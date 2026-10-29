@@ -109,7 +109,23 @@ class SwitchTests(unittest.TestCase):
 
     def test_bad_level(self):
         with self.assertRaises(ValueError):
-            spf.switch(copy.deepcopy(CAR), 'turbo', None)
+            spf.switch(copy.deepcopy(CAR), 'ultra', None)
+
+    def test_turbo_faster_turn_end_and_back_to_max(self):
+        # (10-29 用户"每一个弯道都要等好久才转")turbo：转弯最后几度靠得快、早停转、差 1° 内算转完；换回 max 时这两个改回默认
+        raw = copy.deepcopy(CAR)
+        spf.switch(raw, 'max', None)
+        kp_max = raw['stm32_params']['TCKP']
+        spf.switch(raw, 'turbo', None)
+        sp = raw['stm32_params']
+        self.assertEqual((sp['TCV'], sp['TCA'], sp['TCSTOP'], sp['TCTOL']), (200.0, 1200.0, 0.4, 1.0))
+        self.assertGreater(sp['TCKP'], kp_max)
+        self.assertLessEqual(sp['TCKP'], 10.0)
+        self.assertEqual(spf.level(raw), 'turbo')
+        spf.switch(raw, 'max', None)
+        self.assertEqual((raw['stm32_params']['TCSTOP'], raw['stm32_params']['TCTOL']), (0.15, 0.5))
+        spf.switch(raw, 'normal', None)
+        self.assertNotIn('speed_saved', raw)
 
     def test_show(self):
         lines = []

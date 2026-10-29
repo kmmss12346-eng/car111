@@ -1365,4 +1365,8 @@ git_log.txt                ← 分支最近 120 条提交记录
   没有就补在最后；只查障碍物和不出场地(场地边余量 0)，不查黄色区/工位/原料转盘。实车那样(RAW 1100,2080 / ROUGH 1180,300 / TEMP 210,1250)：
   RAW→ROUGH 转完弯直接往下开、到粗加工区最后多前进 80；TEMP→RAW 不先横移，直接往北开。用了 no_jog 的段不再做 midlane。
   test_route_safety/margin/nav_route 测规划本身的余量，配置里 no_jog_from=[]；新测试 NoJogTests。
+- **10-29(10) 用户"转弯的时候每次要等待的原因太长了……每一个弯道都要等好久才转"：** 查过：树莓派两条指令之间不等(写死模式转弯前后也不雷达定位)，
+  直行完 STM32 只等 SETTLE 60ms；时间在 Car_Turn_Closed 末段：按 TCKP 指数式靠上去(PPD 47、TCKP 6 时间常数约 0.15 秒，20°→0.15° 约 0.7 秒)，
+  再要停下误差 ≤ TCTOL 0.5° 连续 3 次。加了 `speed turbo`(speed_profile)：TCV 200、TCA 1200、TCKP ×1.4(≤10)、TCSTOP 0.4、TCTOL 1.0、TCMIN 3，
+  直行和 max 一样；从 turbo 换回 fast/max 时 TCSTOP/TCTOL 改回默认。没有实车数据，要实车试(send R 90 看用时、车头误差)。
 

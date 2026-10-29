@@ -3,6 +3,8 @@
     speed            看现在是哪一档、各参数多少
     speed fast       提速：直行/横移快一点、起步刹车猛一点；转弯最后那几度不再慢慢爬
     speed max        再快一档(直行/横移就是以前 220/170 转/分的速度)；车头偏、停不准就退回 fast
+    speed turbo      (10-29 用户"每一个弯道都要等好久才转")直行和 max 一样；转弯最高速、起步拉满，最后几度靠得更快
+                     (TCKP 大一些)、差 0.4° 就停转、停下差 1° 以内算转完(转完接着直行车头会自己扶正)。转弯冲过头/来回摆就退回 max
     speed normal     还原成第一次 speed fast/max 之前的样子(原来的值存在配置的 speed_saved 里)
     turntune         车原地转几次 ±90°，自动选转得最快、又停得准的 TCLAG(车周围留出 40cm 空地)
 
@@ -17,7 +19,7 @@ import math
 
 from stm32_link import parse_done
 
-LEVELS = ('fast', 'max')
+LEVELS = ('fast', 'max', 'turbo')
 
 # 每一档：树莓派配置里的直行/横移速度、用来估时的转弯秒数；STM32 的加减速(直行 SCACC 起步、SCDEC 刹车，横移 SSACC)、
 # 转弯最高速 TCV、起步 TCA、刹车 TCD、最低转速 TCMIN(TCKP 按 PPD 换算，见 tckp_for)
@@ -26,11 +28,17 @@ PRESETS = {
              {'SCACC': 150.0, 'SCDEC': 110.0, 'SSACC': 180.0, 'TCV': 120.0, 'TCA': 600.0, 'TCD': 300.0, 'TCMIN': 2.0}),
     'max': ({'route_speed_rpm': 220, 'strafe_speed_rpm': 170, 'turn90_s': 1.9, 'turn180_s': 2.6},
             {'SCACC': 200.0, 'SCDEC': 150.0, 'SSACC': 200.0, 'TCV': 150.0, 'TCA': 800.0, 'TCD': 300.0, 'TCMIN': 2.0}),
+    # TCD 不再加：刹车受驱动器斜坡限制(STM32 里最多用到斜坡的 0.85)，加了也快不了
+    'turbo': ({'route_speed_rpm': 220, 'strafe_speed_rpm': 170, 'turn90_s': 1.5, 'turn180_s': 2.2},
+              {'SCACC': 200.0, 'SCDEC': 150.0, 'SSACC': 200.0, 'TCV': 200.0, 'TCA': 1200.0, 'TCD': 300.0, 'TCMIN': 3.0,
+               'TCSTOP': 0.4, 'TCTOL': 1.0}),
 }
+TURBO_KP = 1.4                    # turbo 的 TCKP = 按 PPD 换算的值 × 这么多(STM32 最多 10)
 CFG_KEYS = ('route_speed_rpm', 'strafe_speed_rpm', 'turn90_s', 'turn180_s')
-STM_KEYS = ('SCACC', 'SCDEC', 'SSACC', 'TCV', 'TCA', 'TCD', 'TCKP', 'TCMIN')
+STM_KEYS = ('SCACC', 'SCDEC', 'SSACC', 'TCV', 'TCA', 'TCD', 'TCKP', 'TCMIN', 'TCSTOP', 'TCTOL')
 # STM32 程序里编译进去的默认值(配置里没存、也读不到 STM32 现在的值时，还原就按它)
 FW_DEFAULTS = {'SCACC': 300.0, 'SCDEC': 0.0, 'SSACC': 200.0, 'TCV': 80.0, 'TCA': 400.0, 'TCD': 250.0, 'TCKP': 3.0, 'TCMIN': 1.0,
+               'TCSTOP': 0.15, 'TCTOL': 0.5,
                'TCLAG': 0.16, 'PPD': 25.4}
 # 代码里的默认值(配置里没写时)
 CFG_DEFAULTS = {'route_speed_rpm': 220, 'strafe_speed_rpm': 170, 'turn90_s': 1.8, 'turn180_s': 2.5}
@@ -74,6 +82,11 @@ def targets(raw_cfg, name, now=None):
     cfg_t, stm_t = PRESETS[name]
     stm = dict(stm_t)
     stm['TCKP'] = tckp_for(_ppd(raw_cfg, now))
+    if name == 'turbo':
+        stm['TCKP'] = round(min(10.0, stm['TCKP'] * TURBO_KP), 1)
+    elif level(raw_cfg) == 'turbo':
+        for k in ('TCSTOP', 'TCTOL'):
+            stm.setdefault(k, FW_DEFAULTS[k])      # 从 turbo 换回 fast/max：turbo 改过的这两个改回 STM32 默认
     return dict(cfg_t), stm
 
 
@@ -119,7 +132,7 @@ def switch(raw_cfg, name, link=None, log=print):
     """换到 name 档('fast' / 'max' / 'normal')：改 raw_cfg(调用的人存文件)，连着 STM32 就马上 SET。
     返回 (改了哪些 [(名字, 原来, 现在)], 发失败的 STM32 参数名)。"""
     if name not in LEVELS + ('normal',):
-        raise ValueError('格式：speed fast / speed max / speed normal / speed')
+        raise ValueError('格式：speed fast / speed max / speed turbo / speed normal / speed')
     sp = dict(raw_cfg.get('stm32_params') or {})
     saved = raw_cfg.get('speed_saved')
     now = _read_now(link, log)
@@ -187,7 +200,7 @@ def show(raw_cfg, link=None, log=print):
         '  估时 turn90_s=' + _fmt(raw_cfg.get('turn90_s', CFG_DEFAULTS['turn90_s'])))
     keys = STM_KEYS + ('TCLAG', 'PPD')
     log('  STM32：' + '  '.join(f'{k}={_fmt(sp.get(k, (now or {}).get(k, FW_DEFAULTS.get(k))))}' for k in keys))
-    log('  换档：speed fast / speed max / speed normal；转弯再快：turntune(车原地转几次 ±90°，自动选 TCLAG)')
+    log('  换档：speed fast / speed max / speed turbo(转弯最快) / speed normal；转弯再快：turntune(车原地转几次 ±90°，自动选 TCLAG)')
 
 
 def report(changes, bad, name, log=print):
@@ -201,6 +214,7 @@ def report(changes, bad, name, log=print):
     else:
         log(f'已换成 speed {name}(存进配置，下一次 go / race 起作用；STM32 的参数已经发过去)。' +
             ('车头偏、停不准、打滑就 speed fast 或 speed normal 退回。' if name == 'max' else
+             '转弯冲过头、来回摆、车头误差常超过 1° 就 speed max 退回。' if name == 'turbo' else
              '跑一趟看看：车头偏、停不准就 speed normal 退回。转弯再快：turntune'))
     if bad:
         log(f'★ 这几个 STM32 没收：{", ".join(bad)}。下次运行会再发一次')

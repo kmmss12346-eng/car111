@@ -1194,7 +1194,7 @@ def main():
             import speed_profile as spf
             out_=lambda m:print(m,flush=True)
             if len(parts)==1:spf.show(raw_cfg,link,out_);return
-            if len(parts)!=2 or parts[1].lower() not in ('fast','max','normal'):raise ValueError('格式：speed fast(提速) / speed max(再快一档) / speed normal(还原) / speed(看现在)')
+            if len(parts)!=2 or parts[1].lower() not in ('fast','max','turbo','normal'):raise ValueError('格式：speed fast(提速) / speed max(再快一档) / speed turbo(转弯最快) / speed normal(还原) / speed(看现在)')
             if state['auto'] or state['busy']:raise ValueError('正在运行或扫描，等结束再用')
             if link is not None:sync_now()
             ch_,bad_=spf.switch(raw_cfg,parts[1].lower(),link,out_)
@@ -1370,7 +1370,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|turbo|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_jog(c,val):
         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
