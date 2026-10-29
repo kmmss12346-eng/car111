@@ -723,8 +723,9 @@ class LiveTests(unittest.TestCase):
 
     def test_fixed_race_default_waits_are_short(self):
         """(10-29 晚 用户"实测下来……大概要15s，把时间压缩一下，压缩到8s到10s左右"、"你先让这些准备好最后我按这个红色按钮的时候就不用准备了
-        就是我按下之后就可是停三秒直接走了")写死模式默认：按 START 之前先同步参数、准备机械臂，按了以后不再同步，原地等 3 秒 → 第二站动作
-        → 不再等，直接开(以前同步、准备在按了 START 以后，还要等 3 秒、3 秒)，照样跑完回到启停区。"""
+        就是我按下之后就可是停三秒直接走了"、"不是要跳过第二站就是做到我按下红色按钮等三秒然后左移前移旋转然后等2秒就直接动")写死模式默认：
+        按 START 之前先同步参数、准备机械臂，按了以后不再同步，原地等 3 秒 → 第二站动作 → 等 2 秒 → 开(以前同步、准备在按了 START 以后，
+        还要等 3 秒、3 秒)，照样跑完回到启停区。"""
         start = (2250.0, 150.0, 90.0)
         mark = {}
 
@@ -747,7 +748,7 @@ class LiveTests(unittest.TestCase):
                             screen_zone=None, done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t)
         log = self.log
         self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
-        self.assertIn('按了以后原地等 3 秒(不扫描) → 第二站动作 → 不规划', log)
+        self.assertIn('按了以后原地等 3 秒(不扫描) → 第二站动作 → 再等 2 秒(不扫描) → 不规划', log)
         pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
         self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre)
         self.assertIn('参数同步好了', pre)
@@ -755,12 +756,12 @@ class LiveTests(unittest.TestCase):
         self.assertIn('STM32 参数按 START 之前已经同步好了', fx, '按了 START 不再同步')
         self.assertNotIn('STM32 参数已同步', fx)
         self.assertIn('原地等 3 秒(从开跑算)', fx)
-        self.assertNotIn('③ 写死模式', fx, '第二站动作以后不再等')
+        self.assertIn('③ 写死模式：不扫描，原地等 2 秒', fx, '第二站动作以后等 2 秒')
         self.assertIn('② 走第二站：左移', fx, '第二站动作照旧')
         import re
         m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
         self.assertTrue(m, fx[:2000])
-        self.assertTrue(2.9 <= float(m[-1]) <= 4.5, (m, fx[:2000]))      # 3 + 第二站(模拟里很快)
+        self.assertTrue(4.9 <= float(m[-1]) <= 6.5, (m, fx[:2000]))      # 3 + 第二站(模拟里很快) + 2
         big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
         self.assertGreaterEqual(len(big), 8, big)
 
@@ -796,9 +797,9 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(len(car.sent), mark['sent'], '重新规划车不动')
 
     def test_fixroute_replan_from_start_then_fixed_race_goes_straight_away(self):
-        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内"、"按这个红色按钮之前就把这个准备工作做好就行了，按完红色按钮
-        等三秒就直接跑")fixroute replan 默认从起点规划(存 second_move=False)；写死模式 race 2：按 START 之前先同步参数、准备机械臂，
-        按了以后等 3 秒、不走第二站，直接按存好的路线开；路上不用雷达定位(只有回家前)，跑完回到启停区。"""
+        """(10-29 晚)配置 fixed_second_move=false：fixroute replan 从起点规划(存 second_move=False)；写死模式 race 2：按 START 之前
+        先同步参数、准备机械臂，按了以后等 3 秒、不走第二站，直接按存好的路线开；路上不用雷达定位(只有回家前)，跑完回到启停区。
+        (用户后来说"不是要跳过第二站"：默认 fixed_second_move=true，还是做第二站动作，见 test_fixed_race_default_waits_are_short)"""
         start = (2250.0, 150.0, 90.0)
         mark = {}
 
@@ -819,12 +820,11 @@ class LiveTests(unittest.TestCase):
                   (said('已清空历史'), 'fixroute replan'), (said('已重新规划、存好写死路线'), 'fixroute on'),
                   (lambda: said('已打开写死模式')() and back_to_start(), 'race 2')]
         car = self.run_live(2, dict(scale=0.01, drift_deg=0.05, resid_deg=0.2), timeout=150.0,
-                            cfg_extra=dict(race_auto=False, race_start='now'), inputs=inputs, screen_zone=None,
+                            cfg_extra=dict(race_auto=False, race_start='now', fixed_second_move=False), inputs=inputs, screen_zone=None,
                             done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t,
                             keep=('fixed_route.json',))
         log = self.log
         self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
-        self.assertIn('想按了 START 直接从起点开', log, 'fixroute save 提醒可以 replan')
         self.assertIn('从起点 (2250,150) 按现在的停车点重新规划(跑的时候不走第二站，按了 START 等完直接开)', log)
         self.assertIn('从起点直接开(不走第二站)', log)
         snap = self.kept['fixed_route.json']

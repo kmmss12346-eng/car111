@@ -239,8 +239,8 @@ def main():
     # (10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")写死路线(fixroute，见 fixed_route.py)
     fixed_path=fixed_route.path_for(args.config);fix_cache={}
     # (10-29 晚)写死模式按了 START 原地等几秒、第二站动作以后再等几秒(配置 fixed_wait1_s / fixed_wait2_s 可改；以前都是 3)。
-    #   用户"我按下之后就可是停三秒直接走了"：停 3 秒 → 第二站动作 → 不再等，直接开
-    FIXED_WAIT1_S,FIXED_WAIT2_S=3.0,0.0
+    #   用户"不是要跳过第二站就是做到我按下红色按钮等三秒然后左移前移旋转然后等2秒就直接动"：停 3 秒 → 第二站动作 → 等 2 秒 → 开
+    FIXED_WAIT1_S,FIXED_WAIT2_S=3.0,2.0
     def fixed_on():
         return bool(raw_cfg.get('fixed_route',False))
     def fixed_snap():
@@ -674,8 +674,9 @@ def main():
         def fixed_route(self):
             """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。
             (10-29 晚 用户"实测下来……大概要15s，把时间压缩一下"、"你先让这些准备好……我按下之后就可是停三秒直接走了"、"能改多短减多短")
-            同步参数、机械臂准备挪到按 START 之前(fixed_prestart)；按了 START 原地等 3 秒；second_move = 存的路线是不是从第二站规划的
-            (是才做第二站动作、再等 fixed_wait2_s；fixroute replan 默认从起点规划，等完直接开)。"""
+            同步参数、机械臂准备挪到按 START 之前(fixed_prestart)；按了 START 原地等 3 秒 → 第二站动作 → 再等 2 秒 → 开。
+            second_move = 存的路线是不是从第二站规划的(fixroute save / replan 都是；配置 fixed_second_move=false 时 replan 从起点规划，
+            跑的时候不做第二站动作、不等 wait2)。"""
             if not fixed_on():return None
             return dict(wait1=float(raw_cfg.get('fixed_wait1_s',FIXED_WAIT1_S)),wait2=float(raw_cfg.get('fixed_wait2_s',FIXED_WAIT2_S)),
                         t0=state.get('run_t0'),second_move=fixed_second_move())
@@ -1135,17 +1136,15 @@ def main():
                 snap_=fixed_route.snapshot(state,history.views,history.objects,zone_,second_move=True)   # 跑的时候是从第二站规划的
                 fixed_route.save(fixed_path,snap_);fix_cache.clear()
                 print('已存好写死路线：'+fixed_route.describe(snap_)+f'(存在 {fixed_path.name})；停车点 '+fixed_route.stops_text(snap_)+'。'
-                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on')
-                      +('。★ 想按了 START 直接从起点开(不走第二站，快 5 秒左右)：再输入 fixroute replan' if not raw_cfg.get('fixed_second_move',False) else ''),
-                      flush=True);return
+                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
             if sub_=='replan':
                 # (10-29 用户"暂停区域的y轴不能减少要和原来的一样")stop 改了停车点不用再跑一遍：车不动，按存着的地图(存的时候那两次扫描、
                 #   障碍物)，按现在的停车点重新规划，存成新的写死路线(规划不出来就不改)。
-                #   (10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")默认从起点(第一次扫描的车位)规划：跑的时候不走第二站，
-                #   按了 START 直接开；配置 fixed_second_move=true 才和以前一样从存的第二站车位规划
+                #   从存的第二站车位规划(跑的时候照样做第二站动作：用户"不是要跳过第二站")；配置 fixed_second_move=false 才从起点
+                #   (第一次扫描的车位)规划，跑的时候不走第二站
                 snap_=fixed_snap();why_=fixed_route.check(snap_,zone_)
                 if why_:raise ValueError(why_)
-                second_=bool(raw_cfg.get('fixed_second_move',False))
+                second_=bool(raw_cfg.get('fixed_second_move',True))
                 m_=copy.deepcopy(snap_)
                 history.views[:]=m_['views'];history.objects[:]=m_['objects']
                 c1_=history.views[1 if second_ else 0]['config']
@@ -1523,7 +1522,7 @@ def main():
     print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
     print('rtol 1 1.5 = 1、3 号环摄像头微调对到 1mm、2 号环车轮对到 1.5mm 以内才算对准(越小放得越准、多花几秒；只输入 rtol 看现在多少)。',flush=True)
     print('rfine on / off = 1、3 号环要不要用摄像头只动手臂微调(默认 off：按 arm_calib 调的角度直接放；只输入 rfine 看现在是哪个)。',flush=True)
-    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；stop 改了停车点：fixroute replan 重新规划再存(默认从起点规划：按了 START 不走第二站直接开)；只输入 fixroute 看现在。',flush=True)
+    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；stop 改了停车点：fixroute replan 重新规划再存；只输入 fixroute 看现在。',flush=True)
     if fixed_on():print('★ 写死模式开着(fixroute on)：race / go 不扫描、不规划，按存好的路线跑。改回自己规划：fixroute off',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
