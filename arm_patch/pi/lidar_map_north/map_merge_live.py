@@ -1067,13 +1067,37 @@ def main():
         if k=='fixroute':
             # (10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")写死路线：见 fixed_route.py
             sub_=parts[1].lower() if len(parts)>1 else ''
-            if len(parts)>2 or sub_ not in ('','save','on','off'):
-                raise ValueError('格式：fixroute save(存刚才的路线和地图) / fixroute on(写死模式) / fixroute off(改回自己规划) / fixroute(看现在)')
+            if len(parts)>2 or sub_ not in ('','save','replan','on','off'):
+                raise ValueError('格式：fixroute save(存刚才的路线和地图) / fixroute replan(stop 改了停车点：按存的地图重新规划再存) / '
+                                 'fixroute on(写死模式) / fixroute off(改回自己规划) / fixroute(看现在)')
             w1_,w2_=float(raw_cfg.get('fixed_wait1_s',3.0)),float(raw_cfg.get('fixed_wait2_s',3.0))
+            zone_=int(raw_cfg.get('start_zone',2) or 2)
             if sub_=='save':
-                snap_=fixed_route.snapshot(state,history.views,history.objects,int(raw_cfg.get('start_zone',2) or 2))
+                snap_=fixed_route.snapshot(state,history.views,history.objects,zone_)
                 fixed_route.save(fixed_path,snap_);fix_cache.clear()
-                print('已存好写死路线：'+fixed_route.describe(snap_)+f'(存在 {fixed_path.name})。'
+                print('已存好写死路线：'+fixed_route.describe(snap_)+f'(存在 {fixed_path.name})；停车点 '+fixed_route.stops_text(snap_)+'。'
+                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
+            if sub_=='replan':
+                # (10-29 用户"暂停区域的y轴不能减少要和原来的一样")stop 改了停车点不用再跑一遍：车不动，按存着的地图(存的时候那两次扫描、
+                #   障碍物)，从存的第二站车位出发，按现在的停车点重新规划，存成新的写死路线(规划不出来就不改)
+                snap_=fixed_snap();why_=fixed_route.check(snap_,zone_)
+                if why_:raise ValueError(why_)
+                m_=copy.deepcopy(snap_)
+                history.views[:]=m_['views'];history.objects[:]=m_['objects']
+                c1_=history.views[1]['config']
+                state['config']=validate_config(dict(state['config'],car_x_mm=float(c1_['car_x_mm']),car_y_mm=float(c1_['car_y_mm']),
+                                                     car_yaw_deg=float(c1_['car_yaw_deg'])))
+                state.update(plan_start=None,replan_from=None,preplan=None,home_routes={},legs_partial=False)
+                print(f'车不动：按存着的地图(障碍物 {len(history.objects)} 个)、从存的第二站车位 ({c1_["car_x_mm"]:.0f},{c1_["car_y_mm"]:.0f}) '
+                      '按现在的停车点重新规划……',flush=True)
+                plan_route()
+                state['plan_key']=(len(history.views),tuple((round(o['x']),round(o['y'])) for o in history.objects),state['plan_start'])
+                redraw();print_route()
+                if state['reason']!='ROUTE OK' or not state['legs']:
+                    raise ValueError(f'按现在的停车点规划不出来({state["reason"]})：写死路线没改，还是原来那条')
+                snap2_=fixed_route.snapshot(state,history.views,history.objects,zone_)
+                fixed_route.save(fixed_path,snap2_);fix_cache.clear()
+                print('已重新规划、存好写死路线：'+fixed_route.describe(snap2_)+'；停车点 '+fixed_route.stops_text(snap2_)+'。'
                       +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
             if sub_=='on':
                 snap_=fixed_snap()                          # 没存过就报错，不打开
@@ -1084,10 +1108,11 @@ def main():
             if sub_=='off':
                 save_cfg_keys({'fixed_route':False})
                 print('已关掉写死模式(存进配置)：race / go 照常自己扫描、规划',flush=True);return
-            try:d_=fixed_route.describe(fixed_snap())
+            try:
+                sn_=fixed_snap();d_=fixed_route.describe(sn_)+'；停车点 '+fixed_route.stops_text(sn_)
             except ValueError as e:d_=str(e)
             print(('现在：写死模式开着(fixroute on)' if fixed_on() else '现在：写死模式关着(race / go 自己扫描、规划)')+'。存的路线：'+d_
-                  +'。改：fixroute save / fixroute on / fixroute off',flush=True);return
+                  +'。改：fixroute save / fixroute replan / fixroute on / fixroute off',flush=True);return
         if k=='zup':
             # (10-28 用户"把所有的就是高度往上面提高四毫米变成124")升降的高度参数一起加减：zup 4 / zup -4 / zup 4 ZHI，见 zshift.py
             import zshift
@@ -1255,7 +1280,7 @@ def main():
             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
             launch(c,'user_entered_absolute_pose');return
-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
     def command_jog(c,val):
         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
@@ -1333,6 +1358,8 @@ def main():
         if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
         write_json_safe(p_,file_cfg())
         print(f'已改 {n}：({old[0]:.0f},{old[1]:.0f}) 车头 {old[2]:.0f}° → ({x_:.0f},{y_:.0f}) 车头 {stops[n][2]:.0f}°，存进 {p_.name}(原文件备份为 .json.bak)',flush=True)
+        if fixed_on():
+            print('  ★ 写死模式开着：写死的路线还是存的那条，没跟着改。输入 fixroute replan 按新的停车点重新规划再存(车不动，不用再跑一遍)',flush=True)
         if not replan:
             print('  这一趟后面照原来的路线走；下一次 go 按新停车点规划',flush=True);return
         state['preplan_gen']=state.get('preplan_gen',0)+1
@@ -1429,7 +1456,7 @@ def main():
     print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
     print('rtol 1 1.5 = 1、3 号环摄像头微调对到 1mm、2 号环车轮对到 1.5mm 以内才算对准(越小放得越准、多花几秒；只输入 rtol 看现在多少)。',flush=True)
     print('rfine on / off = 1、3 号环要不要用摄像头只动手臂微调(默认 off：按 arm_calib 调的角度直接放；只输入 rfine 看现在是哪个)。',flush=True)
-    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；只输入 fixroute 看现在。',flush=True)
+    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；stop 改了停车点：fixroute replan 重新规划再存；只输入 fixroute 看现在。',flush=True)
     if fixed_on():print('★ 写死模式开着(fixroute on)：race / go 不扫描、不规划，按存好的路线跑。改回自己规划：fixroute off',flush=True)
     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)

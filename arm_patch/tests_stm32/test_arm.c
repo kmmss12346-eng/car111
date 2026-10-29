@@ -596,11 +596,11 @@ int main(void) {
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "(10-23)开机只清屏、不收触摸：屏上按哪里都不算");
     run("ZONE ASK");                                /* 旧流程的选区页(ZONE ASK)还留着 */
     clear(); tap(100, 200);
-    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,128,480,192,0,0,2016,1,1,1,\"START\"")
+    CHECK(zone_is("ZONE 1 0") && scrs("cls 0|") && scrs("xstr 0,0,480,320,0,65535,63488,1,1,1,\"START\"")
           && !scrs("ZONE 1") && !scrs("BACK") && !scrs("xstr 0,84") && !scrs("sendxy"),
-          "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页：(10-23)只有大 START(不写 ZONE 1、没有状态行和 BACK)");
+          "按左边按钮(按下、松开都在按钮 1 里)：选 1 区，画准备页：(10-29)红底白字的大 START 铺满整个屏(不写 ZONE 1、没有状态行和 BACK)");
     clear(); tap(400, 30);
-    CHECK(zone_is("ZONE 1 0") && scr[0] == 0, "(10-23)准备页右上角(以前的 BACK)按了不算");
+    CHECK(zone_is("ZONE 1 1"), "(10-29)准备页整屏都是 START：右上角(以前的 BACK)按了也算");
     run("ZONE ASK");
     clear(); touch(100, 200, 1); touch(400, 200, 0); Arm_Poll();
     CHECK(zone_is("ZONE 0 0") && scr[0] == 0, "在按钮 1 按下、滑到按钮 2 松开：不算");
@@ -613,7 +613,7 @@ int main(void) {
     clear(); touch(240, 250, 1); Arm_Poll();
     CHECK(zone_is("ZONE 2 0") && scr[0] == 0, "START 只按下、还没松开：不算");
     touch(20, 310, 0); Arm_Poll();
-    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,128,480,192,0,0,65504,1,1,1,\"GO\"") && !scrs("xstr 0,84") && !scrs("xstr 336")
+    CHECK(zone_is("ZONE 2 1") && scrs("xstr 0,0,480,320,0,0,65504,1,1,1,\"GO\"") && !scrs("xstr 0,84") && !scrs("xstr 336")
           && !scrs("cls"),
           "在 START 里按下、松开：s=1，START 换成 GO(不整页重画；(10-23)没有状态行、没有 BACK)");
     clear(); tap(400, 30); tap(240, 250); tap(100, 200);

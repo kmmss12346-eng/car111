@@ -105,6 +105,11 @@ class FixedRouteTests(unittest.TestCase):
         self.assertIn('写死路线是启停区 2 的，现在是启停区 1', why)
         self.assertIn('race 2', why)
 
+    def test_stops_text_lists_each_stop_once(self):
+        st = _state()
+        st['legs'] = st['legs'] + [dict(st['legs'][0], goal=(2100.0, 1250.0, 90.0))]          # 第二次去 QR：只写第一次的
+        self.assertEqual(fixed_route.stops_text(fixed_route.snapshot(st, VIEWS, OBJS, 2)), 'QR(2100,1200) START2(2250,150)')
+
     def test_describe(self):
         d = fixed_route.describe(fixed_route.snapshot(_state(), VIEWS, OBJS, 2))
         self.assertIn('启停区 2', d)

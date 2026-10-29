@@ -2108,7 +2108,7 @@ static void Screen_Clear(void)
 }
 
 /* ================= 选启停区(串口屏触摸) =================
- * (10-23 用户"不需要显示启停区1还是2")开机只清屏；树莓派 race 1|2 发 ZONE 1|2 进准备页：只有下面一个大按钮 START
+ * (10-23 用户"不需要显示启停区1还是2")开机只清屏；树莓派 race 1|2 发 ZONE 1|2 进准备页：只有一个大按钮 START((10-29)红底白字、铺满整个屏)
  * (不写 "ZONE n"、没有状态行、没有 BACK)。ZONE ASK(旧流程)还会画选区页：左半边大按钮 "1"、右半边大按钮 "2"。
  * 按 START：s=1，状态显示 GO，以后不再收触摸(只启动一次)。
  * 树莓派用 ZONE? 查选了几区、按没按 START；开跑时发 ZONE LOCK：关掉触摸、清屏回到比赛布局。
@@ -2130,7 +2130,7 @@ static void Screen_Clear(void)
 /* 按钮位置(480x320 横屏)。画按钮和认触摸用同一组数 */
 #define ZP_BTN_Y    52         /* 选区页：两个大按钮从 y=52 到底 */
 #define ZP_BTN_W    236        /* 按钮 1：x 0~235；按钮 2：x 244~479(中间 8 像素的缝按了不算) */
-#define ZR_START_Y  128        /* 准备页：START 从 y=128 到底，整个宽度 */
+#define ZR_START_Y  0          /* 准备页：(10-29 用户"启动的按钮……没有覆盖整个屏幕")START 铺满整个屏(以前从 y=128 到底)，按哪里都算(Zone_Hit) */
 #define ZR_BACK_X   336        /* 准备页：BACK 画在右上角 x 336~471、y 8~71(认触摸时右上角 x≥330、y<80 都算) */
 #define ZONE_TAP_GUARD_MS 500u /* 换页以后这么久以内按下的不算：手指抖一下、连按两下，不会选完区顺手就按到 START */
 
@@ -2161,9 +2161,9 @@ static uint8_t Zone_Hit(uint8_t ui, uint16_t x, uint16_t y)
         if (x < ZP_BTN_W)          return ZBTN_1;
         if (x >= 480 - ZP_BTN_W)   return ZBTN_2;
     }
-    if (ui == ZUI_READY && y >= ZR_START_Y)
+    if (ui == ZUI_READY)
     {
-        return ZBTN_START;                         /* (10-23)准备页只有 START，没有 BACK(右上角按了也不算) */
+        return ZBTN_START;                         /* (10-29)准备页整屏都是 START(没有 BACK) */
     }
     return 0;
 }
@@ -2256,12 +2256,12 @@ static void Zone_ShowMsg(void)
     }
 }
 
-/* 准备页下半部分：没按 START 时是绿色 START；按了以后换成黄色 GO。(10-23)不再有 BACK */
+/* 准备页：没按 START 时是红色 START(10-29 用户"不是红色的是绿色的"：以前绿底黑字)；按了以后换成黄色 GO。(10-23)不再有 BACK */
 static void Zone_ShowButtons(void)
 {
     if (zone_ui == ZUI_READY)
     {
-        Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 0u, 2016u, "START");      /* 绿底黑字 */
+        Zone_Box(0, ZR_START_Y, 480, 320 - ZR_START_Y, SCR_FONT_BIG, 65535u, 63488u, "START"); /* 红底白字 */
     }
     else
     {

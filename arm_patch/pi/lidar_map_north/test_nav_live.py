@@ -311,7 +311,7 @@ class LiveTests(unittest.TestCase):
         WORLD.clear()
 
     def run_live(self, zone, car_kw=None, cfg_extra=None, timeout=90.0, inputs=None, screen_zone='same', argv_extra=(), expect_done=True, end_on=None,
-                 done_when=None):
+                 done_when=None, keep=()):
         with open(USER_CFG, encoding='utf-8') as f:
             raw = json.load(f)
         WORLD['mount'] = {k: raw[k] for k in ('lidar_forward_mm', 'lidar_left_mm', 'lidar_yaw_deg', 'sdk_y_sign')}
@@ -390,6 +390,12 @@ class LiveTests(unittest.TestCase):
                     sys.modules[k] = v
             with open(cfg_path, encoding='utf-8') as f:
                 self.cfg_after = json.load(f)
+            self.kept = {}                                   # keep：跑完读出来的文件(写死路线等)
+            for name in keep:
+                fp = os.path.join(tmp, name)
+                if os.path.exists(fp):
+                    with open(fp, encoding='utf-8') as f:
+                        self.kept[name] = json.load(f)
             shutil.rmtree(tmp, ignore_errors=True)
         self.log = out.text()
         self.assertEqual(rc, 0)
@@ -707,6 +713,37 @@ class LiveTests(unittest.TestCase):
         k0 = next(i for i, q in enumerate(tr) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
         self.assertGreaterEqual(edge_min(tr[k0:], self.cfg_after), 0.0)
         self.assertIs(self.cfg_after.get('fixed_route'), True, 'fixroute on 存进配置')
+
+    def test_fixroute_replan_after_moving_a_stop(self):
+        """(10-29 用户"暂停区域的y轴不能减少要和原来的一样")程序重开过(没有扫描)、stop 改了停车点：fixroute replan 车不动，
+        按存着的地图、从存的第二站车位按新的停车点重新规划，存成新的写死路线；写死模式开着时 stop 提醒要 replan。"""
+        mark = {}
+
+        def said(t, n=1):
+            return lambda: self.out_text().count(t) >= n
+
+        def before_replan():
+            if '已改 TEMP' not in self.out_text():
+                return False
+            mark['sent'] = len(WORLD['car'].sent)
+            return True
+        inputs = [(lambda: True, 'race 2'), (said('路线全部走完'), 'fixroute save'), (said('已存好写死路线'), 'fixroute on'),
+                  (said('已打开写死模式'), 'reset'), (said('已清空历史'), 'stop TEMP 340 1160'), (before_replan, 'fixroute replan')]
+        car = self.run_live(2, dict(scale=0.01), cfg_extra=dict(race_auto=False, race_start='now'), inputs=inputs, screen_zone=None,
+                            done_when=lambda t: '已重新规划、存好写死路线' in t or '★ 出错停止' in t or '写死路线没改' in t,
+                            keep=('fixed_route.json',))
+        log = self.log
+        self.assertIn('已重新规划、存好写死路线', log, log[-3000:])
+        self.assertIn('写死模式开着：写死的路线还是存的那条', log)
+        self.assertIn('车不动：按存着的地图', log)
+        self.assertIn('TEMP(340,1160)', log)
+        tail = log[log.index('车不动：按存着的地图'):]
+        self.assertNotIn('扫描完成', tail, '重新规划不扫描')
+        snap = self.kept['fixed_route.json']
+        goals = {L['stop']: L['goal'] for L in snap['legs']}
+        self.assertEqual(goals['TEMP'][:2], [340.0, 1160.0])
+        self.assertEqual(len(snap['views']), 2)
+        self.assertEqual(len(car.sent), mark['sent'], '重新规划车不动')
 
     def test_fixroute_off_by_default_and_needs_a_saved_route(self):
         """fixroute 看现在：默认关着；没存过路线 fixroute save 要先有两次扫描、fixroute on 不打开。"""

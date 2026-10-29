@@ -1179,6 +1179,19 @@ git_log.txt                ← 分支最近 120 条提交记录
     改了 ZOBRAW/ZOBRNG 提醒十字可能差一两个像素(开跑时 sync_params 也会说"重做 vclaw")。test_zshift、test_nav_live.test_zup_command_raises_all_heights。
     **用户跑了 zup 4 以后说"不对不是的，只需要把这个最高点改上去就好了，其他的点不要改"**：用户要的只是 ZHI 120→124。
     让用户 `zup -4 ZGRAB ZDROP ZPLC ZSTK ZOBRAW ZOBRNG` 改回去(车上实际的值：ZGRAB 102、ZDROP 104、ZPLC 2、ZSTK 67、ZOBRAW/ZOBRNG 120)。
+- **10-29 用户跑了写死模式(ROUGH 1155 300、TEMP 310 1150、ZOBRAW 124)，跑到暂存区按 q/abort：**"暂存区域的y轴不能减少要和原来的一样"、
+  "放置二号环的时候……一直有一个偏向3号环的固定偏差"、"启动的按钮也不是红色的是绿色的而且没有覆盖整个屏幕只是覆盖了屏幕的一半"。
+  - `fixroute replan`(map_merge_live)：程序重开过、没有扫描时 stop 改了停车点也能更新写死路线：载入存的 views/objects、state['config'] = 存的
+    第二次扫描车位，plan_route，plan_key 按 redraw 的算法设好(不规划两遍)，snapshot + save；规划不出来抛 ValueError、文件不改。
+    写死模式开着时 stop 提醒 replan。fixed_route.stops_text 列出每站停在哪(save / replan / fixroute 都打)。
+    test_nav_live.test_fixroute_replan_after_moving_a_stop(run_live 加了 keep=() 读回 tmp 里的文件)、test_fixed_route 加 stops_text。
+  - 日志看到的(写死这一趟)：ROUGH (1155,300) 对 2 号环车轮挪了 横移 +26(离开粗加工区)、前进 +53 → 对上时车在 (1208,326) 左右(离白色区 46mm，
+    和 arm_calib 调 A1P 时一样)；TEMP (310,1150) 时 2 号环在车后 153mm(以前 1250 时约 50mm，用户要回 1250)。
+    1、3 号环"再转一次"反而转过头：-0.20°→+0.70°、-0.40°→+0.60°(第一下已经在 return_tol 以内，再转一次多给的 comp 让它过了)，问用户要不要改。
+  - 2 号环偏向 3 号环(两个工位 3 号环都在车尾那边，画面右边)：主程序 `g +N 0` 挪红十字，N ≈ 1.25 × 偏的毫米数(10-25 的说明"物料偏车尾 → 正数")。
+    红十字挪了 1、3 号环一起跟着挪(车对 2 号环的位置变了)。
+  - 固件 arm.c：准备页 START 红底白字(63488/65535)、ZR_START_Y 0 铺满整个屏，Zone_Hit 准备页整屏都算 START；GO 也铺满。
+    tests_stm32/test_arm.c 跟着改(右上角按了现在算 START)。test_arm 370、chassis 225、servo 42 全过。
 - **10-28 深夜(2) 写死路线 fixroute(用户"我们老师要求我们交两个视频对比一下一个是写死的一个是自己规划的……先做好这个写死的")：**
   用户一开始说"装模做样扫描一下"时以为是交比赛的视频，那时没做；后来说清楚是交给老师、明说是写死版的对比视频，才做。
   用户确认过的流程(复述后用户说"行你的建议行开始改吧")：按屏上红色 START → 屏变白 → 原地等 3 秒(不扫描，机械臂准备算在里面)

@@ -2,6 +2,7 @@
 
     fixroute          看写死模式开没开、存的是哪条路线
     fixroute save     把刚才规划好(跑过)的路线和这次的地图存下来(fixed_route.json，和配置文件放在一起)
+    fixroute replan   (10-29)stop 改了停车点以后：车不动，按存着的地图、从存的第二站车位按现在的停车点重新规划，再存(不用再跑一遍)
     fixroute on       打开写死模式(存进配置)
     fixroute off      关掉，race / go 照常自己扫描、规划
 
@@ -101,6 +102,18 @@ def check(snap, zone):
         return (f'写死路线是启停区 {z} 的，现在是启停区 {int(zone)}：用 race {z}，'
                 f'或者在启停区 {int(zone)} 正常跑一次再 fixroute save')
     return None
+
+
+def stops_text(snap):
+    """存的路线停在哪：停车点名字和车中心坐标(规划时停车点被挡住挪过的，按挪过的写)，同名的只写一次。"""
+    seen, out = set(), []
+    for L in snap.get('legs') or []:
+        n, g = str(L.get('stop')), L.get('goal')
+        if g is None or n in seen:
+            continue
+        seen.add(n)
+        out.append(f'{n}({float(g[0]):.0f},{float(g[1]):.0f})')
+    return ' '.join(out)
 
 
 def describe(snap):
