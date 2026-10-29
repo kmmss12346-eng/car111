@@ -1573,7 +1573,7 @@ class MissionSimTests(unittest.TestCase):
 
             def read_angles(self):
                 return self.at
-        h = make(SimWorld(seed=3, code=self.CODE))
+        h = make(SimWorld(seed=3, code=self.CODE), dict(arm_no_swing=False))   # 测的是以前的做法(回读再转)
         h.arm = Arm([(0.9, 0.0), (0.0, -0.5)])
         h._return_to_pose(300.0, -500.0)
         self.assertEqual(len(h.arm.cmds), 3)
@@ -1959,7 +1959,7 @@ class ZoneFlowTests(unittest.TestCase):
             w = SimWorld(seed=5, code=self.CODE, cam_deg=90.0, ap_bias=(0.9, 1.6))
             lines = []
             # (10-27 晚)zone_same_approach 开着时转回来先停在多转的地方再转回来，不学多转/少转，也不用"再转一次"：这里关掉测学偏差
-            h = make(w, dict(return_bias=learn, zone_same_approach=False), log=lines.append)
+            h = make(w, dict(return_bias=learn, zone_same_approach=False, arm_no_swing=False), log=lines.append)
             run_mission(w, h, log=lines.append)
             text = '\n'.join(lines)
             self._assert_all_good(w, h, text, 5)
@@ -4243,7 +4243,7 @@ class ZoneCalTests(unittest.TestCase):
         for quick in (True, False):
             w = self._world(1)
             lines = []
-            h = self._make(w, dict(pickback_quick=quick), lines=lines)
+            h = self._make(w, dict(pickback_quick=quick, arm_no_swing=False), lines=lines)
             durs = []
             orig = h._pickback_item
 
@@ -4443,7 +4443,7 @@ class ZoneCalTests(unittest.TestCase):
                 w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}        # 和实车一样 1 号环的角度离车上转盘最远
                 w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
                 lines = []
-                cfg = dict(self.CAR_TOL, zone_cal_fine=True)
+                cfg = dict(self.CAR_TOL, zone_cal_fine=True, arm_no_swing=False)
                 if old:
                     cfg.update(zone_backlash_extra_deg=1.0, zone_same_approach=False, zone_cal_fine_tol_mm=None, zone_vel_tol_mm=None)
                 h = self._make(w, cfg, lines=lines)
@@ -4482,7 +4482,7 @@ class ZoneCalTests(unittest.TestCase):
                 side = 1.0 if w.params['A1D'] >= w.params['A1P'] else -1.0   # 往 -side 转到位：手臂比舵机多 side × 间隙/2
                 w.a1_cal_off = (1.0 if same else -1.0) * side * 0.5 * w.id1_backlash_deg
                 lines = []
-                h = self._make(w, dict(self.CAR_TOL), lines=lines)
+                h = self._make(w, dict(self.CAR_TOL, arm_no_swing=False), lines=lines)   # 从车上转盘那边到位的做法
                 run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
                 text = '\n'.join(lines)
                 if same:
@@ -4499,6 +4499,31 @@ class ZoneCalTests(unittest.TestCase):
         self.assertLess(out[False][0][2], 2.0, out)                             # 2 号环照样准(车轮对的)
         self.assertGreater(min(out[False][0][1], out[False][0][3]), 4.0, out)   # 1、3 号环偏好几毫米
 
+    def test_ring13_direct_one_ap_no_turning_back(self):
+        """(10-29 用户"一二三环就是一次性都过去，就不要再来回摆动了")默认 arm_no_swing：夹着物料一条 AP 转到调的角度直接放，
+        不多转过头再回来、不回读再转。代价：ID1 齿轮间隙 2.3° 时 1、3 号环比"从转盘那边到位"偏几毫米(打印出来)。"""
+        errs, sent13 = {1: [], 2: [], 3: []}, []
+        for seed in range(4):
+            w = self._world(seed, id1_backlash_deg=2.3, id1_stick_deg=0.8, ap_fast_err=True)
+            w.ring_tan['ROUGH'] = {1: -150.0, 2: 0.0, 3: 150.0}
+            w.ring_tan['TEMP'] = dict(w.ring_tan['ROUGH'])
+            side = 1.0 if w.params['A1D'] >= w.params['A1P'] else -1.0
+            w.a1_cal_off = side * 0.5 * w.id1_backlash_deg
+            lines = []
+            h = self._make(w, dict(self.CAR_TOL), lines=lines)
+            run_mission(w, h, stops=('QR', 'RAW', 'ROUGH', 'TEMP'), log=lines.append)
+            text = '\n'.join(lines)
+            self.assertEqual((w.air, w.loose, w.collisions, w.sweep_hits), (0, 0, 0, 0), text[-3000:])
+            self.assertEqual((h.stats.grab_ok, h.stats.place_ok, h.stats.place_total), (6, 6, 6), text[-3000:])
+            for (z, k, _c, e, _st) in w.placed:
+                errs[k].append(e)
+            sent13.append(text.count('回到对准姿态差了'))
+            self.assertNotIn('再转一次', text)
+        print(f'\n  [1、2、3 号环一条 AP 直接转过去放(arm_no_swing)；间隙 2.3° + 摩擦] 三个环放置误差最大：'
+              f'{ {k: round(max(v), 2) for k, v in errs.items()} }')
+        self.assertLess(max(errs[2]), 10.0)                      # (10-29)2 号环也一条 AP 转回对准时的角度
+        self.assertLess(max(errs[1] + errs[3]), 10.0)
+
     def test_ring_tol_is_the_smaller_one(self):
         """(10-27 晚)zone_cal_fine_tol_mm / zone_vel_tol_mm 和 tol_mm.RING 取小的；None 就是 tol_mm.RING。"""
         w = self._world(0)
@@ -4512,14 +4537,14 @@ class ZoneCalTests(unittest.TestCase):
     def test_ring13_placement_turns_back_at_most_once(self):
         """(10-28)arm_calib 调过的区：放 1、3 号环时(夹着物料从车上转盘转回来)差得多只再转 1 次，2 号环照旧 2 次；照样都放好。"""
         w = self._world(2)
-        h = self._make(w)
+        h = self._make(w, dict(arm_no_swing=False))                 # 测的是以前的做法(10-29 起默认 1、3 号环一条 AP 直接转过去)
         got = []
         orig = h._return_to_pose
 
-        def rec(a1, a2, from_tray=False, retries=2):
+        def rec(a1, a2, from_tray=False, retries=2, direct=False):
             if from_tray:
                 got.append(retries)
-            return orig(a1, a2, from_tray=from_tray, retries=retries)
+            return orig(a1, a2, from_tray=from_tray, retries=retries, direct=direct)
         h._return_to_pose = rec
         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
         rings = [k for (z, k, _c, _e, _st) in w.placed if z == 'ROUGH']
@@ -4603,7 +4628,7 @@ class ZoneCalTests(unittest.TestCase):
                     n_in[role] = n_in.get(role, 0) + 1
             w.arrive = arrive
             lines = []
-            h = self._make(w, extra, lines=lines)
+            h = self._make(w, dict(extra or {}, arm_no_swing=False), lines=lines)   # 测第一轮/第二轮停的地方(按 1mm 比)
             ends, ob = {}, h._zone_back
 
             def back(zone, w=w, ends=ends, ob=ob):
@@ -5063,7 +5088,7 @@ class ZoneCalTests(unittest.TestCase):
             w = self._world(seed, park={'TEMP': -10.0}, park_side={'TEMP': 35.0}, stop_err_mm=0.5)
             lines = []
             pose = [415.0, 1250.0, 90.0]          # 车头朝北：左边(雷达那边)朝西 = 暂存区；车身西边 415-130-45=240，离区 90mm
-            h = self._make(w, dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0), lines=lines, raw={'stops': {'TEMP': pose}})
+            h = self._make(w, dict(zone_timeout_s=6.0, ring_strafe_max_mm=20.0, arm_no_swing=False), lines=lines, raw={'stops': {'TEMP': pose}})
             orig = w.vision.ring_px
 
             def ring_px(n=None, expect=None, any_size=False, max_px=None):
@@ -5623,7 +5648,7 @@ class SingleGlitchTests(unittest.TestCase):
     def _full(self, fail_cmd, seed=1):
         w = SimWorld(seed=seed, code=self.CODE, fail_cmd=fail_cmd)
         lines = []
-        h = make(w, dict(round_s=1e9), log=lines.append)
+        h = make(w, dict(round_s=1e9, arm_no_swing=(fail_cmd[0] != 'APZ')), log=lines.append)   # (10-29)不来回摆时放环不用 APZ
         run_mission(w, h, log=lines.append, nav=dict(pre=True))
         return w, h, '\n'.join(lines)
 

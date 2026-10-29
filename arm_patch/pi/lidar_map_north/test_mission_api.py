@@ -580,7 +580,7 @@ class AuditTests(unittest.TestCase):
         """工位里手臂提前转过(AP)、STM32 这次没回报角度：对准的手臂行程按转到的角度算，不按观察角度 A2P 算
         (不然 ID2 可能被推到 A2P±limit 以外，或者还没到头就当成到头)。"""
         w = SimWorld(seed=1, code=CODE)
-        h, lines = hooks(w)
+        h, lines = hooks(w, dict(arm_no_swing=False))    # 按 1 单位比手臂角度记账；(10-29)不来回摆时大角度 AP 停的地方差 ID2 两三个单位(约 0.2mm)
         real = w.handle
 
         def handle(text):

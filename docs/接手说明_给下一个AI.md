@@ -1384,4 +1384,9 @@ git_log.txt                ← 分支最近 120 条提交记录
   第二次挪完差 1.4mm 那种就不再挪第三次。新测试 test_place_align_time_cap_and_direct_pickback。
 - **10-29(14) 用户"启停区域的时间想办法再砍3秒吧就是等待，移动，前移，等待这再压缩3s"：** FIXED_WAIT1_S / FIXED_WAIT2_S 1.5、1.5 → 0、0
   (按 START 直接走第二站动作，做完直接开；第二站动作本身照旧约 3.3 秒)。配置里写了 fixed_wait1_s / fixed_wait2_s 的按配置。
+- **10-29(15) 用户"一二三环就是一次性都过去，就不要再来回摆动了……全给它去掉"：** mission_hooks `arm_no_swing`(默认 True)：
+  _return_to_pose 一律一条 AP(大角度 STM32 用大动作速度、停在 ATOL 以内；不用 APZ，APZ 差 ATOLC 1° 就停)，不先多转再回来、不回读再转；
+  _ap_from_tray_side 一条 AP；_same_approach() 返回 False(码垛 _carry_rest、回 A1P 都不再多转)。代价(模拟里 ID1 间隙 2.3° + 摩擦)：
+  三个环放置误差最大约 7mm(以前 2mm 内)。run_live `swing on` 改回以前、`swing off` 不摆。测旧做法的测试都加了 arm_no_swing=False；
+  新测试 test_ring13_direct_one_ap_no_turning_back。
 

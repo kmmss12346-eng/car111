@@ -1319,6 +1319,27 @@ def main():
             print(f'已设置 rtol {a_:g} {b_:g}：1、3 号环微调对到 {eff_("",a_):g}mm 以内、2 号环车轮对到 {eff_("",b_):g}mm 以内(马上起作用，存进配置)'
                   +(f'；超过 tol_mm.RING={base_:g} 的按 {base_:g}' if max(a_,b_)>base_ else '')
                   +('' if mc_.get('zone_cal_fine',MD_.get('zone_cal_fine')) else '。1、3 号环摄像头微调现在关着(rfine off)，第一个数先不起作用'),flush=True);return
+        if k=='swing':
+            # (10-29 用户"一二三环就是一次性都过去，就不要再来回摆动了")mission_cfg.arm_no_swing：swing off(默认) = 手臂一条指令转到圆环的角度；
+            #   swing on = 以前的做法(先多转一个齿轮间隙再转回来到位，放得准几毫米、慢一点、看着来回摆)
+            from mission_hooks import DEFAULTS as MD_
+            mc_=dict(raw_cfg.get('mission_cfg') or {})
+            off_=bool(mc_.get('arm_no_swing',MD_.get('arm_no_swing',True)))
+            if len(parts)==1:
+                print(('现在：swing off，1、2、3 号环手臂一条指令转过去，不来回摆' if off_ else
+                       '现在：swing on，手臂先多转一点再转回来到位(消齿轮间隙，准几毫米、来回摆)')+'。改：swing off / swing on',flush=True);return
+            if len(parts)!=2 or parts[1] not in ('on','off'):raise ValueError('格式：swing off(一条指令转过去) / swing on(多转一点再转回来到位)')
+            mc_['arm_no_swing']=parts[1]=='off';raw_cfg['mission_cfg']=mc_
+            p_=Path(args.config);bak=p_.with_suffix('.json.bak')
+            if not bak.exists():bak.write_text(p_.read_text(encoding='utf-8'),encoding='utf-8')
+            write_json_safe(p_,file_cfg())
+            try:
+                import mission_cli as mcli_
+                hh_=mcli_._S.get('hooks')
+                if hh_ is not None:hh_.cfg['arm_no_swing']=parts[1]=='off'
+            except Exception:pass
+            print('已设置 swing off：1、2、3 号环手臂一条指令转过去，不来回摆(存进配置)' if parts[1]=='off' else
+                  '已设置 swing on：手臂先多转一点再转回来到位(存进配置)',flush=True);return
         if k=='rfine':
             # (10-28 用户"摄像头微调整没有什么效果啊……退回到那个没有添加摄像头对准的那个版本")1、3 号环要不要用摄像头只动手臂微调：
             #   mission_cfg.zone_cal_fine(默认关：按 arm_calib 调的角度直接放)
