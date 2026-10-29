@@ -1,0 +1,705 @@
+diff --git a/arm_patch/pi/lidar_map_north/auto_run.py b/arm_patch/pi/lidar_map_north/auto_run.py
+index 80d86af..159484f 100644
+--- a/arm_patch/pi/lidar_map_north/auto_run.py
++++ b/arm_patch/pi/lidar_map_north/auto_run.py
+@@ -1647,7 +1647,8 @@ def _hold(ctx, tick, t_end, sleep=time.sleep):
+ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0.8, hooks=None, cfg=None, scanned=False):
+     """first_scan=True: 完整流程(scanned=True：第一次扫描开跑前已经做好了，屏幕选区一键启动时)；False: 只按当前已规划的路线行驶。
+     1010：开跑(输入 go / 屏上按 START)以后不再问任何问题(规则：开始后不能碰车和电脑)；配置 confirm_route=true 时才要输入 y(只在桌上调试用)。
+-    (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。"""
++    (10-28)写死模式(ctx.fixed_route() 不是 None，fixroute on)：两次扫描都不做，改成原地等(第一次从开跑算)，不规划，用存好的路线和地图。
++    (10-29 晚)两次原地等默认 0 秒；存的路线是从起点规划的(second_move=False，fixroute replan 默认这样)：不做第二站动作，直接开。"""
+     cfg = cfg or {}
+     fx = ctx.fixed_route() if (first_scan and not scanned and hasattr(ctx, 'fixed_route')) else None
+     t_go = float((fx or {}).get('t0') or time.monotonic())
+@@ -1680,9 +1681,12 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
+         if not ok:
+             raise Abort(f'STM32 不认识 HOME：{reply}（STM32 程序是不是新版）')
+         if fx:
+-            log(f'① 写死模式：不扫描、不规划，用存好的地图和路线；原地等 {float(fx["wait1"]):g} 秒(从开跑算，机械臂准备也在里面)……')
++            w1 = float(fx.get('wait1') or 0.0)
++            log('① 写死模式：不扫描、不规划，用存好的地图和路线' +
++                (f'；原地等 {w1:g} 秒(从开跑算，机械臂准备也在里面)……' if w1 > 0 else '；不等，直接开'))
+             ctx.fixed_first()
+-            _hold(ctx, tick, t_go + float(fx['wait1']))
++            if w1 > 0:
++                _hold(ctx, tick, t_go + w1)
+             log(f'  (开跑到现在 {time.monotonic() - t_go:.1f} 秒)')
+         elif not scanned:
+             log('① 第一次扫描：车保持不动……')
+@@ -1699,20 +1703,25 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
+         else:
+             log('① 第一次扫描开跑前已经做好了。')
+         rel = cfg.get('second_relative_moves', DEFAULT_SECOND_MOVES)
+-        log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
+-        t_ph = time.monotonic()
+-        ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
+-        if not ok:
+-            raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
+-        err = parse_done(reply).get('err')
+-        if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
+-            raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
+-        log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
+-        if fx:
++        if fx and not fx.get('second_move', True):
++            log('② 写死模式：存的路线是从起点规划的，不走第二站，直接开')
++        else:
++            log(f'② 走第二站：左移{rel.get("left_mm", 0)}、前进{rel.get("forward_mm", 0)}、顺时针转{rel.get("cw_deg", 0)}°（绕车中心）……')
+             t_ph = time.monotonic()
+-            getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
+-            log(f'③ 写死模式：不扫描，原地等 {float(fx["wait2"]):g} 秒……')
+-            _hold(ctx, tick, t_ph + float(fx['wait2']))
++            ok, reply = link.second_move(None if cfg.get('second_use_p2', False) else rel, log=log)
++            if not ok:
++                raise Abort(f'STM32 第二站移动失败：{reply}' + (f'。{STALL_HINT}' if 'STALL' in str(reply) else ''))
++            err = parse_done(reply).get('err')
++            if err is not None and abs(err) > MAX_HEAD_ERR_DEG:
++                raise Abort(f'第二站没转到位(车头还差 {err:+.1f}°)，接着扫描会把地图建错，所以停下。{STALL_HINT}')
++            log(f'  (第二站移动用时 {time.monotonic() - t_ph:.1f} 秒)')
++        if fx:
++            w2 = float(fx.get('wait2') or 0.0) if fx.get('second_move', True) else 0.0
++            if w2 > 0:
++                t_ph = time.monotonic()
++                getattr(tick, 'moved', lambda: None)()          # 车刚动过：等的这几秒手臂不用轻摆
++                log(f'③ 写死模式：不扫描，原地等 {w2:g} 秒……')
++                _hold(ctx, tick, t_ph + w2)
+             ctx.fixed_second()
+         else:
+             time.sleep(float(cfg.get('second_settle_s', settle_s)) if cfg else settle_s)
+diff --git a/arm_patch/pi/lidar_map_north/fixed_route.py b/arm_patch/pi/lidar_map_north/fixed_route.py
+index b72c6e9..4deb25f 100644
+--- a/arm_patch/pi/lidar_map_north/fixed_route.py
++++ b/arm_patch/pi/lidar_map_north/fixed_route.py
+@@ -2,14 +2,16 @@
+ 
+     fixroute          看写死模式开没开、存的是哪条路线
+     fixroute save     把刚才规划好(跑过)的路线和这次的地图存下来(fixed_route.json，和配置文件放在一起)
+-    fixroute replan   (10-29)stop 改了停车点以后：车不动，按存着的地图、从存的第二站车位按现在的停车点重新规划，再存(不用再跑一遍)
++    fixroute replan   (10-29)stop 改了停车点以后：车不动，按存着的地图、按现在的停车点重新规划，再存(不用再跑一遍)。
++                      (10-29 晚)默认从起点规划(按了 START 不走第二站，直接开)；配置 fixed_second_move=true 才从存的第二站车位规划
+     fixroute on       打开写死模式(存进配置)
+     fixroute off      关掉，race / go 照常自己扫描、规划
+ 
+-写死模式 race 1 / race 2 只等屏上按 START：按了以后原地等 3 秒(不扫描；机械臂准备就在这 3 秒里做)→ 第二站动作
+-(左移、前进、转)→ 再等 3 秒(不扫描)→ 不规划，按存好的路线跑，二维码那里不做站点扫描。
+-跑的时候雷达定位照常做：和存下来的地图(存的时候那两次扫描)对位置。所以障碍物要摆在存的时候的位置，车放在同一个启停区。
+-存的路线是从第二站算的(和自己规划时一样)。"""
++写死模式 race 1 / race 2：机械臂准备(收臂、清旧任务码、开摄像头)在按 START 之前做好；按了 START 不扫描、不规划，按存好的路线跑，
++二维码那里不做站点扫描。路线是 fixroute replan 从起点规划的(second_move=False)：直接从起点开；fixroute save 存的(跑的时候从第二站规划的)
++先做第二站动作(左移、前进、转)再开。(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")两次原地等默认 0 秒
++(配置 fixed_wait1_s / fixed_wait2_s，以前是 3 秒)。
++跑的时候雷达定位照常做：和存下来的地图(存的时候那两次扫描)对位置。所以障碍物要摆在存的时候的位置，车放在同一个启停区。"""
+ import json
+ import os
+ import shutil
+@@ -30,8 +32,9 @@ def path_for(config_path):
+     return Path(config_path).with_name(FILE_NAME)
+ 
+ 
+-def snapshot(state, views, objects, zone, now=time.localtime):
+-    """现在的路线和地图 -> 存进文件的内容。没有两次扫描、没有规划好的全程路线就抛 ValueError(说清楚先做什么)。"""
++def snapshot(state, views, objects, zone, now=time.localtime, second_move=True):
++    """现在的路线和地图 -> 存进文件的内容。没有两次扫描、没有规划好的全程路线就抛 ValueError(说清楚先做什么)。
++    second_move = 这条路线是从第二站车位规划的(跑的时候先做第二站动作)；False = 从起点规划的(按了 START 直接开)。"""
+     legs = list(state.get('legs') or [])
+     if len(views) < 2:
+         raise ValueError('还没有两次扫描：先正常跑一次(race 2 / go)，或者 scan → p2 → second 规划好路线，再 fixroute save')
+@@ -43,7 +46,8 @@ def snapshot(state, views, objects, zone, now=time.localtime):
+         raise ValueError('不知道这条路线是从哪个车位规划的：先 route 规划全程，再 fixroute save')
+     out = dict(version=VERSION, saved_at=time.strftime('%m-%d %H:%M', now()), zone=int(zone), legs=legs,
+                views=list(views[:2]), objects=list(objects), path=list(state.get('path') or []),
+-               plan_start=state.get('plan_start') or legs[0].get('start'))    # 跑完 plan_start 清掉了：第一段的起点就是它
++               plan_start=state.get('plan_start') or legs[0].get('start'),    # 跑完 plan_start 清掉了：第一段的起点就是它
++               second_move=bool(second_move))
+     for k in STATE_KEYS:
+         out[k] = state.get(k)
+     return out
+@@ -92,6 +96,7 @@ def load(path):
+             snap[k] = tuple(snap[k])
+     for k in ('path', 'plan_obs', 'sealed'):
+         snap[k] = [tuple(q) for q in snap.get(k) or []]
++    snap['second_move'] = bool(snap.get('second_move', True))   # 10-29 晚以前存的都是从第二站规划的
+     return snap
+ 
+ 
+@@ -121,4 +126,5 @@ def describe(snap):
+     legs = snap.get('legs') or []
+     t = sum(float(L.get('time_s') or 0.0) for L in legs)
+     return (f'启停区 {snap.get("zone")}，{snap.get("saved_at") or "?"} 存的，{len(legs)} 站 ' + '→'.join(str(L.get('stop')) for L in legs)
+-            + f'，障碍物 {len(snap.get("objects") or [])} 个' + (f'，预计行驶 {t:.0f} 秒' if t > 0 else ''))
++            + f'，障碍物 {len(snap.get("objects") or [])} 个' + (f'，预计行驶 {t:.0f} 秒' if t > 0 else '')
++            + ('，先走第二站再开' if snap.get('second_move', True) else '，从起点直接开(不走第二站)'))
+diff --git a/arm_patch/pi/lidar_map_north/map_merge_live.py b/arm_patch/pi/lidar_map_north/map_merge_live.py
+index a3d6a89..cf22581 100644
+--- a/arm_patch/pi/lidar_map_north/map_merge_live.py
++++ b/arm_patch/pi/lidar_map_north/map_merge_live.py
+@@ -256,9 +256,17 @@ def main():
+                      legs_partial=False,replan_from=None,plan_key=None)
+         state['plan_obj_key']=obj_key();state['fixed_loaded']=True
+         redraw()
++    def fixed_from_start():
++        """(10-29 晚)现在跑的是写死路线，而且是从起点规划的(不走第二站)。"""
++        return bool(state.get('fixed_loaded')) and not (state.get('fix_snap') or {}).get('second_move',True)
++    def fixed_second_move():
++        """(10-29 晚)存的写死路线是从第二站车位规划的(跑的时候先做第二站动作)：True；从起点规划的(按了 START 直接开)：False。"""
++        try:return bool(fixed_snap().get('second_move',True))
++        except ValueError:return True
+     def fixed_second_pose():
+-        """界面线程：第二站动作做完(不扫描)，车位当成存的时候第二次扫描的车位。"""
+-        c1=history.views[1]['config']
++        """界面线程：第二站动作做完(不扫描)，车位当成存的时候第二次扫描的车位。
++        (10-29 晚)路线是从起点规划的(不走第二站)：车位就是起点(存的时候第一次扫描的车位)。"""
++        c1=history.views[1 if (state.get('fix_snap') or {}).get('second_move',True) else 0]['config']
+         state['config']=validate_config(dict(state['config'],car_x_mm=float(c1['car_x_mm']),car_y_mm=float(c1['car_y_mm']),
+                                              car_yaw_deg=float(c1['car_yaw_deg'])))
+         redraw()
+@@ -470,6 +478,10 @@ def main():
+         ref=reloc.build_reference([(v['raw_frames'],view_pose(v)) for v in vs],
+                                   lambda fr,n,c=vs[0]['config']:reloc.body_points(fr,c,max_n=n),cfg=raw_cfg)
+         for i,p_old,p_new,r in getattr(ref,'align_notes',[]):
++            if fixed_from_start():
++                # (10-29 晚)写死模式不走第二站：这是存的地图里第二次扫描的车位，只用来拼参考点云，车现在在起点
++                print('  (存的地图：两次扫描'+('对不上，按记下的第二站车位拼' if p_new is None else '已对齐')+'；这次不走第二站，车在起点)',flush=True)
++                continue
+             if p_new is None:print(f'  (第二次扫描和第一次对不上({r["why"]})：参考点云按记下的第二站车位合并)',flush=True)
+             else:
+                 d=math.hypot(p_new[0]-p_old[0],p_new[1]-p_old[1]);a=reloc.wrap180(p_new[2]-p_old[2])
+@@ -549,9 +561,11 @@ def main():
+             self._tick();return relocalize(plan_pose,frames,use_init,frames_data,max_shift)
+         def obstacles(self):return obstacles()
+         def route_start(self):
+-            """路线起点：ref = 规划时按的第二站车位；est = 第二站实际车位 + STM32 现在要保持的车头(开跑时 HOME 的车头 - 第二站顺时针转的角度)。"""
++            """路线起点：ref = 规划时按的第二站车位；est = 第二站实际车位 + STM32 现在要保持的车头(开跑时 HOME 的车头 - 第二站顺时针转的角度)。
++            (10-29 晚)写死模式、路线是从起点规划的(不走第二站)：车就在起点，不用"第二站雷达对齐"的车位(那是存的地图里第二次扫描的车位)。"""
+             c=state['config'];ref=state.get('route_ref') or (c['car_x_mm'],c['car_y_mm'],c['car_yaw_deg'])
+             t0=state.get('stm_target_yaw');p2=state.get('second_icp')     # 第二站雷达对齐出来的实际车位(有就用它)
++            if fixed_from_start():p2=None
+             x,y=(p2[0],p2[1]) if (p2 and t0 is not None) else (c['car_x_mm'],c['car_y_mm'])
+             return dict(est=(x,y,t0 if t0 is not None else c['car_yaw_deg']),ref=tuple(ref),yaw_real=c['car_yaw_deg'])
+         def home_route(self,name,goal):
+@@ -606,14 +620,15 @@ def main():
+             commands.put('__second');self._wait('done_count',before)
+         def plan(self):
+             """1010：规划在后台线程里做(不卡界面)，等的时候手臂轻摆；race 时开跑前规划好的路线能用就直接用。
+-            (10-28)写死模式：不规划，直接用存好的路线(fixed_first 放进来的)。"""
+-            try:run_bg(reference,self.tick,lambda:state['abort'])          # 雷达定位的参考点云(顺便把第二站和第一次扫描对齐)
+-            except Abort:raise
+-            except Exception as e:print('  (建雷达定位参考点云出错：',repr(e),')',flush=True)
++            (10-28)写死模式：不规划，直接用存好的路线(fixed_first 放进来的)。
++            (10-29 晚)写死模式也不在这里等参考点云：fixed_first 已经在后台建了，第一次雷达定位要用时还没建完才等它(按 START 就开)。"""
+             if state.get('fixed_loaded'):
+                 print('写死模式：不规划，直接用存好的路线。',flush=True)
+                 if not state['home_routes']:start_home_routes()
+                 return state.get('turn_back',0) or 0,list(state['legs']),state['reason']
++            try:run_bg(reference,self.tick,lambda:state['abort'])          # 雷达定位的参考点云(顺便把第二站和第一次扫描对齐)
++            except Abort:raise
++            except Exception as e:print('  (建雷达定位参考点云出错：',repr(e),')',flush=True)
+             cur_ok=state['legs'] and state['reason']=='ROUTE OK' and not state.get('legs_partial') and state.get('plan_obj_key')==obj_key()
+             if not cur_ok and not try_reuse_preplan():
+                 state['plan_start']=None;state['replan_from']=None
+@@ -654,9 +669,11 @@ def main():
+                 return state['step_ans']
+             finally:state['step_wait']=False
+         def fixed_route(self):
+-            """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。"""
++            """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。
++            (10-29 晚)second_move = 存的路线是不是从第二站规划的(是才做第二站动作)；两次原地等默认 0 秒。"""
+             if not fixed_on():return None
+-            return dict(wait1=float(raw_cfg.get('fixed_wait1_s',3.0)),wait2=float(raw_cfg.get('fixed_wait2_s',3.0)),t0=state.get('run_t0'))
++            return dict(wait1=float(raw_cfg.get('fixed_wait1_s',0.0)),wait2=float(raw_cfg.get('fixed_wait2_s',0.0)),t0=state.get('run_t0'),
++                        second_move=fixed_second_move())
+         def fixed_first(self):
+             """(10-28)写死模式代替第一次扫描：存好的地图和路线放进来；雷达定位的参考点云在后台先建(原地等的这几秒里建完)。"""
+             try:snap=fixed_snap()
+@@ -744,15 +761,33 @@ def main():
+         h=MissionHooks(raw_cfg,log=log)
+         print('已启用机械臂任务钩子(mission_cfg.enabled=true)。',flush=True)
+         return h
+-    def mission_body(first_scan,scanned=False):
+-        hooks=None
++    def fixed_prestart():
++        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")写死模式：按 START 之前先把机械臂准备好(同步参数、收臂、
++        清旧任务码、开摄像头)，按了 START 直接开。返回准备好的钩子(没启用机械臂返回 None)；出错只提示(按了 START 以后照常再准备)。"""
++        h=None
++        try:
++            h=make_hooks()
++            if link is None:return h
++            t_=time.monotonic()
++            print('写死模式：按 START 之前先准备机械臂(同步参数、收臂、清旧任务码、开摄像头)，车别动……',flush=True)
++            sync_now()
++            if h is not None:h.prepare(link,lambda m:print(m,flush=True))
++            print(f'  (准备好了，用时 {time.monotonic()-t_:.1f} 秒：按了 START 直接开)',flush=True)
++        except Exception as e:
++            print('  ★ 开跑前准备机械臂出错：',repr(e),'(按了 START 以后再准备一次)',flush=True)
++        return h
++    def mission_body(first_scan,scanned=False,hooks=None):
++        """hooks = 按 START 之前已经准备好的机械臂钩子(写死模式，fixed_prestart)；None = 这里新建。"""
+         state['run_t0']=time.monotonic();state['fixed_loaded']=False      # (10-28)写死模式第一次原地等从这里(按 START)算
+         fixed=first_scan and not scanned and fixed_on()
+         try:
+-            hooks=make_hooks();state['hooks']=hooks or state.get('hooks')
++            if hooks is None:hooks=make_hooks()
++            state['hooks']=hooks or state.get('hooks')
+             if first_scan:
+                 # STM32 开跑时 HOME：要保持的车头 = 出发时的车头；第二站顺时针转 cw 度以后 = 出发车头 - cw
+-                state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
++                #   (10-29 晚)写死模式、存的路线是从起点规划的(不走第二站)：车头不转
++                cw_=0.0 if (fixed and not fixed_second_move()) else float(rel.get('cw_deg',60))
++                state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-cw_
+                 state['legs']=[];state['plan_obj_key']=None;state['second_icp']=None;state['second_failed']=False   # 不用上一次的路线
+                 if not scanned:state['preplan']=None;state['home_routes']={}          # go：没有开跑前的预先规划
+             # 写死模式二维码那里不做站点扫描(不找新障碍物：路线写死了)
+@@ -782,15 +817,21 @@ def main():
+         try:mission_body(first_scan)
+         finally:state['auto']=False
+     def race_thread(zone=None):
++        pre=[None,False]                                    # (10-29 晚)写死模式按 START 之前准备好的钩子、用上了没有
+         try:
+             state['race']=True                              # race_start=screen 时在等按屏上的 START(终端 zone 1|2 可以改区)
++            if fixed_on():pre[0]=fixed_prestart()
+             def start_run(z,scanned):
+-                state['race']=False;mission_body(True,scanned)
++                state['race']=False;pre[1]=True;mission_body(True,scanned,hooks=pre[0])
+             st=race_flow(Ctx(),link,log,raw_cfg,start_run,zone=zone)
+             if st=='nozone':print('（race 没开始：用 zone 1 / zone 2 选区，go 开始）',flush=True)
+         except Abort as e:print('★ 比赛流程已停止：',e,flush=True)
+         except Exception as e:print('★ 比赛流程出错：',repr(e),flush=True)
+-        finally:state['auto']=False;state['race']=False
++        finally:
++            state['auto']=False;state['race']=False
++            if pre[0] is not None and not pre[1]:            # 没按 START 就 abort 了：准备好的钩子关掉(放掉摄像头)
++                try:pre[0].close()
++                except Exception:pass
+     def command(line):
+         import unicodedata
+         line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
+@@ -1070,40 +1111,48 @@ def main():
+             if len(parts)>2 or sub_ not in ('','save','replan','on','off'):
+                 raise ValueError('格式：fixroute save(存刚才的路线和地图) / fixroute replan(stop 改了停车点：按存的地图重新规划再存) / '
+                                  'fixroute on(写死模式) / fixroute off(改回自己规划) / fixroute(看现在)')
+-            w1_,w2_=float(raw_cfg.get('fixed_wait1_s',3.0)),float(raw_cfg.get('fixed_wait2_s',3.0))
++            w1_,w2_=float(raw_cfg.get('fixed_wait1_s',0.0)),float(raw_cfg.get('fixed_wait2_s',0.0))
+             zone_=int(raw_cfg.get('start_zone',2) or 2)
+             if sub_=='save':
+-                snap_=fixed_route.snapshot(state,history.views,history.objects,zone_)
++                snap_=fixed_route.snapshot(state,history.views,history.objects,zone_,second_move=True)   # 跑的时候是从第二站规划的
+                 fixed_route.save(fixed_path,snap_);fix_cache.clear()
+                 print('已存好写死路线：'+fixed_route.describe(snap_)+f'(存在 {fixed_path.name})；停车点 '+fixed_route.stops_text(snap_)+'。'
+-                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
++                      +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on')
++                      +('。★ 想按了 START 直接从起点开(不走第二站，快 5 秒左右)：再输入 fixroute replan' if not raw_cfg.get('fixed_second_move',False) else ''),
++                      flush=True);return
+             if sub_=='replan':
+                 # (10-29 用户"暂停区域的y轴不能减少要和原来的一样")stop 改了停车点不用再跑一遍：车不动，按存着的地图(存的时候那两次扫描、
+-                #   障碍物)，从存的第二站车位出发，按现在的停车点重新规划，存成新的写死路线(规划不出来就不改)
++                #   障碍物)，按现在的停车点重新规划，存成新的写死路线(规划不出来就不改)。
++                #   (10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")默认从起点(第一次扫描的车位)规划：跑的时候不走第二站，
++                #   按了 START 直接开；配置 fixed_second_move=true 才和以前一样从存的第二站车位规划
+                 snap_=fixed_snap();why_=fixed_route.check(snap_,zone_)
+                 if why_:raise ValueError(why_)
++                second_=bool(raw_cfg.get('fixed_second_move',False))
+                 m_=copy.deepcopy(snap_)
+                 history.views[:]=m_['views'];history.objects[:]=m_['objects']
+-                c1_=history.views[1]['config']
++                c1_=history.views[1 if second_ else 0]['config']
+                 state['config']=validate_config(dict(state['config'],car_x_mm=float(c1_['car_x_mm']),car_y_mm=float(c1_['car_y_mm']),
+                                                      car_yaw_deg=float(c1_['car_yaw_deg'])))
+                 state.update(plan_start=None,replan_from=None,preplan=None,home_routes={},legs_partial=False)
+-                print(f'车不动：按存着的地图(障碍物 {len(history.objects)} 个)、从存的第二站车位 ({c1_["car_x_mm"]:.0f},{c1_["car_y_mm"]:.0f}) '
+-                      '按现在的停车点重新规划……',flush=True)
++                print(f'车不动：按存着的地图(障碍物 {len(history.objects)} 个)、从'+('存的第二站车位' if second_ else '起点')
++                      +f' ({c1_["car_x_mm"]:.0f},{c1_["car_y_mm"]:.0f}) 按现在的停车点重新规划'
++                      +('' if second_ else '(跑的时候不走第二站，按了 START 直接开)')+'……',flush=True)
+                 plan_route()
+                 state['plan_key']=(len(history.views),tuple((round(o['x']),round(o['y'])) for o in history.objects),state['plan_start'])
+                 redraw();print_route()
+                 if state['reason']!='ROUTE OK' or not state['legs']:
+                     raise ValueError(f'按现在的停车点规划不出来({state["reason"]})：写死路线没改，还是原来那条')
+-                snap2_=fixed_route.snapshot(state,history.views,history.objects,zone_)
++                snap2_=fixed_route.snapshot(state,history.views,history.objects,zone_,second_move=second_)
+                 fixed_route.save(fixed_path,snap2_);fix_cache.clear()
+                 print('已重新规划、存好写死路线：'+fixed_route.describe(snap2_)+'；停车点 '+fixed_route.stops_text(snap2_)+'。'
+                       +('写死模式开着：下一次 race 就按它跑' if fixed_on() else '打开写死模式：fixroute on'),flush=True);return
+             if sub_=='on':
+                 snap_=fixed_snap()                          # 没存过就报错，不打开
+                 save_cfg_keys({'fixed_route':True})
+-                print(f'已打开写死模式(存进配置)：race 1 / race 2 以后只等屏上按 START；按了以后原地等 {w1_:g} 秒(不扫描) → 第二站动作 → '
+-                      f'再等 {w2_:g} 秒(不扫描) → 不规划，按存好的路线跑(二维码那里不做站点扫描，雷达定位照常)。存的路线：'
++                sm_=bool(snap_.get('second_move',True))
++                print('已打开写死模式(存进配置)：race 1 / race 2 先把机械臂准备好，再等屏上按 START；按了以后'
++                      +(f'原地等 {w1_:g} 秒 → ' if w1_>0 else '')+('第二站动作 → '+(f'再等 {w2_:g} 秒 → ' if w2_>0 else '') if sm_ else '')
++                      +'不扫描、不规划，按存好的路线跑(二维码那里不做站点扫描，雷达定位照常)。存的路线：'
+                       +fixed_route.describe(snap_)+'。改回自己规划：fixroute off',flush=True);return
+             if sub_=='off':
+                 save_cfg_keys({'fixed_route':False})
+@@ -1139,15 +1188,20 @@ def main():
+             spf.report(ch_,bad_,parts[1].lower(),out_);return
+         if k=='turntune':
+             # (10-26 用户"尤其是转向的时候")实车原地转几次 ±90°，自动选转弯最快、停得准的 TCLAG，存进配置
++            # (10-29 晚 用户"转弯的时候速度再加快一点点")后面可以写要试的 TCLAG：turntune 0.06 0.07 0.08 0.09 0.10 0.11(默认 0.16 0.13 0.10 0.08)
+             if link is None:raise ValueError('没有连接 STM32（--stm-port）')
+             if state['auto'] or state['busy']:raise ValueError('正在运行或扫描，等结束再用')
+             import speed_profile as spf
++            try:lags_=tuple(float(v) for v in parts[1:]) or spf.TUNE_LAGS
++            except ValueError:raise ValueError('格式：turntune 或 turntune 0.06 0.08 0.10(要试的 TCLAG，0~0.5)') from None
++            if len(lags_)>10 or any(not 0.0<=v<=0.5 for v in lags_):raise ValueError('TCLAG 要在 0~0.5 之间，最多试 10 个')
+             sync_now()
+-            print('turntune：车会原地转 +90°、-90° 共 16 次(约 40 秒)，最后转回现在的车头。车周围留出 40cm 空地；要停输入 abort',flush=True)
++            print(f'turntune：每个 TCLAG({" ".join(f"{v:g}" for v in lags_)})车原地转 +90°、-90° 各 2 次，共 {4*len(lags_)} 次'
++                  f'(约 {10*len(lags_)} 秒)，最后转回现在的车头。车周围留出 40cm 空地；要停输入 abort',flush=True)
+             state['busy']=True;state['abort']=False
+             def tworker():
+                 try:
+-                    best,old,rows=spf.turn_tune(link,lambda m:print(m,flush=True),aborted=lambda:state['abort'])
++                    best,old,rows=spf.turn_tune(link,lambda m:print(m,flush=True),lags=lags_,aborted=lambda:state['abort'])
+                     save_params({'TCLAG':best})
+                     est=spf.turn_estimates(rows,best)
+                     if est:save_cfg_keys({'turn90_s':est[0],'turn180_s':est[1]})
+@@ -1280,7 +1334,7 @@ def main():
+             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
+             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
+             launch(c,'user_entered_absolute_pose');return
+-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
++        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune [TCLAG 值…](自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+     def command_jog(c,val):
+         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
+         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
+@@ -1456,7 +1510,7 @@ def main():
+     print('turnloc on / off = 离黄色区/工位/场地边近的转弯要不要先停下用雷达确认位置(默认 on；只输入 turnloc 看现在是哪个)。',flush=True)
+     print('rtol 1 1.5 = 1、3 号环摄像头微调对到 1mm、2 号环车轮对到 1.5mm 以内才算对准(越小放得越准、多花几秒；只输入 rtol 看现在多少)。',flush=True)
+     print('rfine on / off = 1、3 号环要不要用摄像头只动手臂微调(默认 off：按 arm_calib 调的角度直接放；只输入 rfine 看现在是哪个)。',flush=True)
+-    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；stop 改了停车点：fixroute replan 重新规划再存；只输入 fixroute 看现在。',flush=True)
++    print('写死路线(给老师的对比视频)：正常跑一次以后 fixroute save 存下路线和地图，fixroute on 打开(race 只等屏上 START，不扫描、不规划)，fixroute off 关掉；stop 改了停车点：fixroute replan 重新规划再存(默认从起点规划：按了 START 不走第二站直接开)；只输入 fixroute 看现在。',flush=True)
+     if fixed_on():print('★ 写死模式开着(fixroute on)：race / go 不扫描、不规划，按存好的路线跑。改回自己规划：fixroute off',flush=True)
+     print('（可选）标定：起点放好车，在雷达看得到的一侧放已知圆柱，输入 calib X1 Y1 X2 Y2 …，满意后 calib save。',flush=True)
+     print('分步：1) 车停在起点输入 scan   2) 车自己走完 左移/前进/顺时针 后停稳，输入 second   3) route 重新规划，pose X Y 角度 改规划起点。q退出。',flush=True)
+diff --git a/arm_patch/pi/lidar_map_north/mission_hooks.py b/arm_patch/pi/lidar_map_north/mission_hooks.py
+index 8066981..a6ce99a 100644
+--- a/arm_patch/pi/lidar_map_north/mission_hooks.py
++++ b/arm_patch/pi/lidar_map_north/mission_hooks.py
+@@ -166,7 +166,9 @@ DEFAULTS = dict(
+     raw_orbit_ratio=0.77,               # 还没看到物料时：物料所在圆的半径 ≈ 外圆半径 × 这个
+     raw_center_smooth=True,             # (10-16 用户)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心(STM32 的 V 指令)，不再挪一下停一下；
+                                         #   STM32 是旧程序(不认 V)时自动改回一步一步挪
+-    raw_center_speed=15.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
++    raw_center_speed=25.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
++                                        #   (10-29 晚 用户"尽你最大的努力来节约时间")15 -> 25：只管离得远的那一段(偏多少毫米就每秒走多少，越近越慢)
++    vel_back_speed=60.0,                # (10-29 晚)原料区、工位做完只用 V 挪回停车点时最快多少毫米/秒(以前按 raw_center_search_speed 30；往外挪，快到了照样慢下来)
+     raw_center_search_speed=30.0,       # 找中心(挪着找)、只用 V 挪到一个地方(_vel_goto)时车轮最快多少毫米/秒(10-21：20 -> 30)
+     raw_center_align_s=25.0,            # 对准中心最多用多少秒
+     raw_center_iters=5,                 # 车轮最多挪几次
+@@ -350,6 +352,9 @@ DEFAULTS = dict(
+                                         #   "再转一次"，ID1 往转的方向多给这么多度，停下的地方才是要的地方。None = ATOL 的 0.7 倍；0 = 不补(以前)
+     return_tol_fine_deg=0.15,           # (10-27)从车上转盘转回对准的角度(放 1、2、3 号环之前)：差这么多以上就再转一次(以前 0.4°，
+                                         #   1 号环离转轴最远，0.4° 在那里约 1.7mm)；zone_atol_comp 是 0 时照旧按 return_tol_deg
++    ring13_return_tol_deg=0.45,         # (10-29 晚 用户"反正你就先尽你最大的努力来节约时间")夹着物料转回 1、3 号环的角度：ID1 差这么多以内就照常放，
++                                        #   不再转一次(实车 10-29：差 -0.20° 再转一次成了 +0.70°，差 -0.40° 成了 +0.60°，反而更偏，还多花 1~1.5 秒)。
++                                        #   2 号环照旧按 return_tol_fine_deg。0 = 以前的做法
+     ring13_return_retries=1,            # (10-28 用户"角度实在转不动转不过去……除了 2 号环之外的 1、3 号环的对准时间要缩短")夹着物料转回 1、3 号环
+                                         #   的角度以后差得多最多再转几次(以前和 2 号环一样 2 次；一次要 1~1.5 秒)。2 号环照旧 2 次
+     zone_cal_fine_tol_mm=1.0,           # (10-27 晚)1、3 号环摄像头微调对到多少毫米以内才算"微调好了"(和 tol_mm.RING 取小的)。以前按 tol_mm.RING，
+@@ -381,7 +386,9 @@ DEFAULTS = dict(
+     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
+     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
+                                         #   STM32 不认 V 才用 S/F
+-    zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
++    zone_calc_speed=60.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
++                                        #   (10-29 晚 用户"在粗加工区域对准的时间太长了")30 -> 60：离得远走快一点；_vel_goto 按"还差多少走多快"、
++                                        #   串口来回的时间提前停，快到了照样慢下来(最后一两毫米按 1 转/分 一小段一小段走)
+     # (10-24 用户"故意对偏的那个红色十字去掉，把粗加工区域和暂存区域的十字中心做成可调节的")r2off(ring2_off_mm 故意对偏)去掉了：
+     #   2 号环对到圆环这边的爪子点 claw_px.RING(vlive 里的红十字)，在 arm_calib 看圆环的那几步 g 左右 上下 挪它。配置里还写着 ring2_off_mm 也不用
+     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
+@@ -2249,7 +2256,7 @@ class MissionHooks:
+         ts, tf = self._zone_back_target('RAW')
+         if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+             if math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)) \
+-                    and self._vel_goto(ts, tf, tol_mm=0.6):
++                    and self._vel_goto(ts, tf, tol_mm=0.6, vmax=float(self.cfg.get('vel_back_speed', 60.0))):
+                 self.log('    车轮挪回停车点(只用 V，不转车头)')
+             d = self.act.disp
+             if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+@@ -3323,7 +3330,7 @@ class MissionHooks:
+         where = '爪子点' if goal is None else '示教时的位置'
+         colors = self._raw_center_colors()
+         tol = float(cfg.get('raw_center_tol_mm', 4.0)) if tol is None else float(tol)
+-        vmax = float(cfg.get('raw_center_speed', 15.0))
++        vmax = float(cfg.get('raw_center_speed', 25.0))
+         vmin = float(cfg.get('raw_center_min_speed', 5.0))
+         vsearch = float(cfg.get('raw_center_search_speed', 30.0))
+         smax, fmax = (float(x) for x in lim) if lim else (float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0)))
+@@ -6944,9 +6951,9 @@ class MissionHooks:
+                 self.holding = item
+                 adj = self.place_adj('STACK' if stack else 'RING')
+                 if adj is not None:                              # pcal 量过：落点按这一层的补偿挪
+-                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True, retries=self._ring_retries(ring))
++                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+                 else:
+-                    self._return_to_pose(a1, a2, from_tray=True, retries=self._ring_retries(ring))     # 回到记下的角度
++                    self._return_to_pose(a1, a2, from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))     # 回到记下的角度
+                 self._drop(stack)                                # 下降、松手、抬起
+                 held = False
+                 self.holding = None
+@@ -7772,7 +7779,7 @@ class MissionHooks:
+         calc_fr = int(cfg.get('zone_calc_frames', 3))
+         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
+         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
+-        calc_v = float(cfg.get('zone_calc_speed', 30.0))
++        calc_v = float(cfg.get('zone_calc_speed', 60.0))
+         calc_smooth = bool(cfg.get('zone_calc_smooth', True))
+ 
+         def still_rings():
+@@ -8306,7 +8313,7 @@ class MissionHooks:
+         else:
+             self.arm.ap(wps[0][0], wps[0][1])
+         a1c = self._carry_rest(wps, a1t)
+-        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))
++        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+         return True
+ 
+     def _carry_rest(self, wps, a1t):
+@@ -8367,7 +8374,7 @@ class MissionHooks:
+         else:
+             self.arm.ap(wps[0][0], wps[0][1])
+         a1c = self._carry_rest(wps, a1t)                        # 只往里缩；缩着只转(最后转到目标环那一下同一个动作到位)
+-        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))   # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
++        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))   # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
+         return True
+ 
+     def _place_item_arm(self, item, zone, ring, stack, label, T):
+@@ -8463,7 +8470,7 @@ class MissionHooks:
+             adj = self.place_adj(key)
+             ta1, ta2 = a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0)
+             if not (stack and self._stack_carry(zone, ring, p2, T, ta1, ta2)):
+-                self._return_to_pose(ta1, ta2, from_tray=True, retries=self._ring_retries(ring))
++                self._return_to_pose(ta1, ta2, from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+             self._drop(stack)
+             held = False
+             self.holding = None
+@@ -9559,6 +9566,16 @@ class MissionHooks:
+         else:
+             self.arm.ap(a1, a2)
+ 
++    def _ring13_tol(self, ring):
++        """(10-29 晚)夹着物料转回 ring 号环的角度以后 ID1 差多少以内不再转：1、3 号环 ring13_return_tol_deg，2 号环 None(照旧)。"""
++        if int(ring) == 2:
++            return None
++        try:
++            v = float(self.cfg.get('ring13_return_tol_deg', 0.45) or 0.0)
++        except (TypeError, ValueError):
++            return None
++        return v if v > 0 else None
++
+     def _ring_retries(self, ring):
+         """(10-28)夹着物料转回 ring 号环的角度以后，差得多最多再转几次：1、3 号环 ring13_return_retries(默认 1)，2 号环照旧 2 次。"""
+         if int(ring) == 2:
+@@ -9568,8 +9585,9 @@ class MissionHooks:
+         except (TypeError, ValueError):
+             return 1
+ 
+-    def _return_to_pose(self, a1, a2, from_tray=False, retries=2):
++    def _return_to_pose(self, a1, a2, from_tray=False, retries=2, tol_fine=None):
+         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 retries 次(默认 2)。
++        tol_fine = (10-29 晚)ID1 差这么多以内就不再转(1、3 号环 ring13_return_tol_deg；None = 照旧)。
+         from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。
+         (10-27 晚)from_tray 且 zone_same_approach：大幅转回来先停在往车上转盘那边多转(间隙 + zone_backlash_extra_deg)的地方，再转回来到位
+         ——和 1、3 号环微调的每一下、对准 2 号环前回 A1P 是同一个动作，手臂停的地方就是对准时停的地方(这时不学多转/少转、不用 return_preload_deg)。"""
+@@ -9615,6 +9633,8 @@ class MissionHooks:
+             # (10-27)ID1 "再转一次"多给了补偿(_ap_from_tray_side)，比 ATOL 小的差也转得动：差 return_tol_fine_deg 以上就再转
+             #   (1 号环离转轴最远，以前的 0.4° 在那里约 1.7mm)。ID2 每度不到 0.1mm，照旧
+             tol1 = float(self.cfg.get('return_tol_fine_deg') or 0.15)
++        if tol_fine is not None:
++            tol1 = max(tol1, float(tol_fine))               # (10-29 晚)1、3 号环：差一点就照常放(再转一次实车反而转过头)
+         for k in range(retries + 1):
+             self.sleep(0.2)
+             try:
+@@ -9824,7 +9844,7 @@ class MissionHooks:
+                 and math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)):
+             tried = True
+             try:
+-                if self._vel_goto(ts, tf, tol_mm=0.6):
++                if self._vel_goto(ts, tf, tol_mm=0.6, vmax=float(self.cfg.get('vel_back_speed', 60.0))):
+                     self.log('    车轮挪回停车点(只用 V，不转车头)')
+             except ArmAbort as ex:
+                 raise Abort(str(ex))
+diff --git a/arm_patch/pi/lidar_map_north/sim_mission.py b/arm_patch/pi/lidar_map_north/sim_mission.py
+index 44f4cb9..b7a1070 100644
+--- a/arm_patch/pi/lidar_map_north/sim_mission.py
++++ b/arm_patch/pi/lidar_map_north/sim_mission.py
+@@ -4502,16 +4502,54 @@ class ZoneCalTests(unittest.TestCase):
+         got = []
+         orig = h._return_to_pose
+ 
+-        def rec(a1, a2, from_tray=False, retries=2):
++        def rec(a1, a2, from_tray=False, retries=2, tol_fine=None):
+             if from_tray:
+                 got.append(retries)
+-            return orig(a1, a2, from_tray=from_tray, retries=retries)
++            return orig(a1, a2, from_tray=from_tray, retries=retries, tol_fine=tol_fine)
+         h._return_to_pose = rec
+         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+         rings = [k for (z, k, _c, _e, _st) in w.placed if z == 'ROUGH']
+         self.assertEqual(sorted(rings), [1, 2, 3])
+         self.assertEqual(got[-3:], [2 if k == 2 else 1 for k in rings], (got, rings))
+ 
++    def test_ring13_small_return_error_is_not_turned_again(self):
++        """(10-29 晚 用户"反正你就先尽你最大的努力来节约时间")夹着物料转回 1、3 号环：ID1 差 ring13_return_tol_deg(0.45°)以内照常放，
++        不再转一次(实车 -0.20° 再转一次成了 +0.70°，反而更偏)；2 号环照旧按 return_tol_fine_deg(0.15°)再转。"""
++        w = self._world(2)
++        lines = []
++        h = self._make(w, lines=lines)
++
++        class Arm:
++            def __init__(self):
++                self.cmds = []
++
++            def params(self):
++                return {'ATOL': 0.3, 'ZOBRNG': 120.0}
++
++            def ap(self, a1, a2):
++                self.cmds.append(('AP', round(a1, 2), round(a2, 2)))
++
++            def apz(self, a1, a2, z):
++                self.cmds.append(('APZ', round(a1, 2), round(a2, 2)))
++
++            def read_angles(self):
++                return 99.7, -800.0                                     # 每次都停在差 -0.3° 的地方
++        h._same_approach = lambda: False
++        h._id1_comp = lambda: 0.2                                       # 再转一次会多给补偿(车上的做法)：差 0.15° 以上就再转
++        h._ap_from_tray_side = lambda a1, a2, cur1=None, always=False: h.arm.cmds.append(('AGAIN', a1))
++        self.assertEqual((h._ring13_tol(1), h._ring13_tol(3), h._ring13_tol(2)), (0.45, 0.45, None))
++        for ring, again in ((1, 0), (3, 0), (2, 2)):
++            h.arm = Arm()
++            lines.clear()
++            h._return_to_pose(100.0, -800.0, from_tray=True, retries=h._ring_retries(ring), tol_fine=h._ring13_tol(ring))
++            n = sum(1 for c in h.arm.cmds if c[0] == 'AGAIN')
++            self.assertEqual(n, again, (ring, h.arm.cmds, lines))
++            self.assertEqual(any('再转一次' in l for l in lines), again > 0, (ring, lines))
++        h.cfg['ring13_return_tol_deg'] = 0                              # 0 = 以前的做法：1 号环也再转
++        h.arm = Arm()
++        h._return_to_pose(100.0, -800.0, from_tray=True, retries=h._ring_retries(1), tol_fine=h._ring13_tol(1))
++        self.assertEqual(sum(1 for c in h.arm.cmds if c[0] == 'AGAIN'), 1, h.arm.cmds)
++
+     def test_approach_id1_slow_steps_from_the_tray_side(self):
+         """(10-27 晚)arm_link.approach_id1：先转到多转的地方(快慢不管)，转回来每一下不到 3.5°(STM32 一下 4.5° 以内才慢慢转、停得准)；
+         多转的那一下没转过去就再转一次。"""
+diff --git a/arm_patch/pi/lidar_map_north/test_nav_live.py b/arm_patch/pi/lidar_map_north/test_nav_live.py
+index 9467f9b..fdc5621 100644
+--- a/arm_patch/pi/lidar_map_north/test_nav_live.py
++++ b/arm_patch/pi/lidar_map_north/test_nav_live.py
+@@ -745,6 +745,69 @@ class LiveTests(unittest.TestCase):
+         self.assertEqual(len(snap['views']), 2)
+         self.assertEqual(len(car.sent), mark['sent'], '重新规划车不动')
+ 
++    def test_fixroute_replan_from_start_then_fixed_race_goes_straight_away(self):
++        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")fixroute replan 默认从起点规划(存 second_move=False)；
++        写死模式 race 2：按 START 之前先准备机械臂，按了以后不走第二站、不等，直接按存好的路线开，跑完回到启停区。"""
++        start = (2250.0, 150.0, 90.0)
++        mark = {}
++
++        def said(t, n=1):
++            return lambda: self.out_text().count(t) >= n
++
++        def back_to_start():
++            if '已打开写死模式' not in self.out_text():
++                return False
++            car = WORLD['car']
++            with car.lock:
++                car.x, car.y, car.yaw = start
++                car.g_off = 0.0
++                car.T = car.yaw
++                mark.update(trace=len(car.trace), req=len(car.requests), sent=len(car.sent))
++            return True
++        inputs = [(lambda: True, 'race 2'), (said('路线全部走完'), 'fixroute save'), (said('已存好写死路线'), 'reset'),
++                  (said('已清空历史'), 'fixroute replan'), (said('已重新规划、存好写死路线'), 'fixroute on'),
++                  (lambda: said('已打开写死模式')() and back_to_start(), 'race 2')]
++        car = self.run_live(2, dict(scale=0.01, drift_deg=0.05, resid_deg=0.2), timeout=150.0,
++                            cfg_extra=dict(race_auto=False, race_start='now'), inputs=inputs, screen_zone=None,
++                            done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t,
++                            keep=('fixed_route.json',))
++        log = self.log
++        self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
++        self.assertIn('想按了 START 直接从起点开', log, 'fixroute save 提醒可以 replan')
++        self.assertIn('从起点 (2250,150) 按现在的停车点重新规划(跑的时候不走第二站，按了 START 直接开)', log)
++        self.assertIn('从起点直接开(不走第二站)', log)
++        snap = self.kept['fixed_route.json']
++        self.assertIs(snap['second_move'], False)
++        self.assertLess(abs(float(snap['turn_back'] or 0.0)), 0.5, '从起点规划：不用先转回来')
++        s0 = snap['legs'][0]['start']
++        self.assertLess(math.hypot(s0[0] - start[0], s0[1] - start[1]), 1.0, s0)
++        fx = log[log.rindex('★ 按了 START'):]
++        pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
++        self.assertIn('写死模式：按 START 之前先准备机械臂', pre, '机械臂在按 START 之前准备好')
++        self.assertIn('② 写死模式：存的路线是从起点规划的，不走第二站，直接开', fx)
++        self.assertIn('不等，直接开', fx)
++        self.assertNotIn('走第二站：左移', fx)
++        self.assertNotIn('③ 写死模式', fx)
++        for word in ('第一次扫描', '第二次扫描', '规划全程路线'):
++            self.assertNotIn(word, fx)
++        first = [(c, v) for c, v, *_ in car.sent[mark['sent']:]][:3]
++        self.assertNotIn(('R', -60), first, f'不走第二站：{first}')
++        self.assertNotIn(('S', 42), first, f'不走第二站：{first}')
++        # 车就在起点：第一段照存的走，不能按"存的地图里第二站的车位"补偏差(那样会少走 84、少横移 42，二维码那站停偏)
++        plan0 = [(c, v) for c, v in snap['legs'][0]['cmds'] if c in ('F', 'S')]
++        sent0 = [(c, v) for c, v in first if c in ('F', 'S')][:len(plan0)]
++        self.assertEqual([c for c, _ in sent0], [c for c, _ in plan0], (sent0, plan0))
++        for (c, v), (_, w) in zip(sent0, plan0):
++            self.assertLess(abs(v - w), 25, f'第一段 {c} 发了 {v}，存的是 {w}：按错的起点补了偏差')
++        self.assertIn('这次不走第二站，车在起点', fx)
++        self.assertNotIn('第二站雷达对齐：实际车位', fx)
++        goal = auto_run.inset_goal(start, self.cfg_after)
++        p = car.pose()
++        self.assertLess(math.hypot(p[0] - goal[0], p[1] - goal[1]), 10.0, f'写死模式没回到出发位置：{p}')
++        tr = car.trace[mark['trace']:]
++        k0 = next(i for i, q in enumerate(tr) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
++        self.assertGreaterEqual(edge_min(tr[k0:], self.cfg_after), 0.0)
++
+     def test_fixroute_off_by_default_and_needs_a_saved_route(self):
+         """fixroute 看现在：默认关着；没存过路线 fixroute save 要先有两次扫描、fixroute on 不打开。"""
+         self.run_live(2, dict(scale=0.0), cfg_extra=dict(race_auto=False),
+diff --git a/arm_patch/pi/lidar_map_north/test_nav_race.py b/arm_patch/pi/lidar_map_north/test_nav_race.py
+index d55ee47..eae5541 100644
+--- a/arm_patch/pi/lidar_map_north/test_nav_race.py
++++ b/arm_patch/pi/lidar_map_north/test_nav_race.py
+@@ -542,6 +542,42 @@ class RunMissionTests(unittest.TestCase):
+         self.assertLess(time.monotonic() - t, 1.0, '等的时候 abort 马上停')
+         self.assertNotIn('second_move', calls, '车没动')
+ 
++    def test_fixed_route_from_start_goes_straight_away(self):
++        """(10-29 晚 用户"从电机红色按钮到去往原料区域的时间改到10s之内")写死模式、存的路线是从起点规划的(second_move=False)、
++        两次原地等 0 秒：不做第二站动作、不等，按了 START 马上按存好的路线开。"""
++        calls = []
++        stamp = {}
++
++        class FixedCtx(MissionCtx):
++            t0 = None
++
++            def fixed_route(self):
++                return dict(wait1=0.0, wait2=0.0, t0=self.t0, second_move=False)
++
++            def fixed_first(self):
++                calls.append('fixed_first')
++
++            def fixed_second(self):
++                calls.append('fixed_second')
++
++            def plan(self):
++                calls.append('plan')
++                stamp['plan'] = time.monotonic()
++                return 0, [{'stop': 'QR', 'cmds': [('S', 150), ('F', 1100)]}], 'ROUTE OK'
++        ctx = FixedCtx(calls)
++        ctx.t0 = time.monotonic()
++        logs = []
++        auto_run.run_mission(ctx, RecLink(calls), log=logs.append, stop_wait=0, settle_s=0, hooks=MissionHooksRec(calls), cfg={})
++        self.assertEqual(calls[:7], ['start_clock', 'ping', 'prepare', 'home', 'fixed_first', 'fixed_second', 'plan'])
++        self.assertNotIn('second_move', calls, '不走第二站')
++        self.assertIn('task QR', calls)
++        self.assertLess(stamp['plan'] - ctx.t0, 0.3, '不等')
++        text = '\n'.join(logs)
++        self.assertIn('不等，直接开', text)
++        self.assertIn('② 写死模式：存的路线是从起点规划的，不走第二站，直接开', text)
++        self.assertNotIn('③', text)
++        self.assertNotIn('走第二站：左移', text)
++
+     def test_prepare_error_does_not_stop(self):
+         calls = []
+ 

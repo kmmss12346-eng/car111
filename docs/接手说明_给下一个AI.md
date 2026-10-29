@@ -1192,6 +1192,24 @@ git_log.txt                ← 分支最近 120 条提交记录
     红十字挪了 1、3 号环一起跟着挪(车对 2 号环的位置变了)。
   - 固件 arm.c：准备页 START 红底白字(63488/65535)、ZR_START_Y 0 铺满整个屏，Zone_Hit 准备页整屏都算 START；GO 也铺满。
     tests_stm32/test_arm.c 跟着改(右上角按了现在算 START)。test_arm 370、chassis 225、servo 42 全过。
+- **10-29(3) 用户"这个写死了还是太慢了……从电机红色按钮到去往原料区域的时间改到10s之内……路上太慢了……粗加工区域对准的时间太长了"，**
+  我先一起改了好几样，用户打断："不是我的意思是一开始不是扫描车停吗然后等三秒然后转向然后再等3s……实测下来花费太多时间了，大概要15s，
+  把时间压缩一下，压缩到8s到10s左右合理分配一下"、"你先做这个其他不用改先把这个时间改短"。**只做了写死模式开头这一段**：
+  - 两次原地等默认 3 秒 → `fixed_wait1_s` 1.5、`fixed_wait2_s` 1(map_merge_live 的 FIXED_WAIT1_S / FIXED_WAIT2_S；配置里写了就按配置)。
+  - 写死模式 race：按 START 之前先准备机械臂(`fixed_prestart`：sync_now + hooks.prepare，收臂、清旧任务码、开摄像头，实车约 3 秒)，
+    钩子传进 mission_body 接着用(run_mission 里 prepare 做过的不再做)；没按 START 就 abort 了把钩子关掉。prepare 里清屏(ZONE LOCK)在
+    race_flow 发 ZONE 2 之前，屏上照样出 START(固件 ZONE n 任何时候都回准备页)。go(终端)没有这一步，照旧开跑以后准备。
+  - 时间：按 START → 停 1.5 秒(含 ping、sync 的 GET 0.3 秒) → 第二站 3.3 秒 → 停 1 秒 → 转回 +60° 1.8 秒 → 左移、前进开出启停区约 1.5 秒，
+    约 9 秒(以前 4.2 + 3.3 + 3 + 0.5 + 1.8 + 1.5 ≈ 14~15 秒，和用户实测一样)。
+  - test_nav_live.test_fixed_race_default_waits_are_short(默认 1.5、1 秒、按 START 前准备)，test_fixroute_save_then_fixed_race 加了按 START 前准备。
+  - **撤回、没上车的(补丁 `docs/搁置的改动/speedup_station_nosecond_1029.patch`，是改之前的版本上的 diff，和这次 map_merge_live 的改动有重叠，要用得手动合)：**
+    ① 写死路线不走第二站(snapshot 记 second_move，fixroute replan 默认从起点规划，按 START 直接开，约 5.5 秒到 QR 走完)：**注意坑**——
+    后台建参考点云时 `_reference` 会把 state['second_icp'] 设成存的地图里第二次扫描的车位，route_start 用它当车位，车不走第二站时第一段会按
+    第二站的偏差"补"(少走 84、少横移 42)，二维码那站停偏；补丁里已经让 route_start 不走第二站时不用它。
+    ② zone_calc_speed 30→60、raw_center_speed 15→25、做完挪回停车点 vel_back_speed 60。③ ring13_return_tol_deg 0.45：1、3 号环差 0.45° 以内
+    不再转一次(10-29 实车两次再转都转过头：-0.20→+0.70、-0.40→+0.60)。④ turntune 后面能写要试的 TCLAG。
+    另外算出来的(没改)：ROUGH 对准以后车在 (1208,326) 左右，停车点改 `stop ROUGH 1205 325` 能少挪一大段(规划查过离粗加工区 45mm，能停)；
+    TEMP 对准时车会退到 y≈1300(停在 1250 每次挪 50mm)；RAW 对准横移 86mm 是规划按原料转盘可能的整个范围把停车点 2255 挪到 2155 造成的。
 - **10-29(2) 用户"你把这个原料区域的这个x轴往后改5cm然后这个1号环我想改成g R1 -5 -5可以吗，最后就是转弯的时候速度再加快一点点呗还有就是这个升降结构的速度也加快一些不要太快"，
   接着"那个一号坏偏差你先别管了就管剩下的几个"：** 程序没改，只给了命令(用户自己在主程序里输)。
   - 原料区：RAW 车头 180°(朝 x 小)，往后 = x 加 50：`stop RAW 1130 2255`(y 照旧写 2255，跑的时候和以前一样自动停到 (1130,2155))，再 `fixroute replan`。

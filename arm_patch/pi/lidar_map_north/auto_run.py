@@ -1680,7 +1680,7 @@ def run_mission(ctx, link, log=print, first_scan=True, stop_wait=3.0, settle_s=0
         if not ok:
             raise Abort(f'STM32 不认识 HOME：{reply}（STM32 程序是不是新版）')
         if fx:
-            log(f'① 写死模式：不扫描、不规划，用存好的地图和路线；原地等 {float(fx["wait1"]):g} 秒(从开跑算，机械臂准备也在里面)……')
+            log(f'① 写死模式：不扫描、不规划，用存好的地图和路线；原地等 {float(fx["wait1"]):g} 秒(从开跑算)……')
             ctx.fixed_first()
             _hold(ctx, tick, t_go + float(fx['wait1']))
             log(f'  (开跑到现在 {time.monotonic() - t_go:.1f} 秒)')

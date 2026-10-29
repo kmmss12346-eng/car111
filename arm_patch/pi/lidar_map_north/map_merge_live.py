@@ -238,6 +238,7 @@ def main():
         return mc
     # (10-28 用户"老师要求我们交两个视频对比一下，一个是写死的，一个是自己规划的")写死路线(fixroute，见 fixed_route.py)
     fixed_path=fixed_route.path_for(args.config);fix_cache={}
+    FIXED_WAIT1_S,FIXED_WAIT2_S=1.5,1.0      # (10-29 晚)写死模式按了 START 原地等几秒、第二站动作以后再等几秒(配置 fixed_wait1_s / fixed_wait2_s 可改；以前都是 3)
     def fixed_on():
         return bool(raw_cfg.get('fixed_route',False))
     def fixed_snap():
@@ -654,9 +655,12 @@ def main():
                 return state['step_ans']
             finally:state['step_wait']=False
         def fixed_route(self):
-            """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。"""
+            """(10-28)写死模式开着(fixroute on)：返回两次原地等多少秒、开跑的时间(run_mission、race_flow 用)；关着返回 None。
+            (10-29 晚 用户"实测下来……大概要15s，把时间压缩一下，压缩到8s到10s左右合理分配一下")两次原地等默认 3 秒 → 1.5 秒、1 秒，
+            机械臂准备挪到按 START 之前(fixed_prestart)：按 START 到开出启停区约 9 秒。"""
             if not fixed_on():return None
-            return dict(wait1=float(raw_cfg.get('fixed_wait1_s',3.0)),wait2=float(raw_cfg.get('fixed_wait2_s',3.0)),t0=state.get('run_t0'))
+            return dict(wait1=float(raw_cfg.get('fixed_wait1_s',FIXED_WAIT1_S)),wait2=float(raw_cfg.get('fixed_wait2_s',FIXED_WAIT2_S)),
+                        t0=state.get('run_t0'))
         def fixed_first(self):
             """(10-28)写死模式代替第一次扫描：存好的地图和路线放进来；雷达定位的参考点云在后台先建(原地等的这几秒里建完)。"""
             try:snap=fixed_snap()
@@ -744,12 +748,28 @@ def main():
         h=MissionHooks(raw_cfg,log=log)
         print('已启用机械臂任务钩子(mission_cfg.enabled=true)。',flush=True)
         return h
-    def mission_body(first_scan,scanned=False):
-        hooks=None
+    def fixed_prestart():
+        """(10-29 晚 用户"把时间压缩一下，压缩到8s到10s左右")写死模式：按 START 之前先把机械臂准备好(同步参数、收臂、清旧任务码、
+        开摄像头，实车约 3 秒)，按了 START 只原地等 fixed_wait1_s 秒。返回准备好的钩子(没启用机械臂返回 None)；出错只提示(按了 START 以后照常再准备)。"""
+        h=None
+        try:
+            h=make_hooks()
+            if link is None:return h
+            t_=time.monotonic()
+            print('写死模式：按 START 之前先准备机械臂(同步参数、收臂、清旧任务码、开摄像头)，车别动……',flush=True)
+            sync_now()
+            if h is not None:h.prepare(link,lambda m:print(m,flush=True))
+            print(f'  (准备好了，用时 {time.monotonic()-t_:.1f} 秒)',flush=True)
+        except Exception as e:
+            print('  ★ 开跑前准备机械臂出错：',repr(e),'(按了 START 以后再准备一次)',flush=True)
+        return h
+    def mission_body(first_scan,scanned=False,hooks=None):
+        """hooks = 按 START 之前已经准备好的机械臂钩子(写死模式，fixed_prestart)；None = 这里新建。"""
         state['run_t0']=time.monotonic();state['fixed_loaded']=False      # (10-28)写死模式第一次原地等从这里(按 START)算
         fixed=first_scan and not scanned and fixed_on()
         try:
-            hooks=make_hooks();state['hooks']=hooks or state.get('hooks')
+            if hooks is None:hooks=make_hooks()
+            state['hooks']=hooks or state.get('hooks')
             if first_scan:
                 # STM32 开跑时 HOME：要保持的车头 = 出发时的车头；第二站顺时针转 cw 度以后 = 出发车头 - cw
                 state['stm_target_yaw']=float(state['config']['car_yaw_deg'])-float(rel.get('cw_deg',60))
@@ -782,15 +802,21 @@ def main():
         try:mission_body(first_scan)
         finally:state['auto']=False
     def race_thread(zone=None):
+        pre=[None,False]                                    # (10-29 晚)写死模式按 START 之前准备好的钩子、用上了没有
         try:
             state['race']=True                              # race_start=screen 时在等按屏上的 START(终端 zone 1|2 可以改区)
+            if fixed_on():pre[0]=fixed_prestart()
             def start_run(z,scanned):
-                state['race']=False;mission_body(True,scanned)
+                state['race']=False;pre[1]=True;mission_body(True,scanned,hooks=pre[0])
             st=race_flow(Ctx(),link,log,raw_cfg,start_run,zone=zone)
             if st=='nozone':print('（race 没开始：用 zone 1 / zone 2 选区，go 开始）',flush=True)
         except Abort as e:print('★ 比赛流程已停止：',e,flush=True)
         except Exception as e:print('★ 比赛流程出错：',repr(e),flush=True)
-        finally:state['auto']=False;state['race']=False
+        finally:
+            state['auto']=False;state['race']=False
+            if pre[0] is not None and not pre[1]:            # 没按 START 就 abort 了：准备好的钩子关掉(放掉摄像头)
+                try:pre[0].close()
+                except Exception:pass
     def command(line):
         import unicodedata
         line=unicodedata.normalize('NFKC',line).replace('\u3000',' ')   # 中文输入法打出的全角字母/空格也能认
@@ -1070,7 +1096,7 @@ def main():
             if len(parts)>2 or sub_ not in ('','save','replan','on','off'):
                 raise ValueError('格式：fixroute save(存刚才的路线和地图) / fixroute replan(stop 改了停车点：按存的地图重新规划再存) / '
                                  'fixroute on(写死模式) / fixroute off(改回自己规划) / fixroute(看现在)')
-            w1_,w2_=float(raw_cfg.get('fixed_wait1_s',3.0)),float(raw_cfg.get('fixed_wait2_s',3.0))
+            w1_,w2_=float(raw_cfg.get('fixed_wait1_s',FIXED_WAIT1_S)),float(raw_cfg.get('fixed_wait2_s',FIXED_WAIT2_S))
             zone_=int(raw_cfg.get('start_zone',2) or 2)
             if sub_=='save':
                 snap_=fixed_route.snapshot(state,history.views,history.objects,zone_)
@@ -1102,7 +1128,7 @@ def main():
             if sub_=='on':
                 snap_=fixed_snap()                          # 没存过就报错，不打开
                 save_cfg_keys({'fixed_route':True})
-                print(f'已打开写死模式(存进配置)：race 1 / race 2 以后只等屏上按 START；按了以后原地等 {w1_:g} 秒(不扫描) → 第二站动作 → '
+                print(f'已打开写死模式(存进配置)：race 1 / race 2 先把机械臂准备好，再等屏上按 START；按了以后原地等 {w1_:g} 秒(不扫描) → 第二站动作 → '
                       f'再等 {w2_:g} 秒(不扫描) → 不规划，按存好的路线跑(二维码那里不做站点扫描，雷达定位照常)。存的路线：'
                       +fixed_route.describe(snap_)+'。改回自己规划：fixroute off',flush=True);return
             if sub_=='off':

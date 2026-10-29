@@ -695,6 +695,8 @@ class LiveTests(unittest.TestCase):
         self.assertIn('ZONE LOCK', reqs)
         self.assertIn('① 写死模式：不扫描、不规划', fx)
         self.assertIn('③ 写死模式：不扫描，原地等 0.4 秒', fx)
+        pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
+        self.assertIn('写死模式：按 START 之前先准备机械臂', pre, '(10-29 晚)机械臂在按 START 之前准备好')
         self.assertIn('写死模式：不规划，直接用存好的路线', fx)
         self.assertIn('④ 写死路线', fx)
         for word in ('第一次扫描', '第二次扫描', '扫描完成', '站点扫描', '规划全程路线', '开跑前规划'):
@@ -713,6 +715,45 @@ class LiveTests(unittest.TestCase):
         k0 = next(i for i, q in enumerate(tr) if not auto_run.in_rect(q, auto_run.START_RECTS[2]))
         self.assertGreaterEqual(edge_min(tr[k0:], self.cfg_after), 0.0)
         self.assertIs(self.cfg_after.get('fixed_route'), True, 'fixroute on 存进配置')
+
+    def test_fixed_race_default_waits_are_short(self):
+        """(10-29 晚 用户"实测下来……大概要15s，把时间压缩一下，压缩到8s到10s左右合理分配一下")写死模式默认：按 START 之前先准备机械臂，
+        按了以后原地等 1.5 秒 → 第二站动作 → 再等 1 秒(以前 3 秒、3 秒，机械臂准备在按了 START 以后)，照样跑完回到启停区。"""
+        start = (2250.0, 150.0, 90.0)
+        mark = {}
+
+        def said(t, n=1):
+            return lambda: self.out_text().count(t) >= n
+
+        def back_to_start():
+            if '已打开写死模式' not in self.out_text():
+                return False
+            car = WORLD['car']
+            with car.lock:
+                car.x, car.y, car.yaw = start
+                car.g_off = 0.0
+                car.T = car.yaw
+                mark.update(sent=len(car.sent))
+            return True
+        inputs = [(lambda: True, 'race 2'), (said('路线全部走完'), 'fixroute save'), (said('已存好写死路线'), 'fixroute on'),
+                  (lambda: said('已打开写死模式')() and back_to_start(), 'race 2')]
+        car = self.run_live(2, dict(scale=0.01), timeout=150.0, cfg_extra=dict(race_auto=False, race_start='now'), inputs=inputs,
+                            screen_zone=None, done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t)
+        log = self.log
+        self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
+        self.assertIn('按了以后原地等 1.5 秒(不扫描) → 第二站动作 → 再等 1 秒(不扫描)', log)
+        pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
+        self.assertIn('写死模式：按 START 之前先准备机械臂', pre)
+        fx = log[log.rindex('★ 按了 START'):]
+        self.assertIn('原地等 1.5 秒(从开跑算)', fx)
+        self.assertIn('③ 写死模式：不扫描，原地等 1 秒', fx)
+        self.assertIn('② 走第二站：左移', fx, '第二站动作照旧')
+        import re
+        m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
+        self.assertTrue(m, fx[:2000])
+        self.assertTrue(2.4 <= float(m[-1]) <= 4.5, (m, fx[:2000]))      # 1.5 + 第二站(模拟里很快) + 1
+        big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
+        self.assertGreaterEqual(len(big), 8, big)
 
     def test_fixroute_replan_after_moving_a_stop(self):
         """(10-29 用户"暂停区域的y轴不能减少要和原来的一样")程序重开过(没有扫描)、stop 改了停车点：fixroute replan 车不动，
