@@ -1239,6 +1239,17 @@ def main():
             write_json_safe(p_,file_cfg())
             print('已设置 full on：一直跑完全程(下一次 go / race 起作用，存进配置)' if parts[1]=='on' else
                   '已设置 full off：3 分钟内回家，150 秒以后不再开始新的夹放、来不及就直接回家(下一次 go / race 起作用，存进配置)',flush=True);return
+        if k=='stopexact':
+            # (10-29 晚 用户"你把这个区域限制的你的计算打开呗……按我的想法改这四个位置的坐标")stop 输入的停车点按地图压到暂存区/粗加工区/
+            #   原料转盘/黄色区也照样停在那里(不再自动挪到最近停得下的)；出场地、碰障碍物照旧挪
+            on_=bool(raw_cfg.get('stop_exact',False))
+            if len(parts)==1:
+                print(('现在：stopexact on，stop 输入的停车点压到区域也照样停在那里' if on_ else
+                       '现在：stopexact off，停车点按地图压到区域就自动停到最近停得下的位置')+'。改：stopexact on / stopexact off',flush=True);return
+            if len(parts)!=2 or parts[1] not in ('on','off'):raise ValueError('格式：stopexact on(照输入的停) / stopexact off(压到区域自动挪开)')
+            save_cfg_keys({'stop_exact':parts[1]=='on'})
+            print(('已设置 stopexact on：停车点照你输入的停(按地图压到区域也不挪)，存进配置。写死模式改完停车点再输入 fixroute replan' if parts[1]=='on'
+                   else '已设置 stopexact off：压到区域的停车点自动挪到最近停得下的位置，存进配置'),flush=True);return
         if k=='turnloc':
             # (10-27 用户"到了转弯的地方不应该是立马转过去吗")离黄色区/工位/场地边近的转弯，转之前先停下用雷达确认位置(reloc_before_turn)
             on_=bool(raw_cfg.get('reloc_before_turn',True))

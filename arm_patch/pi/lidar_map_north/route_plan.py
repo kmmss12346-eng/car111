@@ -1313,12 +1313,14 @@ class Planner:
                 low = sg[k]
                 notes.append(f'⚠ 起点离{it[0]}只有 {sg[k]:.0f}mm(要 {it[7]:.0f}mm)，离开时按 {max(sg[k], 0):.0f}mm 放宽')
             if gg[k] < it[7] - EPS_MM and it[1] != 'obs':
-                if gg[k] < 0 or (it[1] == 'edge' and it[7] <= 0):
+                exact = bool(self.cfg.get('stop_exact', False)) and it[1] in ('zone', 'raw', 'yellow')
+                if (gg[k] < 0 and not exact) or (it[1] == 'edge' and it[7] <= 0):
                     over.append((gg[k], k))
                     continue
                 low = gg[k] if low is None else min(low, gg[k])
                 notes.append(f'⚠ 停车点 {name} 本身离{it[0]}只有 {gg[k]:.0f}mm(要 {it[7]:.0f}mm)，'
-                             f'这一段只在{it[0]}这里放宽到 {gg[k]:.0f}mm，请把停车点往外挪')
+                             f'这一段只在{it[0]}这里放宽到 {gg[k]:.0f}mm，请把停车点往外挪' if gg[k] >= 0 else
+                             f'⚠ 停车点 {name} 按地图车身压进{it[0]} {-gg[k]:.0f}mm：stopexact on，照样停在这里(这一段只在{it[0]}这里放宽)')
             if low is not None:
                 lst = list(it); lst[7] = min(it[7], low - 0.5); items[k] = tuple(lst)
                 relaxed = True
@@ -1838,6 +1840,10 @@ def check_stop(cfg, obstacles, name, pose):
             g = gaps[k]
             short = g < it[7] - EPS_MM
             txt = _what(it, g, False)
+            exact = bool(cfg.get('stop_exact', False)) and it[1] in ('zone', 'raw', 'yellow')
+            if short and exact and g < 0:
+                out['warn'].append(f'按地图车身会压进{it[0]} {-g:.0f}mm：stopexact on，照样停在这里')
+                continue
             if short and (g < 0 or (it[1] == 'edge' and it[7] <= 0)):
                 out['moves'] = True                        # Planner.leg：压到区域/出场地 -> _fix_goal 挪到最近停得下的
         if short and (bad is None or g - (pl.goal_min if it[1] == 'obs' else it[7]) < bad[0]):
