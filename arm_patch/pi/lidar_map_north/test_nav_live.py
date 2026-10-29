@@ -748,20 +748,20 @@ class LiveTests(unittest.TestCase):
                             screen_zone=None, done_when=lambda t: t.count('路线全部走完') >= 2 or '★ 已停止' in t or '★ 出错停止' in t)
         log = self.log
         self.assertEqual(log.count('路线全部走完'), 2, log[-3000:])
-        self.assertIn('按了以后原地等 1.5 秒(不扫描) → 第二站动作 → 再等 1.5 秒(不扫描) → 不规划', log)   # (10-29 用户"走两步的等待时间都改成1.5s")
+        self.assertIn('按了以后第二站动作 → 不规划', log)   # (10-29 用户"启停区域的时间想办法再砍3秒")两次都不等
         pre = log[log.rindex('已打开写死模式'):log.rindex('★ 按了 START')]
         self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre)
         self.assertIn('参数同步好了', pre)
         fx = log[log.rindex('★ 按了 START'):]
         self.assertIn('STM32 参数按 START 之前已经同步好了', fx, '按了 START 不再同步')
         self.assertNotIn('STM32 参数已同步', fx)
-        self.assertIn('原地等 1.5 秒(从开跑算)', fx)
-        self.assertIn('③ 写死模式：不扫描，原地等 1.5 秒', fx, '第二站动作以后等 1.5 秒')
+        self.assertIn('不等，直接开', fx)
+        self.assertNotIn('③ 写死模式：不扫描，原地等', fx, '第二站动作以后不等')
         self.assertIn('② 走第二站：左移', fx, '第二站动作照旧')
         import re
         m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
         self.assertTrue(m, fx[:2000])
-        self.assertTrue(2.9 <= float(m[-1]) <= 4.5, (m, fx[:2000]))      # 1.5 + 第二站(模拟里很快) + 1.5
+        self.assertTrue(float(m[-1]) <= 1.5, (m, fx[:2000]))      # 不等 + 第二站(模拟里很快)
         big = [(c, v) for c, v, *_ in car.sent[mark['sent']:] if c == 'R' or abs(v) >= 100]
         self.assertGreaterEqual(len(big), 8, big)
 
@@ -837,10 +837,10 @@ class LiveTests(unittest.TestCase):
         self.assertIn('写死模式：按 START 之前先同步参数、准备机械臂', pre, '按 START 之前准备好')
         self.assertIn('STM32 参数按 START 之前已经同步好了', fx, '按了 START 不再同步')
         self.assertIn('② 写死模式：存的路线是从起点规划的，不走第二站，直接开', fx)
-        self.assertIn('原地等 1.5 秒(从开跑算)', fx, '(10-29 用户"走两步的等待时间都改成1.5s")')
+        self.assertIn('不等，直接开', fx, '(10-29 用户"启停区域的时间想办法再砍3秒")')
         import re
         m = re.findall(r'开跑到现在 ([\d.]+) 秒', fx)
-        self.assertTrue(m and 1.4 <= float(m[-1]) <= 2.5, (m, fx[:2000]))   # 只等 1.5 秒
+        self.assertTrue(m and float(m[-1]) <= 1.0, (m, fx[:2000]))   # 不等
         for word in ('转弯前雷达定位', '直行前雷达定位', '转弯后雷达定位'):
             self.assertNotIn(word, fx, '写死模式路上不用雷达定位')
         self.assertIn('◆ 雷达定位：车在', fx[fx.index('到达 PREHOME'):], '回家前照样定位')

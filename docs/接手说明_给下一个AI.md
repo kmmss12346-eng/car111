@@ -1382,4 +1382,6 @@ git_log.txt                ← 分支最近 120 条提交记录
   ②放置前对准 2 号环(停着算好再挪 calc)：从第一次算起过了 zone_place_align_s(2 秒)、还差不到 zone_place_cap_mm(3mm)就不再挪，按现在的位置放；
   差得多照旧挪(试过不管差多少到 2 秒就放：ZoneCalTests 里放偏 8mm)。模拟里挪得快，默认参数下不会触发；实车(一次挪 + 停稳拍 3 帧约 1.5 秒)
   第二次挪完差 1.4mm 那种就不再挪第三次。新测试 test_place_align_time_cap_and_direct_pickback。
+- **10-29(14) 用户"启停区域的时间想办法再砍3秒吧就是等待，移动，前移，等待这再压缩3s"：** FIXED_WAIT1_S / FIXED_WAIT2_S 1.5、1.5 → 0、0
+  (按 START 直接走第二站动作，做完直接开；第二站动作本身照旧约 3.3 秒)。配置里写了 fixed_wait1_s / fixed_wait2_s 的按配置。
 
