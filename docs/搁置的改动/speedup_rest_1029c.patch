@@ -1,0 +1,421 @@
+diff --git a/arm_patch/pi/lidar_map_north/arm_link.py b/arm_patch/pi/lidar_map_north/arm_link.py
+index 9e5625d..d80a8e8 100644
+--- a/arm_patch/pi/lidar_map_north/arm_link.py
++++ b/arm_patch/pi/lidar_map_north/arm_link.py
+@@ -49,6 +49,15 @@ def approach_id1(arm, pre1, fin1, a2, slow_max=SLOW_STEP_DEG):
+     arm.ap(float(fin1), float(a2))
+ 
+ 
++def tstat_add(stat, text, dt):
++    """(10-29 晚 用户"能改多短减多短")按指令名(第一个词)记发了几次、一共等了多少秒：每站做完打印出来，看时间花在哪。"""
++    if stat is None:
++        return
++    c = stat.setdefault(str(text).split(' ', 1)[0], [0, 0.0])
++    c[0] += 1
++    c[1] += max(0.0, float(dt))
++
++
+ def _timeout_for(text):
+     head = text.split(' ', 1)[0]
+     for k, t in _TIMEOUTS:
+@@ -156,6 +165,8 @@ class ArmLink:
+         self.lift_boot = None                    # 开机时升降高度是怎么认出来的(LIFT? 回复里的 BOOT=…；旧程序没有)
+         self._n_req = 0                          # 发过几条(第一条可能收到 STM32 上电时留在串口里的 READY/LIFTBOOT，不算中途重启)
+         self.claw_last = None                    # (10-21)上一条指令里夹爪最后一次动作(CLAWSET 的 C/O/OR/OT…，没动过是 None)
++        self.tstat = {}                          # (10-29 晚)每种指令发了几次、一共等了多少秒(tstat_add；底盘 V/S/F 也记在这里)
++        self.tclock = time.monotonic             #   计时用的钟(模拟里换成模拟的时间)
+         try:                                     # 扫码器插在树莓派 USB 口上时从这里读(见 qr_usb.py)；没有就只问 STM32
+             import qr_usb
+             self.usb_qr = qr_usb.reader(log)
+@@ -168,7 +179,11 @@ class ArmLink:
+         if text.split(' ', 1)[0] in _MOVING:
+             self.angle = {1: None, 2: None}
+         self.claw_last = None                       # (10-21)这条指令里夹爪最后一次动作(CLAWSET 的 C/O/OR/OT…)：出错时看爪子里有没有物料
+-        out = self.link.request(text, timeout or _timeout_for(text), collect=True)
++        t0 = self.tclock()
++        try:
++            out = self.link.request(text, timeout or _timeout_for(text), collect=True)
++        finally:
++            tstat_add(self.tstat, text, self.tclock() - t0)
+         ok, reply, info = out
+         reply = reply or ''
+         if 'ABORT' in reply:
+@@ -456,6 +471,15 @@ class ArmActuators:
+     def reset_disp(self):
+         self.disp = {'S': 0.0, 'F': 0.0}
+ 
++    def _timed(self, text, timeout):
++        """(10-29 晚)底盘 V / V? 也按指令记用时(记在 arm.tstat 里，和手臂指令一起打印)。"""
++        clock = getattr(self.arm, 'tclock', time.monotonic)
++        t0 = clock()
++        try:
++            return self.link.request(text, timeout, collect=True)
++        finally:
++            tstat_add(getattr(self.arm, 'tstat', None), text, clock() - t0)
++
+     def arm_move(self, d_id2, d_id1):
+         """ID2、ID1 相对现在的角度再转 d_id2、d_id1 度(一起转)。返回实际转了多少 (ID2, ID1)，用读回来的角度算。"""
+         if self.arm.angle[1] is None or self.arm.angle[2] is None:
+@@ -485,7 +509,7 @@ class ArmActuators:
+         400ms 没发新的就自己停。返回 True；STM32 是旧程序(不认 V)返回 False(以后不再试)。位移不记进 disp：用 vel_read 算。"""
+         if getattr(self, '_no_vel', False):
+             return False
+-        ok, reply, _info = self.link.request(f'V {float(s_mmps):.1f} {float(f_mmps):.1f}', 1.0, collect=True)
++        ok, reply, _info = self._timed(f'V {float(s_mmps):.1f} {float(f_mmps):.1f}', 1.0)
+         reply = reply or ''
+         if 'ABORT' in reply:
+             raise ArmAbort(f'V -> {reply}')
+@@ -498,7 +522,7 @@ class ArmActuators:
+ 
+     def vel_read(self):
+         """V 一共走了多少 (横移, 前进) 毫米(STM32 按发给电机的速度算)；读不到返回 None。"""
+-        ok, reply, info = self.link.request('V?', 1.0, collect=True)
++        ok, reply, info = self._timed('V?', 1.0)
+         for line in info or []:
+             m = re.match(r'VD (-?\d+) (-?\d+)', line)
+             if m:
+@@ -512,7 +536,12 @@ class ArmActuators:
+             if v == 0:
+                 continue
+             sp = int(speed) if speed else (self.fine_speed if abs(v) <= 60 else None)   # 小距离慢一点准一点；大距离用默认速度
+-            ok, reply = self.link.move(cmd, v, sp)
++            clock = getattr(self.arm, 'tclock', time.monotonic)
++            t0 = clock()
++            try:
++                ok, reply = self.link.move(cmd, v, sp)
++            finally:
++                tstat_add(getattr(self.arm, 'tstat', None), cmd, clock() - t0)
+             if 'ABORT' in (reply or ''):
+                 raise ArmAbort(f'{cmd} {v} -> {reply}')
+             if not ok:
+diff --git a/arm_patch/pi/lidar_map_north/map_merge_live.py b/arm_patch/pi/lidar_map_north/map_merge_live.py
+index b78d136..bd0bca2 100644
+--- a/arm_patch/pi/lidar_map_north/map_merge_live.py
++++ b/arm_patch/pi/lidar_map_north/map_merge_live.py
+@@ -1206,15 +1206,20 @@ def main():
+             spf.report(ch_,bad_,parts[1].lower(),out_);return
+         if k=='turntune':
+             # (10-26 用户"尤其是转向的时候")实车原地转几次 ±90°，自动选转弯最快、停得准的 TCLAG，存进配置
++            # (10-29 晚 用户"转弯的时候速度再加快一点点")后面可以写要试的 TCLAG：turntune 0.06 0.07 0.08 0.09 0.10 0.11(默认 0.16 0.13 0.10 0.08)
+             if link is None:raise ValueError('没有连接 STM32（--stm-port）')
+             if state['auto'] or state['busy']:raise ValueError('正在运行或扫描，等结束再用')
+             import speed_profile as spf
++            try:lags_=tuple(float(v) for v in parts[1:]) or spf.TUNE_LAGS
++            except ValueError:raise ValueError('格式：turntune 或 turntune 0.06 0.08 0.10(要试的 TCLAG，0~0.5)') from None
++            if len(lags_)>10 or any(not 0.0<=v<=0.5 for v in lags_):raise ValueError('TCLAG 要在 0~0.5 之间，最多试 10 个')
+             sync_now()
+-            print('turntune：车会原地转 +90°、-90° 共 16 次(约 40 秒)，最后转回现在的车头。车周围留出 40cm 空地；要停输入 abort',flush=True)
++            print(f'turntune：每个 TCLAG({" ".join(f"{v:g}" for v in lags_)})车原地转 +90°、-90° 各 2 次，共 {4*len(lags_)} 次'
++                  f'(约 {10*len(lags_)} 秒)，最后转回现在的车头。车周围留出 40cm 空地；要停输入 abort',flush=True)
+             state['busy']=True;state['abort']=False
+             def tworker():
+                 try:
+-                    best,old,rows=spf.turn_tune(link,lambda m:print(m,flush=True),aborted=lambda:state['abort'])
++                    best,old,rows=spf.turn_tune(link,lambda m:print(m,flush=True),lags=lags_,aborted=lambda:state['abort'])
+                     save_params({'TCLAG':best})
+                     est=spf.turn_estimates(rows,best)
+                     if est:save_cfg_keys({'turn90_s':est[0],'turn180_s':est[1]})
+@@ -1347,7 +1352,7 @@ def main():
+             if history.views:raise ValueError('修改初始车位前请先输入 reset 清空历史')
+             c=copy.deepcopy(state['config']);c.update(zip(('car_x_mm','car_y_mm','car_yaw_deg'),map(float,parts[1:])))
+             launch(c,'user_entered_absolute_pose');return
+-        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune(自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
++        raise ValueError('命令：race 1|2(比赛：终端选区直接开跑) / go(一键全流程) / zone 1|2 / park / drive / abort / ping / yaw [秒](看陀螺仪) / mot(电机驱动器状态) / mot en / gtest 颜色号(夹取测试) / g 13 1(红十字往右 13、往下 1 像素；g RAW 13 1 挪绿十字) / send F 300 / speed fast|max|normal(底盘快慢) / turntune [TCLAG 值…](自动调转弯) / get / set 名字 数值 / zup 4(升降高度都加 4mm) / fixroute save|replan|on|off(写死路线) / sync / fix F 1000 985 / cal / p2 / home [check] / calib X Y [X Y..] / calib save / scan / second / second X Y yaw 30 / route / stop [QR|RAW|ROUGH|TEMP X Y [车头]](看/改停车点) / pose X Y 角度 / list / pts / reset / save / q')
+     def command_jog(c,val):
+         """(10-23 用户"在每一个区域之前能再自由调节车的位置")分段调试到站停着：F/S 慢慢挪几毫米、R 转几度，记下一共挪了多少。"""
+         if not state.get('step_can_jog'):raise ValueError('只有 go step 到了 QR / RAW / ROUGH / TEMP 停下等 n 的时候才能这样挪车')
+diff --git a/arm_patch/pi/lidar_map_north/mission_hooks.py b/arm_patch/pi/lidar_map_north/mission_hooks.py
+index 8066981..fe31197 100644
+--- a/arm_patch/pi/lidar_map_north/mission_hooks.py
++++ b/arm_patch/pi/lidar_map_north/mission_hooks.py
+@@ -166,7 +166,9 @@ DEFAULTS = dict(
+     raw_orbit_ratio=0.77,               # 还没看到物料时：物料所在圆的半径 ≈ 外圆半径 × 这个
+     raw_center_smooth=True,             # (10-16 用户)车轮连续、顺滑地慢慢走，一边走一边每帧算圆心(STM32 的 V 指令)，不再挪一下停一下；
+                                         #   STM32 是旧程序(不认 V)时自动改回一步一步挪
+-    raw_center_speed=15.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
++    raw_center_speed=25.0,              # 对准中心时车轮最快多少毫米/秒(边走边看，实车一秒不到 2 帧：再快存的对应关系反了时来不及发现)
++                                        #   (10-29 晚 用户"尽你最大的努力来节约时间")15 -> 25：只管离得远的那一段(偏多少毫米就每秒走多少，越近越慢)
++    vel_back_speed=60.0,                # (10-29 晚)原料区、工位做完只用 V 挪回停车点时最快多少毫米/秒(以前按 raw_center_search_speed 30；往外挪，快到了照样慢下来)
+     raw_center_search_speed=30.0,       # 找中心(挪着找)、只用 V 挪到一个地方(_vel_goto)时车轮最快多少毫米/秒(10-21：20 -> 30)
+     raw_center_align_s=25.0,            # 对准中心最多用多少秒
+     raw_center_iters=5,                 # 车轮最多挪几次
+@@ -350,6 +352,9 @@ DEFAULTS = dict(
+                                         #   "再转一次"，ID1 往转的方向多给这么多度，停下的地方才是要的地方。None = ATOL 的 0.7 倍；0 = 不补(以前)
+     return_tol_fine_deg=0.15,           # (10-27)从车上转盘转回对准的角度(放 1、2、3 号环之前)：差这么多以上就再转一次(以前 0.4°，
+                                         #   1 号环离转轴最远，0.4° 在那里约 1.7mm)；zone_atol_comp 是 0 时照旧按 return_tol_deg
++    ring13_return_tol_deg=0.45,         # (10-29 晚 用户"反正你就先尽你最大的努力来节约时间")夹着物料转回 1、3 号环的角度：ID1 差这么多以内就照常放，
++                                        #   不再转一次(实车 10-29：差 -0.20° 再转一次成了 +0.70°，差 -0.40° 成了 +0.60°，反而更偏，还多花 1~1.5 秒)。
++                                        #   2 号环照旧按 return_tol_fine_deg。0 = 以前的做法
+     ring13_return_retries=1,            # (10-28 用户"角度实在转不动转不过去……除了 2 号环之外的 1、3 号环的对准时间要缩短")夹着物料转回 1、3 号环
+                                         #   的角度以后差得多最多再转几次(以前和 2 号环一样 2 次；一次要 1~1.5 秒)。2 号环照旧 2 次
+     zone_cal_fine_tol_mm=1.0,           # (10-27 晚)1、3 号环摄像头微调对到多少毫米以内才算"微调好了"(和 tol_mm.RING 取小的)。以前按 tol_mm.RING，
+@@ -381,7 +386,9 @@ DEFAULTS = dict(
+     zone_calc_arm_mm=2.5,               #   只差这么多以内：车轮不再挪(小挪动车轮本身就差 1mm 左右)，剩下的手臂补
+     zone_calc_smooth=True,              #   (10-21 用户"改成缓慢移动对准，丝滑一点")算好的那一下用 V 连续慢慢走过去(斜着一起走，不是先横移再前进)；
+                                         #   STM32 不认 V 才用 S/F
+-    zone_calc_speed=30.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
++    zone_calc_speed=60.0,               #   慢慢走过去的最快速度(毫米/秒，快到了自动减速)。(10-21 用户"运动太慢"：20 -> 30)
++                                        #   (10-29 晚 用户"在粗加工区域对准的时间太长了")30 -> 60：离得远走快一点；_vel_goto 按"还差多少走多快"、
++                                        #   串口来回的时间提前停，快到了照样慢下来(最后一两毫米按 1 转/分 一小段一小段走)
+     # (10-24 用户"故意对偏的那个红色十字去掉，把粗加工区域和暂存区域的十字中心做成可调节的")r2off(ring2_off_mm 故意对偏)去掉了：
+     #   2 号环对到圆环这边的爪子点 claw_px.RING(vlive 里的红十字)，在 arm_calib 看圆环的那几步 g 左右 上下 挪它。配置里还写着 ring2_off_mm 也不用
+     zone_wheels_only=True,              # (10-21 用户"对准的时候不要用机械臂修正，就用车轮修正，修正距离可以放开")2 号环只用车轮对准：手臂停在
+@@ -491,6 +498,10 @@ BOOT_TEXT = {'ENC': '按编码器认的高度', 'NOCAL': '没标定，当成 60m
+ PICK_COLORS = (1, 2, 3, 4, 6)          # 能按物料顶面对准的颜色。黑色(5)物料放在黑环上和黑环连成一片，分不出来：认圆环
+ 
+ 
++# (10-29 晚)车上配置里写着这些旧的默认值 = 没人改过：按 DEFAULTS 里现在的值用(见 MissionHooks._upgrade_old_speeds)
++OLD_SPEED_DEFAULTS = {'raw_center_speed': (15.0,), 'zone_calc_speed': (20.0, 30.0)}
++
++
+ def deep_merge(base, extra):
+     out = {}
+     for k, v in base.items():
+@@ -861,6 +872,7 @@ class MissionHooks:
+         self.raw_cfg = raw_cfg or {}
+         self.cfg = deep_merge(DEFAULTS, self.raw_cfg.get('mission_cfg'))
+         self.log = log
++        self._upgrade_old_speeds()
+         self.now = now
+         self.sleep = sleep
+         self.ctx = ctx                      # auto_run.drive 会把 ctx 填进来，用来检查 abort
+@@ -937,6 +949,23 @@ class MissionHooks:
+         self._raw_pose = None               # 原料区第一次夹到时对准好的 (ID1, ID2)：后面的物料直接从这里开始
+         self._seek = None         # 从转盘回到记下的姿态时 ID1、ID2 总是多转了多少度(学出来的，下次提前补上)
+ 
++    def _upgrade_old_speeds(self):
++        """(10-29 晚 用户"能改多短减多短")车上配置的 mission_cfg 是以前 apply_mission_config 按当时的默认值整个写进去的：
++        这几个对准/挪车速度还是以前的默认值(没人改过)就按现在的默认值用(只在这一次运行里换，不改配置文件)；改过的照旧。"""
++        mc = self.raw_cfg.get('mission_cfg') or {}
++        said = []
++        for k, olds in OLD_SPEED_DEFAULTS.items():
++            v = mc.get(k)
++            try:
++                hit = v is not None and any(abs(float(v) - float(o)) < 1e-9 for o in olds)
++            except (TypeError, ValueError):
++                hit = False
++            if hit and self.cfg.get(k) != DEFAULTS[k]:
++                self.cfg[k] = DEFAULTS[k]
++                said.append(f'{k} {v:g}→{DEFAULTS[k]:g}')
++        if said:
++            self.log('  (配置里这几个还是以前的默认值，按现在的默认值用：' + '、'.join(said) + ')')
++
+     # ------------------------------------------------------------------ 给 auto_run 的接口
+     def adjust(self, stop, link, log):
+         """到停车点后调姿态：目前什么也不做(车位已经由雷达定位好；精确对准在 task 里用摄像头做)。"""
+@@ -993,6 +1022,7 @@ class MissionHooks:
+         self._gap_now = None
+         self.visits[role] = self.visits.get(role, 0) + 1
+         t_start = self.now()
++        ts0 = {k: list(v) for k, v in (getattr(self.arm, 'tstat', None) or {}).items()}
+         self._items_t = 0.0
+         try:
+             if role in ('RAW', 'ROUGH', 'TEMP') and self.plan is None and str(self.cfg.get('qr_fixed_code') or '').strip():
+@@ -1019,6 +1049,26 @@ class MissionHooks:
+             self._learn_t(self.base_t, role, max(0.0, dt - self._items_t))
+         if role != 'START':
+             self.log(f'    ({stop} 用了 {dt:.0f} 秒；从出发算已用 {self.elapsed():.0f} 秒)')
++            tt = self._tstat_text(ts0, dt)
++            if tt:
++                self.log(f'    ({stop} 时间花在：{tt})')
++
++    def _tstat_text(self, ts0, dt):
++        """(10-29 晚 用户"能改多短减多短")这一站每种指令发了几次、等了多少秒(用时多的在前)，剩下的是树莓派自己在看画面、等原料盘转、算。"""
++        now = getattr(self.arm, 'tstat', None) or {}
++        rows = []
++        for k, (n, t) in now.items():
++            n0, t0 = ts0.get(k, (0, 0.0))
++            if n > n0:
++                rows.append((t - t0, n - n0, k))
++        if not rows:
++            return ''
++        rows.sort(reverse=True)
++        used = sum(r[0] for r in rows)
++        big = [f'{k} {n}次 {t:.1f}秒' for t, n, k in rows if t >= 0.3][:9]
++        rest = sum(r[0] for r in rows if r[0] < 0.3) + sum(r[0] for r in rows[9:] if r[0] >= 0.3)
++        return ('、'.join(big) + (f'、其他指令 {rest:.1f}秒' if rest >= 0.05 else '')
++                + f'；不在等 STM32 的时间(看画面、等原料盘转、算) {max(0.0, dt - used):.1f}秒')
+ 
+     # ------------------------------------------------------------------ (10-23)到站前提前摆臂
+     def pre_arrive(self, stop, link=None, log=None):
+@@ -1414,6 +1464,7 @@ class MissionHooks:
+         """只建立和 STM32 的指令通道(不初始化升降、不检查 ARMOK)：给 arm / qr 这类简单测试命令用。"""
+         if self.arm is None:
+             self.arm = ArmLink(link, log=self.log)
++            self.arm.tclock = self.now                # (10-29 晚)每站各指令用时按这里的钟算(模拟里是模拟的时间)
+ 
+     def _ensure_vision(self):
+         if self.vision is None:
+@@ -2249,7 +2300,7 @@ class MissionHooks:
+         ts, tf = self._zone_back_target('RAW')
+         if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+             if math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)) \
+-                    and self._vel_goto(ts, tf, tol_mm=0.6):
++                    and self._vel_goto(ts, tf, tol_mm=0.6, vmax=float(self.cfg.get('vel_back_speed', 60.0))):
+                 self.log('    车轮挪回停车点(只用 V，不转车头)')
+             d = self.act.disp
+             if abs(d['S'] - ts) >= 1 or abs(d['F'] - tf) >= 1:
+@@ -3323,7 +3374,7 @@ class MissionHooks:
+         where = '爪子点' if goal is None else '示教时的位置'
+         colors = self._raw_center_colors()
+         tol = float(cfg.get('raw_center_tol_mm', 4.0)) if tol is None else float(tol)
+-        vmax = float(cfg.get('raw_center_speed', 15.0))
++        vmax = float(cfg.get('raw_center_speed', 25.0))
+         vmin = float(cfg.get('raw_center_min_speed', 5.0))
+         vsearch = float(cfg.get('raw_center_search_speed', 30.0))
+         smax, fmax = (float(x) for x in lim) if lim else (float(cfg.get('raw_center_s_mm', 40.0)), float(cfg.get('raw_center_f_mm', 60.0)))
+@@ -6944,9 +6995,9 @@ class MissionHooks:
+                 self.holding = item
+                 adj = self.place_adj('STACK' if stack else 'RING')
+                 if adj is not None:                              # pcal 量过：落点按这一层的补偿挪
+-                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True, retries=self._ring_retries(ring))
++                    self._return_to_pose(a1 + adj[0], a2 + adj[1], from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+                 else:
+-                    self._return_to_pose(a1, a2, from_tray=True, retries=self._ring_retries(ring))     # 回到记下的角度
++                    self._return_to_pose(a1, a2, from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))     # 回到记下的角度
+                 self._drop(stack)                                # 下降、松手、抬起
+                 held = False
+                 self.holding = None
+@@ -7772,7 +7823,7 @@ class MissionHooks:
+         calc_fr = int(cfg.get('zone_calc_frames', 3))
+         calc_settle = float(cfg.get('zone_calc_settle_s', 0.3))
+         calc_arm = float(cfg.get('zone_calc_arm_mm', 2.5))
+-        calc_v = float(cfg.get('zone_calc_speed', 30.0))
++        calc_v = float(cfg.get('zone_calc_speed', 60.0))
+         calc_smooth = bool(cfg.get('zone_calc_smooth', True))
+ 
+         def still_rings():
+@@ -8306,7 +8357,7 @@ class MissionHooks:
+         else:
+             self.arm.ap(wps[0][0], wps[0][1])
+         a1c = self._carry_rest(wps, a1t)
+-        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))
++        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+         return True
+ 
+     def _carry_rest(self, wps, a1t):
+@@ -8367,7 +8418,7 @@ class MissionHooks:
+         else:
+             self.arm.ap(wps[0][0], wps[0][1])
+         a1c = self._carry_rest(wps, a1t)                        # 只往里缩；缩着只转(最后转到目标环那一下同一个动作到位)
+-        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring))   # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
++        self._return_to_pose(a1c, a2t, from_tray=False, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))   # 到了目标环的角度：只伸出去(再回读、差得多再转一次)
+         return True
+ 
+     def _place_item_arm(self, item, zone, ring, stack, label, T):
+@@ -8463,7 +8514,7 @@ class MissionHooks:
+             adj = self.place_adj(key)
+             ta1, ta2 = a1 + (adj[0] if adj else 0.0), a2 + (adj[1] if adj else 0.0)
+             if not (stack and self._stack_carry(zone, ring, p2, T, ta1, ta2)):
+-                self._return_to_pose(ta1, ta2, from_tray=True, retries=self._ring_retries(ring))
++                self._return_to_pose(ta1, ta2, from_tray=True, retries=self._ring_retries(ring), tol_fine=self._ring13_tol(ring))
+             self._drop(stack)
+             held = False
+             self.holding = None
+@@ -9559,6 +9610,16 @@ class MissionHooks:
+         else:
+             self.arm.ap(a1, a2)
+ 
++    def _ring13_tol(self, ring):
++        """(10-29 晚)夹着物料转回 ring 号环的角度以后 ID1 差多少以内不再转：1、3 号环 ring13_return_tol_deg，2 号环 None(照旧)。"""
++        if int(ring) == 2:
++            return None
++        try:
++            v = float(self.cfg.get('ring13_return_tol_deg', 0.45) or 0.0)
++        except (TypeError, ValueError):
++            return None
++        return v if v > 0 else None
++
+     def _ring_retries(self, ring):
+         """(10-28)夹着物料转回 ring 号环的角度以后，差得多最多再转几次：1、3 号环 ring13_return_retries(默认 1)，2 号环照旧 2 次。"""
+         if int(ring) == 2:
+@@ -9568,8 +9629,9 @@ class MissionHooks:
+         except (TypeError, ValueError):
+             return 1
+ 
+-    def _return_to_pose(self, a1, a2, from_tray=False, retries=2):
++    def _return_to_pose(self, a1, a2, from_tray=False, retries=2, tol_fine=None):
+         """取完物料回到对准时记下的 ID1、ID2 角度。回读一下，差得多(> return_tol_deg)就再转一次，最多再转 retries 次(默认 2)。
++        tol_fine = (10-29 晚)ID1 差这么多以内就不再转(1、3 号环 ring13_return_tol_deg；None = 照旧)。
+         from_tray=True：从车上转盘那边大幅转回来(每次走法一样，多转/少转的度数也差不多)：按前几次学到的提前补上，补完多半就不用再转一次。
+         (10-27 晚)from_tray 且 zone_same_approach：大幅转回来先停在往车上转盘那边多转(间隙 + zone_backlash_extra_deg)的地方，再转回来到位
+         ——和 1、3 号环微调的每一下、对准 2 号环前回 A1P 是同一个动作，手臂停的地方就是对准时停的地方(这时不学多转/少转、不用 return_preload_deg)。"""
+@@ -9615,6 +9677,8 @@ class MissionHooks:
+             # (10-27)ID1 "再转一次"多给了补偿(_ap_from_tray_side)，比 ATOL 小的差也转得动：差 return_tol_fine_deg 以上就再转
+             #   (1 号环离转轴最远，以前的 0.4° 在那里约 1.7mm)。ID2 每度不到 0.1mm，照旧
+             tol1 = float(self.cfg.get('return_tol_fine_deg') or 0.15)
++        if tol_fine is not None:
++            tol1 = max(tol1, float(tol_fine))               # (10-29 晚)1、3 号环：差一点就照常放(再转一次实车反而转过头)
+         for k in range(retries + 1):
+             self.sleep(0.2)
+             try:
+@@ -9824,7 +9888,7 @@ class MissionHooks:
+                 and math.hypot(float(d['S']) - ts, float(d['F']) - tf) <= float(self.cfg.get('raw_vel_back_mm', 160.0)):
+             tried = True
+             try:
+-                if self._vel_goto(ts, tf, tol_mm=0.6):
++                if self._vel_goto(ts, tf, tol_mm=0.6, vmax=float(self.cfg.get('vel_back_speed', 60.0))):
+                     self.log('    车轮挪回停车点(只用 V，不转车头)')
+             except ArmAbort as ex:
+                 raise Abort(str(ex))
+diff --git a/arm_patch/pi/lidar_map_north/sim_mission.py b/arm_patch/pi/lidar_map_north/sim_mission.py
+index 44f4cb9..b7a1070 100644
+--- a/arm_patch/pi/lidar_map_north/sim_mission.py
++++ b/arm_patch/pi/lidar_map_north/sim_mission.py
+@@ -4502,16 +4502,54 @@ class ZoneCalTests(unittest.TestCase):
+         got = []
+         orig = h._return_to_pose
+ 
+-        def rec(a1, a2, from_tray=False, retries=2):
++        def rec(a1, a2, from_tray=False, retries=2, tol_fine=None):
+             if from_tray:
+                 got.append(retries)
+-            return orig(a1, a2, from_tray=from_tray, retries=retries)
++            return orig(a1, a2, from_tray=from_tray, retries=retries, tol_fine=tol_fine)
+         h._return_to_pose = rec
+         run_mission(w, h, stops=('QR', 'RAW', 'ROUGH'))
+         rings = [k for (z, k, _c, _e, _st) in w.placed if z == 'ROUGH']
+         self.assertEqual(sorted(rings), [1, 2, 3])
+         self.assertEqual(got[-3:], [2 if k == 2 else 1 for k in rings], (got, rings))
+ 
++    def test_ring13_small_return_error_is_not_turned_again(self):
++        """(10-29 晚 用户"反正你就先尽你最大的努力来节约时间")夹着物料转回 1、3 号环：ID1 差 ring13_return_tol_deg(0.45°)以内照常放，
++        不再转一次(实车 -0.20° 再转一次成了 +0.70°，反而更偏)；2 号环照旧按 return_tol_fine_deg(0.15°)再转。"""
++        w = self._world(2)
++        lines = []
++        h = self._make(w, lines=lines)
++
++        class Arm:
++            def __init__(self):
++                self.cmds = []
++
++            def params(self):
++                return {'ATOL': 0.3, 'ZOBRNG': 120.0}
++
++            def ap(self, a1, a2):
++                self.cmds.append(('AP', round(a1, 2), round(a2, 2)))
++
++            def apz(self, a1, a2, z):
++                self.cmds.append(('APZ', round(a1, 2), round(a2, 2)))
++
++            def read_angles(self):
++                return 99.7, -800.0                                     # 每次都停在差 -0.3° 的地方
++        h._same_approach = lambda: False
++        h._id1_comp = lambda: 0.2                                       # 再转一次会多给补偿(车上的做法)：差 0.15° 以上就再转
++        h._ap_from_tray_side = lambda a1, a2, cur1=None, always=False: h.arm.cmds.append(('AGAIN', a1))
++        self.assertEqual((h._ring13_tol(1), h._ring13_tol(3), h._ring13_tol(2)), (0.45, 0.45, None))
++        for ring, again in ((1, 0), (3, 0), (2, 2)):
++            h.arm = Arm()
++            lines.clear()
++            h._return_to_pose(100.0, -800.0, from_tray=True, retries=h._ring_retries(ring), tol_fine=h._ring13_tol(ring))
++            n = sum(1 for c in h.arm.cmds if c[0] == 'AGAIN')
++            self.assertEqual(n, again, (ring, h.arm.cmds, lines))
++            self.assertEqual(any('再转一次' in l for l in lines), again > 0, (ring, lines))
++        h.cfg['ring13_return_tol_deg'] = 0                              # 0 = 以前的做法：1 号环也再转
++        h.arm = Arm()
++        h._return_to_pose(100.0, -800.0, from_tray=True, retries=h._ring_retries(1), tol_fine=h._ring13_tol(1))
++        self.assertEqual(sum(1 for c in h.arm.cmds if c[0] == 'AGAIN'), 1, h.arm.cmds)
++
+     def test_approach_id1_slow_steps_from_the_tray_side(self):
+         """(10-27 晚)arm_link.approach_id1：先转到多转的地方(快慢不管)，转回来每一下不到 3.5°(STM32 一下 4.5° 以内才慢慢转、停得准)；
+         多转的那一下没转过去就再转一次。"""
